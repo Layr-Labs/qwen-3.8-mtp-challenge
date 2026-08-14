@@ -1,0 +1,57 @@
+# SHA256 manifest for EigenLabs/Qwen3.8-27B-MTP-bf16.
+# Revision: 26a328e070875b0314d652a039b6b59902690f03
+# Format: <sha256> <byte_count> <relative_path>
+#
+# GENERATED FROM THE PUBLISHED HEAD REPOSITORY 2026-08-14, replacing the 3.6
+# head's records this file carried as a worked example while the upload was
+# outstanding. The head was extracted from the official bf16 base
+# Qwen/Qwen3.8-27B @ 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 and published at
+# the revision above.
+#
+# THE PUBLISHED TREE IS FOUR FILES, and the reason is the LOADER, not the
+# upload. The first publish carried only model.safetensors plus the
+# `.gitattributes` Hugging Face generates for every repository, on the reasoning
+# that the head merges into the target's tree under the `mtp.` prefix at load
+# and carries no independent tokenizer. That reasoning was right about the
+# tokenizer and wrong about the rest: Qwen36MTPHeadAttachment.verifyHeadTree
+# REQUIRES `model.safetensors.index.json` and `config.json` in the head
+# directory and refuses the load without them. It reads the index to assert the
+# head names exactly 15 BARE tensors -- a pre-merged, already-`mtp.`-prefixed
+# tree is refused rather than accommodated -- and it reads the config to assert
+# the head belongs to the same architecture family and declares the single MTP
+# layer the backbone's `mtp_num_hidden_layers: 1` promises. Neither file is a
+# load INPUT (the model is built from the backbone's config); both are
+# compatibility assertions the head cannot be verified without. So the head
+# repository grew to four files at revision 26a328e0 and the manifest, the
+# workflow shape pins and the contract fixture moved with it. There are still no
+# tokenizer files, and there never will be.
+#
+# `.gitattributes` IS PINNED. The ranked workflow's `verify_cache` runs a
+# strict flat inventory check in BOTH directions and rejects any file in the
+# cache that the manifest does not name; a stock `snapshot_download` stages it,
+# so omitting the record would not keep a git plumbing file out of the pins, it
+# would just fail the run (run 31665285024 died on exactly that).
+#
+# THE ON-BOX STAGING DIRECTORY IS NOT THIS TREE. The eight-file layout that
+# ~/qwen38-mtp-head held on the ai-server is box-local extraction scratch; what
+# this manifest pins, and what MLXFAST_QWEN_MTP_HEAD_DIR must contain
+# file-for-file, is the PUBLISHED repository above.
+#
+# The whole-manifest shape pins move with this body, in this commit:
+#
+#   MLXFAST_QWEN_MTP_HEAD_MANIFEST_RECORDS: 4
+#   MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES:   849406438
+#
+# and so do the contract fixture's mtp_head.manifest_sha256 and
+# mtp_head.expected_total_bytes.
+#
+# THE LAST PINNED HEAD, kept as provenance rather than as a template now that
+# real records exist, was mlx-community/Qwen3.6-27B-MTP-4bit @
+# 83795d546e9d328160e593fb0bf10b2bf2fe637e: 8 records, 258490810 bytes, and a
+# 31-tensor index, because that head was 4-bit group-64 and its 8 matrices
+# appeared as weight/scales/biases triples alongside 7 norms. The 3.8 head is
+# bf16, so the same 8 matrices are 8 entries and 8 + 7 = 15.
+11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361 1519 .gitattributes
+fb2a5bd03bc4a2ac6a161f2f2eb5bf9fc3e4e23bf50a55c2ba41fe6b692d2b95 3570 config.json
+8fceddc664f3ea96d02e304463aa1319213ff52cdf1f3401d4bce64e7075c349 849400347 model.safetensors
+b21c0c41a317926d438d8c5080adbeddb71ee03f78323a8dc5890d1a96325feb 1002 model.safetensors.index.json

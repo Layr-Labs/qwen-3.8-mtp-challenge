@@ -1,0 +1,22 @@
+# SHA256 manifest for the Laguna XS 2.1 DFlash draft model (assistant slot),
+# track laguna-xs-2.1-dflash-v1.
+#
+# Provenance: converted from the upstream BF16 checkpoint
+#   poolside/Laguna-XS-2.1-DFlash @ 5c36361aab23c8ed3afbd079c10c426b677bc607
+# to MLX layout by Vendor/mlx-swift-lm/scripts/convert_laguna_dflash.py
+#   (converter sha256 25d49093b3e68e1f304d4eb306630772587962ff575d4651b13a0b71fcac5963)
+# The converter is a stdlib-only byte repack that splits the fused qkv tensor
+# ([q 8192; k 1024; v 1024]); BF16 precision is PRESERVED (the drafter is not
+# quantized -- it is only 924 MB and keeping it BF16 avoids adding draft-side
+# quantization error to the accept rate). Output is 68 tensors.
+#
+# Hashes below were generated ON m5-bench (M5-C) from the provisioned artifact
+# at /opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/assistant, which is
+# the exact tree the ranked worker loads (runner-owned, mode 0444).
+# The upstream BF16 payload is 924135848 bytes per Hugging Face LFS metadata;
+# the MLX repack below is 924137156 bytes (differing safetensors header), which
+# is expected and is why the repacked artifact is pinned rather than upstream.
+#
+# Format: <sha256> <byte_count> <relative_path>
+52c5f769ff3fb0ad85b1294f15f10d1f0a178a5fdcd2a8b0f6881810d29165b9 1121 config.json
+314e908029abb30513e1f45d47bd412ba6bddfa22686de2846d26fe4bec599a8 924137156 model.safetensors

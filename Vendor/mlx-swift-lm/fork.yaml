@@ -1,0 +1,116 @@
+title: "Layr-Labs/mlx-swift-lm"
+footer: |
+  [Layr-Labs/mlx-swift-lm](https://github.com/Layr-Labs/mlx-swift-lm) fork overview &middot; created with [Forkdiff](https://github.com/protolambda/forkdiff)
+base:
+  name: ml-explore/mlx-swift-lm
+  url: https://github.com/ml-explore/mlx-swift-lm
+  ## upstream pin (merge-base with fork)
+  hash: 7e2b7107be52ffbfe488f3c7987d3f52c1858b4b
+fork:
+  name: Layr-Labs/mlx-swift-lm
+  url: https://github.com/Layr-Labs/mlx-swift-lm
+  ## latest fork commit pin
+  hash: 8d1cbcd803aaf056a893a69ac4162b059eab464e
+def:
+  title: "Layr-Labs mlx-swift-lm Fork Diff Overview"
+  description: |
+    The original mlx-swift-lm codebase can be found at [`github.com/ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm).
+    The Layr-Labs fork at [`github.com/Layr-Labs/mlx-swift-lm`](https://github.com/Layr-Labs/mlx-swift-lm) adds continuous batching and Mixture-of-Experts support.
+
+  sub:
+    - title: "Continuous Batching Engine"
+      description: |
+        Adds a full continuous batching inference engine that supports concurrent generation of multiple sequences
+        with iterative prefill/decode scheduling, per-row sampling, and sequence lifecycle management via a state machine.
+        This enables high-throughput serving of LLMs on Apple Silicon.
+
+      sub:
+        - title: "Batch Generation & Scheduling"
+          description: |
+            The `BatchGenerator` orchestrates the continuous batching loop: it manages a pool of sequences,
+            schedules prefills and decodes, and yields generation results as they complete. It handles
+            adding new sequences, cancelling sequences, and recycling KV cache slots.
+          globs:
+            - "Libraries/MLXLMCommon/BatchGenerator.swift"
+
+        - title: "Generation Batch"
+          description: |
+            `GenerationBatch` holds the model, KV cache, and active sequences for a single batch step.
+            It performs the forward pass over the batch, applies logits processing, and samples tokens
+            per-row using the configured sampler.
+          globs:
+            - "Libraries/MLXLMCommon/GenerationBatch.swift"
+
+        - title: "Batch KV Cache"
+          description: |
+            `BatchKVCache` extends the standard KV cache with paged/batched allocation to support
+            multiple concurrent sequences. It manages slot assignment, cache growth, and efficient
+            batched attention across heterogeneous sequence lengths.
+          globs:
+            - "Libraries/MLXLMCommon/BatchKVCache.swift"
+
+        - title: "Prompt Processing (Batched Prefill)"
+          description: |
+            `PromptProcessingBatch` handles the prefill phase: tokenizing prompts, setting up
+            initial KV cache entries, and processing multiple prompt tokens in a single batched
+            forward pass for throughput.
+          globs:
+            - "Libraries/MLXLMCommon/PromptProcessingBatch.swift"
+
+        - title: "Per-Row Samplers"
+          description: |
+            `RowSamplers` provides per-sequence sampling strategies within a batch. Each row in
+            the batch can use a different sampling configuration (temperature, top-p, top-k, etc.),
+            enabling heterogeneous generation parameters across concurrent requests.
+          globs:
+            - "Libraries/MLXLMCommon/RowSamplers.swift"
+
+        - title: "Sequence State Machine"
+          description: |
+            `SequenceStateMachine` models the lifecycle of each generation sequence through states
+            (waiting, prefilling, decoding, completed, cancelled) and transitions between them,
+            ensuring correct scheduling and resource cleanup.
+          globs:
+            - "Libraries/MLXLMCommon/SequenceStateMachine.swift"
+
+        - title: "KV Cache Extensions"
+          description: |
+            Modifications to the existing `KVCache` to support batched access patterns required
+            by the continuous batching engine, including batched updates and cache state queries.
+          globs:
+            - "Libraries/MLXLMCommon/KVCache.swift"
+
+        - title: "Continuous Batching Tests"
+          description: |
+            Tests validating the continuous batching engine: sequence lifecycle, batch scheduling,
+            cancellation, concurrent generation correctness, and KV cache management.
+          globs:
+            - "Tests/MLXLMTests/ContinuousBatchingTests.swift"
+
+    - title: "Gemma 4 MoE Support"
+      description: |
+        Extends the Gemma 4 text model to support Mixture-of-Experts variants (specifically the 26B-A4B model).
+        Adds MoE configuration fields (num_experts, top_k_experts, moe_intermediate_size), a MixtureOfExperts
+        module, and shared KV attention layers used in the later transformer blocks of the MoE variant.
+      globs:
+        - "Libraries/MLXLLM/Models/Gemma4Text.swift"
+
+    - title: "Documentation"
+      description: |
+        Adds documentation for the continuous batching feature, including architecture overview
+        and usage guide.
+      globs:
+        - "Libraries/MLXLMCommon/Documentation.docc/continuous-batching.md"
+        - "Libraries/MLXLMCommon/Documentation.docc/Documentation.md"
+
+    - title: "Build & Dependencies"
+      description: |
+        Switches the mlx-swift dependency from the remote SPM package to a local path reference
+        (`../mlx-swift`) for development against a custom mlx-swift build. Also adds the `MLXRandom`
+        product dependency needed by the continuous batching samplers.
+      globs:
+        - "Package.swift"
+
+ignore:
+  - ".git"
+  - "*.sum"

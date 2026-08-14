@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "track_id": "qwen3.8-27b-mtp-v1",
+  "qwen38_cutover_status": "RESOLVED 2026-08-14. The 3.8 bring-up completed: both checkpoint halves are published and pinned by sha, the timed pool was re-measured on the 3.8 tower across six gated sessions on both ranked boxes, the on-box baseline is installed and calibrated (baseline-calibration.json authored by cal38-3 on each box), and the track is ARMED. Serving moved to the production repository Layr-Labs/qwen-3.8-mtp-challenge in the same cutover.",
+  "qwen38_cutover_blocking_flags": [],
+  "qwen38_cutover_resolved_2026_08_14": [
+    "target.upstream_model_id -> EigenLabs/Qwen3.8-27B-4bit, OUR OWN mlx-0.32.0 conversion (revision pending publish)",
+    "target.upstream_source_model_id / upstream_source_revision -> Qwen/Qwen3.8-27B @ 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "target.geometry_note -> VERIFIED byte-identical to 3.6; the QWEN38-VERIFY-AT-RELEASE hedge is discharged, and the later identity swap did not reopen it (the terminating cross-check was numerical, not structural)",
+    "target.quantization -> unchanged and confirmed equal to the checkpoint's own quantization / quantization_config blocks",
+    "mtp_head.upstream_model_id -> EigenLabs/Qwen3.8-27B-MTP-bf16 (revision pending upload)",
+    "mtp_head.tensor_count -> 15 bf16 tensors, MEASURED; the QWEN38-VERIFY-AT-RELEASE hedge on the inherited 31 is discharged"
+  ],
+  "official_scoring_enabled": true,
+  "official_scoring_enabled_note": "DISABLED FOR THE 3.6 -> 3.8 CUTOVER. It was true from the 3.6 operator go-live of 2026-08-13 (docs/qwen-mtp-go-live-runbook.md), flipped together with reference_baseline.publication_allowed. Everything this fixture pinned at that point was measured on box 3 against the real Qwen 3.6 27B tower with the pinned native MTP head at tip 6a3bee9, and all 8 pool objects plus the hidden goldens were uploaded to R2 and re-verified by digest on download. NONE OF THAT TRANSFERS TO QWEN 3.8. A ranked dispatch is refused while this is false, and it must stay false until the 3.8 tower is pinned, its goldens are regenerated and uploaded under correctness_prompts/qwen3.8-27b-mtp-v1/, the timed pool is re-measured and the on-box baseline is installed and calibrated. Flipping it back to true is a deliberate single commit that also moves MLXFAST_QWEN_MTP_CALIBRATION_READY and QwenMTPTrackNamingTests, exactly as the 3.6 go-live did.",
+  "mlx_swift_lm_revision": "6a3bee95eadaef0445b8201304f3417ec431f0f0",
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-beagle.json",
+      "sha256": "919318e117fd04fd827e4cbc82abc30f37f6aea0e1c2609b27e3679c64c25fca",
+      "bytes": 110395,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.144,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-botany.json",
+      "sha256": "192fb6218ae7c1950dffb24b13ce3608857162bcd17853d3892f1d70876ad313",
+      "bytes": 109627,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.331,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-drama.json",
+      "sha256": "4b9e88cdbe5aa2e76c03dcd76c5d2166e1e89c40ec2f777720aa87b225d7e1ff",
+      "bytes": 109722,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 3,
+      "noop_decode_speedup_spread_pct": 0.219,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-essays.json",
+      "sha256": "a2ea8b60458057ae731c11ff841eb95ad66f6f785b9bc8a6ef169d59ccca679b",
+      "bytes": 109685,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.155,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-medicine.json",
+      "sha256": "00142a4454b01e746b517c35eb23d1f248cd934bc3a743250b03745b9e711986",
+      "bytes": 110440,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 8,
+      "noop_decode_speedup_spread_pct": 0.207,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-plutarch.json",
+      "sha256": "c1ec58669d032878b7fd82d811132bca19e79c91e19bf1414fe47c9b6d16e09e",
+      "bytes": 109643,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.437,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-republic.json",
+      "sha256": "ea82dcb5931a2d78a42cebd4fb4189bf875a31c947b67792782e455f88a155a1",
+      "bytes": 109875,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.269,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    },
+    {
+      "r2_path": "correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-pool-travel.json",
+      "sha256": "3b10cb4dcae4b7f8222b1594861c4bbcc72aa890d72b46e97caee994884c82a5",
+      "bytes": 109677,
+      "noop_decode_speedup": 1.0,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.167,
+      "noop_decode_speedup_role": "informational_diagnostic_not_scored"
+    }
+  ],
+  "timed_prompt_pool_note": "Contract layer L6 (anti-lottery). Each entry IS a timed MTP reference-rows golden (the object the ranked job downloads and passes to mtp-timed --golden), NOT the prose prompt it was seeded from. Each was generated on box 3 with `mtp-verify --emitted <plan> --generate 513` over the transformed weights tree plus the pinned MTP head, from a DIFFERENT 512-token prose seed (8 distinct domains), and each returned reference_self_consistent=true with 513 rows.",
+  "noop_decode_speedup_note": "RE-MEASURED 2026-08-13 on box 3 as N-PAIR MEANS; supersedes the single-shot values measured at tip 6a3bee9. Per entry: raw_ratio = mean(depth-0 serial parent_measured_seconds_per_token over accepted pairs) / mean(depth-2 parent measured_seconds_per_token over the same pairs) -- ratio-of-means, matching how the ranked job aggregates -- over the same 512-token window and the same rows golden, candidate = a clone of the pinned baseline tree (baseline-equivalent, so each entry's honest value IS its no-op reference). noop_decode_speedup_pairs records the accepted pairs behind each mean and noop_decode_speedup_spread_pct the measured spread, so the tolerance provenance is data rather than folklore. SPREAD METHOD: conservative propagation sqrt(CV_serial^2 + CV_mtp^2) of the two legs' per-phase CVs, applied identically to every entry. It OVER-states true paired spread by roughly 1.4-1.9x because the two legs of a pair share a thermal session and are positively correlated; where exact pair-level ratios were available (beagle, botany, drama) they were 0.104%, 0.281% and 0.116%. WHY THE RE-MEASUREMENT WAS NEEDED: the 6a3bee9-era references were each ONE pair (one depth-0 run, one depth-2 run, no averaging), and they were taken in a measurably different thermal/frequency regime -- their depth-0 serial legs cluster at 0.035653 s/tok while the current regime, and the pinned on-box serial calibration 0.037994794617407023, both sit at ~0.03800 s/tok, a +6.58% delta. That delta very nearly cancels in a ratio, but not exactly and not equally per prompt, so the old references and the pinned calibration were never mutually consistent. These means put both on the same footing for the first time. OBSERVED SHIFT: predominantly upward but NOT coherent -- 6 of 8 entries moved up, essays -0.475% and medicine -0.642% moved down; mean +0.32%, range -0.64% to +1.55%. A uniform shift would pass straight through the median-of-8 statistic, so the non-uniformity is the reason per-entry re-measurement was required rather than a single global correction. REJECTION-RATE FINDING (operator-ratified 2026-08-13): timing tolerance on this track is derived from measured per-prompt spread, never inherited from the serial era, because speculative decode is structurally prompt-sensitive -- rejection-heavy prompts do more rollback and re-forward work. In THIS data the correlation between acceptance rate and CURRENT spread is weak (r = -0.26, n=8, not significant); the strong relationship is between acceptance rate and the ERROR IN THE OLD SINGLE-SHOT REFERENCE (r = -0.75): the lowest-acceptance prompts are exactly where one-pair references were least reliable (botany 0.383 -> +1.55%, plutarch 0.434 -> +1.40%, against medicine 0.585 -> -0.64% and essays 0.563 -> -0.48%). Pair-averaging has already absorbed it: current spreads are 0.14-0.44% across the pool with no acceptance ordering. TOKEN EXACTNESS IS UNAFFECTED by anything in this note -- these are timing/score tolerances only. One anomaly is on record: medicine's first 4-pair session contained a single depth-0 serial reading of 0.039470826 s/tok, a >10 sigma excursion against the 31 other accepted serial observations (the depth-0 leg does prompt-independent work, so all serial readings are interchangeable and sit at ~0.03800). Rather than discard an accepted measurement, medicine was re-run at 8 pairs: the outlier did not recur, serial CV fell 1.632% -> 0.144%, and the mean landed at 1.0845 (pooling all 12 pairs minus the outlier gives 1.0844). The 8-pair value is the one pinned here.",
+  "target": {
+    "upstream_model_id": "EigenLabs/Qwen3.8-27B-4bit",
+    "upstream_revision": "eda45ab47f465d08d6558f0353a2346e2eb9d5b3",
+    "upstream_pin_note": "OUR OWN CONVERSION, decided 2026-08-14 (second decision of the day; see upstream_source_note for what it replaced). MLX 4-bit affine, group_size 64, produced under a PINNED TOOLCHAIN (mlx 0.32.0) from the official bf16 base named below, and published as EigenLabs/Qwen3.8-27B-4bit. The quantization envelope is exactly {\"group_size\": 64, \"bits\": 4, \"mode\": \"affine\"} in both the quantization and quantization_config blocks and equal to each other -- the same envelope the 3.6 target shipped -- so the quantization contract below is carried unchanged rather than re-negotiated. The tower is 1,847 tensors, ALL under the language_model. prefix and NONE under mtp.: the head ships separately, exactly as it did on 3.6. Raw model_type is qwen3_5, the same immutable internal architecture name the 3.6 artifact carried. THE REVISION IS PUBLISHED: eda45ab47f465d08d6558f0353a2346e2eb9d5b3. It was a pending marker for exactly one commit, because a repository name that is decided while the artifact is unuploaded has no commit sha; every path that spells one (MLXFAST_QWEN_MTP_TARGET_DIR, MLXFAST_REFERENCE_DIR, the provisioning job's third spelling, MLXFastConstants.defaultReferenceCachePath, setup.sh's download URL, the manifest fixture's Revision header) moved off that marker onto this sha in a single commit, which is the only safe way to move a value spelled in six places. The repository is PRIVATE. The published shard split, measured at publish rather than assumed, is three safetensors files; the file count and byte total live in expected_source_bytes and the manifest body rather than being restated here.",
+    "upstream_source_model_id": "Qwen/Qwen3.8-27B",
+    "upstream_source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "upstream_source_note": "The official bf16 base (55.6 GB) the pinned 4-bit target is quantized from, and the same artifact the MTP head is extracted from. UNCHANGED across both 2026-08-14 decisions and still correct: it is the lineage that makes the derived target auditable. TERMINATION ON THE RECORD: earlier on 2026-08-14 this track adopted a third-party personal-account 4-bit conversion of this same base, kenotron/Qwen3.8-27B-mlx-4Bit @ 51cb82b951deba7dceebff4644c6e4046c873441, on inspection of its quantization blocks and file inventory, with a deterministic reconversion cross-check RESERVED rather than performed; that adoption was TERMINATED hours later by the operator's validation kill-switch when the reserved cross-check was run and found 994 of 1,847 tensors numerically different from our own pinned-toolchain (mlx 0.32.0) conversion of this base, so the reference is now that conversion of ours instead. The terminated identity is named here, and ONLY here, so a future reader can tell which artifact was rejected rather than rediscovering it -- it must not be re-adopted, and no other site in this repository spells it.",
+    "manifest_path": "fixtures/reference_qwen3_8_27b_4bit.sha256",
+    "manifest_sha256": "6058b1ae56744a1ee66ec305f880373d9f91f62af586ad0147207826850f63b0",
+    "manifest_sha256_note": "SHA-256 of the checked-in manifest file itself, so a tampered manifest is caught before any weight byte is read. It is recomputed here because that file gained its generated per-file body in this commit: its repository line names EigenLabs/Qwen3.8-27B-4bit, its Revision line reads eda45ab47f465d08d6558f0353a2346e2eb9d5b3, and its ten records are generated from the published snapshot.",
+    "expected_source_bytes": 15153237117,
+    "expected_source_bytes_note": "SUMMED FROM THE PINNED MANIFEST ENTRIES, never typed from a directory listing: this field is DEFINED as that sum, which is why it could not be written down before the body existed. It resolved in the same commit as the manifest body and MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES, which it equals. Ten records: three safetensors shards plus seven metadata files. NOTE THE SCOPE -- the published repository carries an eleventh file, Hugging Face's generated .gitattributes, which the manifest does not pin; read that file's own RECORD SCOPE header note before staging the snapshot, because verify_cache rejects any cache file the manifest does not name. Previously 16081490064, the sum of the 3.6 backbone's 16 entries.",
+    "model_type": "qwen3_5_text",
+    "model_type_note": "The TRANSFORMED runtime tree declares qwen3_5_text and loads as Qwen35TextModel with the `language_model.` text-tower prefix stripped; the raw pinned reference declares qwen3_5 and loads as the Qwen35Model wrapper. Both are MTP-capable and both are accepted by the worker (verified on box 3 at this tip: layout=textModel and layout=wrappedTextModel both reach the protocol hello).",
+    "num_hidden_layers": 64,
+    "full_attention_interval": 4,
+    "vocab_size": 248320,
+    "geometry_note": "VERIFIED 2026-08-14 against the Qwen 3.8 27B config.json. It SURVIVED the backbone identity swap later that day untouched: geometry is a property of the official bf16 base recorded in upstream_source_* and is inherited by every conversion of it, and the reconversion cross-check that terminated the earlier adoption was NUMERICAL (tensor values), not structural. The 3.8 27B text tower is BYTE-IDENTICAL IN GEOMETRY to the 3.6 27B one: 64 hidden layers on the same 4-layer hybrid repeat (every 4th layer full attention, the other three gated-delta linear attention), vocab 248320, hidden 5120, 24 attention heads / 4 KV heads, head_dim 256, and the same affine 4-bit / group-64 quantization. These values were CARRIED across the cutover rather than guessed, and the carry is now confirmed rather than hedged -- the QWEN38-VERIFY-AT-RELEASE marker this note used to open with is resolved. The three sites that had to move with these numbers therefore do not move: MLXFAST_EXPECTED_NUM_LAYERS in the ranked workflow, MLXFastConstants.numHiddenLayers, and fixtures/qwen3_6_27b_config.json (which keeps its 3.6 name because its CONTENT is the 3.6 checkpoint's config and renaming it would only hide that -- the geometry it records is now known to describe both).",
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4
+    }
+  },
+  "mtp_head": {
+    "upstream_model_id": "EigenLabs/Qwen3.8-27B-MTP-bf16",
+    "upstream_revision": "26a328e070875b0314d652a039b6b59902690f03",
+    "upstream_pin_note": "PUBLISHED 2026-08-14: EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e070875b0314d652a039b6b59902690f03, extracted from the official bf16 base Qwen/Qwen3.8-27B @ 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0. The question the cutover commit posed here -- whether Qwen 3.8 27B ships a native-MTP head at all -- was answered that day, the repository was decided the same day, and the upload closed the last third of it. While that was outstanding the head's revision and whole-tree byte total carried their OWN pending marker rather than the backbone's, because the two halves publish independently and a single shared marker would have made 'which upload are we waiting on' a guess; both markers are retired now. The published tree is FOUR files, and the LOADER is why it is not two. The first publish, 5419d386875bbc00bb322fb2444aa2b3b6af1f00, carried only model.safetensors plus Hugging Face's generated .gitattributes, on the reasoning that the head merges into the target's tree under the mtp. prefix at load and carries no independent tokenizer. That reasoning holds for the TOKENIZER and failed for the rest: Qwen36MTPHeadAttachment.verifyHeadTree requires model.safetensors.index.json and config.json in the head directory and refuses the load without them -- the index to assert exactly 15 BARE tensor names (a pre-merged, already-mtp.-prefixed tree is refused rather than accommodated), the config to assert the same architecture family and the single MTP layer the backbone's mtp_num_hidden_layers: 1 promises. Neither is a load INPUT; both are compatibility assertions the head cannot be verified without. The repository was therefore republished at 26a328e070875b0314d652a039b6b59902690f03 with those two files added, taking the tree from 2 records / 849401866 bytes to 4 records / 849406438 bytes. There are still no tokenizer files. The repository is PRIVATE. Note the backbone snapshot carries ZERO mtp.* tensors (1,847 tensors, all language_model.), so the head remains a separately pinned artifact on 3.8 exactly as it was on 3.6 -- and this track has no meaning without it, because the speculator IS the checkpoint's own head rather than a substitutable drafter. The last PINNED head, whose records fixtures/qwen3_8_27b_mtp_head.sha256 carried as a worked example until this commit replaced them, was mlx-community/Qwen3.6-27B-MTP-4bit @ 83795d546e9d328160e593fb0bf10b2bf2fe637e.",
+    "manifest_path": "fixtures/qwen3_8_27b_mtp_head.sha256",
+    "manifest_sha256": "1034f92634351b0bb4c4a02afa62df316c7a56a41a35e16f36479fde47041f81",
+    "expected_total_bytes": 849406438,
+    "expected_total_bytes_note": "849406438: the WHOLE-TREE sum of all four published manifest records, pinned equal to MLXFAST_QWEN_MTP_HEAD_MANIFEST_BYTES. It is deliberately NOT weights_file_bytes (849400347) -- the extra 6,091 bytes are the .gitattributes (1,519), config.json (3,570) and model.safetensors.index.json (1,002) records, all pinned because verify_cache rejects any cache file the manifest does not name. It was 849401866 across TWO records at 5419d386, when the tree was weights plus .gitattributes; the two config files were added at 26a328e0 because verifyHeadTree refuses a head tree without them. On 3.6 this was 258490810 across EIGHT records (weights plus config, index, tokenizer, vocab, README and .gitattributes); the 3.8 tree is still a smaller TREE despite much larger WEIGHTS, because the head ships no tokenizer files. Resolved with the manifest body and manifest_sha256, in one commit, exactly as this note required.",
+    "weights_file_bytes": 849400347,
+    "tensor_bytes": 849398784,
+    "dtype": "bf16",
+    "weights_shape_note": "MEASURED 2026-08-14 on the head extracted from the official bf16 base: a SINGLE model.safetensors of 849,400,347 bytes carrying 15 bf16 tensors totalling 849,398,784 tensor bytes (the 1,563-byte remainder is the safetensors JSON header). These are facts about the artifact and are pinned here because they are knowable without the upload; they are NOT a substitute for expected_total_bytes, which is a whole-tree sum, nor for the manifest body, which is per-file digests.",
+    "tensor_count": 15,
+    "tensor_count_note": "MEASURED 2026-08-14 on the 3.8 head; the QWEN38-VERIFY-AT-RELEASE hedge this field carried is DISCHARGED. Mirrored by MLXFastConstants.qwenMTPHeadTensorCount and asserted at load: a head tree that lost or gained a tensor fails the load instead of drafting from a partly-uninitialised head. WHY IT WAS 31: that count came from the 3.6 head's own model.safetensors.index.json, and that head was a 4-bit group-64 MLX conversion, so its 8 matrices each appeared as a weight/scales/biases TRIPLE (24 entries) alongside 7 norms. The 3.8 head is bf16 and unquantized, so the same 8 matrices are 8 entries and 8 + 7 = 15. The head did not change shape; the old number was counting a quantization layout rather than an architecture. CONSEQUENCE: setup-qwen-mtp.sh still defaults to the 3.6 head for the local developer path, so the local load now refuses on this constant -- the same intended refusal the already-mismatched local pair carried, arriving earlier and naming the right cause.",
+    "merge_note": "The head is a SEPARATELY PINNED tree, merged at load under the `mtp.` key prefix before sanitize and before the quantization walk. It is resident on BOTH sides of the pair, so its residency cost is charged to the serial denominator too; only the drafting differs.",
+    "residency_verified": "SUPERSEDED BY THE PUBLISH, and recorded rather than deleted. The 8/8 byte-verification this field described was of the 3.6 head staged on box 3 against the 3.6 records this manifest carried; the manifest now pins the PUBLISHED 3.8 tree, so that verification no longer describes anything the workflow checks. What must be re-verified is the 2-file published tree against the regenerated manifest, in the directory MLXFAST_QWEN_MTP_HEAD_DIR names -- verify_cache compares it file-for-file in BOTH directions, so the eight-file box-local extraction layout under ~/qwen38-mtp-head is not what to stage. The lesson that produced the earlier note stands and is why .gitattributes is pinned here too: pinning is the fix, not deleting from the cache."
+  },
+  "protocol": {
+    "name": "trusted_qwen_mtp_block_v1",
+    "serial_control_depth": 0,
+    "serial_control_depth_note": "0 means MTP OFF: one token per target forward, no draft, no head cache, no head forward, no verify window, no rollback. It is NOT 1. Depth 1 still drafts one token and accepts ~70% of those drafts (measured 0.699 on box 3), so dividing by depth 1 measures depth 2 against one-deep speculation rather than against serial decode, and understates the gain. The depth-0 leg is asserted structurally, not assumed: round_count == decode tokens, accepted == rejected == 0, declared == target_tail == decode tokens, is_serial_control true, uses_native_mtp_head false.",
+    "maximum_depth": 8,
+    "decode_tokens": 512,
+    "parent_oracle_required": true,
+    "worker_timing_is_authoritative": false,
+    "offered_draft_depth_ceiling": 8,
+    "offered_draft_depth_ceiling_note": "OPERATOR-RATIFIED 2026-08-14, replacing candidate_depth 2. The trusted parent OFFERS a per-round draft ceiling and the CANDIDATE chooses how many tokens it actually drafts -- 0 through this value, per round, adaptively. Depth is competitive surface now: the previous pin carried a standing TODO to re-derive it across the whole pool, and opening it moves that re-derivation from the operator to the competitor. The ranked workflow sets MLXFAST_QWEN_MTP_DEPTH to this value, and it is pinned equal to MLXFastConstants.qwenMTPMaxDraftDepth.",
+    "maximum_depth_note": "The TRUSTED bound, and the only bound. It exists to bound the verify width a single round may ask the target for -- not to express an opinion about which depth is good. Enforced by the trusted parent (QwenRuntimeMTPDriver.requireStructurallySound) against the drafts a round ACTUALLY proposed, and mirrored by the box wrapper's QMTP_MAX_DRAFT_DEPTH for its row-accounting ceiling.",
+    "empty_draft_rounds_legal": true,
+    "empty_draft_rounds_legal_note": "A round may propose nothing and commit only its primary. The old refusal (stopTokenInsideWindow on a drafts-empty round) defended the normalised denominator: with an unmodified depth-2 tree pinned at 1.0, a candidate that stopped drafting would have been measuring serial against a reference it no longer resembled. Serial anchoring removes the incentive by construction -- a non-drafting candidate IS the serial control and scores 1.0. Every ledger-closure and bit-exactness rule is unchanged and is derived from the ACTUAL draft count of each round.",
+    "candidate_declares_no_depth": true,
+    "candidate_declares_no_depth_note": "The candidate asserts nothing about its schedule. Effective per-round draft counts are read out of the parent's own round journal and summarised in the sealed report as effective_mean_draft_len, effective_max_draft_len, non_drafting_round_count and effective_draft_lengths. This closes the requested-vs-effective provenance gap (k-matrix finding 5): the report used to name only the requested depth, which under an adaptive schedule can describe a run that never happened.",
+    "shipped_default_draft_policy": 2,
+    "shipped_default_draft_policy_note": "Qwen36MTPBlockSession.draftPolicy, which is EDITABLE, returns min(offer, 2). It is a starting line, not a recommendation: 2 is the depth this track was pinned at while depth was an operator parameter, so an unmodified tree reproduces the reference behaviour the calibration was measured against even though the offered ceiling is now 8."
+  },
+  "reference_baseline": {
+    "status": "measured_qwen38_cutover_calibration_2026_08_14",
+    "publication_allowed": true,
+    "required_rebaseline_hardware": "m5-qwen38-27b-mtp",
+    "_note": "MEASURED ON QWEN 3.8. Six gated calibration sessions (three per box) ran on 2026-08-14 against the pinned 3.8 backbone EigenLabs/Qwen3.8-27B-4bit @ eda45ab47f465d08d6558f0353a2346e2eb9d5b3 and the pinned head EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e070875b0314d652a039b6b59902690f03, all 48 scored prompts parity=true. Per-box serial decode means: m5-qwen38-27b-mtp-2 0.03799388007610105 s/token, m5-qwen38-27b-mtp-3 0.03793544849031605 s/token -- 0.15% apart, which is the cross-box agreement gate. Supersedes the 3.6 box3-phase5 telemetry this field carried."
+  },
+  "scoring_semantics": {
+    "status": "operator_ratified_2026-08-14",
+    "supersedes": "median_of_per_prompt_normalized_ratio_of_means (operator-ratified 2026-08-13); the normalised figure is still computed and sealed as a cutover-era diagnostic and is not read by any gate",
+    "aggregation": "median_of_per_prompt_raw_serial_relative_speedup",
+    "score_anchor": "serial = 1.0",
+    "score_anchor_note": "THE POINT OF THE RECUT. Dividing by each prompt's pinned no-op reference made an UNMODIFIED candidate score exactly 1.0 by construction, which silently declared the shipped depth-2 speculative decoder to be the zero point. It is not: measured on box 3 it is a ~6.5% REGRESSION against true serial decode at the 512-token window. Anchoring at serial makes the leaderboard read as physics -- 1.0 is serial decode, above 1.0 is a real speedup, and the shipped configuration starts below the line with work to do. It is also what makes the opened speculative surface safe: a candidate that drafts nothing degenerates to serial and scores 1.0, so 'turn speculation off' is an honest submission rather than an exploit.",
+    "prompt_selection": "one prompt per collection; each of the 8 timed_prompt_pool collections is a singleton today, so a ranked run times ALL 8. There is no per-run draw.",
+    "per_prompt_score": "raw_p = mean(serial depth-0 seconds/token over p's accepted pairs) / mean(candidate seconds/token over the same pairs). Both means come from the same thermally-gated session, alternating order, so the serial leg is the normaliser and it is measured rather than pinned.",
+    "published_score": "median(raw_p over all timed prompts)",
+    "median_rule": "even_n_mean_of_two_central_order_statistics",
+    "median_rule_note": "8 is EVEN, so the rule matters: the score is the mean of the two central order statistics, NOT the lower-median rule used by the per-pair mtp_decode_speedup_median diagnostic and by the CLI's own p50 fields. results.json names both.",
+    "floor": 0.9,
+    "floor_note": "Applied to the RAW median; pinned equal to MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR in the ranked workflow, which is the enforcing site. OPERATOR DECISION 2026-08-14: 0.90, \"do not regress serial by more than 10%\". WHY NOT 0.95, WHICH IS THE FAMILY CONVENTION: at 0.95 this track could not launch. Yukon's import dispatches a BASELINE RUN OF THE SOURCE TREE and requires a published score to seed currentBestScore; no published score means the benchmark never opens and no submission can ever be made. The stock tree medians ~0.935 raw -- a measured ~6.5% regression against true serial decode at this window, which is exactly the fact serial anchoring exists to stop hiding -- so a 0.95 floor rejects the one run the whole track bootstraps from. The 0.95 convention came from a NORMALISED score where an unmodified tree sat at 1.0 by construction; it does not survive the change of anchor. WHAT 0.90 MEANS: a regression bound, not a quality bar. A submission may be slower than serial and the board will say so, but not by more than 10%. A candidate that cannot beat serial should stop drafting and take 1.0 -- legal, free, and strictly better than publishing 0.92. CONSEQUENCES: the stock tree publishes 0.935 and holds the board at -6.5%; calibration dispatches publish normally; k3-class regressions (~0.777) still floor-fail, which is the intended terminal state for a submission that is simply slower. Operator-confirmable default.",
+    "ceiling": 3.0,
+    "ceiling_note": "ADDED 2026-08-14 (k-matrix finding 3). Until now the box wrapper bounded per-PAIR ratios at 5.0 and NOTHING bounded the aggregate that reached the leaderboard, so an implausible published median could only be caught by a human reading it. 3.0 is deliberately generous: the authors' own exact-greedy envelope tops out at 1.74x at a 32-token window and kernel work on this tower has historically bought tens of percent, so 3.0 leaves room for both compounding and still calls anything above it a measurement fault or an escape. Enforced independently by the ranked workflow (MLXFAST_QWEN_MTP_DECODE_SPEEDUP_CEILING) and by the wrapper (MAX_PLAUSIBLE_PUBLISHED_SPEEDUP). Operator-confirmable default.",
+    "reference_key": "timed_prompt_pool[].sha256, matched against the SHA-256 of the golden object itself. Still load-bearing for POOL MEMBERSHIP -- a golden that is not a pinned pool member fails closed before the first thermal gate -- but no longer for scoring.",
+    "pairs_per_prompt": 1,
+    "pairs_per_prompt_note": "PER PROMPT, not per run: a ranked run is 8 prompts x 1 pair = 8 pairs / 16 timed phases. k=1 is the ranked default and is raisable via the wrapper's --pairs-per-prompt.",
+    "serial_denominator_banding": "UNCHANGED and still load-bearing. The band check runs on the mean of every accepted serial pair of every prompt against the one top-level calibration. The serial control is depth 0 -- 512 plain forwards -- and is prompt-invariant by construction. This is the guard that catches a box whose denominator drifted, and re-anchoring the score does not touch it: the score is a ratio, and a band on the denominator is what stops a slow box from inflating every ratio at once.",
+    "effective_depth_provenance": "The candidate declares no depth. effective_mean_draft_len, effective_max_draft_len, non_drafting_round_count and effective_draft_lengths are derived by the trusted parent from its own round journal and sealed per prompt and per run (k-matrix finding 5).",
+    "token_exactness": "unchanged: every timed phase must return all_tokens_matched=true, parity_all_ok is the AND over every accepted pair of every prompt, and the per-prompt breakdown carries its own parity_ok so a failure names the prompt."
+  },
+  "proposed_scoring": {
+    "status": "SUPERSEDED_2026-08-14 by the top-level scoring_semantics block; retained as the record of how the track's scoring was reasoned into its current shape",
+    "score": "qwen_mtp_decode_speedup = (paired_serial_decode_sec_per_token at --mtp-depth 0) / (candidate decode_sec_per_token at the candidate's own chosen per-round draft schedule), over the same rows golden and the same parent-counted 512-token window",
+    "ranked_decode_window_tokens": 512,
+    "aggregation": "ratio_of_means WITHIN a prompt: mean(serial seconds/token across that prompt's accepted pairs) / mean(candidate seconds/token across the same pairs). The RUN's published score is the median of those RAW per-prompt values -- see the scoring_semantics block above, which is the authority.",
+    "denominator_authority": "trusted parent wall time divided by the parent-configured decode token count; worker-reported timing is never scored",
+    "component_floor": "RAW median >= 0.90, and RAW median <= 3.0. See scoring_semantics.floor / scoring_semantics.ceiling, which are the authority.",
+    "normalized_scoring": {
+      "status": "RETIRED_2026-08-14. Normalisation was removed from the scoring path entirely. Retained here as the record of why it existed and why it was wrong to keep: it cancelled the BASELINE's prompt-dependence at the price of declaring the shipped depth-2 configuration to be 1.0, which is a ~6.5% regression wearing the zero point's clothes.",
+      "rationale": "The measured no-op reference spans 0.756 to 1.0915 across the pool. Under the ORIGINAL single-draw design one pool prompt was drawn uniformly at random per run, and without normalisation that draw would have dominated the score. Normalisation is still applied per prompt for exactly this reason; what changed is that a run now times ALL 8 prompts and publishes the median, because normalisation alone cannot cancel a candidate's own prompt-dependent improvement profile.",
+      "reference_source": "timed_prompt_pool[].noop_decode_speedup, keyed by sha256. Each entry's own measured no-op normalises to 1.0.",
+      "published_score": "RETIRED. The normalised median is still computed and sealed as normalized_decode_speedup_median_informational so a cutover-era artifact can be read both ways; no gate reads it."
+    },
+    "token_fidelity_gate": "Every emitted token must equal the serial trajectory: mtp-verify at the candidate depth must return all_tokens_matched=true AND parity_all_ok=true, with the row ledger CLOSED (reference_checked_row_total == declared_rows_total, and accepted + rejected + target_tail == declared_rows_total). Verified on box 3 across all 8 pool prompts and the hidden correctness golden.",
+    "token_fidelity_gate_status": "implemented",
+    "stall_guardrail": "a run whose max block latency exceeds 4x its p50 block latency is rejected. CALIBRATION NOTE: as measured, max_block_request_seconds is the FIRST block after the seed prefill and is a one-time warmup, not a stall -- it is flat to within 1% across 8/32/128/512-round windows (serial ~0.19s, depth-2 ~0.267s). At the 512 window the serial leg therefore trips 4x (measured 5.72-5.90x) while the depth-2 leg does not (3.30-3.36x). The guardrail should exclude the first block before this track is enabled.",
+    "prefill_component": "none; seed prefill is charged inside the decode measurement, identically on both legs",
+    "leaderboard": "separate qwen3.8-27b-mtp-v1 namespace, never mixed with the serial or DFlash tracks",
+    "measurement_protocol": "minimum three accepted thermal-gated pairs per session (target four), alternating order"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3.8-27B",
+    "verified_repositories": [
+      "Qwen/Qwen3.6-27B",
+      "mlx-community/Qwen3.6-27B-4bit",
+      "mlx-community/Qwen3.6-27B-MTP-4bit"
+    ],
+    "verification_status": "QWEN38-PENDING-RELEASE for the 3.8 artifacts. The three repositories listed in verified_repositories are the 3.6 ones, confirmed 2026-08-13 against the Hugging Face API; they are RETAINED as the record of what was actually checked rather than replaced by 3.8 names nobody has queried. The 3.8 chain -- Qwen/Qwen3.8-27B @ 1d4bf0f2 plus the two unpublished EigenLabs artifacts, EigenLabs/Qwen3.8-27B-4bit and EigenLabs/Qwen3.8-27B-MTP-bf16 -- has NOT been re-confirmed against the API, and neither derived repository exists yet, so it cannot be. Both are ours and both derive from the Apache-2.0 base above, which is why the SPDX identifier is not in doubt; what is unconfirmed is the published tags. Re-run the confirmation and replace this list when both uploads land.",
+    "_note": "CONFIRMED 2026-08-13 against the Hugging Face API, FOR THE 3.6 ARTIFACTS. All three repositories the 3.6 track depended on -- the upstream Qwen/Qwen3.6-27B, the pinned target mlx-community/Qwen3.6-27B-4bit, and the pinned MTP head mlx-community/Qwen3.6-27B-MTP-4bit -- carry the license tag apache-2.0, which is the Hugging Face spelling of SPDX Apache-2.0 recorded above. Both derivative repositories agreed with upstream, so no per-artifact license split had to be represented. The SPDX identifier and url above are updated to the 3.8 upstream because that is the base the adopted target is quantized from and the base the MTP head is extracted from, but see verification_status: the 3.8 tags are not re-confirmed. Re-confirm whenever a pinned revision moves."
+  },
+  "noop_decode_speedup_role_note": "ROLE CHANGE 2026-08-14 (operator-ratified). These references are RETAINED, still pinned, still joined on the golden object's own sha256, and still sealed into every per-prompt breakdown -- but they no longer divide anything. Scoring is anchored at serial = 1.0 and each prompt's score is its own raw serial-over-candidate ratio-of-means, measured in the same thermally-gated session, so the serial leg IS the normaliser. The key name is deliberately UNCHANGED so the wrapper's pool-membership join -- which is how a golden that is not a pinned pool member fails closed before the first thermal gate -- keeps working; the role is declared in this field and per entry instead. What these numbers MEAN now: each is the shipped depth-2 configuration's own measured per-prompt performance against true serial decode, i.e. the reference tree's regression profile. That is exactly what a submitter wants printed next to their own raw ratio, and it is why they are published rather than deleted.",
+  "mtp_head_delivery": {
+    "status": "operator_ratified_2026-08-14",
+    "declaration_path": "mtp-head.manifest.json",
+    "declaration_is_editable": true,
+    "weights_path": "mtp-head",
+    "sources": [
+      "pinned",
+      "remote",
+      "in_branch"
+    ],
+    "default": "pinned",
+    "default_note": "ABSENCE of the declaration means the pinned head, and absence is the COMMON case: submissions arrive as archives with replace semantics, so most will not carry one. benchmark.json lists both the declaration and the weights directory in optionalEditablePaths, so the overlay keeps the trusted copy instead of failing closed. A declaration that is PRESENT and broken -- unparseable, unverifiable, oversize, digest-mismatched -- is a refusal, never a silent fall back.",
+    "max_bytes": 2147483648,
+    "max_bytes_note": "2 GiB. Admits a full re-quantised 27B-class head (the pinned one is 258,490,810 bytes) with room for a larger-rank replacement, while keeping one submission's fetch inside the runner's disk and time budget. Operator-confirmable default.",
+    "primary_path": "remote",
+    "primary_path_note": "Submission archives are capped at 25 MiB, so nothing head-shaped travels in one. `remote` (an HF repo@revision or an R2 key, fetched and digest-verified runner-side, pre-sandbox) is the real delivery path; `in_branch` is the direct-dispatch and tiny-delta fallback.",
+    "applies_to": "candidate_leg_only",
+    "applies_to_note": "The BASELINE leg always runs the section-9d pinned head out of the pinned baseline tree. That asymmetry is what keeps the paired ratio anchored: the denominator never moves. The wrapper takes the resolved directory as QMTP_CANDIDATE_HEAD_DIR and uses it on the MTP side only.",
+    "provenance_recorded": "head_provenance",
+    "provenance_recorded_note": "Every sealed report carries head_provenance {source, sha256, bytes, file_count, origin}. The digest is a tree digest: sha256 over '<file sha256>  <relative path>' lines in LC_ALL=C sorted order, README.md excluded, so one number describes a multi-file head and a participant can recompute the value they are asked to declare. This is what REPLACED uses_pinned_mtp_head / uses_native_mtp_head / mtp_head_attached as pass-conditions in the ranked workflow, the local runner and the box wrapper: those three are recorded fields now, and uses_native_mtp_head means 'the head actually drafted' rather than 'a speculative depth was requested'.",
+    "safety_argument": "A head only PROPOSES tokens. The organizer-pinned target decides every emitted token and the trusted parent re-checks the whole stream against the hidden serial trajectory after the clock stops, so a substituted head can move the accept rate -- which is the game -- and cannot move the output."
+  },
+  "calibration": {
+    "status": "measured_qwen38_cutover_2026_08_14",
+    "expected_raw_median": 0.9940390645,
+    "band_pct": 2.0,
+    "expected_raw_median_note": "WHAT AN UNMODIFIED TREE SCORES under the raw serial-anchored semantics, MEASURED on Qwen 3.8 rather than seeded. Six gated sessions (cal38-1..3 on each of the two m5-qwen38-27b-mtp boxes, 2026-08-14) produced session medians 0.995231 0.993918 0.994609 (box 2) and 0.993847 0.993622 0.993008 (box 3): a total spread of 0.0022 (0.12%). This value is the even-n median of the eight per-prompt ratios below, each itself the mean of that prompt's six runs. It REPLACES the 3.6 k-matrix seed of 0.9350424303 -- Qwen 3.8's shipped depth-2 configuration is a ~0.6% regression against true serial, not the ~6.5% the 3.6 tower showed.",
+    "expected_raw_median_provenance": {
+      "source_run": "qwen38 cutover calibration, 6 gated sessions across both ranked boxes",
+      "baseline_tree": "e183bfa25b509f354730d774a70c638b8494c488",
+      "measured_at": "2026-08-14T19:46:50Z",
+      "sessions": 6,
+      "prompts_per_session": 8,
+      "scored_prompts": 48,
+      "parity": "true on all 48",
+      "effective_depth": "1 on all 48 (configured depth 2)",
+      "per_prompt_raw_ratios": {
+        "919318e1 beagle": 0.9837151863,
+        "192fb621 botany": 0.8467346316,
+        "4b9e88cd drama": 0.9586513767,
+        "a2ea8b60 essays": 1.0043629427,
+        "00142a44 medicine": 1.0726148639,
+        "c1ec5866 plutarch": 0.9700803136,
+        "ea82dcb5 republic": 1.0115888698,
+        "3b10cb4d travel": 1.0580756661
+      }
+    },
+    "band_note": "+/- 2.0% around expected_raw_median, i.e. [0.9742, 1.0139]. The measured dispersion across the six 3.8 sessions is 0.12%, an order of magnitude inside this band; 2.0% is retained from the ratified sizing rather than tightened, so the window still absorbs thermal and box-to-box variation.",
+    "serial_denominator_band_unchanged": true,
+    "serial_denominator_band_unchanged_note": "The TOP-LEVEL serial band in the on-box baseline-calibration.json is untouched and stays load-bearing: serial_decode_seconds_per_token_mean 0.037994794617407023 with serial_band_low 0.95 / serial_band_high 1.05. That band guards the DENOMINATOR; expected_raw_median guards the SCORE. They are different questions and neither replaces the other.",
+    "clears_submission_floor": true,
+    "clears_submission_floor_note": "LAUNCH-CRITICAL INVARIANT, asserted by test. expected_raw_median (0.9940390645) minus the 2.0% band is 0.9742, which clears the 0.90 submission floor with room to spare -- so Yukon's import baseline run publishes a score and the benchmark can open."
+  }
+}

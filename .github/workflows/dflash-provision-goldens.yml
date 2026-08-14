@@ -1,0 +1,642 @@
+name: dflash-provision-goldens
+
+# OPERATOR TOOL, NOT A RANKED PIPELINE. This job freezes the two hidden DFlash
+# IT-target goldens (go-live runbook step B) and uploads them to R2. It publishes
+# no score, writes nothing the ranked job reads at run time, and edits no pins.
+#
+# WHY IT EXISTS. The ranked DFlash job's "Prepare hidden DFlash goldens" step
+# downloads two objects that DO NOT EXIST in R2. Run 30604267251 died there with
+# HTTP 404 <Code>NoSuchKey</Code> after six correctly-signed attempts, with every
+# other gate in that run green (public tripwire, hidden correctness golden, GPQA
+# attach, full base case + hidden gates, semantic GPQA). The objects cannot be
+# produced off-box: the R2 credentials live ONLY as GitHub environment secrets in
+# `benchmark-private-prompts-v2`, injected per run, and are on no dev machine and
+# on no runner's disk. Generation and upload therefore have to happen inside a
+# job bound to that environment. This is that job.
+#
+# WHAT THE MATERIAL MUST BE, AND WHY THIS JOB REFUSES TO TRUST PROSE ABOUT IT.
+# The go-live runbook used to say `--seed-generate N` extends a seed. It does --
+# with REFERENCE-GENERATED tokens, i.e. greedy self-continuation, which is
+# precisely the material docs/dflash-track-correctness-contract.md Amendment 10
+# measured and condemned:
+#
+#   golden                 seed len  distinct seed  rows gap<0.25  min gap
+#   seam-512-golden.json   512       122            0              1.875
+#   seam-b-golden.json     600       122            0              2.625
+#   seam-a-golden.json     509       122            0              1.875
+#   varied-512-golden.json 512       317            3              0.0000  (prose)
+#
+# Draft acceptance measured ~100% on the repetitive fixtures and 69% on prose;
+# Amendment 11 puts the score consequence at 1.117x versus 0.840x. A golden
+# frozen from a self-continuation would advertise a speedup that does not exist,
+# and the runbook was instructing the operator to build exactly that. The
+# runbook is fixed (steps A and B), AND this job refuses such material
+# mechanically -- `.github/scripts/check-dflash-golden-degeneracy.sh`, run on the
+# operator's seed BEFORE generation and on both goldens AFTER it. There is no
+# input on this workflow that can reach `--seed-generate`, and the generation
+# step asserts its own command line does not contain the flag.
+#
+# THE SEED IS OPERATOR-SUPPLIED AND THIS JOB DOES NOT INVENT ONE. The trusted
+# binary links no tokenizer, so a seed arrives as TOKEN IDS, not text: an R2
+# object holding a `DFlashEmittedPlan` with `seed_tokens` set and `emitted`
+# empty. (The shape of a legitimate one is visible in the public fixture
+# correctness_prompts/public_longcopy_gate_english_512_256.json ->
+# cases[0].prompt_tokens, which is the tokenization of real English prose.
+# Hidden prose seeds come from the operator's private store, never from here.)
+# With no seed named, this job FAILS CLOSED. It never falls back to generating
+# one.
+#
+# WHAT IT CANNOT DO, by construction and pinned by
+# Tests/MLXFastTests/DFlashGoldenProvisioningTests.swift:
+#   * publish a score -- it runs no measure job, computes no speedup, writes no
+#     score.json, and touches no ranked timing state;
+#   * run from a branch a participant can create -- main only, enforced by
+#     .github/scripts/enforce-trusted-dflash-provision-workflow.sh;
+#   * edit the pins in dflash-benchmark.yml -- it PRINTS the four values and
+#     stops. Applying them is a reviewed commit, deliberately.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_provision_goldens:
+        description: "Provisioning interlock. Defaults FALSE. Same shape as dflash-benchmark.yml's confirm_track_enabled: nothing on the operator's box happens without the operator ticking this on the dispatch itself. Ticking it uploads objects to the private R2 bucket."
+        required: false
+        default: false
+        type: boolean
+      correctness_seed_r2_path:
+        description: "R2 object key of the PRE-TOKENIZED PROSE seed plan for the untimed correctness golden ({seed_tokens:[...], emitted:[]}). REQUIRED -- absent fails the job closed. See go-live runbook step A. NEVER a greedy self-continuation (Amendment 10)."
+        required: false
+        default: ""
+        type: string
+      correctness_object_path:
+        description: "R2 object key to WRITE the frozen correctness golden to. Must equal the key dflash-benchmark.yml downloads (MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH) if this is replacing it. REQUIRED."
+        required: false
+        default: ""
+        type: string
+      bench_seed_r2_path:
+        description: "R2 object key of the PRE-TOKENIZED PROSE seed plan for one hidden TIMED (benchmark) golden. REQUIRED. Dispatch once per timed_prompt_pool entry; step A wants at least 8, each a different prose seed."
+        required: false
+        default: ""
+        type: string
+      bench_object_path:
+        description: "R2 object key to WRITE this frozen timed golden to. Becomes one timed_prompt_pool entry's r2_path. REQUIRED, and must differ from correctness_object_path."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serial with itself. NOT grouped with the ranked job: they share the box's
+  # single runner label, so GitHub already serialises them, and grouping them
+  # here would let a provisioning dispatch cancel or queue against a ranked run
+  # under a name that does not say so.
+  group: mlxfast-dflash-provision-goldens
+  cancel-in-progress: false
+
+jobs:
+  dflash-provision-goldens:
+    name: "freeze and upload the hidden DFlash goldens (m5-laguna-dflash)"
+    # The DFlash box: it is where the pinned baseline tree, the target cache and
+    # the drafter cache live. The serial `m5-bench` pool has none of them.
+    runs-on: [self-hosted, m5-laguna-dflash]
+    # Two full-length reference generations (512 rows each, one width-1 forward
+    # per row plus the declared-frame replays) with the 21.6 GB target and the
+    # 881 MB drafter resident, plus two uploads and two verification downloads.
+    # Generous; this job has no timing history and is not thermally gated
+    # because nothing it produces is a measurement.
+    timeout-minutes: 300
+    # MUST EQUAL the environment dflash-benchmark.yml binds. The R2 secret NAMES
+    # are the same in both jobs and resolve PER ENVIRONMENT, so a different
+    # binding here would upload the goldens into a different bucket with
+    # different credentials -- and the ranked job would keep getting its 404
+    # while this job reported success. That exact class of mismatch cost run
+    # 30588892999 (six retried HTTP 400s, environment the only variable).
+    # Pinned by DFlashGoldenProvisioningTests and by
+    # DFlashPrivateMaterialBindingTests.
+    environment: benchmark-private-prompts-v2
+    env:
+      # --- Host contract (operator-provisioned, janitor-audited; consumed here,
+      # never installed). Identical values to dflash-benchmark.yml.
+      MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh
+      MLXFAST_JANITOR: /opt/bench/janitor.sh
+      MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      MLXFAST_DFLASH_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-dflash-v1/current
+      MLXFAST_DFLASH_TARGET_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      MLXFAST_DFLASH_ASSISTANT_DIR: /opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/assistant
+      # Distinct stable path from BOTH the serial track's ranked-current and the
+      # DFlash ranked job's dflash-ranked-current, inside the same
+      # /Users/Shared/bench-jobs confinement bench-exec.sh enforces.
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/dflash-provision-current
+      # Runner-only private material (0700 runner): seeds in, goldens out,
+      # verification downloads. Never readable by the bench uid.
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-dflash-provision-${{ github.run_id }}-${{ github.run_attempt }}
+      # --- Track contract. The two token counts are the ONLY reason this job
+      # knows how many rows to generate, and they are the same values the ranked
+      # job will request; a golden shorter than these is refused below rather
+      # than discovered 25 minutes into a ranked run.
+      MLXFAST_DFLASH_TRACK_ID: laguna-xs-2.1-dflash-v1
+      MLXFAST_DFLASH_CONTRACT_PATH: fixtures/laguna_xs_2_1_dflash_track.json
+      MLXFAST_DFLASH_BLOCK_SIZE: "3"
+      MLXFAST_DFLASH_DECODE_TOKENS: "512"
+      MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
+      # The reference must run its worker sandboxed exactly as a ranked run
+      # does; 1 also makes mlxfast-swift fail closed on MLXFAST_NO_SANDBOX and
+      # on a stale metallib rather than warn.
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_METAL_TOOLCHAIN_IDENTIFIER: com.apple.dt.toolchain.Metal.32023.883
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+    steps:
+      # Fail fast on a quarantined or unprovisioned box, before any checkout or
+      # secret use.
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname) chip=$(sysctl -n machdep.cpu.brand_string) user=$(id -un) uid=$(id -u)"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::box is quarantined (${MLXFAST_QUARANTINE_FLAG}); janitor detected drift -- see RUNBOOK" >&2
+            exit 1
+          fi
+          test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
+          test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # main-only, workflow_dispatch-only, this repository only. Stricter than
+      # the ranked job's allowlist on purpose: this job holds R2 WRITE
+      # credentials.
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-dflash-provision-workflow.sh
+
+      # THE FAIL-CLOSED WALL. Every refusal this job owns that can be decided
+      # before touching the box or the network is decided here, by name, in one
+      # place -- so an operator reads one error instead of discovering the next
+      # missing input 40 minutes later.
+      - name: Enforce provisioning interlock and required inputs
+        id: provision_inputs
+        env:
+          CONFIRM_PROVISION: ${{ inputs.confirm_provision_goldens && '1' || '0' }}
+          CORRECTNESS_SEED_R2_PATH: ${{ inputs.correctness_seed_r2_path }}
+          CORRECTNESS_OBJECT_PATH: ${{ inputs.correctness_object_path }}
+          BENCH_SEED_R2_PATH: ${{ inputs.bench_seed_r2_path }}
+          BENCH_OBJECT_PATH: ${{ inputs.bench_object_path }}
+        run: |
+          set -euo pipefail
+          # (a) The interlock, same shape as dflash-benchmark.yml's
+          # confirm_track_enabled: mandatory, defaults false, no dispatch-kind
+          # carve-out. Ticking it writes to the private R2 bucket.
+          if [[ "${CONFIRM_PROVISION}" != "1" ]]; then
+            echo "::error::DFlash golden provisioning interlock is disabled; dispatch requires confirm_provision_goldens=true. This job uploads objects to the private R2 bucket and freezes material a ranked run will be scored against." >&2
+            exit 1
+          fi
+
+          # (b) The seed sources. ABSENT MEANS STOP. There is deliberately no
+          # fallback to `dflash-reference --seed-generate`: that flag extends a
+          # seed with the reference's own greedy continuation, which
+          # docs/dflash-track-correctness-contract.md Amendment 10 measured as
+          # degenerate (122 distinct tokens in 512, ZERO rows with a top-2 gap
+          # below 0.25, minimum gap 1.875) and which Amendment 11 shows scores
+          # 1.117x where prose scores 0.840x. A convenience fallback here would
+          # silently reintroduce exactly the defect this workflow was written to
+          # remove, so the failure is the feature.
+          if [[ -z "${CORRECTNESS_SEED_R2_PATH}" || -z "${BENCH_SEED_R2_PATH}" ]]; then
+            echo "::error::no operator seed named (correctness_seed_r2_path='${CORRECTNESS_SEED_R2_PATH}', bench_seed_r2_path='${BENCH_SEED_R2_PATH}'). Each golden needs an R2 object holding a PRE-TOKENIZED PROSE seed plan. Provision them per docs/dflash-go-live-runbook.md step A and re-dispatch. This job will NOT fall back to 'dflash-reference --seed-generate': that produces the degenerate greedy self-continuation Amendment 10 condemned." >&2
+            exit 1
+          fi
+
+          # (c) The upload destinations. Named explicitly rather than defaulted,
+          # because the default would be the key the ranked job currently pins
+          # and a mistyped dispatch would overwrite live hidden material.
+          if [[ -z "${CORRECTNESS_OBJECT_PATH}" || -z "${BENCH_OBJECT_PATH}" ]]; then
+            echo "::error::no upload destination named (correctness_object_path='${CORRECTNESS_OBJECT_PATH}', bench_object_path='${BENCH_OBJECT_PATH}'). Name both explicitly; there is no default, because the obvious default is the key dflash-benchmark.yml already pins. See docs/dflash-go-live-runbook.md step B." >&2
+            exit 1
+          fi
+
+          # (d) The two goldens must be DIFFERENT objects built from DIFFERENT
+          # seeds. One prose seed serving both would make the untimed
+          # correctness gate run on the same prompt the timed phase is scored
+          # against, which is a leak of the timed target through a gate whose
+          # output a submitter can observe the timing of.
+          if [[ "${CORRECTNESS_OBJECT_PATH}" == "${BENCH_OBJECT_PATH}" ]]; then
+            echo "::error::correctness_object_path and bench_object_path are the same key (${BENCH_OBJECT_PATH}); the timed golden would overwrite the correctness golden" >&2
+            exit 1
+          fi
+          if [[ "${CORRECTNESS_SEED_R2_PATH}" == "${BENCH_SEED_R2_PATH}" ]]; then
+            echo "::error::both goldens were pointed at the same seed (${BENCH_SEED_R2_PATH}); the untimed correctness gate would then run the same prompt the timed phase is scored on, leaking the timed target" >&2
+            exit 1
+          fi
+
+          # (e) Credentials. Without the environment binding these resolve to
+          # empty and the upload dies deep inside a signer with a message about
+          # a malformed key.
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::R2 credentials are not present in this job. This workflow must bind the SAME GitHub environment as dflash-benchmark.yml (benchmark-private-prompts-v2); a missing or mismatched binding hands it empty secrets." >&2
+            exit 1
+          fi
+
+          {
+            echo "correctness_seed=${CORRECTNESS_SEED_R2_PATH}"
+            echo "correctness_object=${CORRECTNESS_OBJECT_PATH}"
+            echo "bench_seed=${BENCH_SEED_R2_PATH}"
+            echo "bench_object=${BENCH_OBJECT_PATH}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "dflash-provision-goldens: interlock verified; two seeds named, two distinct destinations named"
+
+      - name: DFlash host preflight
+        run: |
+          set -euo pipefail
+          test -f "${MLXFAST_DFLASH_TARGET_DIR}/config.json" || { echo "::error::DFlash target cache missing" >&2; exit 1; }
+          test -f "${MLXFAST_DFLASH_ASSISTANT_DIR}/config.json" || { echo "::error::DFlash drafter cache missing" >&2; exit 1; }
+          test -d "${MLXFAST_DFLASH_BASELINE_WS}" || { echo "::error::pinned DFlash baseline workspace missing at ${MLXFAST_DFLASH_BASELINE_WS}; the goldens must come from the PINNED BASELINE tree, not from a fresh build of main" >&2; exit 1; }
+          resolved="$(readlink -f "${MLXFAST_DFLASH_BASELINE_WS}")"
+          test -d "${resolved}/.build/release" || { echo "::error::resolved baseline is not a built workspace: ${resolved}" >&2; exit 1; }
+          test -d "${resolved}/weights" || { echo "::error::resolved baseline has no transformed weights/: ${resolved}" >&2; exit 1; }
+          echo "MLXFAST_DFLASH_BASELINE_RESOLVED=${resolved}" >> "${GITHUB_ENV}"
+          echo "dflash-provision-goldens: baseline resolved to ${resolved}"
+
+      # The reference runs from a CLONE of the pinned baseline, for the same
+      # reason measure-dflash-job.sh clones it: bench-exec.sh refuses any
+      # workspace outside /Users/Shared/bench-jobs, and /opt is
+      # manifest-protected and read-only. `cp -c` is an APFS clone, so the 23 GB
+      # tree costs metadata rather than bytes.
+      - name: Prepare provisioning workspace from the pinned baseline
+        run: |
+          set -euo pipefail
+          rm -rf "${MLXFAST_JOB_WS}" || true
+          if [[ -e "${MLXFAST_JOB_WS}" || -L "${MLXFAST_JOB_WS}" ]]; then
+            echo "::error::stale workspace at ${MLXFAST_JOB_WS} could not be removed; run the janitor and retry" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "${MLXFAST_JOB_WS}")"
+          cp -c -R "${MLXFAST_DFLASH_BASELINE_RESOLVED}" "${MLXFAST_JOB_WS}" 2>/dev/null \
+            || { rm -rf "${MLXFAST_JOB_WS}"; cp -R "${MLXFAST_DFLASH_BASELINE_RESOLVED}" "${MLXFAST_JOB_WS}"; }
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift" \
+            || { echo "::error::cloned baseline has no mlxfast-swift binary" >&2; exit 1; }
+          mkdir -p "${MLXFAST_PRIVATE_DIR}"
+          chmod 700 "${MLXFAST_PRIVATE_DIR}"
+          # Where the reference writes. Inside the workspace because the bench
+          # uid cannot write to MLXFAST_PRIVATE_DIR (0700 runner) by design; the
+          # trusted shell copies the results out immediately afterwards.
+          mkdir -p "${MLXFAST_JOB_WS}/.dflash-provision"
+          /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
+          echo "dflash-provision-goldens: workspace ready at ${MLXFAST_JOB_WS}"
+
+      # Seeds are hidden operator material: they land ONLY in the 0700 runner
+      # private dir and are copied into the bench-readable workspace one at a
+      # time by the generation step.
+      - name: Fetch operator seed plans
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CORRECTNESS_SEED_R2_PATH: ${{ steps.provision_inputs.outputs.correctness_seed }}
+          BENCH_SEED_R2_PATH: ${{ steps.provision_inputs.outputs.bench_seed }}
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${CORRECTNESS_SEED_R2_PATH}" "${MLXFAST_PRIVATE_DIR}/correctness_seed.json"
+          .github/scripts/download-r2-object.sh \
+            "${BENCH_SEED_R2_PATH}" "${MLXFAST_PRIVATE_DIR}/bench_seed.json"
+          # A seed plan is a DFlashEmittedPlan carrying ONLY a seed. `emitted`
+          # non-empty would make dflash-reference replay a supplied chain
+          # instead of generating one, which is a different artifact with
+          # different meaning; refuse rather than silently produce it.
+          for side in correctness bench; do
+            plan="${MLXFAST_PRIVATE_DIR}/${side}_seed.json"
+            seed_len="$(jq -r 'if (.seed_tokens | type) == "array" then (.seed_tokens | length) else "" end' "${plan}")"
+            if [[ ! "${seed_len}" =~ ^[0-9]+$ || "${seed_len}" -eq 0 ]]; then
+              echo "::error::${side} seed plan has no usable .seed_tokens array (read '${seed_len}'); it must be a PRE-TOKENIZED prose seed -- an array of token ids, because the trusted binary links no tokenizer. See docs/dflash-go-live-runbook.md step A." >&2
+              exit 1
+            fi
+            # `emitted` must be PRESENT and an array, not merely empty-or-absent.
+            # DFlashEmittedPlan.emitted is `[Int]`, non-optional, with synthesized
+            # Codable -- so a plan written as `{"seed_tokens":[...]}` decodes
+            # nowhere: dflash-reference dies on a JSON keyNotFound several minutes
+            # into a 300-minute job, blaming the decoder instead of the seed. Say
+            # it here, on the seed, in the step whose job is to reject bad seeds.
+            emitted_type="$(jq -r '.emitted | type' "${plan}")"
+            if [[ "${emitted_type}" != "array" ]]; then
+              echo "::error::${side} seed plan has no .emitted array (read type '${emitted_type}'). A seed plan is a DFlashEmittedPlan and its 'emitted' key is REQUIRED by the decoder even when the chain is empty: write {\"seed_tokens\":[...],\"emitted\":[]}. See docs/dflash-go-live-runbook.md step A." >&2
+              exit 1
+            fi
+            emitted_len="$(jq -r '.emitted | length' "${plan}")"
+            if [[ "${emitted_len}" != "0" ]]; then
+              echo "::error::${side} seed plan carries ${emitted_len} emitted token(s); a provisioning seed must be seed-only so the reference GENERATES the chain. A supplied chain is a replay artifact, not a frozen reference golden." >&2
+              exit 1
+            fi
+            echo "dflash-provision-goldens: ${side} seed plan carries ${seed_len} seed token(s)"
+          done
+          # PRE-GENERATION DEGENERACY SCREEN. Same script, same constants as the
+          # post-generation screen, so the two cannot drift. Catching a
+          # self-continuation seed here saves ~40 minutes of reference
+          # generation per side -- and, more importantly, means the operator is
+          # told what is wrong with their MATERIAL rather than with an artifact
+          # derived from it.
+          .github/scripts/check-dflash-golden-degeneracy.sh --seed-only \
+            "${MLXFAST_PRIVATE_DIR}/correctness_seed.json" "correctness-seed"
+          .github/scripts/check-dflash-golden-degeneracy.sh --seed-only \
+            "${MLXFAST_PRIVATE_DIR}/bench_seed.json" "bench-seed"
+
+      # Generation. Two full-length references from the CLONED PINNED BASELINE
+      # binary, through bench-exec, with the worker sandboxed.
+      #
+      # NOTE THE FLAGS, and note what is ABSENT. `--emitted` supplies the
+      # operator's seed-only plan; `--generate N` makes the reference produce
+      # the decode chain itself. `--seed-generate` IS NOT PASSED and there is no
+      # dispatch input that could reach it: it extends the SEED by greedy
+      # self-continuation, which is the degenerate material of Amendment 10. The
+      # assertion below is not decoration -- it executes on the exact string
+      # that is about to run, so a future edit that reintroduces the flag fails
+      # here instead of shipping a golden that advertises a speedup that does
+      # not exist.
+      - name: Generate both goldens from the pinned baseline
+        run: |
+          set -euo pipefail
+          generate_one() {
+            local side="$1" tokens="$2"
+            local seed_src="${MLXFAST_PRIVATE_DIR}/${side}_seed.json"
+            local seed_dst="${MLXFAST_JOB_WS}/.dflash-provision/${side}_seed.json"
+            local out_rel=".dflash-provision/${side}_golden.json"
+            install -m 0444 "${seed_src}" "${seed_dst}"
+
+            # Built as an ARRAY, checked as an array, executed as that same
+            # array -- no eval, and nothing between the assertion and the exec
+            # that could reintroduce a flag the assertion just cleared.
+            local -a cmd=(
+              .build/release/mlxfast-swift dflash-reference
+              --weights weights
+              --drafter "${MLXFAST_DFLASH_ASSISTANT_DIR}"
+              --emitted ".dflash-provision/${side}_seed.json"
+              --generate "${tokens}"
+              --block-size "${MLXFAST_DFLASH_BLOCK_SIZE}"
+              --output "${out_rel}"
+              --plan-output ".dflash-provision/${side}_plan.json"
+            )
+            # Executed self-check on the literal argv that is about to run.
+            local argument
+            for argument in "${cmd[@]}"; do
+              if [[ "${argument}" == "--seed-generate" ]]; then
+                echo "::error::the ${side} generation argv contains --seed-generate. That flag extends the seed with the reference's OWN greedy continuation, which docs/dflash-track-correctness-contract.md Amendment 10 measured as degenerate (122 distinct tokens in 512, zero near-tie rows, minimum top-2 gap 1.875) and Amendment 11 prices at 1.117x versus prose's 0.840x. Ranked goldens are never built that way." >&2
+                exit 1
+              fi
+            done
+
+            echo "dflash-provision-goldens: generating ${side} golden (${tokens} tokens) from the pinned baseline"
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env \
+                MJOB_WS="${MLXFAST_JOB_WS}" \
+                MLXFAST_OFFICIAL_BENCHMARK_RUN="${MLXFAST_OFFICIAL_BENCHMARK_RUN}" \
+                MLXFAST_DFLASH_ASSISTANT_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR}" \
+                MLXFAST_DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
+                /bin/bash -c '
+                  set -u
+                  cd "${MJOB_WS}" || exit 97
+                  exec "$@"
+                ' dflash-reference "${cmd[@]}"
+            test -s "${MLXFAST_JOB_WS}/${out_rel}" \
+              || { echo "::error::${side} golden was not written" >&2; exit 1; }
+            # Out of the bench-writable workspace immediately: everything after
+            # this point reads the runner-private copy, which the bench uid
+            # cannot modify.
+            install -m 0400 "${MLXFAST_JOB_WS}/${out_rel}" \
+              "${MLXFAST_PRIVATE_DIR}/${side}_golden.json"
+          }
+          generate_one correctness "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}"
+          generate_one bench "${MLXFAST_DFLASH_DECODE_TOKENS}"
+
+      # VERIFY BEFORE UPLOAD. Every arm is fail-closed and every arm is a
+      # property some shipped golden has actually violated.
+      - name: Verify both goldens
+        run: |
+          set -euo pipefail
+          verify_one() {
+            local side="$1" wanted="$2"
+            local path="${MLXFAST_PRIVATE_DIR}/${side}_golden.json"
+
+            # (1) R5 self-consistency. The admissible sets a golden defines are
+            # undefined if the reference is not deterministic. dflash-reference
+            # already refuses to exit 0 without this, so the check here is
+            # against the ARTIFACT rather than against the process -- a golden
+            # copied from somewhere else, or produced by an older build, would
+            # carry a false or absent flag.
+            local consistent
+            consistent="$(jq -r '.reference_self_consistent // false' "${path}")"
+            if [[ "${consistent}" != "true" ]]; then
+              echo "::error::${side} golden reports reference_self_consistent=${consistent}; the reference build is nondeterministic (OPERATOR fault) and the golden must not be frozen" >&2
+              exit 1
+            fi
+
+            # (2) The chain must agree with its own rows. Amendment 10 Defect 1:
+            # THREE goldens shipped with reference_self_consistent=true while
+            # emitted_tokens[i] != rows[i].sequential_argmax, because the
+            # self-consistency replay compared scoring runs to each other and
+            # never compared the emitted chain to the scored chain. Such a
+            # golden REJECTS the honest candidate that reproduces the
+            # reference's own emitted token. Checked here on the bytes, so it
+            # holds regardless of which build produced them.
+            local mismatches
+            mismatches="$(jq -r '
+              (.emitted_tokens // []) as $e
+              | (.rows // []) as $r
+              | if ($e | length) == 0 then "no-emitted-chain"
+                elif ($e | length) != ($r | length) then
+                  "length \($e | length) vs \($r | length)"
+                else
+                  ([ range(0; $e | length) | select($e[.] != $r[.].sequential_argmax) ]
+                   | if length == 0 then "0" else "\(length) (first index \(.[0]))" end)
+                end' "${path}")"
+            if [[ "${mismatches}" != "0" ]]; then
+              echo "::error::${side} golden contradicts itself: emitted_tokens vs rows[].sequential_argmax mismatch: ${mismatches}. Amendment 10 Defect 1 -- a golden carrying this rejects the honest candidate that reproduces the reference's own chain." >&2
+              exit 1
+            fi
+
+            # (3) Row count against what the gate will actually request. The
+            # driver requires options.totalTokenCount <= golden.rows.count; the
+            # ranked job discovers a violation ~25 minutes in, inside the gate.
+            # Hard error, never a clamp: silently lowering the token count would
+            # shorten the correctness window and the scored decode window
+            # without anyone deciding to.
+            local rows
+            rows="$(jq -r 'if (.rows | type) == "array" then (.rows | length) else "" end' "${path}")"
+            if [[ ! "${rows}" =~ ^[0-9]+$ || "${rows}" -lt "${wanted}" ]]; then
+              echo "::error::${side} golden carries '${rows}' rows but the gate will request ${wanted}; regenerate with a larger --generate" >&2
+              exit 1
+            fi
+            echo "dflash-provision-goldens: ${side} golden -- self-consistent, chain agrees with its rows, ${rows} rows for ${wanted} requested tokens"
+
+            # (4) DEGENERACY. The three statistics are printed by the script on
+            # every run, pass or fail.
+            .github/scripts/check-dflash-golden-degeneracy.sh "${path}" "${side}-golden"
+          }
+          verify_one correctness "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}"
+          verify_one bench "${MLXFAST_DFLASH_DECODE_TOKENS}"
+
+      - name: Upload both goldens to R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CORRECTNESS_OBJECT_PATH: ${{ steps.provision_inputs.outputs.correctness_object }}
+          BENCH_OBJECT_PATH: ${{ steps.provision_inputs.outputs.bench_object }}
+        run: |
+          set -euo pipefail
+          .github/scripts/upload-r2-object.sh \
+            "${CORRECTNESS_OBJECT_PATH}" "${MLXFAST_PRIVATE_DIR}/correctness_golden.json"
+          .github/scripts/upload-r2-object.sh \
+            "${BENCH_OBJECT_PATH}" "${MLXFAST_PRIVATE_DIR}/bench_golden.json"
+
+      # PINS COME FROM THE OBJECT, NOT FROM THE LOCAL FILE.
+      #
+      # Hashing the local copy would pin what this job MEANT to upload. The
+      # ranked job downloads what the bucket actually holds and compares against
+      # the pin, so the only digest worth pinning is one computed from bytes that
+      # made the round trip: a truncated PUT, a bucket-side transform, a
+      # prefix/bucket mismatch between the endpoint and the key, or an upload
+      # that silently landed in a different environment's bucket all produce a
+      # local hash that looks perfect and a ranked run that fails on a pin
+      # mismatch -- or, worse, another 404.
+      #
+      # The local file is still compared, as a separate assertion, because a
+      # round trip that returns DIFFERENT bytes is a bucket fault worth naming
+      # rather than pinning around.
+      - name: Re-download the uploaded objects and pin from those bytes
+        id: pins
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CORRECTNESS_OBJECT_PATH: ${{ steps.provision_inputs.outputs.correctness_object }}
+          BENCH_OBJECT_PATH: ${{ steps.provision_inputs.outputs.bench_object }}
+        run: |
+          set -euo pipefail
+          verify_dir="${MLXFAST_PRIVATE_DIR}/roundtrip"
+          mkdir -p "${verify_dir}"
+          chmod 700 "${verify_dir}"
+
+          pin_one() {
+            local side="$1" key="$2"
+            local fetched="${verify_dir}/${side}_golden.json"
+            rm -f "${fetched}"
+            .github/scripts/download-r2-object.sh "${key}" "${fetched}"
+            test -s "${fetched}" || { echo "::error::re-downloaded ${side} object is empty" >&2; exit 1; }
+
+            # THE PIN: computed from the downloaded bytes.
+            local sha bytes
+            sha="$(shasum -a 256 < "${fetched}" | awk '{print $1}')"
+            bytes="$(wc -c < "${fetched}" | tr -d ' ')"
+
+            # Independent round-trip assertion, NOT the source of the pin.
+            if ! cmp -s "${fetched}" "${MLXFAST_PRIVATE_DIR}/${side}_golden.json"; then
+              echo "::error::the ${side} object read back from R2 differs from the bytes this job uploaded (key ${key}). The pin below would be correct for the ranked job and wrong for this artifact; investigate the bucket before pinning anything." >&2
+              exit 1
+            fi
+            # The re-downloaded copy must also still pass every content gate --
+            # the pin is only useful if it pins something admissible.
+            .github/scripts/check-dflash-golden-degeneracy.sh "${fetched}" "${side}-roundtrip"
+
+            {
+              echo "${side}_sha256=${sha}"
+              echo "${side}_bytes=${bytes}"
+            } >> "${GITHUB_OUTPUT}"
+            printf '%s %s %s\n' "${side}" "${sha}" "${bytes}" \
+              >> "${MLXFAST_PRIVATE_DIR}/pins.txt"
+          }
+          pin_one correctness "${CORRECTNESS_OBJECT_PATH}"
+          pin_one bench "${BENCH_OBJECT_PATH}"
+
+      # PRINT, DO NOT APPLY. Editing dflash-benchmark.yml from inside a job that
+      # holds R2 write credentials and runs on the benchmark box would make the
+      # ranked pipeline self-modifying: the same dispatch that produces the
+      # material would also declare it trusted, with no review between. The pins
+      # are four short values; applying them is a commit a human reads.
+      #
+      # Object KEYS are echoed here deliberately. This is an operator dispatch on
+      # main, not a participant-visible ranked run, and the operator needs the
+      # key to pin it. The ranked job's own timed-target key stays private
+      # because a participant can read that log; this one they cannot dispatch.
+      - name: Print the pins to apply
+        env:
+          CORRECTNESS_OBJECT_PATH: ${{ steps.provision_inputs.outputs.correctness_object }}
+          BENCH_OBJECT_PATH: ${{ steps.provision_inputs.outputs.bench_object }}
+          CORRECTNESS_SHA256: ${{ steps.pins.outputs.correctness_sha256 }}
+          CORRECTNESS_BYTES: ${{ steps.pins.outputs.correctness_bytes }}
+          BENCH_SHA256: ${{ steps.pins.outputs.bench_sha256 }}
+          BENCH_BYTES: ${{ steps.pins.outputs.bench_bytes }}
+        run: |
+          set -euo pipefail
+          for value in "${CORRECTNESS_SHA256}" "${CORRECTNESS_BYTES}" "${BENCH_SHA256}" "${BENCH_BYTES}"; do
+            if [[ -z "${value}" ]]; then
+              echo "::error::a pin is empty; the re-download step did not produce it" >&2
+              exit 1
+            fi
+          done
+          cat <<EOF
+          ============================================================
+          DFlash hidden golden pins -- computed from the RE-DOWNLOADED
+          objects, not from the local files.
+
+          Apply BY HAND to .github/workflows/dflash-benchmark.yml (job env),
+          in a reviewed commit. This job deliberately does not edit it.
+
+            MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256: ${CORRECTNESS_SHA256}
+            MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES: "${CORRECTNESS_BYTES}"
+            MLXFAST_DFLASH_BENCH_GOLDEN_SHA256: ${BENCH_SHA256}
+            MLXFAST_DFLASH_BENCH_GOLDEN_BYTES: "${BENCH_BYTES}"
+
+          Correctness object key (step env
+          MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH):
+            ${CORRECTNESS_OBJECT_PATH}
+
+          Timed object key -- this is ONE timed_prompt_pool entry for
+          fixtures/laguna_xs_2_1_dflash_track.json. Step A wants at least 8,
+          each from a DIFFERENT prose seed; re-dispatch this workflow once per
+          entry.
+            { "r2_path": "${BENCH_OBJECT_PATH}",
+              "sha256":  "${BENCH_SHA256}",
+              "bytes":   ${BENCH_BYTES} }
+
+          Note the ranked job verifies the TIMED golden against the POOL
+          ENTRY's own sha256/bytes, not against
+          MLXFAST_DFLASH_BENCH_GOLDEN_SHA256/_BYTES. Those two job-env pins are
+          only required to be NON-EMPTY by the enablement guard; pin them from
+          the first pool entry and keep the pool authoritative.
+          ============================================================
+          EOF
+
+      - name: Cleanup workspace and private material
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
+            rm -rf "${MLXFAST_JOB_WS}" || true
+            if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+              echo "::warning::workspace residue left at ${MLXFAST_JOB_WS}"
+            fi
+          fi
+          # The seeds AND the goldens are hidden material; neither may survive
+          # the job on the box.
+          if ! rm -rf -- "${MLXFAST_PRIVATE_DIR}"; then
+            echo "::error::could not remove runner-private material at ${MLXFAST_PRIVATE_DIR}" >&2
+            exit 1
+          fi
+          if [[ -e "${MLXFAST_PRIVATE_DIR}" || -L "${MLXFAST_PRIVATE_DIR}" ]]; then
+            echo "::error::runner-private cleanup failed: ${MLXFAST_PRIVATE_DIR}" >&2
+            exit 1
+          fi
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_JANITOR}"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::janitor quarantined the box after this run" >&2
+            exit 1
+          fi
+          echo "dflash-provision-goldens: janitor reset + integrity audit clean"

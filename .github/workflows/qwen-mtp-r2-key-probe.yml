@@ -1,0 +1,347 @@
+# Diagnostic: which R2 keys actually resolve?
+#
+# WHY THIS EXISTS. A wrong hidden-golden key is only discoverable ~25 minutes
+# into qwen-mtp-ranked-benchmark.yml, after build, transform and the whole
+# reused serial gate leg have been paid for. Three separate dispatches were
+# spent learning nothing but "404 NoSuchKey" against three different guesses at
+# one key. This answers the same question in about a minute.
+#
+# It reads. It never writes, never uploads, never scores, and prints only an
+# HTTP status, a byte count and a sha256 per key -- never a single byte of
+# object content, because the objects it probes are hidden competition material.
+#
+# It is nonetheless restricted to trusted refs, like qwen-mtp-provision-goldens.yml
+# and unlike the ranked job. It runs `.github/scripts/download-r2-object.sh` FROM
+# THE DISPATCHED REF with the real R2 credentials, so whoever chooses the ref
+# chooses the code that touches a hidden golden; "it only prints a byte count" is
+# a property of the trusted copy of that script, not of the workflow. The
+# allowlist is refs/heads/main only. See
+# .github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh.
+#
+# The control key is probed FIRST: a known-good key that proves the credentials
+# and the bucket in one shot. It is no longer a QWEN-MTP-PENDING-ORGANIZER
+# placeholder -- the Qwen-MTP hidden correctness goldens ARE uploaded, and run
+# 31665216255 (2026-08-13T03:52Z) probed 11 of 11 supplied keys FOUND at ref
+# 43fec75, including the then-current control (eef3b817, 21036b).
+#
+# The control below was advanced to the faf1a679 key when c070938 re-pinned the
+# raw correctness golden. No PROBE has run against it since, but the object is
+# known present: gates-only dispatch 31692337492 (2026-08-13T10:49Z) downloaded
+# and digest-verified it (36183 bytes). So a 'missing' control here means the
+# credentials or the bucket are wrong, and every candidate result below it is
+# meaningless.
+name: qwen-mtp-r2-key-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      keys:
+        description: >-
+          Newline- or comma-separated R2 object keys to probe, relative to
+          whatever bucket R2_BUCKET_ENDPOINT names. The Qwen-MTP correctness
+          golden control (currently a PENDING placeholder that does not exist in
+          R2 yet) is always probed first, so until the real key replaces it an
+          empty candidate list will simply report the placeholder as missing.
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # A group of its own, so two probes cannot overlap each other.
+  #
+  # It does NOT keep the probe away from a ranked run -- an earlier comment
+  # here claimed it did, which was wrong: a DISTINCT concurrency group is
+  # exactly what lets two workflows run at the same time. What actually
+  # serialises them is that both target the single m5-qwen38-27b-mtp runner,
+  # so GitHub queues one behind the other regardless of grouping. The probe
+  # is read-only and ~1 minute, so queueing behind a ranked run costs
+  # nothing; the point of naming this is that the protection comes from the
+  # runner, not from this stanza.
+  group: mlxfast-qwen-mtp-r2-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: probe R2 keys (m5-qwen38-27b-mtp)
+    runs-on: [self-hosted, m5-qwen38-27b-mtp]
+    timeout-minutes: 15
+    # MUST match qwen-mtp-ranked-benchmark.yml's binding, or the probe tests
+    # different credentials than the ranked job uses and its answer is worthless.
+    environment: benchmark-private-prompts-v2  # TODO(operator): confirm the Qwen-MTP R2 secrets are bound in this Environment (must MATCH qwen-mtp-ranked-benchmark.yml's binding); rename here if a Qwen-specific Environment is created.
+    env:
+      # --- Host contract (operator-provisioned, janitor-audited; consumed here,
+      # never installed). Same values as qwen-mtp-ranked-benchmark.yml and
+      # qwen-mtp-provision-goldens.yml. This job never invokes bench-exec.sh --
+      # it runs no submitted code -- so MLXFAST_BENCH_EXEC is deliberately
+      # absent.
+      MLXFAST_JANITOR: /opt/bench/janitor.sh
+      MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      # Runner-only scratch for the downloaded object bytes (0700 runner). The
+      # basename prefix `mlxfast-qwen-mtp-r2-probe-` is load-bearing: the Probe
+      # step sweeps sibling directories matching it, and refuses to run if this
+      # value does not carry it. Same shape as the siblings' MLXFAST_PRIVATE_DIR
+      # and, like them, the ONE place the path is written.
+      MLXFAST_PROBE_PRIVATE_DIR: /tmp/mlxfast-qwen-mtp-r2-probe-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      # Fail fast on a quarantined or unprovisioned box, before any checkout or
+      # secret use.
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname) chip=$(sysctl -n machdep.cpu.brand_string) user=$(id -un) uid=$(id -u)"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::box is quarantined (${MLXFAST_QUARANTINE_FLAG}); janitor detected drift -- see RUNBOOK" >&2
+            exit 1
+          fi
+          test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          # Without this, actions/checkout leaves a credentialled
+          # `http.extraheader` in .git/config on a SELF-HOSTED box, where the
+          # workspace outlives the job. Both siblings set it; this job did not
+          # even have a `with:` block.
+          persist-credentials: false
+
+      # main, workflow_dispatch-only, this repository only -- the
+      # provisioning job's model, not the ranked job's allowlist. See the
+      # script's header for why a read-only probe still needs the stricter one:
+      # it executes download-r2-object.sh from the DISPATCHED REF with real R2
+      # credentials against hidden material.
+      #
+      # This must stay the first step after checkout: everything below it either
+      # uses the credentials or runs a script from the dispatched ref.
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-qwen-mtp-r2-probe-workflow.sh
+
+      - name: Probe
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          # Keys are attacker-irrelevant here (operator-supplied) but still pass
+          # through the signer's charset guard, so a typo fails loudly.
+          CANDIDATE_KEYS: ${{ inputs.keys }}
+          # download-r2-object.sh hardcodes 6 attempts and there is no env knob,
+          # so each missing key costs 6 immediate 404s. That is cheap (a 404
+          # returns at once) and the summary below collapses them to one line,
+          # so it is not worth plumbing an override for a diagnostic.
+        run: |
+          set -uo pipefail
+
+          if [[ -z "${R2_ACCESS_KEY_ID}" || -z "${R2_SECRET_ACCESS_KEY}" || -z "${R2_BUCKET_ENDPOINT}" ]]; then
+            echo "::error::R2 credentials are not bound; this workflow must run in the same environment as qwen-mtp-ranked-benchmark.yml" >&2
+            exit 1
+          fi
+
+          # WHERE THE HIDDEN BYTES GO, AND WHAT IS ACTUALLY GUARANTEED ABOUT
+          # THEM. They have to reach disk: download-r2-object.sh writes to a
+          # path, and both the byte count and the sha256 below are computed from
+          # that file. So the question is only where, for how long, and readable
+          # by whom.
+          #
+          # Guaranteed: probe() deletes its own output file immediately after
+          # reporting on it; the trap below deletes the directory when this
+          # shell exits, normally or on error; the "Remove probe scratch" step
+          # runs `if: always()`, which also covers this step failing and a
+          # GitHub-initiated cancellation, neither of which reliably runs a trap
+          # here.
+          #
+          # NOT guaranteed, and this file used to claim otherwise ("Never keep
+          # hidden bytes around, even briefly"): a SIGKILL of this shell, a
+          # runner crash or a power cut runs no trap and no later step. The
+          # janitor does not cover it either -- it purges BENCH-owned scratch,
+          # and this directory is runner-owned because the probe never goes
+          # through bench-exec.sh. The residual exposure is real: a 0700
+          # runner-owned directory holding at most one object's bytes.
+          #
+          # Two things bound that residue, and neither is a guarantee. The path
+          # is deterministic and run-scoped, so a leak is findable by name and
+          # by run id instead of buried under an opaque mktemp name in the
+          # runner's $TMPDIR. And the sweep below removes every earlier probe's
+          # scratch, so at most one run's residue can exist at a time.
+          if [[ -z "${MLXFAST_PROBE_PRIVATE_DIR:-}" ]]; then
+            echo "::error::MLXFAST_PROBE_PRIVATE_DIR is not set; refusing to download hidden material to an unspecified path" >&2
+            exit 1
+          fi
+          work="${MLXFAST_PROBE_PRIVATE_DIR}"
+          # The sweep matches on this prefix, so a rename that broke the match
+          # would silently stop reaping. Refuse instead of sweeping nothing.
+          case "$(basename -- "${work}")" in
+            mlxfast-qwen-mtp-r2-probe-*) ;;
+            *)
+              echo "::error::MLXFAST_PROBE_PRIVATE_DIR must be named mlxfast-qwen-mtp-r2-probe-*; the stale-scratch sweep matches that prefix and would reap nothing. Got: ${work}" >&2
+              exit 1
+              ;;
+          esac
+          umask 077
+          rm -rf -- "${work}"
+          mkdir -p "${work}"
+          chmod 700 "${work}"
+          trap 'rm -rf "${work}"' EXIT
+          shopt -s nullglob
+          for stale in "$(dirname -- "${work}")"/mlxfast-qwen-mtp-r2-probe-*; do
+            [[ "${stale}" == "${work}" ]] && continue
+            rm -rf -- "${stale}" \
+              || echo "::warning::could not remove stale probe scratch ${stale}"
+          done
+          shopt -u nullglob
+
+          # The control: the Qwen RAW hidden correctness golden key, SHA-addressed,
+          # mirroring qwen-mtp-ranked-benchmark.yml's
+          # MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256 /
+          # MLXFAST_CORRECTNESS_GOLDEN_R2_PATH. A control is only a control while
+          # it names an object that IS uploaded: the probe must report it present
+          # with a matching digest, and a missing or mismatched control means the
+          # probe itself is wrong rather than that provisioning is outstanding.
+          #
+          # QWEN38-PENDING-RELEASE. No 3.8 object exists yet, so there is no
+          # known-good control to name. It is reset in lockstep with the ranked
+          # workflow's pin rather than left pointing at the 3.6 object: probing
+          # correctness_prompts/qwen3.6-27b-mtp-v1/... would still SUCCEED, and a
+          # green probe against the retired track's namespace is worse than no
+          # probe at all -- it would read as evidence that the 3.8 bucket layout
+          # is provisioned.
+          #
+          # For the record, the 3.6 control was
+          # correctness_prompts/qwen3.6-27b-mtp-v1/ + the digest faf1a679...
+          # (which superseded eef3b817, the box-3 golden from before the
+          # `.benchmark` oracle was attached; that sibling remains in R2).
+          control='correctness_prompts/qwen3.8-27b-mtp-v1/qwen3.8-27b-hidden-correctness-golden-QWEN38-PENDING-RELEASE.json'
+
+          probe() {
+            local key="$1" label="$2" out="${work}/probe.bin"
+            rm -f "${out}"
+            local log="${work}/probe.log" rc=0
+            .github/scripts/download-r2-object.sh "${key}" "${out}" >"${log}" 2>&1 || rc=$?
+            local status
+            status="$(grep -oE 'HTTP [0-9]{3}' "${log}" | tail -1 || true)"
+            local code
+            code="$(grep -oE '<Code>[A-Za-z]+</Code>' "${log}" | tail -1 | tr -d '<>/' | sed 's/^Code//;s/Code$//' || true)"
+            if (( rc == 0 )) && [[ -s "${out}" ]]; then
+              # sha256 as well as the byte count, because a byte count alone
+              # cannot confirm a PIN. The bench golden in particular is only
+              # downloaded by a RANKED run, so its pin was never verified
+              # against the stored object by any pipeline that has actually run
+              # -- a gates-only dispatch skips it entirely. This closes that.
+              printf '  FOUND    %-9s %s  %s\n' \
+                "$(wc -c < "${out}" | tr -d ' ')b" \
+                "$(shasum -a 256 "${out}" | cut -d' ' -f1)" \
+                "${key}"
+            else
+              printf '  missing  %-9s %s  (%s)\n' "${status:-?}" "${key}" "${code:-no code}"
+            fi
+            # Drop this key's bytes now rather than at end of step, so only one
+            # object is ever on disk at a time. See the scratch-directory
+            # comment above for what survives a SIGKILL and what does not; the
+            # line here used to say "Never keep hidden bytes around, even
+            # briefly", which was a claim about the whole step that no `rm` in
+            # it can make.
+            rm -f "${out}"
+          }
+
+          echo "=== control: the Qwen-MTP correctness golden key (real key; unprobed since the faf1a679 re-pin) ==="
+          probe "${control}" control
+
+          echo
+          echo "=== candidates ==="
+          if [[ -z "${CANDIDATE_KEYS//[[:space:]]/}" ]]; then
+            echo "  (none supplied)"
+          else
+            # printf '%s\n', NOT '%s': without a trailing newline `read` drops
+            # the final line, so the LAST key was silently skipped. Measured --
+            # probe run 30613434387 reported 4 results for 5 keys and run
+            # 30614611778 probed 1 of 2, and neither said anything was missing.
+            # A diagnostic that silently drops input is worse than none, because
+            # its silence reads as "checked and fine".
+            #
+            # Counted, too: a probe that examines fewer keys than it was handed
+            # now says so rather than leaving it to be noticed.
+            #
+            # `supplied` is derived from the INPUT, before the loop and
+            # independently of it. It used to be incremented inside the loop,
+            # one line above the probe call, which counted iterations that
+            # REACHED the probe rather than keys the workflow was handed: when
+            # the loop dropped a key, supplied dropped with it. Measured with
+            # those counters attached, input 'a,b,c':
+            #
+            #   newline-terminated feeder  -> "probed 3 of 3"   COMPLETE
+            #   the old `printf '%s'` form -> "probed 2 of 2"   COMPLETE
+            #
+            # and nothing between the two increments could abort an iteration
+            # (probe() swallows its own rc, and this step runs `set -uo
+            # pipefail` with no `-e`), so `probed != supplied` was
+            # unconditionally unreachable -- an assertion that could not fire.
+            # Two independent sources is the whole point; keep them independent.
+            #
+            # `tr -d ' \t\r\f\v'`, NOT `tr -d '[:space:]'`: the latter deletes
+            # the NEWLINES too, collapsing every key onto one line so the count
+            # is 1 for any input and the assertion fires on every multi-key
+            # dispatch. This set is exactly [:space:] minus newline, i.e. what
+            # the loop's own per-key `tr -d '[:space:]'` does to a single line.
+            # `grep -c` exits 1 when the count is 0, which `|| true` absorbs
+            # without discarding the "0" it already printed.
+            supplied="$(printf '%s\n' "${CANDIDATE_KEYS}" | tr ',' '\n' | tr -d ' \t\r\f\v' | grep -c '.' || true)"
+            probed=0
+            while IFS= read -r key; do
+              key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+              [[ -z "${key}" ]] && continue
+              probe "${key}" candidate
+              probed=$(( probed + 1 ))
+            done < <(printf '%s\n' "${CANDIDATE_KEYS}" | tr ',' '\n')
+            echo
+            echo "  probed ${probed} of ${supplied} supplied key(s)"
+            if (( probed != supplied )); then
+              echo "::error::probe examined ${probed} of ${supplied} keys; results are incomplete" >&2
+              exit 1
+            fi
+          fi
+
+          echo
+          echo "Read the control line first. The control is a real uploaded key,"
+          echo "no longer a PENDING placeholder: the Qwen-MTP hidden artifacts are"
+          echo "provisioned (probe run 31665216255 found 11 of 11 supplied keys,"
+          echo "and gates dispatch 31692337492 downloaded and digest-verified the"
+          echo "two later re-pinned objects). So a 'missing' control means the"
+          echo "credentials or the bucket are wrong, and every candidate result"
+          echo "below it is meaningless."
+
+      # Backstop for the Probe step's own trap. This runs when that step fails
+      # and when GitHub cancels the job -- neither of which reliably runs a trap
+      # in the step's shell. It is NOT a backstop for SIGKILL or a runner crash;
+      # nothing in this workflow is, and the janitor below reaps bench-owned
+      # scratch, not this runner-owned directory.
+      - name: Remove probe scratch
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -z "${MLXFAST_PROBE_PRIVATE_DIR:-}" ]]; then
+            echo "::error::MLXFAST_PROBE_PRIVATE_DIR is not set; cannot confirm hidden bytes were removed" >&2
+            exit 1
+          fi
+          if ! rm -rf -- "${MLXFAST_PROBE_PRIVATE_DIR}"; then
+            echo "::error::could not remove probe scratch at ${MLXFAST_PROBE_PRIVATE_DIR}" >&2
+            exit 1
+          fi
+          if [[ -e "${MLXFAST_PROBE_PRIVATE_DIR}" || -L "${MLXFAST_PROBE_PRIVATE_DIR}" ]]; then
+            echo "::error::probe scratch cleanup failed: ${MLXFAST_PROBE_PRIVATE_DIR}" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-r2-key-probe: probe scratch removed (${MLXFAST_PROBE_PRIVATE_DIR})"
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_JANITOR}"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::janitor quarantined the box after this run" >&2
+            exit 1
+          fi
+          echo "qwen-mtp-r2-key-probe: janitor reset + integrity audit clean"

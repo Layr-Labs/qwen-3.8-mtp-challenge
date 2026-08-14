@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor session"
+      },
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor session",
+        "matcher": "mlxfast"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ],
+    "stop": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "sh \".hilbert/hooks/hilbert-trace.sh\" cursor capture"
+      }
+    ]
+  }
+}

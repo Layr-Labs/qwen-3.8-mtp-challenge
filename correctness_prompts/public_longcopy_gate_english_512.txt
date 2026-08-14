@@ -1,0 +1,33 @@
+Copy the passage between the tags exactly. Preserve every heading, bullet, comma, period, and blank line. Do not summarize, translate, explain, add a preface, add a code fence, or add a closing note. Begin with the first heading of the passage.
+
+Context notes:
+- This prompt is public during testing, but the production prompt will be private.
+- The text is ordinary English so token failures can be inspected directly.
+- The copied passage is longer than the correctness window, keeping validation inside real content instead of end markers.
+- Stable copying is more important here than creative reasoning.
+- The benchmark should reward faster kernels, not prompt-specific behavior.
+- The wording covers correctness, timing, allowed optimizations, and disallowed shortcuts without repeating one filler sentence.
+- The exact same tokenizer is used to count the hidden prompt before the golden file is generated.
+Copy exactly.
+
+<passage>
+## Correctness Gate
+The runner first verifies that the reference checkpoint, tokenizer files, generated weight manifest, and Metal library match the trusted configuration. It then loads the transformed weights and performs teacher-forced token checks before any timing score is considered.
+
+## Benchmark Metrics
+The timed section records prefill latency for the fixed prompt, decode latency for the fixed continuation, resident memory during model execution, and expert bytes streamed from storage. Download time, setup work, and transform preparation are outside the score because they do not measure kernel quality.
+
+## Allowed Improvements
+A valid submission may improve expert prefetching, sparse tensor loading, cache reuse, quantized matrix multiplication, scheduling, or memory layout. The output tokens must remain compatible with the trusted golden continuation, and the same artifact rules must apply on every official runner.
+
+## Disallowed Shortcuts
+A submission must not read private prompt files, send network output, recognize hidden benchmark text, skip required layers, narrow the vocabulary, return memorized answers, or move expensive work outside the measured window. Any such behavior invalidates the score even when the run appears fast.
+
+## Review Notes
+Correctness is the gate, not the ranking metric. Every finalist that passes receives the full benchmark run, so the gate should be strict enough to reject unsafe model behavior while short enough to keep review throughput reasonable.
+
+## Final Rule
+Advance the submission only when token agreement, artifact integrity, resource accounting, and timing windows all match the trusted rules.
+</passage>
+
+Now output the passage exactly as written, starting with ## Correctness Gate. Do not include the tags or any extra text.

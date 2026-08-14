@@ -1,0 +1,15 @@
+;; macOS Seatbelt profile: allow everything except network access.
+;; Loopback and unix sockets stay open so local IPC keeps working;
+;; anything that would reach the internet is denied.
+;; Applied with `sandbox-exec -f` — no root required.
+;; NOTE: do not add `(allow network* (local ip ...))` — when combined with a
+;; unix-socket allow rule, Seatbelt merges the filters and outbound internet
+;; access leaks through. Bind/inbound are scoped separately below instead.
+(version 1)
+(allow default)
+(deny network*)
+(allow network* (remote ip "localhost:*"))
+(allow network* (local unix-socket))
+(allow network* (remote unix-socket))
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))

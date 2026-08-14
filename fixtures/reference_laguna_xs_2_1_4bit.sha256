@@ -1,0 +1,21 @@
+# SHA256 manifest for mlx-community/Laguna-XS-2.1-4bit.
+# Pinned from an on-box M5 download (laguna-migration go-live): every entry is
+# the full-content SHA256 and byte count of the checkpoint file at the pinned
+# revision. The four safetensors shard hashes are bit-identical to the
+# upstream Hugging Face LFS object IDs for this revision, cross-verifying the
+# download against the hub's own content addressing.
+# Repository: mlx-community/Laguna-XS-2.1-4bit
+# Revision: c42e0a8f8d504ceacde015a535dcb286d65c8799
+# Format: <sha256> <byte_count> <relative_path>
+7916152a1f3a59d1f8bad3c2a6b0c7d9215f74f6eed657dfb7c1bedf855f4772 2005 README.md
+5f1bf14725b6a0e662678e7ca66d7b347bbaa436b09db038472045aba37da2f2 6116 chat_template.jinja
+c5da07236e90d8cb15611c4e5414b7000cd9ea23f0adc5644a632531b18f45a5 15272 config.json
+00380271cff87fdd107f7e9a6ca562ec03527db044faa976883fc3399f8a1463 463 generation_config.json
+4d3251ee69c8d30968495bb5ccf0f1a33c07947a5660c040888875efef0bdbf2 172667 model.safetensors.index.json
+1402abbee7f06e91436d68aa80b54177a676049a96afc1b46e189fec036a909c 5241219330 model-00001-of-00004.safetensors
+8616704b15b3c3e7938ec87ae09c1094b667a91f8ef1d59dd93762cd1fa792d3 5362975136 model-00002-of-00004.safetensors
+b0c5c8ebd27ecb09b0800c347f80693908b3500fddfbb104f51776dd2d8022d5 5269182121 model-00003-of-00004.safetensors
+e0bcc2fe3a78efcfbf21b4828f1235d85fb24278b9681a5ad1b1f3c0b521939f 2948805674 model-00004-of-00004.safetensors
+70cd3459fde61761e9440751a590e89a108c09b1803cc7727f5ad1ed1ea6122b 214 special_tokens_map.json
+ff04405d2d1e1b6c77a8be25f0fce9371003a558b055c23248d9e8ca1d956d92 7287678 tokenizer.json
+1c05d3da3b62a884f66d05c0b68327a69c491bc105ba370cae94d14f3e4f6af9 429 tokenizer_config.json

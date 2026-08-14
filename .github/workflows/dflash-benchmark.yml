@@ -1,0 +1,2594 @@
+name: dflash-benchmark
+
+# DEFAULT RANKED TRACK: Poolside Laguna XS 2.1 DFlash (track id
+# laguna-xs-2.1-dflash-v1). LIVE since go-live 2026-07-31 (contract
+# Amendment 31); scoring per-prompt normalised since 2026-08-01 (Amendment 32).
+#
+# This is the ranked entrypoint declared by benchmark.json (which IS the
+# DFlash manifest). It runs the trusted organizer-drafter block protocol
+# pinned by fixtures/laguna_xs_2_1_dflash_track.json, using the
+# organizer-provisioned DFlash draft model (a separate ~924 MB EAGLE-style
+# speculator) against the pinned Laguna target. The retired serial track's
+# ranked workflow (benchmark.yml) was DELETED at go-live; its score,
+# baseline, calibration state, and leaderboard namespace were never mixed
+# into this track.
+#
+# ENABLEMENT STATE (LIVE): official_scoring_enabled is true in the contract
+#   fixture, reference_baseline.publication_allowed is true, and
+#   tokenFidelityGateStatus is "implemented" (flipped together at go-live,
+#   Amendment 31 -- flipping all three back takes the track offline again;
+#   the enablement guard fails closed on a reverted contract). The
+#   anti-lottery lock stands independently: the selection step refuses a
+#   RANKED run unless the hidden timed-prompt pool carries at least 8
+#   DISTINCT targets -- distinct sha256 AND distinct r2_path (it also fails
+#   closed on an empty pool, and on any malformed entry; the pool has held 8
+#   distinct entries since 2026-07-31). It is not a floor on pool LENGTH:
+#   eight copies of one golden have length 8 and anti-lottery value zero.
+#   The "Enforce track enablement" step is the standing guard: it rejects a
+#   reverted contract, disabled publication, empty hidden-golden pins, or an
+#   explicitly disabled dispatch. Both dispatch inputs default to TRUE
+#   (Amendment 31: Yukon omits custom inputs, so the defaults must arm a
+#   scored run). For submissions/* the contract is read from
+#   trusted main, so a submission cannot flip the track on or off.
+#
+# ADOPTED SCORING (2026-07-14 scoring-decision memo; mirrors the serial
+#   track's paired mechanics):
+#   - ranked decode window: 512 parent-counted tokens (contract max);
+#   - aggregation: RATIO-OF-MEANS across accepted pairs —
+#       score = mean(serial s/tok) / mean(dflash s/tok);
+#   - floor: aggregate >= 0.95 (floor applies to the aggregate, not per pair).
+#     The aggregate is NORMALISED per-prompt (Amendment 32): the raw ratio-of-means
+#     is divided by the sampled prompt's own pinned no-op reference, so every pool
+#     prompt's no-op maps to 1.0 and 0.95 is a uniform 'within 5% of this prompt's
+#     own no-op' threshold. NOT parity with serial: block decode spends compute per
+#     DECLARED row, so at this pool's ~75% draft acceptance a no-op is ~12% slower
+#     than serial K=1 (raw ~0.87) and normalises to 1.0. Supersedes the raw 0.83
+#     (worst no-op 0.8726 x 0.952 across the 8-prompt pool, M5 2026-07-31, no-ops
+#     0.8726-0.8939). See the contract fixture's proposed_scoring.normalized_scoring
+#     and component_floor and Amendments 30/32; 26/28 explain the superseded
+#     0.80/0.52 values.
+#   - pairs: minimum 3 accepted, target 4, alternating order;
+#   - stall guardrail: a run with max block latency > 4x its p50 is rejected
+#     as measurement-invalid, with one gated retry (owned by measure-dflash-job,
+#     same class as its throttle rejection);
+#   - token gate across every timed run: parity_all_ok from the measure job,
+#     plus the adopted token-fidelity gate (trusted sequential re-verification
+#     with a bounded near-tie budget -- Amendment 29/31; strict bit-exactness
+#     alone is unachievable for block-vs-sequential frames at near-tie argmaxes).
+#
+# WHAT A LIVE RUN DOES (after go-live):
+#   1. Verifies the operator-provisioned Laguna target + DFlash drafter caches
+#      against the checked-in byte manifests (every file, every run).
+#   2. Builds the candidate through the bench-exec bridge and transforms the
+#      Laguna target source into weights (sandboxed, network-denied).
+#   3. Runs the untimed DFlash correctness/parity gate: one full-length
+#      dflash-benchmark pass over the hidden Laguna correctness golden. The trusted
+#      parent (the trusted DFlash harness) owns the timer, the serial oracle, and the
+#      denominator; a single divergent token fails the run. Report stdout is
+#      sealed in the trusted shell exactly like the serial gates score.
+#   4. Scrubs hidden material back to the post-transform snapshot, reaps
+#      bench processes, and waits for quiescence.
+#   5. Runs the timed paired measurement LAST via the box-owned
+#      MLXFAST_DFLASH_MEASURE_JOB (fixed 40C thermal contract, 2 Hz macmon
+#      telemetry, throttle/telemetry rejection). Pairing discipline mirrors
+#      the serial track: the decode-only denominator is the trusted serial
+#      K=1 target decode (the dflash-probe path) executed from the PINNED,
+#      operator-owned DFlash baseline tree; the numerator is the candidate's
+#      dflash-benchmark decode over the SAME hidden benchmark golden, same
+#      session, same silicon, alternating order, at least
+#      MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS accepted pairs. Worker-reported timing
+#      has no authority anywhere; the parent divides its own wall time by
+#      its own configured token total.
+#   6. Applies the decode-only score contract in the trusted shell:
+#        raw   = mean(serial s/tok over accepted pairs)
+#                / mean(dflash s/tok over accepted pairs)   [ratio-of-means]
+#        score = dflash_decode_speedup
+#              = raw / noop_reference[sampled_prompt]        [per-prompt normalised]
+#        floor >= 0.95 on that aggregate, hard (normalised: every prompt's no-op is
+#        1.0, so 0.95 == within 5% of the sampled prompt's own no-op; Amendment 32.
+#        Supersedes the raw floor 0.83 = worst pool no-op 0.8726 x 0.952);
+#        bit-exact gate: parity_all_ok must be true across every timed run.
+#      There is no prefill component: the DFlash protocol charges seed prefill
+#      inside the decode measurement.
+#
+# HOST CONTRACT (operator-provisioned, janitor-audited; consumed, never
+# installed, by this workflow — see the DFlash go-live runbook):
+#   MLXFAST_DFLASH_TARGET_DIR / MLXFAST_DFLASH_ASSISTANT_DIR
+#       Read-only runner-owned caches holding exactly the files pinned by
+#       fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256 and
+#       fixtures/dflash_laguna_xs_2_1_drafter.sha256 (setup-dflash.sh
+#       layout).
+#   MLXFAST_DFLASH_BASELINE_WS
+#       Pinned prebuilt challenge-repo tree (trusted ref) with weights
+#       already transformed; the serial dflash-probe denominator runs from
+#       here, never from the candidate workspace, so a submission cannot
+#       slow the reference to inflate its ratio.
+#   MLXFAST_DFLASH_BASELINE_CALIBRATION
+#       Operator calibration (fresh gated sessions, authored per the go-live
+#       runbook at a ref containing the block-0 stall fix) with sanity bands
+#       for the serial denominator.
+#   MLXFAST_DFLASH_MEASURE_JOB
+#       Box-owned timing wrapper (sibling of measure-job.sh) with the same
+#       FIXED, non-overridable thermal-stability contract: per-phase
+#       quiescence + reap, GPU < 40C gate before every timed phase (900 s
+#       ceiling), 2 Hz macmon telemetry, throttle/telemetry rejection, one
+#       gated retry, the 4x-p50 stall-guardrail rejection (also one gated
+#       retry), baseline calibration band check, alternating-order pairs
+#       (target --target-pairs, minimum --min-pairs accepted), per-side
+#       BENCH_GOLDEN_PATH worker denial of the hidden benchmark golden, and
+#       a sealed results.json whose aggregate carries the per-side
+#       seconds/token means consumed by "Compute DFlash score and enforce
+#       floor" below.
+#
+# Dispatch-only, same self-hosted safety rules as the serial pipeline: no
+# PR/push triggers, refs restricted to main, submissions/*, baseline/*, and
+# yukon/baseline/*. Submission branches contribute only the exact dispatched
+# SHA's editablePaths over trusted main. Submitted-process logs are
+# suppressed on submission branches. The static review runs with the DFlash
+# track policy (MLXFAST_SUBMISSION_TRACK_ID=laguna-xs-2.1-dflash-v1).
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_track_enabled:
+        description: "ARMING interlock. The guard still refuses any dispatch that EXPLICITLY passes this false (pinned by confirmTrackEnabledIsRequiredEvenForAGatesOnlyDryRun and the interlock truth table), so a manual `-f confirm_track_enabled=false` is still rejected at 'Enforce DFlash track enablement'. DEFAULT FLIPPED TO true at go-live 2026-07-31 (Amendment 31): Yukon drives every real dispatch -- baseline validation on yukon/baseline/* and each participant submission on submissions/* -- and it OMITS this custom input, so it takes the default. A false default made Yukon's automated dispatches unarmable and the benchmark un-importable. The load-bearing gate is NOT this flag: it is the trusted contract (official_scoring_enabled + reference_baseline.publication_allowed) checked earlier in the same step, which refuses a scored run whenever the track is not enabled, plus the anti-lottery pool floor. This flag only ever ARMS a dispatch; the contract fields decide ranked-vs-gates-only and whether a score may be produced at all."
+        required: false
+        default: true
+        type: boolean
+      run_benchmark:
+        description: "Run the timed paired DFlash measurement after the correctness/parity gate. false = correctness/parity only."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlxfast-dflash-ranked-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  dflash-ranked:
+    name: "single-machine DFlash ranked benchmark (m5-laguna-dflash)"
+    # DEDICATED label, deliberately NOT the serial track's `m5-bench`.
+    #
+    # Sharing `m5-bench` meant a DFlash dispatch could be picked up by a runner in
+    # the LIVE ranked serial pool and occupy it for the length of a DFlash job --
+    # transform, gates and four thermally-gated pairs. The two tracks also have
+    # different box prerequisites (DFlash needs its own pinned baseline workspace
+    # and per-track calibration), so a serial-pool box would fail the run at the
+    # prerequisite check anyway.
+    #
+    # With a dedicated label an unserved dispatch QUEUES instead of running on the
+    # wrong box, which is the safe failure for an inert track. Registering a runner
+    # under this label is an operator action; until then no DFlash job can start,
+    # which is intentional.
+    runs-on: [self-hosted, m5-laguna-dflash]
+    # Job budget: build (~15m) + IT transform (~10m) + artifact hashing of
+    # the 18.4 GB source (~3m) + full-length parity pass (~15m) + cooldowns
+    # (up to 900s per timed phase) + >=3 alternating timed pairs. Generous
+    # until the track has its own timing history.
+    timeout-minutes: 360
+    # MUST match the environment the serial ranked job binds. Both jobs read
+    # the SAME secret NAMES (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+    # R2_BUCKET_ENDPOINT), but those resolve per environment -- so binding a
+    # different environment silently hands this job different credentials and
+    # a different endpoint for the same object names.
+    #
+    # This was inherited from the retired MTP job and was stale. Proven by run
+    # 30588892999: "Prepare hidden correctness golden" is a copy of the serial
+    # step, fetching the SAME raw_golden.json that serial fetches
+    # successfully, and it failed with six retried curl HTTP 400s. Same box,
+    # same object, same secret names, different environment -- the binding is
+    # the only variable.
+    environment: benchmark-private-prompts-v2
+    env:
+      # --- Host contract (see header; operator-provisioned, janitor-audited).
+      MLXFAST_BENCH_EXEC: /opt/bench/bench-exec.sh
+      MLXFAST_JANITOR: /opt/bench/janitor.sh
+      MLXFAST_QUARANTINE_FLAG: /opt/bench/quarantine.flag
+      MLXFAST_MACMON: /opt/bench-runner/bin/macmon
+      MLXFAST_DFLASH_MEASURE_JOB: /opt/bench-runner/measure-dflash-job.sh
+      # Per-track, and NOT the retired MTP paths this scaffolding was restored
+      # from: /opt/bench-runner/mtp-baseline/current and
+      # /opt/bench-runner/state/mtp-baseline-calibration.json do not exist on any
+      # box, so a ranked run died at the prerequisite check (exit 8). The
+      # calibration path in particular must stay inside the per-track state dir --
+      # measure-dflash-job.sh's own header warns that the bare
+      # /opt/bench-runner/state is the SERIAL track's and that banding DFlash runs
+      # against serial numbers would cross-write the serial oracle cache.
+      MLXFAST_DFLASH_BASELINE_WS: /opt/bench-runner/baseline/laguna-xs-2.1-dflash-v1/current
+      MLXFAST_DFLASH_BASELINE_CALIBRATION: /opt/bench-runner/state/laguna-xs-2.1-dflash-v1/baseline-calibration.json
+      MLXFAST_MEASURE_STATE_DIR: /opt/bench-runner/state/laguna-xs-2.1-dflash-v1
+      MLXFAST_DFLASH_TARGET_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      MLXFAST_DFLASH_ASSISTANT_DIR: /opt/bench-runner/cache/dflash/laguna-xs-2.1-dflash-v1/assistant
+      # Bench workspace: distinct stable path from the serial track's
+      # ranked-current (same /Users/Shared/bench-jobs confinement contract,
+      # same absolute-path build-cache reasoning as serial-benchmark.yml).
+      MLXFAST_JOB_WS: /Users/Shared/bench-jobs/dflash-ranked-current
+      # --- Runner-only private material (0700 runner).
+      MLXFAST_PRIVATE_DIR: /tmp/mlxfast-dflash-private-${{ github.run_id }}-${{ github.run_attempt }}
+      # Distinct from the serial track's artifact run root while satisfying
+      # stage-benchmark-artifacts.sh's /tmp/mlxfast-artifacts- prefix contract
+      # (run component "dflash-<run>-<attempt>", which is what the value below
+      # actually spells).
+      MLXFAST_ARTIFACT_ROOT: /tmp/mlxfast-artifacts-dflash-${{ github.run_id }}-${{ github.run_attempt }}
+      MLXFAST_MEASURE_OUT: /tmp/mlxfast-dflash-measure-${{ github.run_id }}-${{ github.run_attempt }}
+      # --- Track contract.
+      MLXFAST_DFLASH_TRACK_ID: laguna-xs-2.1-dflash-v1
+      MLXFAST_DFLASH_CONTRACT_PATH: fixtures/laguna_xs_2_1_dflash_track.json
+      # The BENCHMARK MANIFEST (editablePaths / scoring), as distinct from the
+      # track contract fixture above. Passed as CONTRACT_PATH to both
+      # enforce-modifiable-surface.sh and overlay-editable-paths.sh so a DFlash
+      # submission is judged and overlaid against the DFlash editable surface
+      # (which includes nine DFlash-only files benchmark.json does not list)
+      # rather than the serial track's.
+      MLXFAST_DFLASH_EDITABLE_SURFACE_CONTRACT: benchmark.json
+      MLXFAST_DFLASH_TARGET_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
+      MLXFAST_DFLASH_ASSISTANT_MANIFEST_PATH: fixtures/dflash_laguna_xs_2_1_drafter.sha256
+      # Decode-only score contract (adopted 2026-07-14; see header). Keep in
+      # sync with the contract fixture's proposed_scoring block; the floor is
+      # HARD (a DFlash submission that is not actually faster than trusted
+      # serial decode does not rank) and applies to the ratio-of-means
+      # aggregate over the accepted pairs.
+      #
+      # Block size 2, measured on the RANKED HIDDEN GOLDEN 2026-07-31 -- the
+      # third re-derivation of K, each time because the optimum follows the
+      # material's draft-acceptance rate: the short-prompt sweep said 8 (1.86x),
+      # the 1755-token fixture said 3 (K=2 0.82x | K=3 1.09x | K=4 1.06x |
+      # K=8 0.92x, Amendment 5), and the ranked golden at ~34% acceptance says 2
+      # (no-op 0.6201 vs K=3's 0.5493 at 128 tokens, confirmed at the ranked
+      # 512-token window -- Amendment 28). At 34% acceptance the third verify row
+      # is almost always wasted compute. K must be RE-DERIVED across the whole
+      # pool when timed_prompt_pool is populated, exactly like the floor: a K
+      # tuned to one prompt is the same trap as a floor tuned to one prompt.
+      MLXFAST_DFLASH_BLOCK_SIZE: "2"
+      MLXFAST_DFLASH_DECODE_TOKENS: "512"
+      MLXFAST_DFLASH_CORRECTNESS_TOKENS: "512"
+      # 0.95 NORMALISED (Amendment 32): the score is the raw ratio-of-means DIVIDED
+      # by the sampled prompt's own pinned no-op reference, so every pool prompt's
+      # no-op maps to 1.0 and 0.95 == within 5% of the sampled prompt's own no-op,
+      # uniformly across the pool. Matches scoring.decodeSpeedupFloor in
+      # benchmark.json and the contract fixture's proposed_scoring.component_floor
+      # (all three pinned equal by test). This is the trusted enforcing site: the
+      # score is recomputed here in the trusted shell from the sealed per-side means
+      # and the pinned reference, then gated against this value, so a 1.0 here would
+      # override the 0.95 everywhere else. The box wrapper's MIN_ACCEPTED_SPEEDUP
+      # is DECOUPLED from this to a LOOSE RAW measurement-sanity floor (0.50,
+      # APPLIED on the serving box 2026-08-01 with a manifest re-sign) because the
+      # box measures raw speedup and has no reference; the raw 0.83 it previously
+      # enforced would false-reject a Russell-drawn candidate whose raw sits
+      # in [0.829, 0.83) but normalises to >= 0.95. Supersedes the raw floor 0.83
+      # (worst no-op 0.8726 x 0.952 across the 8-prompt pool 0.8726-0.8939, M5
+      # 2026-07-31), which was correct only for the worst prompt. On this track
+      # parity with serial is NOT the no-change line: block decode spends compute per
+      # DECLARED row, so at ~75% draft acceptance a no-op is ~12% slower than serial
+      # K=1 (raw ~0.87) and normalises to 1.0. THREE superseded raw values: 0.80
+      # (0.840x @69% on a different golden), 0.52 (K=3 over a 128-token window), 0.55
+      # (a single deliberately-hard lowsim prompt @34%, since dropped). See contract
+      # Amendments 26, 28, 30, 32.
+      MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR: "0.95"
+      MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS: "3"
+      MLXFAST_DFLASH_TARGET_PAIRS: "4"
+      # Contract layer L6: attributable ranked failures allowed per submission
+      # branch before further attempts are refused. Sized so honest iteration
+      # (a genuine correctness or floor miss, fixed and resubmitted) stays
+      # possible while submit-until-green against a sampled prompt pool of N
+      # does not pay: with a pool of 8 and 5 attempts the chance of clearing a
+      # tuned threshold on every sampled target is negligible.
+      MLXFAST_DFLASH_MAX_RANKED_FAILURES: "5"
+      # Hidden IT-target golden pins, frozen 2026-07-15 on M5 silicon from the
+      # pinned IT target at the post-stall-fix tip (go-live runbook step B;
+      # capture record in the operator private store). PENDING box-2 replay
+      # confirmation: if the serving box's stack diverges on any near-tie
+      # argmax, the goldens are regenerated there and these pins updated
+      # before this change merges. The enablement gate fails closed if any
+      # pin is emptied. (The R2 object KEYS are deliberately scoped to the
+      # one trusted download step, exactly like the serial pipeline.)
+      MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256: b991333b5a96664b2187422894dad0b0bfbe7ce3c9f4fc6b29fc0512710cfd31
+      MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES: "185394"
+      MLXFAST_DFLASH_BENCH_GOLDEN_SHA256: 5b9e2c4a09904391213fd2d80f4b5d1ccde39a163b88de22990ec34f3f781ad8
+      MLXFAST_DFLASH_BENCH_GOLDEN_BYTES: "185433"
+      # --- REUSED SERIAL GATE CONTRACT --------------------------------------
+      # Copied VERBATIM from .github/workflows/benchmark.yml. This track does not
+      # own a second correctness/GPQA implementation: the four gate steps below
+      # ("Public behavior gate", "Attach GPQA gates and verify augmented
+      # golden", "Correctness and gates", "Semantic GPQA gate") are the SERIAL
+      # track's live, calibrated steps re-hosted here and pointed at this job's
+      # build. That works because a DFlash submitter edits the same vendored
+      # model and kernel surface a serial submitter does and this job builds the
+      # same .build/release/mlxfast-swift + .build-worker/release/
+      # mlxfast-runtime-worker, so the serial hidden goldens are already valid
+      # inputs and the serial gates already prove the model is still sound --
+      # which is the whole guarantee these gates are here to give.
+      #
+      # NOTHING BELOW IS RETUNED FOR DFLASH. Keep every value in lockstep with
+      # benchmark.yml; a divergence here silently weakens a gate on one track
+      # only, which is exactly how these two workflows drifted last time.
+      #
+      # The ONE renamed input: the serial gates read MLXFAST_REFERENCE_DIR,
+      # while this workflow calls the same directory MLXFAST_DFLASH_TARGET_DIR.
+      # They are the SAME pinned Laguna snapshot, verified against the SAME
+      # fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256 manifest, so the
+      # duplication is safe -- and "DFlash host preflight" asserts the two
+      # strings are equal so it cannot rot. It is spelled as a literal because
+      # job-level env cannot read the `env` context.
+      MLXFAST_REFERENCE_DIR: /opt/bench-runner/cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      # Trusted final-artifact shape contract; keep in sync with
+      # MLXFastConstants.numHiddenLayers.
+      MLXFAST_EXPECTED_NUM_LAYERS: "40"
+      # The transform already ran and was hashed above, so the gates pass does
+      # not re-verify it. Serial takes this from a dispatch input this workflow
+      # deliberately does not expose.
+      MLXFAST_VERIFY_TRANSFORM: "0"
+      MLXFAST_ANTHROPIC_PRESENT: ${{ secrets.ORG_ANTHROPIC_API_KEY != '' && '1' || '0' }}
+      # Runner-private trusted copies (the private dir is 0700 runner, so
+      # neither the bench parent nor the worker can read them).
+      MLXFAST_CORRECTNESS_GOLDEN_PATH: /tmp/mlxfast-dflash-private-${{ github.run_id }}-${{ github.run_attempt }}/correctness_golden.json
+      MLXFAST_SEMANTIC_GPQA_RESULTS_PATH: /tmp/mlxfast-dflash-private-${{ github.run_id }}-${{ github.run_attempt }}/semantic_gpqa_results.json
+      # Serial hidden pins. The private R2 object KEYS stay scoped to the one
+      # trusted download step (never job level), exactly as in benchmark.yml.
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256: 94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023
+      MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES: "35892"
+      MLXFAST_GPQA_REFERENCE_SHA256: 6e149e58908d086091ed7e7980e9f8beca7deb4d04063035d68d23e70ee1726f
+      MLXFAST_GPQA_REFERENCE_BYTES: "13534"
+      MLXFAST_EXPECTED_CORRECTNESS_STEPS: "64"
+      MLXFAST_BENCHMARK_CORRECTNESS_STEPS: "64"
+      # Keep in sync with MLXFastConstants.{correctnessGPQACaseCount,
+      # correctnessGPQAMaxNewTokens,semanticGPQACaseCount,
+      # semanticGPQAMaxNewTokens,semanticGPQAMinPassCount}.
+      MLXFAST_GPQA_CASE_COUNT: "9"
+      MLXFAST_GPQA_MAX_NEW_TOKENS: "128"
+      # Must equal MLXFAST_GPQA_CASE_COUNT (gpqa_ttft_case_count is derived per
+      # attached case).
+      MLXFAST_GPQA_TTFT_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_CASE_COUNT: "9"
+      MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS: "128"
+      # 7 of 9, calibrated ON THE SERIAL TRACK from 27 self-match runs / 243
+      # judgements (9/9 every time, zero variance): each damaged answer costs
+      # exactly one case, and >= 6 is required to reject a submission that
+      # hardcodes one fixed letter (which can match at most 5 of 9). This is a
+      # measured number, not a prediction -- do not retune it for this track.
+      MLXFAST_SEMANTIC_GPQA_MIN_PASS: "7"
+      # REQUIRED, not advisory. For GPQA behavior cases the exact-token
+      # comparison is hardcoded to pass
+      # (LagunaRuntimeCorrectnessCompare.swift), so the semantic judge plus the
+      # GPQA TTFT coverage check are the ONLY things standing between a
+      # semantically damaged model and a green ranked run.
+      MLXFAST_SEMANTIC_GPQA_REQUIRED: "1"
+      MLXFAST_SEMANTIC_GPQA_MODEL: claude-opus-4-8
+      # Public drift tripwire: the checked-in, M5-generated fixture the serial
+      # track gates on, run BEFORE any hidden byte enters the workspace.
+      MLXFAST_PUBLIC_CORRECTNESS_PROMPT_PATH: correctness_prompts/public_longcopy_gate_english_512.txt
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH: correctness_prompts/public_longcopy_gate_english_512_256.json
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256: b9509697c08a2cf3c2943a85f0b76e39c485c441794690fa76835b40a58d7a63
+      MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_BYTES: "10686"
+      # --- Benchmark plumbing (shared with serial-benchmark.yml).
+      MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      MLXFAST_PRIVATE_PROMPTS_R2_PRESENT: ${{ (secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_ENDPOINT != '' && secrets.R2_SECRET_ACCESS_KEY != '') && '1' || '0' }}
+      MLXFAST_RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
+      MLXFAST_CANDIDATE_SHA: ${{ github.sha }}
+      MLXFAST_IS_SUBMISSION_BRANCH: ${{ startsWith(github.ref, 'refs/heads/submissions/') && '1' || '0' }}
+      # Same operator-pinned Metal toolchain as the serial ranked build.
+      MLXFAST_METAL_TOOLCHAIN_IDENTIFIER: com.apple.dt.toolchain.Metal.32023.883
+    steps:
+      # Fail fast if the box is quarantined or the isolation stack is missing,
+      # before any checkout or secret use. DFlash-specific host paths are only
+      # asserted after the enablement gate (they do not exist until go-live).
+      - name: Host preflight
+        run: |
+          set -euo pipefail
+          echo "host=$(hostname) chip=$(sysctl -n machdep.cpu.brand_string) user=$(id -un) uid=$(id -u)"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::box is quarantined (${MLXFAST_QUARANTINE_FLAG}); janitor detected drift -- see RUNBOOK" >&2
+            exit 1
+          fi
+          test -e "${MLXFAST_BENCH_EXEC}" || { echo "::error::bench-exec bridge missing" >&2; exit 1; }
+          test -e "${MLXFAST_JANITOR}" || { echo "::error::janitor missing" >&2; exit 1; }
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Submission branches contribute editable paths only; trusted main
+          # is the harness/workflow/contract base (including the enablement
+          # fixture read below). Main, baseline/*, and yukon/baseline/* run
+          # their exact SHA.
+          ref: ${{ startsWith(github.ref, 'refs/heads/submissions/') && 'main' || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce trusted workflow context
+        run: .github/scripts/enforce-trusted-dflash-benchmark-workflow.sh
+
+      # Standing fail-closed gate. Order matters: this runs before any secret
+      # use, submitted-code handling, or bench execution.
+      # ENABLEMENT IS TWO SEPARATE QUESTIONS, and conflating them made the
+      # pipeline untestable before go-live.
+      #
+      #   may this job RUN?      confirm_track_enabled, a matching track_id,
+      #                          and non-empty golden pins.
+      #   may it PUBLISH a
+      #   ranked score?          official_scoring_enabled AND
+      #                          reference_baseline.publication_allowed, the two
+      #                          trusted-contract fields the go-live runbook
+      #                          flips.
+      #
+      # Requiring the PUBLISH answer in order to RUN meant the only way to
+      # exercise this pipeline was to declare the track live first -- so the
+      # correctness gates, the fail-closed guards, and the reused serial gate
+      # leg could never be validated before the switch they gate was already
+      # thrown. That is backwards, and it is how the fifth copy of the decode
+      # floor survived review: it was only ever found by dispatching for real.
+      #
+      # A gates-only dispatch (run_benchmark=false) produces NO ranked score.
+      # It writes a sealed local gates-score.json and the gates-only
+      # correctness artifacts, and every timed and scoring step is gated on
+      # inputs.run_benchmark. So it is allowed to run against a not-yet-enabled
+      # track. Anything that can publish still requires both flags, checked
+      # here AND again at the scoring step, so a future reordering of these
+      # steps cannot turn a dry run into a publishing one.
+      - name: Enforce DFlash track enablement
+        env:
+          CONFIRM_TRACK_ENABLED: ${{ inputs.confirm_track_enabled && '1' || '0' }}
+          RUN_BENCHMARK: ${{ inputs.run_benchmark && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          test -s "${MLXFAST_DFLASH_CONTRACT_PATH}"
+          track_id="$(jq -r '.track_id' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          if [[ "${track_id}" != "${MLXFAST_DFLASH_TRACK_ID}" ]]; then
+            echo "::error::contract track_id ${track_id} does not match workflow track ${MLXFAST_DFLASH_TRACK_ID}" >&2
+            exit 1
+          fi
+          scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          # The PUBLISH question. Enforced for any run that can emit a ranked
+          # score; a dry run is told the track is not yet enabled and carries
+          # on, because it cannot publish one.
+          if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
+            if [[ "${RUN_BENCHMARK}" == "1" ]]; then
+              echo "::error::DFlash track ${MLXFAST_DFLASH_TRACK_ID} is NOT enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}). A RANKED run is deliberately refused until the operator completes the DFlash go-live runbook and flips both trusted-contract fields on main. Dispatch with run_benchmark=false to validate the gates without producing a score." >&2
+              exit 1
+            fi
+            echo "::notice::DFlash track ${MLXFAST_DFLASH_TRACK_ID} is not enabled for ranked scoring (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed}); proceeding as a GATES-ONLY dry run, which publishes no score."
+            echo "MLXFAST_DFLASH_DRY_RUN_UNENABLED=1" >> "${GITHUB_ENV}"
+          fi
+          for pin_name in \
+            MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256 \
+            MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES \
+            MLXFAST_DFLASH_BENCH_GOLDEN_SHA256 \
+            MLXFAST_DFLASH_BENCH_GOLDEN_BYTES; do
+            if [[ -z "${!pin_name}" ]]; then
+              echo "::error::hidden DFlash golden pin ${pin_name} is empty; freeze the DFlash target goldens (go-live runbook step B) and pin them here before enabling the track" >&2
+              exit 1
+            fi
+          done
+          # The RUN question. Unchanged and still mandatory for BOTH kinds of
+          # dispatch: nothing about this job -- gates included -- happens
+          # without the operator ticking the interlock on the dispatch itself.
+          if [[ "${CONFIRM_TRACK_ENABLED}" != "1" ]]; then
+            echo "::error::DFlash track enablement interlock is disabled; dispatch requires confirm_track_enabled=true" >&2
+            exit 1
+          fi
+          if [[ "${RUN_BENCHMARK}" == "1" ]]; then
+            echo "dflash-benchmark: track ${MLXFAST_DFLASH_TRACK_ID} enablement verified (RANKED: scoring enabled and publication allowed)"
+          else
+            echo "dflash-benchmark: track ${MLXFAST_DFLASH_TRACK_ID} enablement verified (GATES-ONLY dry run: no ranked score is produced)"
+          fi
+
+      # DFlash-specific host contract, asserted only once the track is live.
+      - name: DFlash host preflight
+        run: |
+          set -euo pipefail
+          test -x "${MLXFAST_DFLASH_MEASURE_JOB}" || { echo "::error::measure-dflash-job missing" >&2; exit 1; }
+          test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing" >&2; exit 1; }
+          test -f "${MLXFAST_DFLASH_TARGET_DIR}/config.json" || { echo "::error::DFlash target cache missing" >&2; exit 1; }
+          test -f "${MLXFAST_DFLASH_ASSISTANT_DIR}/config.json" || { echo "::error::DFlash drafter cache missing" >&2; exit 1; }
+          # The reused serial gate steps read MLXFAST_REFERENCE_DIR; this
+          # workflow calls the same directory MLXFAST_DFLASH_TARGET_DIR. Job-level
+          # env cannot reference the env context, so the path is spelled twice --
+          # assert the two spellings are the same string so the duplication can
+          # never rot into "the serial gates checked a different checkpoint".
+          if [[ "${MLXFAST_REFERENCE_DIR}" != "${MLXFAST_DFLASH_TARGET_DIR}" ]]; then
+            echo "::error::MLXFAST_REFERENCE_DIR (${MLXFAST_REFERENCE_DIR}) must be the same path as MLXFAST_DFLASH_TARGET_DIR (${MLXFAST_DFLASH_TARGET_DIR}); the reused serial correctness/GPQA gates and the DFlash target must be the same pinned checkpoint" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            test -d "${MLXFAST_DFLASH_BASELINE_WS}" || { echo "::error::pinned DFlash baseline workspace missing" >&2; exit 1; }
+            test -s "${MLXFAST_DFLASH_BASELINE_CALIBRATION}" || { echo "::error::DFlash baseline calibration missing" >&2; exit 1; }
+          fi
+
+      - name: Capture candidate commit
+        id: candidate_context
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${CANDIDATE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::candidate SHA must be an exact 40-character lowercase commit SHA" >&2
+            exit 1
+          fi
+          trusted_main_sha="$(git rev-parse HEAD)"
+          printf '%s\n' "${CANDIDATE_SHA}" > candidate.sha
+          printf 'trusted_main_sha=%s\n' "${trusted_main_sha}" >> "${GITHUB_OUTPUT}"
+
+      # CONTRACT LAYER L6, second half (the pool is the first half). Sampling a
+      # timed target per run makes a tuned threshold a 1/N gamble; rate limiting
+      # is what stops the gamble being repeated for free. Only failures a
+      # PARTICIPANT is responsible for count -- an overloaded judge API, a
+      # thermal reject or a nondeterministic reference is an operator fault and
+      # must never consume a submitter's budget (see the recorder step near the
+      # end, which only increments for dflash_*/floor/correctness categories).
+      - name: Enforce DFlash ranked-failure rate limit
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          limit="${MLXFAST_DFLASH_MAX_RANKED_FAILURES}"
+          counts_dir="${MLXFAST_MEASURE_STATE_DIR}/failure-counts"
+          mkdir -p "${counts_dir}"
+          # Branch names are attacker-influenced, so derive the filename from a
+          # digest rather than from the ref text itself.
+          branch_key="$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')"
+          counter="${counts_dir}/${branch_key}.count"
+          used=0
+          if [[ -s "${counter}" ]]; then
+            used="$(tr -dc '0-9' < "${counter}")"
+            used="${used:-0}"
+          fi
+          # NOTE: the private audit copy of this branch key is written by
+          # "Prepare bench workspace" below, which is the step that creates
+          # MLXFAST_PRIVATE_DIR. It used to be written HERE, against a directory
+          # that does not exist until ~10 steps later, with the failure swallowed
+          # by `2>/dev/null || true` -- so the record was never produced.
+          if [[ "${used}" -ge "${limit}" ]]; then
+            echo "::error::this submission branch has used ${used} of ${limit} attributable ranked DFlash attempts; further attempts are rate limited" >&2
+            exit 1
+          fi
+          echo "dflash-benchmark: attributable ranked failures for this branch: ${used}/${limit}"
+
+      - name: Checkout submitted editable paths
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          path: .mlxfast-submission-src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify submitted commit and modifiable surface
+        id: verify_submission
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          SUBMISSION_REF: ${{ github.sha }}
+          TRUSTED_MAIN_SHA: ${{ steps.candidate_context.outputs.trusted_main_sha }}
+        run: |
+          set -euo pipefail
+          hardened_git="${GITHUB_WORKSPACE}/.github/scripts/hardened-git.sh"
+          actual_sha="$("${hardened_git}" -C .mlxfast-submission-src rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${SUBMISSION_REF}" ]]; then
+            echo "::error::submitted checkout resolved to ${actual_sha}, expected ${SUBMISSION_REF}" >&2
+            exit 1
+          fi
+          if ! "${hardened_git}" -C .mlxfast-submission-src cat-file -e "${TRUSTED_MAIN_SHA}^{commit}"; then
+            echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
+            exit 1
+          fi
+          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
+          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
+            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+            exit 1
+          fi
+          # CONTRACT_PATH is load-bearing, not cosmetic: without it the script
+          # defaults to benchmark.json (the SERIAL contract) and a DFlash
+          # submitter's edits to the nine DFlash-only editablePaths are rejected
+          # as "outside the modifiable surface" -- while "Overlay submitted
+          # editable paths" below, reading the same default, silently does not
+          # overlay them. Both invocations must name the DFlash contract.
+          (
+            cd .mlxfast-submission-src
+            BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
+              CONTRACT_PATH="${MLXFAST_DFLASH_EDITABLE_SURFACE_CONTRACT}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
+          )
+          if ! "${hardened_git}" cat-file -e "${actual_sha}^{commit}"; then
+            "${hardened_git}" fetch --no-tags .mlxfast-submission-src "${actual_sha}"
+          fi
+          "${hardened_git}" cat-file -e "${actual_sha}^{commit}"
+          printf 'base_sha=%s\n' "${base_sha}" >> "${GITHUB_OUTPUT}"
+          echo "dflash-benchmark: verified submitted commit ${actual_sha} against base ${base_sha}"
+
+      # Static review with the DFlash-track policy: organizer-assistant,
+      # target-verified block speculation is permitted; prompt lookup,
+      # assistant substitution, unverified drafts, timing forgery, and
+      # cross-request future state remain fail-worthy.
+      - name: Review submitted code for benchmark bypasses (DFlash policy)
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          HEAD_SHA: ${{ github.sha }}
+          REVIEW_BASE_SHA: ${{ steps.verify_submission.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          (
+            cd .mlxfast-submission-src
+            MLXFAST_SUBMISSION_TRACK_ID="${MLXFAST_DFLASH_TRACK_ID}" \
+            MLXFAST_SUBMISSION_REVIEW_BASE_SHA="${REVIEW_BASE_SHA}" \
+              "${GITHUB_WORKSPACE}/.github/scripts/run-submission-static-review.sh"
+          )
+
+      - name: Overlay submitted editable paths
+        if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
+        env:
+          SUBMISSION_WORKTREE: .mlxfast-submission-src
+          # Must match the CONTRACT_PATH the surface enforcement above used, or
+          # the overlay silently drops files the enforcement just accepted.
+          CONTRACT_PATH: ${{ env.MLXFAST_DFLASH_EDITABLE_SURFACE_CONTRACT }}
+        run: .github/scripts/overlay-editable-paths.sh
+
+      - name: Remove submitted checkout
+        if: ${{ always() && startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          rm -rf .mlxfast-submission-src
+          test ! -e .mlxfast-submission-src
+
+      # Same Seatbelt-semantics probe as the serial pipeline: this host's
+      # sandbox-exec must still deny golden reads, private-dir reads,
+      # non-workspace writes, network, and fork/exec under a worker profile.
+      - name: Probe runtime worker sandbox
+        run: .github/scripts/probe-runtime-worker-sandbox.sh
+
+      # The hidden DFlash goldens come from R2 in both correctness-only and
+      # timed dispatches, so the secrets must be present either way.
+      - name: Check private material present
+        run: |
+          set -euo pipefail
+          if [[ "${MLXFAST_PRIVATE_PROMPTS_R2_PRESENT}" != "1" ]]; then
+            echo "::error::hidden DFlash goldens require private R2 secrets" >&2
+            exit 1
+          fi
+          # Copied from benchmark.yml. The reused semantic GPQA gate is
+          # REQUIRED (see MLXFAST_SEMANTIC_GPQA_REQUIRED), so an unreachable
+          # judge must fail the run -- and must fail HERE, before ~25 minutes of
+          # build and transform, not after them.
+          if [[ "${MLXFAST_ANTHROPIC_PRESENT}" != "1" ]]; then
+            echo "::error::semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+
+      # Full content hash of every target and assistant cache file against
+      # the checked-in manifests, every run, plus a strict flat-inventory
+      # check — a corrupted or swapped cache can never feed the transform or
+      # the assistant load. (The runtime revalidates through
+      # the trusted DFlash provenance check as well; this is the trusted-shell anchor.)
+      - name: Verify DFlash target and drafter caches against pinned manifests
+        run: |
+          set -euo pipefail
+          verify_cache() {
+            local manifest="$1" root="$2" label="$3"
+            test -s "${manifest}"
+            local failures=0 checked=0
+            local expected_names=()
+            while read -r want_hash want_bytes rel_path; do
+              [[ -z "${want_hash}" || "${want_hash}" == \#* ]] && continue
+              expected_names+=("${rel_path}")
+              local path="${root}/${rel_path}"
+              if [[ ! -f "${path}" || -L "${path}" ]]; then
+                echo "::error::${label} file missing or not a regular file: ${rel_path}" >&2
+                failures=$((failures + 1))
+                continue
+              fi
+              local actual_bytes actual_hash
+              actual_bytes="$(wc -c < "${path}" | tr -d ' ')"
+              actual_hash="$(shasum -a 256 "${path}" | awk '{print $1}')"
+              if [[ "${actual_bytes}" != "${want_bytes}" || "${actual_hash}" != "${want_hash}" ]]; then
+                echo "::error::${label} file mismatch: ${rel_path}" >&2
+                failures=$((failures + 1))
+              fi
+              checked=$((checked + 1))
+            done < "${manifest}"
+            while IFS= read -r existing; do
+              local name found expected
+              name="$(basename "${existing}")"
+              found=0
+              for expected in "${expected_names[@]}"; do
+                if [[ "${name}" == "${expected}" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if [[ "${found}" != "1" ]]; then
+                echo "::error::unexpected file in ${label} cache: ${existing}" >&2
+                failures=$((failures + 1))
+              fi
+            done < <(find "${root}" -mindepth 1 -maxdepth 1 -print)
+            if [[ "${failures}" -ne 0 || "${checked}" -eq 0 ]]; then
+              echo "::error::${label} cache failed manifest verification (checked=${checked} failures=${failures})" >&2
+              exit 1
+            fi
+            echo "dflash-benchmark: ${label} cache verified against pinned manifest (${checked} files)"
+          }
+          verify_cache "${MLXFAST_DFLASH_TARGET_MANIFEST_PATH}" "${MLXFAST_DFLASH_TARGET_DIR}" "DFlash target"
+          verify_cache "${MLXFAST_DFLASH_ASSISTANT_MANIFEST_PATH}" "${MLXFAST_DFLASH_ASSISTANT_DIR}" "DFlash drafter"
+
+      # Trusted caches are RESTORE-ONLY here: only main-ref dispatches of the
+      # legacy serial-benchmark.yml may save into the trusted cache namespaces (the
+      # same anti-poisoning gate), and this workflow never saves at all.
+      - name: Restore trusted SwiftPM dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+            .build-worker/checkouts
+            .build-worker/repositories
+            .build-worker/artifacts
+            .build-worker/workspace-state.json
+          key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+
+      - name: Compute MLX Metal library cache fingerprint
+        id: mlx_metallib_fingerprint
+        run: |
+          set -euo pipefail
+          cmake_bin="$(command -v cmake 2>/dev/null || true)"
+          if [[ -z "${cmake_bin}" ]]; then
+            for candidate in /opt/homebrew/bin/cmake /usr/local/bin/cmake; do
+              if [[ -x "${candidate}" ]]; then
+                cmake_bin="${candidate}"
+                break
+              fi
+            done
+          fi
+          test -x "${cmake_bin}"
+          metal_toolchain_identifier="$(
+            xcodebuild -showComponent MetalToolchain 2>/dev/null \
+              | awk -F': ' '/Toolchain Identifier/ { print $2; exit }' \
+              || true
+          )"
+          if [[ -n "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" \
+              && "${metal_toolchain_identifier}" != "${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" ]]; then
+            echo "::error::installed Metal toolchain (${metal_toolchain_identifier:-none}) does not match the ranked pin (${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}); update the pin or the box deliberately" >&2
+            exit 1
+          fi
+          # Same two-fingerprint scheme as the serial pipeline: the vendored
+          # kernel sources of THIS (overlaid) work tree key the metallib
+          # cache so a cached mlx.metallib can never mask participant kernel
+          # edits; the base fingerprint keys the build-products caches.
+          vendored_metal_fingerprint="$(tools/build-mlx-metallib.sh --print-fingerprint)"
+          test "${#vendored_metal_fingerprint}" -eq 64
+          base_fingerprint="$({
+            printf '%s\n' mlx-metallib-m5-max-v2
+            uname -m
+            sysctl -n machdep.cpu.brand_string
+            sw_vers -buildVersion
+            xcodebuild -version
+            printf 'METAL_TOOLCHAIN_IDENTIFIER=%s\n' "${metal_toolchain_identifier}"
+            xcrun --sdk macosx --show-sdk-build-version
+            if [[ -n "${metal_toolchain_identifier}" ]]; then
+              TOOLCHAINS="${metal_toolchain_identifier}" xcrun -sdk macosx metal -v 2>&1
+            else
+              xcrun -sdk macosx metal -v 2>&1
+            fi
+            "${cmake_bin}" --version
+            shasum -a 256 Package.swift Package.resolved tools/build-mlx-metallib.sh
+          } | shasum -a 256 | awk '{print $1}')"
+          test "${#base_fingerprint}" -eq 64
+          fingerprint="$({
+            printf 'BASE_FINGERPRINT=%s\n' "${base_fingerprint}"
+            printf 'VENDORED_METAL_FINGERPRINT=%s\n' "${vendored_metal_fingerprint}"
+          } | shasum -a 256 | awk '{print $1}')"
+          test "${#fingerprint}" -eq 64
+          printf 'sha256=%s\n' "${fingerprint}" >> "${GITHUB_OUTPUT}"
+          printf 'base_sha256=%s\n' "${base_fingerprint}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore trusted MLX Metal library cache
+        id: restore_mlx_metallib_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .mlxfast-cache/mlx.metallib
+            .mlxfast-cache/mlx.metallib.fingerprint
+          key: mlx-metallib-m5-max-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.sha256 }}
+
+      - name: Verify restored MLX Metal library
+        env:
+          CACHE_HIT: ${{ steps.restore_mlx_metallib_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_HIT}" == "true" ]]; then
+            test -s .mlxfast-cache/mlx.metallib
+            test -s .mlxfast-cache/mlx.metallib.fingerprint
+            expected_record="mlxfast-metallib-fingerprint-v1 $(tools/build-mlx-metallib.sh --print-fingerprint)"
+            restored_record="$(cat .mlxfast-cache/mlx.metallib.fingerprint)"
+            if [[ "${restored_record}" != "${expected_record}" ]]; then
+              echo "::warning::restored mlx.metallib does not match the vendored Metal sources in this work tree; discarding it so the bench build recompiles"
+              /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
+            fi
+          else
+            /bin/rm -f .mlxfast-cache/mlx.metallib .mlxfast-cache/mlx.metallib.fingerprint
+          fi
+
+      - name: Reset staged trusted build products
+        run: /bin/rm -rf .mlxfast-cache/trusted-build .mlxfast-cache/worker-build
+
+      - name: Restore trusted build products cache
+        id: restore_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/trusted-build
+          key: bench-trusted-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
+
+      - name: Restore worker build products cache
+        id: restore_worker_build_products_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mlxfast-cache/worker-build
+          key: bench-worker-build-products-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx_metallib_fingerprint.outputs.base_sha256 }}
+
+      - name: Verify restored build products
+        env:
+          TRUSTED_CACHE_HIT: ${{ steps.restore_build_products_cache.outputs.cache-hit }}
+          WORKER_CACHE_HIT: ${{ steps.restore_worker_build_products_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "${TRUSTED_CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/trusted-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/trusted-build
+          fi
+          if [[ "${WORKER_CACHE_HIT}" == "true" ]]; then
+            test -d .mlxfast-cache/worker-build/release
+          else
+            /bin/rm -rf .mlxfast-cache/worker-build
+          fi
+
+      # Same workspace discipline as the serial pipeline: proven-fresh stable
+      # path, trusted resolve while networked, bench ACL grant, then explicit
+      # bench-deny of every trusted surface (including fixtures/, which
+      # carries the DFlash contract and manifests) and a runner-owned
+      # bench-NON-writable staging dir for the predictable-name hidden golden.
+      - name: Prepare bench workspace
+        run: |
+          set -euo pipefail
+          rm -rf "${MLXFAST_JOB_WS}" || true
+          if [[ -e "${MLXFAST_JOB_WS}" || -L "${MLXFAST_JOB_WS}" ]]; then
+            echo "::error::stale bench workspace at ${MLXFAST_JOB_WS} could not be fully removed; run the janitor and retry" >&2
+            exit 1
+          fi
+          cp -c -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}" 2>/dev/null \
+            || { rm -rf "${MLXFAST_JOB_WS}"; cp -R "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"; }
+          .github/scripts/hardened-git.sh -C "${MLXFAST_JOB_WS}" cat-file -e "${MLXFAST_CANDIDATE_SHA}^{commit}"
+          .github/scripts/hardened-git.sh -C "${MLXFAST_JOB_WS}" update-ref --no-deref HEAD "${MLXFAST_CANDIDATE_SHA}"
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/trusted-build" "${MLXFAST_JOB_WS}/.build"
+            echo "dflash-benchmark: seeded trusted build products into bench workspace"
+          fi
+          if [[ -d "${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build/release" ]]; then
+            rm -rf "${MLXFAST_JOB_WS}/.build-worker"
+            mv "${MLXFAST_JOB_WS}/.mlxfast-cache/worker-build" "${MLXFAST_JOB_WS}/.build-worker"
+            echo "dflash-benchmark: seeded worker build products into bench workspace"
+          fi
+          mkdir -p "${MLXFAST_PRIVATE_DIR}"
+          chmod 700 "${MLXFAST_PRIVATE_DIR}"
+          # Private audit record of the rate-limit branch key. Written HERE (not
+          # in the rate-limit step, which runs ~10 steps before this directory
+          # exists) and unconditionally fatal on failure, so a broken write is
+          # visible instead of swallowed.
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            printf '%s\n' "$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')" \
+              > "${MLXFAST_PRIVATE_DIR}/dflash_branch_key"
+          fi
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/.dflash-ranked-src"
+          # Staging dir for the REUSED serial hidden inputs. Deliberately named
+          # .ranked-src -- serial's own name -- so the copied "Attach GPQA gates"
+          # step stays byte-identical to benchmark.yml instead of being
+          # retargeted (a retargeted copy is how these two workflows drifted).
+          mkdir -p "${MLXFAST_JOB_WS}/.ranked-src"
+          # Resolve dependencies for both SwiftPM roots while still trusted
+          # and networked (the bench uid has a PF egress block).
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions)
+          (cd "${MLXFAST_JOB_WS}" && swift package resolve --force-resolved-versions --scratch-path .build-worker)
+          /bin/chmod -R +a "user:bench allow list,search,readattr,readextattr,read,execute,add_file,add_subdirectory,delete_child,write,append,writeattr,writeextattr,file_inherit,directory_inherit" "${MLXFAST_JOB_WS}"
+          /bin/chmod -R +a "user:bench deny write,append,writeattr,writeextattr,delete,delete_child,add_file,add_subdirectory,chown,file_inherit,directory_inherit" \
+            "${MLXFAST_JOB_WS}/.github" \
+            "${MLXFAST_JOB_WS}/tools" \
+            "${MLXFAST_JOB_WS}/Sources" \
+            "${MLXFAST_JOB_WS}/correctness_prompts" \
+            "${MLXFAST_JOB_WS}/fixtures" \
+            "${MLXFAST_JOB_WS}/.dflash-ranked-src" \
+            "${MLXFAST_JOB_WS}/.ranked-src"
+          /bin/chmod +a "user:bench deny write,append,writeattr,writeextattr,delete,chown" \
+            "${MLXFAST_JOB_WS}/benchmark.sh" \
+            "${MLXFAST_JOB_WS}/benchmark.json" \
+            "${MLXFAST_JOB_WS}/benchmark-dflash.sh" \
+            "${MLXFAST_JOB_WS}/setup-dflash.sh" \
+            "${MLXFAST_JOB_WS}/Package.swift" \
+            "${MLXFAST_JOB_WS}/Package.resolved"
+          echo "dflash-benchmark: bench workspace ready at ${MLXFAST_JOB_WS} (trusted harness surfaces ACL-locked against bench writes)"
+
+      # Same trusted-source-scope pin as the serial pipeline: the manifests
+      # and the trusted-harness source trees the bench build will compile
+      # must match the trusted git content byte for byte.
+      - name: Verify trusted source scope
+        run: .github/scripts/verify-trusted-source-scope.sh "${GITHUB_WORKSPACE}" "${MLXFAST_JOB_WS}"
+
+      # Same conditional-until-live PF egress preflight as the serial
+      # pipeline, run before the first execution of submission-built code.
+      - name: Assert bench network egress lockdown
+        run: |
+          set -euo pipefail
+          probe="$(cat <<'PROBE'
+            set -u
+            [ -x /usr/bin/curl ] || exit 2
+            rc=1
+            for target in https://1.1.1.1 https://8.8.8.8; do
+              if /usr/bin/curl --silent --show-error --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+                echo "bench egress reached ${target}"
+                rc=0
+                break
+              fi
+            done
+            exit "${rc}"
+          PROBE
+          )"
+          runner_egress=0
+          for target in https://1.1.1.1 https://8.8.8.8; do
+            if /usr/bin/curl --silent --max-time 5 --output /dev/null "${target}" 2>/dev/null; then
+              runner_egress=1
+              break
+            fi
+          done
+          if [[ "${runner_egress}" -ne 1 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (trusted-uid egress probe failed; box appears offline); continuing -- trusted network steps will fail closed if the box is truly offline"
+            exit 0
+          fi
+          bench_rc=0
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" /bin/bash -c "${probe}" || bench_rc=$?
+          if [[ "${bench_rc}" -eq 1 ]]; then
+            echo "dflash-benchmark: bench network egress lockdown verified (bench-uid egress blocked)"
+            exit 0
+          fi
+          if [[ "${bench_rc}" -ne 0 ]]; then
+            echo "::warning::bench egress preflight cannot assess PF lockdown (bench probe exited ${bench_rc}: curl unavailable or bridge error); continuing without a verdict"
+            exit 0
+          fi
+          pf_provisioned=0
+          if grep -Eisq 'mlxfast|darkbloom|bench[-_.]?egress|egress[-_.]?bench|uid[-_.]?560|user[[:space:]]+bench|user[[:space:]]+560([^0-9]|$)' /etc/pf.conf /etc/pf.anchors/* 2>/dev/null; then
+            pf_provisioned=1
+          fi
+          if [[ "${MLXFAST_REQUIRE_BENCH_EGRESS_LOCKDOWN:-0}" == "1" ]]; then
+            pf_provisioned=1
+          fi
+          if [[ "${pf_provisioned}" -eq 1 ]]; then
+            echo "::error::bench network egress is NOT locked down (a bench-uid outbound connection succeeded) although the PF bench-egress lockdown is provisioned on this box; refusing to run submitted code" >&2
+            exit 1
+          fi
+          echo "::warning::PF bench-egress lockdown not yet active on this box; egress preflight is dormant (bench-uid egress currently open). It will enforce automatically once the operator ships the PF lockdown."
+
+      # Same two-root build discipline as the serial pipeline: the trusted
+      # CLI builds in .build and the participant worker (which compiles the
+      # participant-editable vendored MLX forks) in its own .build-worker
+      # scratch root, as two separate bench-exec invocations.
+      - name: Build trusted CLI in bench sandbox
+        env:
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-build
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release --force-resolved-versions --product mlxfast-swift
+            '
+          test -x "${MLXFAST_JOB_WS}/.build/release/mlxfast-swift"
+          # Pin the trusted timer/gates/score artifacts before the
+          # participant worker build runs (same reasoning as the serial
+          # pipeline: worker-build-time code execution must not be able to
+          # alter the trusted binary between its build and its pin).
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+
+      - name: Build participant worker in bench sandbox
+        env:
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-buildworker
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="${MLXFAST_JOB_WS}" \
+              GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1="${MLXFAST_JOB_WS}/*" \
+              MLXFAST_METAL_TOOLCHAIN_IDENTIFIER="${MLXFAST_METAL_TOOLCHAIN_IDENTIFIER}" /bin/bash -c '
+              set -euo pipefail
+              cd "${MJOB_WS}"
+              /usr/bin/swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
+              if [[ -s .mlxfast-cache/mlx.metallib && -s .mlxfast-cache/mlx.metallib.fingerprint ]]; then
+                /bin/cp .mlxfast-cache/mlx.metallib .build-worker/release/mlx.metallib
+                /bin/cp .mlxfast-cache/mlx.metallib.fingerprint .build-worker/release/mlx.metallib.fingerprint
+                echo "dflash-benchmark: restored trusted MLX Metal library"
+              else
+                tools/build-mlx-metallib.sh
+              fi
+              /bin/chmod 0644 .build-worker/release/mlx.metallib .build-worker/release/mlx.metallib.fingerprint
+            '
+          test -x "${MLXFAST_JOB_WS}/.build-worker/release/mlxfast-runtime-worker"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib"
+          test -s "${MLXFAST_JOB_WS}/.build-worker/release/mlx.metallib.fingerprint"
+          # Separate participant-worker attestation (TOCTOU defense): every
+          # scored phase must execute exactly the worker binary and metallib
+          # built from the reviewed source tree; the worker stays OUT of the
+          # trusted pin.
+          .github/scripts/pin-trusted-harness.sh write \
+            "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # Transform the pinned Laguna target source into the candidate's runtime
+      # weights.
+      #
+      # THE DFLASH TARGET IS THE SAME CHECKPOINT THE SERIAL TRACK RANKS AGAINST.
+      # MLXFAST_DFLASH_TARGET_DIR and benchmark.yml's MLXFAST_REFERENCE_DIR are
+      # the same snapshot (841778bd...), verified against the same
+      # fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256 manifest. A comment
+      # here previously asserted the opposite, which is what made the two
+      # workflows look like they needed two sets of hidden goldens. They do not:
+      # the shared checkpoint identity is exactly why this job reuses the serial
+      # track's hidden correctness golden and GPQA gates verbatim. Do not
+      # regenerate per-track goldens on the belief that the checkpoints differ.
+      - name: Transform DFlash target in bench sandbox
+        env:
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-transform
+        run: |
+          set -euo pipefail
+          status=0
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            echo "dflash-benchmark: running submitted transform with private process logs suppressed"
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                mkdir -p weights
+                exec .build/release/mlxfast-swift transform \
+                  --reference "${MLXFAST_DFLASH_TARGET_DIR}" \
+                  --output weights
+              ' > "${MLXFAST_PRIVATE_DIR}/transform-private.log" 2>&1 || status=$?
+          else
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" MLXFAST_DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
+                MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+                set -euo pipefail
+                cd "${MJOB_WS}"
+                mkdir -p weights
+                exec .build/release/mlxfast-swift transform \
+                  --reference "${MLXFAST_DFLASH_TARGET_DIR}" \
+                  --output weights
+              ' || status=$?
+          fi
+          test "${status}" -eq 0
+          test -f "${MLXFAST_JOB_WS}/weights/config.json"
+
+      - name: Hash transformed DFlash weights for ranked audit
+        run: .github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights" dflash-weights.sha256
+
+      # ---- REUSED SERIAL GATE 1 of 4: public drift tripwire ----------------
+      # Copied VERBATIM from .github/workflows/benchmark.yml (including its
+      # "benchmark:" log prefixes and its own TOCTOU guard) so the two workflows
+      # cannot drift. Deliberately ordered BEFORE the workspace snapshot and
+      # BEFORE any hidden byte -- of either track -- enters the workspace, so
+      # the worker running this public case cannot read a hidden oracle.
+      #
+      # TOCTOU guard: the submitted transform just ran with workspace write
+      # access. Re-verify that the trusted driver + binary and the participant
+      # worker + metallib still match their post-build pins before executing
+      # them as bench again.
+      - name: Verify trusted harness before public gate
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # Public drift tripwire (issue #83 class): one independent 64-step
+      # teacher-forced check against the checked-in public fixture, run BEFORE
+      # the hidden gates so honest numeric drift fails fast. A tripwire for
+      # accidental behavior change, NOT a security boundary -- the hidden gates
+      # and the static review remain the adversarial defenses. Deliberately
+      # ordered BEFORE the hidden golden ever enters the bench workspace, so
+      # the worker running this public case cannot read any hidden bytes.
+      # In correctness-only dispatches (run_benchmark=false) this is also the
+      # produced correctness verdict, replacing the old correctness-only job.
+      - name: Public behavior gate
+        env:
+          BENCH_JOB_ID: ranked-${{ github.run_id }}-${{ github.run_attempt }}-publicgate
+          # Harness parity: the worker Seatbelt profile denies the golden under
+          # check, exactly like writeRuntimeWorkerSandboxProfile does on the VM
+          # pipeline. env_keep carries this through sudo to bench-exec.
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_prompts/public_longcopy_gate_english_512_256.json
+        run: |
+          set -euo pipefail
+          actual_hash="$(shasum -a 256 "${MLXFAST_JOB_WS}/${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          if [[ "${actual_hash}" != "${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_SHA256}" ]]; then
+            echo "::error::public correctness golden hash mismatch (${actual_hash})" >&2
+            exit 1
+          fi
+          status=0
+          started="${SECONDS}"
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" == "1" ]]; then
+            echo "benchmark: running public behavior gate with process logs suppressed"
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+                MLXFAST_PUBLIC_GOLDEN="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                exec .build/release/mlxfast-swift correctness \
+                  --weights weights \
+                  --golden "${MLXFAST_PUBLIC_GOLDEN}"
+              ' > public-gate-report.json \
+                2> "${MLXFAST_PRIVATE_DIR}/public-gate-private.log" || status=$?
+          else
+            # shellcheck disable=SC2024  # trusted shell owns the capture files
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+                MLXFAST_PUBLIC_GOLDEN="${MLXFAST_PUBLIC_CORRECTNESS_GOLDEN_PATH}" /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                exec .build/release/mlxfast-swift correctness \
+                  --weights weights \
+                  --golden "${MLXFAST_PUBLIC_GOLDEN}"
+              ' > public-gate-report.json || status=$?
+          fi
+          # The report only ever references the checked-in public fixture, so
+          # surfacing the mismatch position and tokens leaks nothing hidden.
+          jq -r '"benchmark: public gate passed=\(.passed) checked_steps=\(.checked_steps) first_failing_step=\(.first_failing_step) expected_token=\(.expected_token) actual_token=\(.actual_token)"' \
+            public-gate-report.json || true
+          echo "benchmark: public behavior gate finished in $((SECONDS - started))s"
+          exit "${status}"
+
+      # Reap stragglers from the unsandboxed build/transform BEFORE hidden
+      # material enters the workspace.
+      - name: Reap lingering bench processes before hidden material
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+
+      # Record every file in the bench workspace BEFORE any hidden material
+      # enters it, for the allowlist scrub before timing (same design and
+      # same reasoning as the serial pipeline).
+      - name: Snapshot post-transform workspace
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
+          manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
+          find_err="${MLXFAST_PRIVATE_DIR}/post-transform-find.err"
+          set +e
+          ( cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 2> "${find_err}" ) \
+            | LC_ALL=C sort -z > "${manifest}"
+          set -e
+          if [[ -s "${find_err}" ]]; then
+            if grep -vq 'Permission denied' "${find_err}"; then
+              echo "::error::workspace snapshot hit unexpected find errors (only bench-private Permission denied subtrees are tolerated):" >&2
+              cat "${find_err}" >&2
+              exit 1
+            fi
+            skipped="$(grep -c 'Permission denied' "${find_err}" | tr -d ' ')"
+            echo "dflash-benchmark: snapshot skipped ${skipped} bench-private (0700) subtrees the runner cannot read; the scrub is equally blind there and end-of-job cleanup wipes them"
+          fi
+          test -s "${manifest}"
+          count="$(tr -cd '\0' < "${manifest}" | wc -c | tr -d ' ')"
+          echo "dflash-benchmark: snapshotted ${count} pre-hidden workspace files for the allowlist scrub"
+
+      # ---- REUSED SERIAL GATES 2-4: hidden correctness + GPQA --------------
+      # The next six steps are .github/workflows/benchmark.yml's live gate steps,
+      # copied VERBATIM (same script invocations, same R2 object keys, same
+      # thresholds, same log prefixes) and pointed at THIS job's build. There is
+      # deliberately no second GPQA implementation and no block-decode-specific
+      # correctness path: GPQA proves the MODEL is sound, and asking the question
+      # through the normal decode path is exactly what that requires. A DFlash
+      # submitter edits the same vendored model/kernel surface and this job
+      # builds the same mlxfast-swift + mlxfast-runtime-worker, so these gates
+      # already give that guarantee.
+      #
+      # THREE deliberate deviations from byte-identical, each named:
+      #   1. the `if: ${{ inputs.run_benchmark }}` guards are dropped, so a
+      #      correctness-only dispatch exercises the whole reused leg (matching
+      #      this workflow's existing unconditional DFlash gate);
+      #   2. the gates pass reads `dflash-weights.sha256`, this track's name for
+      #      serial's `weights.sha256`;
+      #   3. the sealed gates score is `gates-score.json` /
+      #      `benchmark-integrity.gates.json`, NOT `score.json` --- see the
+      #      collision note on "Validate sealed gates score" below.
+      #
+      # ORDERING IS A SECURITY PROPERTY HERE. BENCH_GOLDEN_PATH denies exactly
+      # ONE literal path in the worker Seatbelt profile, and this job now handles
+      # two hidden goldens. So the serial augmented golden must be fully scrubbed
+      # before the DFlash golden is installed, and vice versa; overlapping
+      # residency would hand each leg's worker the other track's token oracle.
+      # The "Scrub serial hidden material" step below is that bracket -- do not
+      # reorder these steps or move the DFlash golden install above them.
+      - name: Prepare hidden correctness golden
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # Private object keys scoped to this trusted download step only (not
+          # job-level), so untrusted bench phases never receive the object
+          # names. SHA-addressed names are immutable and cannot alias v1. These
+          # are the SAME objects the serial track consumes -- authored nothing.
+          MLXFAST_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/hidden-correctness-golden-94239d59b435eb8f370c82bcf8c86822d1bbc1094e3650aeff3abc5558137023.json
+          MLXFAST_GPQA_R2_PATH: correctness_prompts/laguna-xs-2.1-serial-v2/gpqa-reference-cases-6e149e58908d086091ed7e7980e9f8beca7deb4d04063035d68d23e70ee1726f.json
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/raw_golden.json"
+          raw_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | awk '{print $1}')"
+          raw_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | tr -d ' ')"
+          if [[ "${raw_hash}" != "${MLXFAST_RAW_CORRECTNESS_GOLDEN_SHA256}" || "${raw_bytes}" != "${MLXFAST_RAW_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::raw hidden correctness golden pin mismatch" >&2
+            exit 1
+          fi
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_GPQA_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json"
+          gpqa_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | awk '{print $1}')"
+          gpqa_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" | tr -d ' ')"
+          if [[ "${gpqa_hash}" != "${MLXFAST_GPQA_REFERENCE_SHA256}" || "${gpqa_bytes}" != "${MLXFAST_GPQA_REFERENCE_BYTES}" ]]; then
+            echo "::error::private GPQA reference pin mismatch" >&2
+            exit 1
+          fi
+          echo "benchmark: raw hidden golden verified ${raw_hash} bytes=${raw_bytes}; GPQA reference verified ${gpqa_hash} bytes=${gpqa_bytes}"
+
+      # PARITY CONTRACT: attach-gpqa-gates augments the raw golden with GPQA
+      # behavior gates but MUST NOT mutate its .cases (the base teacher-forced
+      # case) -- enforced directly below by re-pinning the augmented golden's
+      # .cases against the raw hash-pinned golden, with
+      # verify-correctness-golden.sh's coverage arithmetic plus the final
+      # checked_steps validation as backstops. attach-gpqa-gates loads the tokenizer, i.e.
+      # runs code from the submitted build, so it executes through bench-exec
+      # like every other untrusted invocation. The raw
+      # inputs are copied in as runner-owned files and scrubbed immediately
+      # after, so during any later worker-spawning phase the only hidden file
+      # in the workspace is the augmented golden, which the worker Seatbelt
+      # profile denies by literal path (BENCH_GOLDEN_PATH below).
+      - name: Attach GPQA gates and verify augmented golden
+        env:
+          BENCH_JOB_ID: ranked-${{ github.run_id }}-${{ github.run_attempt }}-attach
+        run: |
+          set -euo pipefail
+          # Symlink-safe placement of the predictable-name hidden inputs. They
+          # go into the runner-owned, bench-NON-writable .ranked-src/ staging
+          # dir (ACL-denied to bench in "Prepare bench workspace"), so the
+          # submitted transform can no longer pre-plant a symlink at these names
+          # and redirect the trusted copy to leak the raw hidden golden. The
+          # explicit reject-if-exists/symlink guard plus install(1) (which
+          # creates a fresh regular file, never writes through a symlink) are
+          # belt-and-suspenders on top of the ACL.
+          golden_src="${MLXFAST_JOB_WS}/.ranked-src/golden.json"
+          gpqa_src="${MLXFAST_JOB_WS}/.ranked-src/gpqa.json"
+          for hidden_target in "${golden_src}" "${gpqa_src}"; do
+            if [[ -e "${hidden_target}" || -L "${hidden_target}" ]]; then
+              echo "::error::refusing to place hidden input over pre-existing path ${hidden_target}" >&2
+              exit 1
+            fi
+          done
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/raw_golden.json" "${golden_src}"
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/gpqa_reference.json" "${gpqa_src}"
+          status=0
+          # MLXFAST_SANDBOX_PARENT_TOOLS=1 arms the CLI's parent-tool Seatbelt
+          # sandbox: attach-gpqa-gates runs the submission-built binary directly
+          # to read the raw hidden golden + GPQA answer key, so it self-confines
+          # (deny network/fork/exec/DNS mach-lookup) before opening those inputs.
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_GPQA_CASE_COUNT="${MLXFAST_GPQA_CASE_COUNT}" \
+              MLXFAST_GPQA_MAX_NEW_TOKENS="${MLXFAST_GPQA_MAX_NEW_TOKENS}" \
+              MLXFAST_SANDBOX_PARENT_TOOLS=1 /bin/bash -c '
+              set -u
+              cd "${MJOB_WS}" || exit 97
+              exec .build/release/mlxfast-swift attach-gpqa-gates \
+                --golden .ranked-src/golden.json \
+                --gpqa .ranked-src/gpqa.json \
+                --tokenizer weights \
+                --output correctness_golden_ranked.json \
+                --case-count "${MLXFAST_GPQA_CASE_COUNT}" \
+                --max-new-tokens "${MLXFAST_GPQA_MAX_NEW_TOKENS}"
+            ' > "${MLXFAST_PRIVATE_DIR}/attach-gpqa.log" 2>&1 || status=$?
+          # Runner-owned files: this unlinks the real trusted inputs, never an
+          # attacker symlink (bench could not have created one here).
+          rm -rf "${MLXFAST_JOB_WS}/.ranked-src"
+          test "${status}" -eq 0 || { echo "::error::attach-gpqa-gates failed" >&2; exit 1; }
+          test -s "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
+          # Trusted copy is the pinned instance the artifacts reference; the
+          # workspace copy is what the (bench) harness parent reads at run time.
+          cp "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" "${MLXFAST_CORRECTNESS_GOLDEN_PATH}"
+          # Defense in depth: attach-gpqa-gates executes the SUBMITTED build,
+          # so never trust its output to preserve the base case. Re-pin the
+          # augmented golden's .cases against the raw hash-pinned golden
+          # (canonicalized with jq -S, since augmentation re-encodes key order
+          # and whitespace): augmentation may only append behavior gates,
+          # never mutate the teacher-forced base .cases.
+          raw_cases_hash="$(jq -S '.cases' "${MLXFAST_PRIVATE_DIR}/raw_golden.json" | shasum -a 256 | awk '{print $1}')"
+          augmented_cases_hash="$(jq -S '.cases' "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | shasum -a 256 | awk '{print $1}')"
+          if [[ "${augmented_cases_hash}" != "${raw_cases_hash}" ]]; then
+            echo "::error::attach-gpqa-gates mutated the pinned base .cases (augmented ${augmented_cases_hash} != raw ${raw_cases_hash})" >&2
+            exit 1
+          fi
+          echo "benchmark: augmented golden base cases re-pinned to raw pinned golden (cases sha256 ${raw_cases_hash})"
+          actual_hash="$(shasum -a 256 "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | awk '{print $1}')"
+          actual_bytes="$(wc -c < "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" | tr -d ' ')"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256="${actual_hash}"
+          export MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES="${actual_bytes}"
+          {
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_SHA256=${actual_hash}"
+            echo "MLXFAST_EXPECTED_CORRECTNESS_GOLDEN_BYTES=${actual_bytes}"
+          } >> "${GITHUB_ENV}"
+          # Writes the golden.sha256/.bytes sidecars and exports the expected
+          # case/step coverage (MLXFAST_EXPECTED_CORRECTNESS_{CASES,CHECKED_STEPS})
+          # into GITHUB_ENV for the final artifact validation.
+          .github/scripts/verify-correctness-golden.sh
+          # Guard the augmented workspace copy against divergence from the
+          # verified trusted copy (they must be byte-identical).
+          ws_hash="$(shasum -a 256 "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" | awk '{print $1}')"
+          test "${ws_hash}" == "${actual_hash}"
+          echo "benchmark: using private GPQA-augmented correctness golden ${actual_hash} bytes=${actual_bytes}"
+
+      # TOCTOU guard before the first --official invocation: attach-gpqa-gates
+      # and the public gate executed the binaries as bench since the last
+      # check, so re-verify the trusted driver + binary and the participant
+      # worker + metallib against their post-build pins. A replaced
+      # benchmark.sh or binary here could otherwise forge the sealed gates
+      # score.
+      - name: Verify trusted harness before gates
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # The single gates+base pass: ONE `mlxfast-swift benchmark` invocation
+      # (via benchmark.sh --official) that teacher-forces the FULL 64-step
+      # hidden base case AND runs the anchor/free-run/behavior/GPQA gates,
+      # GPQA TTFT, and the semantic-answer capture, while SKIPPING the timed
+      # benchmark (MLXFAST_BENCHMARK_SKIP_TIMED=1). This is the SERIAL decode
+      # path on purpose: it is what proves the model is still sound. The DFlash
+      # block-decode parity gate below is a separate, additional check, and the
+      # timed DFlash measurement runs LAST behind measure-dflash-job's thermal
+      # gate.
+      - name: Correctness and gates (full base case + hidden gates, no timing)
+        id: gates_run
+        env:
+          BENCH_JOB_ID: ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
+          # Worker Seatbelt literal deny for the augmented hidden golden. Only
+          # the harness PARENT (trusted control flow) may read it to drive
+          # teacher forcing; the worker that executes submitted model code
+          # cannot. Kept through sudo env_reset via the sudoers env_keep list.
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/correctness_golden_ranked.json
+          MLXFAST_NOTE: "ci ${{ github.event_name }} ${{ env.MLXFAST_CANDIDATE_SHA }} mode=single-machine-gates"
+        run: |
+          set -euo pipefail
+          # Known, documented residual: the semantic-answer capture (which
+          # embeds hidden reference answers) is written by the harness parent
+          # into ${MLXFAST_JOB_WS}/private/ at the very END of this pass, after
+          # every behavior verdict is already recorded; the bench-exec worker
+          # template cannot subpath-deny it like the VM harness profile did.
+          # The exposure window is the few seconds between that write and
+          # worker teardown, gains nothing (all gate verdicts are final by
+          # then), and the file is scrubbed by a trusted step before any later
+          # phase spawns another worker.
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/gates-stdout.raw"
+          gates_log="${MLXFAST_PRIVATE_DIR}/gates-private.log"
+          started="${SECONDS}"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env \
+              MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_OFFICIAL_BENCHMARK_RUN=1 \
+              MLXFAST_SKIP_TRANSFORM=1 \
+              MLXFAST_VERIFY_TRANSFORM="${MLXFAST_VERIFY_TRANSFORM}" \
+              MLXFAST_REFERENCE_DIR="${MLXFAST_REFERENCE_DIR}" \
+              MLXFAST_WEIGHTS_PATH=weights \
+              MLXFAST_CORRECTNESS_GOLDEN_PATH=correctness_golden_ranked.json \
+              MLXFAST_BENCHMARK_CORRECTNESS_STEPS="${MLXFAST_EXPECTED_CORRECTNESS_STEPS}" \
+              MLXFAST_BENCHMARK_CHECK_GATES=1 \
+              MLXFAST_BENCHMARK_SKIP_TIMED=1 \
+              MLXFAST_PRIVATE_DIR="${MLXFAST_JOB_WS}/private" \
+              MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH="${MLXFAST_JOB_WS}/private/semantic_gpqa_answers.json" \
+              MLXFAST_SEMANTIC_GPQA_CASE_COUNT="${MLXFAST_SEMANTIC_GPQA_CASE_COUNT}" \
+              MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS="${MLXFAST_SEMANTIC_GPQA_MAX_NEW_TOKENS}" \
+              MLXFAST_SCORE_PATH=score.gates.json \
+              MLXFAST_INTEGRITY_PATH=benchmark-integrity.gates.json \
+              MLXFAST_NOTE="${MLXFAST_NOTE}" \
+              MLXFAST_COMMIT_SHA="${MLXFAST_CANDIDATE_SHA}" \
+              GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=safe.directory \
+              GIT_CONFIG_VALUE_0='*' \
+              /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                ./benchmark.sh --official 1>&2
+                status=$?
+                if [ -s "${MLXFAST_SCORE_PATH}" ]; then
+                  cat "${MLXFAST_SCORE_PATH}"
+                fi
+                exit "${status}"
+              ' > "${raw_stdout}" 2> "${gates_log}" &
+          pid="$!"
+          # ps -p, not kill -0: the backgrounded pid is a setuid sudo process,
+          # so the runner user cannot signal it (kill -0 would EPERM and end
+          # the heartbeat immediately) but can still see it in the process
+          # table.
+          while ps -p "${pid}" >/dev/null 2>&1; do
+            sleep 60
+            if ps -p "${pid}" >/dev/null 2>&1; then
+              echo "benchmark: correctness+gates still running elapsed=$((SECONDS - started))s"
+            fi
+          done
+          wait "${pid}" || status=$?
+          # Submitted-process stderr stays private on submission branches; on
+          # trusted branches replay it for operators.
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
+            cat "${gates_log}" || true
+          fi
+          # SCORE SEALING (mirrors measure-job.sh and benchmark.sh): the score
+          # payload is taken from the exec'd process's stdout, captured in THIS
+          # trusted shell -- exactly one JSON object shaped like a score.
+          # On-disk workspace files are untrusted after bench ran; the sealed
+          # copy plus the integrity hash cross-check below discard any tamper.
+          if [[ "$(jq -s 'length' "${raw_stdout}" 2>/dev/null)" != "1" ]] \
+              || ! jq -e '(.passed | type == "boolean") and has("score") and (.metrics | type == "object")' \
+                  "${raw_stdout}" >/dev/null 2>&1; then
+            echo "::error::correctness+gates run did not emit a single valid score payload (exit=${status})" >&2
+            exit 1
+          fi
+          # DEVIATION 3 from benchmark.yml: sealed as gates-score.json, NOT
+          # score.json. This workflow's "Compute DFlash score and enforce floor"
+          # owns score.json; sealing the gates pass there too would have the
+          # timed score overwrite the validated gates score (or vice versa) and
+          # silently publish a DFlash score whose correctness fields were never
+          # validated.
+          cp "${raw_stdout}" gates-score.json
+          cp "${MLXFAST_JOB_WS}/benchmark-integrity.gates.json" benchmark-integrity.gates.json
+          sealed_hash="$(shasum -a 256 gates-score.json | awk '{print $1}')"
+          integrity_hash="$(jq -r '.score_sha256 // empty' benchmark-integrity.gates.json)"
+          if [[ "${sealed_hash}" != "${integrity_hash}" ]]; then
+            echo "::error::sealed gates score hash does not match harness integrity record (possible in-workspace tamper)" >&2
+            exit 1
+          fi
+          # DEVIATION 2 from benchmark.yml: this track names the trusted
+          # post-transform weights hash dflash-weights.sha256.
+          trusted_weights_hash="$(tr -d '[:space:]' < dflash-weights.sha256)"
+          gates_weights_hash="$(jq -r '.metrics.weights_hash // empty' gates-score.json)"
+          integrity_weights_hash="$(jq -r '.weights_sha256 // empty' benchmark-integrity.gates.json)"
+          if [[ "${gates_weights_hash}" != "${trusted_weights_hash}" \
+              || "${integrity_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed weights changed between trusted hashing and the gates run" >&2
+            exit 1
+          fi
+          echo "benchmark: correctness+gates finished exit=${status} seconds=$((SECONDS - started))"
+          exit "${status}"
+
+      # On a real gates failure the score's error/token fields can carry hidden
+      # values, so nothing downstream may consume an unvalidated score. Leak
+      # fields only.
+      - name: Validate sealed gates score
+        run: |
+          set -euo pipefail
+          test -s gates-score.json
+          jq -e '
+            .passed == true
+            and (.metrics.error == "")
+            and (.metrics.first_failing_case == null)
+            and (.metrics.first_failing_layer == null)
+            and (.metrics.first_failing_step == null)
+            and (.metrics.expected_token == null)
+            and (.metrics.actual_token == null)
+            and (.metrics.passed_correctness == true)
+          ' gates-score.json >/dev/null
+
+      # Semantic GPQA judge (Anthropic), trusted step: consumes the bench-
+      # written answer capture, patches the sealed score's semantic fields and
+      # overall verdict, and re-anchors the integrity hash. The API key never
+      # crosses the bridge. This is the ONLY GPQA judge in the repository --
+      # there is no DFlash-specific judge and no second threshold.
+      - name: Semantic GPQA gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_API_KEY }}
+          MLXFAST_SEMANTIC_GPQA_OUTPUT_PATH: ${{ env.MLXFAST_JOB_WS }}/private/semantic_gpqa_answers.json
+          MLXFAST_SCORE_PATH: gates-score.json
+          MLXFAST_INTEGRITY_PATH: benchmark-integrity.gates.json
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+            echo "::error::semantic GPQA gate requires ORG_ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+          .github/scripts/run-semantic-gpqa-gate.sh
+
+      # SINGLE-OCCUPANCY BRACKET for hidden goldens, and the reason the step
+      # order above is load-bearing. BENCH_GOLDEN_PATH denies exactly ONE
+      # literal path in the worker Seatbelt profile, so if the serial augmented
+      # golden were still resident when the DFlash gate's worker runs, submitted
+      # model code could read the other track's hidden golden -- a token oracle.
+      # Remove the serial hidden material (and the semantic-answer capture,
+      # which embeds hidden reference answers) BEFORE the DFlash golden is
+      # installed. This is not the pre-timing allowlist scrub; that still runs
+      # later and additionally backstops this.
+      - name: Scrub serial hidden material before the DFlash gate
+        run: |
+          set -euo pipefail
+          rm -f "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
+          rm -rf "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          chmod 700 "${MLXFAST_JOB_WS}/private"
+          if [[ -e "${MLXFAST_JOB_WS}/correctness_golden_ranked.json" ]]; then
+            echo "::error::could not remove the serial augmented hidden golden before the DFlash gate; refusing to run two hidden goldens in one workspace" >&2
+            exit 1
+          fi
+          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::serial hidden-material scrub left candidates behind: ${leftovers}" >&2
+            exit 1
+          fi
+          echo "dflash-benchmark: serial hidden material scrubbed; workspace holds no hidden golden before the DFlash golden is installed"
+
+      # Trusted download + pin of the hidden IT-target goldens. Raw bytes
+      # live runner-private; only the correctness golden is installed into
+      # the workspace (into the bench-NON-writable .dflash-ranked-src staging
+      # dir, symlink-guarded), because the bench harness PARENT must read it
+      # to drive the oracle. The worker Seatbelt profile denies it by
+      # literal path (BENCH_GOLDEN_PATH). The benchmark golden never enters
+      # the workspace here; measure-dflash-job installs and scrubs it per timed
+      # side.
+      # CONTRACT LAYER L6 (anti-lottery). A single frozen hidden prompt makes a
+      # failed ranked run free to retry, which degrades every output-side gate
+      # from "must be correct" into "must be correct often enough to eventually
+      # pass" -- and lets a confidence threshold be tuned by submit-until-green.
+      # The defense is to sample the timed target from a POOL, uniformly at
+      # random per run, from entropy the participant cannot see or influence
+      # (not the run id, which is visible and stable within a run). Tuning to
+      # one member then buys a 1/N chance instead of a certainty.
+      #
+      # The pool is declared in the contract fixture
+      # (fixtures/laguna_xs_2_1_dflash_track.json -> timed_prompt_pool[]), each
+      # entry carrying r2_path + sha256 + bytes. This step fails CLOSED when the
+      # pool is missing, empty, or carries ANY malformed entry, exactly like the
+      # entry-less weight manifests did before they were regenerated on-box: the
+      # mechanism ships now, the pool objects must be uploaded to R2 before the
+      # track can be enabled. The chosen index is written to the PRIVATE audit
+      # dir only -- echoing it into a participant-visible log would hand back
+      # the sampling.
+      #
+      # "Tuning to one member buys 1/N" is only true if the N members are
+      # DISTINCT, so the ranked floor counts distinct sha256 digests and
+      # distinct r2_path keys rather than pool length.
+      #
+      # RANKED-ONLY, and the guard is load-bearing rather than a convenience.
+      # The pool is deliberately EMPTY on main (pinned by
+      # DFlashEnablementInterlockTests.theTrackFixtureRemainsInertOnMain), so
+      # before go-live this step fails closed on EVERY dispatch -- including the
+      # gates-only dry run that #815 split the enablement interlock apart to
+      # make possible. And it sits ABOVE "DFlash correctness and parity gate
+      # (untimed)", so leaving it unguarded made that gate UNREACHABLE: the dry
+      # run always died red one step short of the only DFlash-specific gate it
+      # exists to exercise, which both defeated the split and trained operators
+      # to read a red dry run as success.
+      #
+      # A dry run times nothing, so it needs no timed target. Guarding on
+      # inputs.run_benchmark does NOT weaken the ranked path: a RANKED dispatch
+      # still runs this step and still fails closed on an empty, missing or
+      # malformed pool, and "Prepare hidden DFlash goldens" independently
+      # refuses a ranked run whose selection outputs are empty, so mis-widening
+      # this guard fails loudly and by name instead of quietly. Both directions
+      # are executed, not read, by DFlashDryRunReachesItsGateTests.
+      - name: Select hidden DFlash timed target from the pool
+        id: select_dflash_target
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          contract="${MLXFAST_DFLASH_CONTRACT_PATH}"
+          test -s "${contract}"
+          pool_type="$(jq -r '(.timed_prompt_pool // []) | type' "${contract}")"
+          if [[ "${pool_type}" != "array" ]]; then
+            echo "::error::DFlash timed prompt pool in ${contract} is a ${pool_type}, not an array; every check below indexes it positionally" >&2
+            exit 1
+          fi
+          pool_size="$(jq '(.timed_prompt_pool // []) | length' "${contract}")"
+          if [[ "${pool_size}" -lt 1 ]]; then
+            echo "::error::DFlash timed prompt pool is empty in ${contract}; upload the pool objects and pin them before enabling this track" >&2
+            exit 1
+          fi
+          # PER-ENTRY COMPLETENESS, for EVERY entry, BEFORE sampling.
+          #
+          # This used to validate only the SAMPLED entry (the loop further down,
+          # which is kept as a belt-and-braces check on what actually leaves
+          # this step). Validating one of N entries gives one-in-N coverage of
+          # the pool: an 8-entry pool whose entry[3] carried no sha256 was
+          # ACCEPTED on 39 of 40 measured dispatches and died on the fortieth,
+          # ~25 minutes into a ranked job, looking exactly like a flake. A pool
+          # is either well formed or it is not; that is a property of the
+          # dispatch, not of the draw.
+          malformed="$(jq -r '
+            .timed_prompt_pool
+            | to_entries
+            | map(
+                .key as $i
+                | .value as $e
+                | if ($e | type) != "object" then
+                    ["entry \($i) is a \($e | type), not an object"]
+                  else
+                    [ (if (($e.r2_path? // null) | type) != "string" then
+                         "entry \($i): r2_path is missing or not a string"
+                       elif ($e.r2_path == "") then
+                         "entry \($i): r2_path is empty"
+                       else empty end),
+                      (if (($e.sha256? // null) | type) != "string" then
+                         "entry \($i): sha256 is missing or not a string"
+                       elif ($e.sha256 | test("^[0-9a-f]{64}$") | not) then
+                         "entry \($i): sha256 is not a 64-character lowercase hex digest"
+                       else empty end),
+                      (if (($e.bytes? // null) | type) != "number" then
+                         "entry \($i): bytes is missing or not a number"
+                       elif ($e.bytes <= 0) or ($e.bytes != ($e.bytes | floor)) then
+                         "entry \($i): bytes is not a positive integer"
+                       else empty end) ]
+                  end
+              )
+            | add // []
+            | .[]' "${contract}")"
+          if [[ -n "${malformed}" ]]; then
+            while IFS= read -r problem; do
+              echo "::error::DFlash timed prompt pool is malformed in ${contract}: ${problem}" >&2
+            done <<<"${malformed}"
+            exit 1
+          fi
+          # ANTI-LOTTERY FLOOR, enforced only for a run that can PUBLISH.
+          #
+          # The pool exists so a failed ranked run is not free to retry: with a
+          # single target, a submission can be resubmitted against a prompt it
+          # has already seen, which degrades every output-side gate into
+          # submit-until-green and lets a drafter-confidence threshold be tuned
+          # across attempts. The fixture's own timed_prompt_pool_note sets the
+          # floor at 8 varied targets, and nothing enforced it until now -- a
+          # one-entry pool would have ranked.
+          #
+          # The floor counts DISTINCT targets, not pool LENGTH. Length buys
+          # nothing on its own: listing TODAY'S SINGLE GOLDEN eight times has
+          # length 8, passes a length check, and has anti-lottery value zero.
+          # The realistic path there is not malice -- an operator dispatches
+          # dflash-provision-goldens.yml eight times with the same
+          # bench_seed_r2_path, gets eight byte-identical goldens at eight
+          # different keys, and a length check cannot tell that from eight real
+          # prompts. BOTH coordinates must be unique: sha256 catches identical
+          # CONTENT at different keys, and r2_path catches the same key listed
+          # twice, which is a different bug (it biases the sampling toward the
+          # duplicate rather than merely failing to widen the pool).
+          #
+          # A missing sha256 cannot launder the distinct count, because the
+          # completeness check ABOVE runs first and rejects it as MALFORMED.
+          # Without that ordering three entries with no sha256 would collapse to
+          # one `null` under `unique` and be reported as "fewer distinct
+          # targets" -- a true number attached to the wrong diagnosis, which is
+          # how a malformed pool gets "fixed" by adding more entries.
+          #
+          # A gates-only dispatch is exempt, and the exemption comes from this
+          # step's own `if: inputs.run_benchmark` -- not from the
+          # MLXFAST_RUN_BENCHMARK conjunct below, which can never be false where
+          # it is evaluated. The conjunct is kept as defence in depth for a
+          # future in which the step-level `if:` is widened or this body is
+          # lifted somewhere else; DFlashEnablementInterlockTests asserts the
+          # `if:`, which is the thing that actually grants the exemption.
+          # (Why exempt at all: a dry run publishes no score, so there is no
+          # lottery to win, and requiring 8 targets to validate the pipeline
+          # would recreate exactly the chicken-and-egg the enablement split
+          # removed.)
+          required_distinct=8
+          distinct_sha="$(jq '[.timed_prompt_pool[].sha256] | unique | length' "${contract}")"
+          distinct_path="$(jq '[.timed_prompt_pool[].r2_path] | unique | length' "${contract}")"
+          if [[ "${MLXFAST_RUN_BENCHMARK:-0}" == "1" ]]; then
+            shortfall=""
+            if [[ "${distinct_sha}" -lt "${required_distinct}" ]]; then
+              shortfall="${shortfall} ${distinct_sha} distinct sha256 digest(s), short by $(( required_distinct - distinct_sha ));"
+            fi
+            if [[ "${distinct_path}" -lt "${required_distinct}" ]]; then
+              shortfall="${shortfall} ${distinct_path} distinct r2_path key(s), short by $(( required_distinct - distinct_path ));"
+            fi
+            if [[ -n "${shortfall}" ]]; then
+              echo "::error::DFlash timed prompt pool has length ${pool_size} but a RANKED run requires at least ${required_distinct} DISTINCT varied targets:${shortfall%;} (see timed_prompt_pool_note in ${contract}). Listing one golden N times has length N and anti-lottery value zero. Dispatch with run_benchmark=false to validate the pipeline against a smaller pool." >&2
+              exit 1
+            fi
+          fi
+          # Uniform selection over [0,pool_size) from kernel entropy, rejecting
+          # the biased tail of the RNG range rather than using a plain modulo.
+          limit=$(( (65536 / pool_size) * pool_size ))
+          while :; do
+            draw=$(( $(od -An -N2 -tu2 < /dev/urandom | tr -d ' ') ))
+            if [[ "${draw}" -lt "${limit}" ]]; then break; fi
+          done
+          index=$(( draw % pool_size ))
+          entry="$(jq -c --argjson i "${index}" '.timed_prompt_pool[$i]' "${contract}")"
+          r2_path="$(jq -r '.r2_path' <<<"${entry}")"
+          sha256="$(jq -r '.sha256' <<<"${entry}")"
+          bytes="$(jq -r '.bytes' <<<"${entry}")"
+          # Redundant with the whole-pool check above, deliberately: this one
+          # guards the three values that actually leave the step, so a future
+          # edit to the extraction (a renamed key, a jq filter typo) still fails
+          # closed rather than exporting an empty pin.
+          for field in "${r2_path}" "${sha256}" "${bytes}"; do
+            if [[ -z "${field}" || "${field}" == "null" ]]; then
+              echo "::error::DFlash timed prompt pool entry ${index} is incomplete" >&2
+              exit 1
+            fi
+          done
+          # Private audit record; never printed to the job log. The distinct
+          # counts are recorded alongside pool_size so an audit can tell a pool
+          # of 8 targets from one golden listed 8 times after the fact.
+          jq -n --argjson i "${index}" --argjson n "${pool_size}" \
+            --argjson ds "${distinct_sha}" --argjson dp "${distinct_path}" \
+            --arg p "${r2_path}" \
+            '{selected_index:$i, pool_size:$n, distinct_sha256:$ds, distinct_r2_path:$dp, r2_path:$p}' \
+            > "${MLXFAST_PRIVATE_DIR}/dflash_timed_target_selection.json"
+          {
+            echo "r2_path=${r2_path}"
+            echo "sha256=${sha256}"
+            echo "bytes=${bytes}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "dflash-benchmark: timed target sampled from a pool of ${pool_size} entries / ${distinct_sha} distinct targets (selection recorded privately)"
+
+      - name: Prepare hidden DFlash goldens
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_BUCKET_ENDPOINT: ${{ secrets.R2_BUCKET_ENDPOINT }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # Private object keys scoped to this trusted download step only. The
+          # benchmark (timed) golden comes from the per-run pool selection; the
+          # correctness golden stays fixed because it is an untimed gate and is
+          # not what the lottery would target.
+          MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH: correctness_prompts/laguna-xs-2.1-dflash/dflash_correctness_golden_hidden.json
+          MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH: ${{ steps.select_dflash_target.outputs.r2_path }}
+          MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED: ${{ steps.select_dflash_target.outputs.sha256 }}
+          MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED: ${{ steps.select_dflash_target.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          .github/scripts/download-r2-object.sh \
+            "${MLXFAST_DFLASH_CORRECTNESS_GOLDEN_R2_PATH}" \
+            "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json"
+          correctness_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" | awk '{print $1}')"
+          correctness_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" | tr -d ' ')"
+          if [[ "${correctness_hash}" != "${MLXFAST_DFLASH_CORRECTNESS_GOLDEN_SHA256}" || "${correctness_bytes}" != "${MLXFAST_DFLASH_CORRECTNESS_GOLDEN_BYTES}" ]]; then
+            echo "::error::hidden DFlash correctness golden pin mismatch" >&2
+            exit 1
+          fi
+          # THE TIMED GOLDEN IS RANKED-ONLY. It is consumed by exactly one
+          # step -- "Timed paired DFlash benchmark (measure-dflash-job)", which
+          # is itself `if: inputs.run_benchmark` -- and it is addressed by the
+          # per-run pool selection, which is now ranked-only for the reasons
+          # given above that step. Downloading it on a gates-only dispatch was
+          # therefore pointless work AND a second reason a dry run could never
+          # go green: the selection it depends on had already failed closed on
+          # the empty pool. The correctness golden above is pinned
+          # INDEPENDENTLY of the pool, which is what lets the untimed leg --
+          # including the DFlash correctness and parity gate -- run at all
+          # before the operator provisions pool objects.
+          bench_hash="not downloaded (gates-only dispatch)"
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            # FAIL CLOSED if the ranked path ever reaches here without a
+            # selection. A SKIPPED step yields EMPTY outputs, not an error, so
+            # widening the guard on "Select hidden DFlash timed target from the
+            # pool" by mistake would silently produce a ranked run with no
+            # sampled target -- and losing per-run sampling is losing contract
+            # layer L6 (anti-lottery) itself.
+            #
+            # Honest scope: this is defence in depth plus a named diagnostic,
+            # NOT the only barrier. download-r2-object.sh already refuses an
+            # empty object key (exit 2), and an empty SHA256/BYTES pin would
+            # mismatch a real digest and fail the pin check below. What this
+            # buys is that the job says WHY -- "the selection step did not run"
+            # -- instead of dying on a generic argument-validation exit 2 in a
+            # helper script, and that the refusal survives any future change to
+            # either of those two downstream behaviours. There is no honest
+            # ranked run with an empty selection.
+            for selected in \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH}" \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED}" \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED}"; do
+              if [[ -z "${selected}" ]]; then
+                echo "::error::ranked DFlash dispatch reached the golden download with no timed-target selection; 'Select hidden DFlash timed target from the pool' did not run or produced no outputs" >&2
+                exit 1
+              fi
+            done
+            .github/scripts/download-r2-object.sh \
+              "${MLXFAST_DFLASH_BENCH_GOLDEN_R2_PATH}" \
+              "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json"
+            bench_hash="$(shasum -a 256 "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | awk '{print $1}')"
+            bench_bytes="$(wc -c < "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" | tr -d ' ')"
+            # Verified against the PER-RUN pool selection, not a fixed pin: the
+            # pool entry carries its own sha256/bytes and both must match, so a
+            # swapped or truncated object fails closed even though the object key
+            # differs from run to run.
+            if [[ "${bench_hash}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_SHA256_SELECTED}" || "${bench_bytes}" != "${MLXFAST_DFLASH_BENCH_GOLDEN_BYTES_SELECTED}" ]]; then
+              echo "::error::hidden DFlash timed golden pin mismatch for the sampled pool entry" >&2
+              exit 1
+            fi
+          else
+            echo "dflash-benchmark: gates-only dispatch; the timed golden is not downloaded and no timed target is sampled"
+          fi
+          # FAIL-CLOSED ROW-COUNT PRECONDITION on the existing gate's input, run
+          # on the runner-private copies before either golden is installed.
+          #
+          # The DFlash driver requires options.totalTokenCount <= golden.rows.
+          # count (LagunaRuntimeDFlashDriver.swift). When that is violated the
+          # run dies ~25 minutes in, inside the gate, with an argument error --
+          # after build, transform, the public gate and the whole reused serial
+          # gate leg have already been paid for. Checking it here turns that into
+          # a second-30 diagnostic naming the actual fix.
+          #
+          # This is NOT a new gate and NOT a threshold: it is the driver's own
+          # inequality, asserted early against the same two numbers. It MUST stay
+          # a hard error -- never a warning, and never a clamp of the requested
+          # token count, because silently lowering the token count would shorten
+          # the correctness window and the scored decode window without anyone
+          # deciding to.
+          check_golden_rows() {
+            local path="$1" wanted="$2" label="$3" rows
+            rows="$(jq -r 'if (.rows | type) == "array" then (.rows | length) else "" end' "${path}")"
+            if [[ ! "${rows}" =~ ^[0-9]+$ || "${rows}" -eq 0 ]]; then
+              echo "::error::hidden DFlash ${label} golden has no usable .rows array (read '${rows}'); regenerate the golden (go-live runbook step B)" >&2
+              exit 1
+            fi
+            if [[ "${rows}" -lt "${wanted}" ]]; then
+              echo "::error::hidden DFlash golden carries ${rows} rows but ${wanted} tokens are requested; regenerate the golden (go-live runbook step B) or lower the token count" >&2
+              exit 1
+            fi
+            echo "dflash-benchmark: ${label} golden carries ${rows} reference rows for ${wanted} requested tokens"
+          }
+          check_golden_rows \
+            "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" \
+            "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}" correctness
+          # Ranked-only for the same reason the download is: on a gates-only
+          # dispatch there is no timed golden on disk to preflight, and nothing
+          # downstream will read one. The check stays UNCONDITIONALLY BINDING on
+          # the ranked path -- it is not relaxed, only scoped to the dispatch
+          # kind that actually times.
+          if [[ "${MLXFAST_RUN_BENCHMARK}" == "1" ]]; then
+            check_golden_rows \
+              "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" \
+              "${MLXFAST_DFLASH_DECODE_TOKENS}" benchmark
+          fi
+          golden_dst="${MLXFAST_JOB_WS}/.dflash-ranked-src/dflash_correctness_golden.json"
+          if [[ -e "${golden_dst}" || -L "${golden_dst}" ]]; then
+            echo "::error::refusing to place hidden input over pre-existing path ${golden_dst}" >&2
+            exit 1
+          fi
+          install -m 0444 "${MLXFAST_PRIVATE_DIR}/dflash_correctness_golden.json" "${golden_dst}"
+          echo "dflash-benchmark: hidden goldens verified (correctness ${correctness_hash}, benchmark ${bench_hash})"
+
+      # TOCTOU guard: the submitted transform ran with workspace write access
+      # since the post-build pins.
+      - name: Verify trusted harness before DFlash correctness gate
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # The untimed DFlash correctness/parity gate: one full-length block-decode
+      # pass over the hidden correctness golden. The trusted parent checks
+      # every returned token against the serial oracle (a single divergence
+      # fails), enforces the block protocol, and re-validates target and
+      # assistant artifacts before and after load. Stdout (the diagnostic
+      # report JSON) is sealed in this trusted shell; on-disk files are never
+      # trusted. Ordered BEFORE the timed phase so a broken submission never
+      # burns gated thermal time.
+      - name: DFlash correctness and parity gate (untimed)
+        env:
+          BENCH_JOB_ID: dflash-ranked-${{ github.run_id }}-${{ github.run_attempt }}-gates
+          # Worker Seatbelt literal deny for the hidden correctness golden:
+          # only the harness parent may read it. Kept through sudo env_reset
+          # via the sudoers env_keep list, exactly like the serial pipeline.
+          BENCH_GOLDEN_PATH: ${{ env.MLXFAST_JOB_WS }}/.dflash-ranked-src/dflash_correctness_golden.json
+        run: |
+          set -euo pipefail
+          raw_stdout="${MLXFAST_PRIVATE_DIR}/dflash-gates-stdout.raw"
+          gates_log="${MLXFAST_PRIVATE_DIR}/dflash-gates-private.log"
+          started="${SECONDS}"
+          status=0
+          # shellcheck disable=SC2024  # trusted shell owns the capture files
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env \
+              MJOB_WS="${MLXFAST_JOB_WS}" \
+              MLXFAST_DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
+              MLXFAST_DFLASH_ASSISTANT_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR}" \
+              MLXFAST_DFLASH_CONTRACT_PATH="${MLXFAST_DFLASH_CONTRACT_PATH}" \
+              MLXFAST_DFLASH_BLOCK_SIZE="${MLXFAST_DFLASH_BLOCK_SIZE}" \
+              MLXFAST_DFLASH_CORRECTNESS_TOKENS="${MLXFAST_DFLASH_CORRECTNESS_TOKENS}" \
+              /bin/bash -c '
+                set -u
+                cd "${MJOB_WS}" || exit 97
+                # Flags audited against Sources/MLXFastCLI/main.swift. Five that
+                # the restored MTP scaffolding passed do not exist on this CLI and
+                # would abort the run on argument validation:
+                #   --target-source            (only `transform` consumes a source tree)
+                #   --assistant                (this CLI spells it --drafter)
+                #   --contract                 (enforced by the workflow interlock and
+                #                               the trusted parent, never a CLI flag)
+                #   --target-verification      (superseded by Criterion E; the trusted
+                #                               parent validates, the worker does not)
+                #   --require-trained-assistant (the drafter is hash-pinned by its
+                #                               manifest instead)
+                exec .build/release/mlxfast-swift dflash-benchmark \
+                  --weights weights \
+                  --drafter "${MLXFAST_DFLASH_ASSISTANT_DIR}" \
+                  --golden .dflash-ranked-src/dflash_correctness_golden.json \
+                  --tokens "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}" \
+                  --block-size "${MLXFAST_DFLASH_BLOCK_SIZE}"
+              ' > "${raw_stdout}" 2> "${gates_log}" || status=$?
+          if [[ "${MLXFAST_IS_SUBMISSION_BRANCH}" != "1" ]]; then
+            cat "${gates_log}" || true
+          fi
+          # Seal + validate: exactly one JSON object with the DFlash report
+          # shape, every token matched, trained drafter in use, and no score
+          # fields (this phase is a gate, not a measurement).
+          if [[ "$(jq -s 'length' "${raw_stdout}" 2>/dev/null)" != "1" ]]; then
+            echo "::error::DFlash correctness gate did not emit a single valid report payload (exit=${status})" >&2
+            exit 1
+          fi
+          # BLOCKER FIX (2026-07-30). Two further conjuncts used to sit here: one
+          # requiring an `experimental` boolean, one requiring a
+          # target-verification-mode string of "exact-pair". runDFlashBenchmark's
+          # payload (Sources/MLXFastCLI/main.swift) emits NEITHER field, so
+          # `jq -e` failed and this step exited 1 on EVERY run -- the DFlash gate
+          # could never pass, enabled or not.
+          #
+          # The ASSERTION was the stale half, not the payload: the flag audit
+          # above records that --target-verification was superseded by Criterion E
+          # (the trusted parent validates work-honesty; the worker declares
+          # nothing), so those two conjuncts asserted a contract that no longer
+          # exists. They are DELETED rather than papered over by adding two
+          # decorative fields to the payload. Every conjunct that remains below
+          # is verified to be emitted.
+          jq -e \
+            --arg track "${MLXFAST_DFLASH_TRACK_ID}" \
+            --argjson tokens "${MLXFAST_DFLASH_CORRECTNESS_TOKENS}" \
+            '
+            .track_id == $track
+            and .uses_trained_drafter == true
+            and .decode_token_count == $tokens
+            and .all_tokens_matched == true
+            and .official_score_produced == false
+            and (has("score") | not)
+            and (has("speedup") | not)
+            ' "${raw_stdout}" >/dev/null || {
+              echo "::error::DFlash correctness gate report failed validation (exit=${status})" >&2
+              exit 1
+            }
+          cp "${raw_stdout}" dflash-gates-report.json
+          echo "dflash-benchmark: correctness/parity gate passed in $((SECONDS - started))s (exit=${status})"
+          exit "${status}"
+
+      # ---- correctness-only (run_benchmark=false) artifact path ------------
+      - name: Stage DFlash correctness artifacts
+        id: stage_dflash_correctness_artifacts
+        # always() matches serial's "Stage correctness artifacts". Without it a
+        # gates-only run that FAILS skips staging, so the diagnostics are lost
+        # in exactly the case they are wanted. The !run_benchmark half is not a
+        # convenience: on a ranked run these artifacts are withheld, because
+        # they are derived from hidden material.
+        if: ${{ always() && !inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          # Checked BEFORE the sha comparison below: under set -e an absent
+          # candidate.sha makes that comparison die with a bare
+          # "cat: candidate.sha: No such file or directory", which names the
+          # symptom and not the problem. Since this step is always() it now runs
+          # after aborted runs, where absence is the likely case.
+          if [[ ! -f candidate.sha ]]; then
+            echo "::error::candidate.sha is missing; refusing to stage artifacts for an unidentified workspace" >&2
+            exit 1
+          fi
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          # public-gate-report.json and gates-score.json are the verdicts of the
+          # reused serial gates; without them a correctness-only dispatch
+          # publishes the DFlash parity report and no evidence that the model
+          # itself is still sound. deny-private-artifacts.sh already name-denies
+          # *correctness_golden*.json, *gpqa_reference_cases*.json and
+          # *gpqa_ttft_results*.json, and "Validate sealed gates score" above has
+          # already asserted the sealed score carries no hidden token fields.
+          # PRESENT-ONLY STAGING. This step is always() on purpose -- a
+          # gates-only run that FAILED is exactly when its diagnostics are
+          # wanted -- but an aborted run has not produced every artifact, and
+          # requiring all of them made THIS step fail too. That cost nothing in
+          # evidence and actively obscured the cause: run 30588892999 died
+          # fetching the hidden golden and reported two red steps, the second
+          # of which was only "gates-score.json does not exist".
+          #
+          # So stage what exists and say what does not. Every name is still
+          # passed through deny-private-artifacts.sh before it is staged, so
+          # tolerating absence does not widen what may be published; a file
+          # that is missing is simply not a candidate for leaking.
+          present=()
+          missing=()
+          suspicious=()
+          for name in \
+            candidate.sha \
+            public-gate-report.json \
+            gates-score.json \
+            dflash-gates-report.json \
+            dflash-weights.sha256; do
+            if [[ -L "${name}" ]]; then
+              # A SYMLINK IS NOT AN ABSENCE. The staging script rejects
+              # symlinked sources outright, and tolerating absence must not
+              # quietly downgrade that to a skip: a symlink where an artifact
+              # belongs is a candidate reaching outside the workspace, which is
+              # the thing artifact staging exists to prevent.
+              suspicious+=("${name}")
+            elif [[ -f "${name}" ]]; then
+              present+=("${name}")
+            else
+              missing+=("${name}")
+            fi
+          done
+          if ((${#suspicious[@]})); then
+            echo "::error::artifact source is a symlink, not a regular file: ${suspicious[*]}" >&2
+            exit 1
+          fi
+          if ((${#missing[@]})); then
+            echo "::notice::DFlash correctness staging: not produced by this run: ${missing[*]}"
+          fi
+
+          # CONTENT GATE. deny-private-artifacts.sh is NAME- and SIZE-based; it
+          # cannot see hidden values INSIDE a permitted filename. That is fine
+          # on the happy path, where "Validate sealed gates score" has already
+          # asserted the sealed score carries no hidden token fields -- but this
+          # step is always(), so it runs precisely when that validation did NOT.
+          #
+          # On a FAILED hidden-gates run the gates pass writes gates-score.json
+          # and exits nonzero; the validation step is then skipped, and staging
+          # would upload the raw file. Its .metrics can carry first_failing_step,
+          # expected_token and actual_token -- values derived FROM THE HIDDEN
+          # GOLDEN. Because a gates-only failure also charges no attributable-
+          # failure budget, repeating it would return one hidden token per run:
+          # an iterated oracle, which is exactly what the redactor's own header
+          # forbids ("a failing score.json must never be uploaded raw").
+          #
+          # So re-assert the sealed-score predicate HERE, inline, with the same
+          # jq that "Validate sealed gates score" uses. A score that does not
+          # satisfy it is dropped from the upload rather than failing the step:
+          # the run has already failed for its own reason, and the remaining
+          # artifacts are still worth having.
+          keep=()
+          for name in "${present[@]}"; do
+            case "${name}" in
+              gates-score.json)
+                if jq -e '
+                  .passed == true
+                  and (.metrics.error == "")
+                  and (.metrics.first_failing_case == null)
+                  and (.metrics.first_failing_layer == null)
+                  and (.metrics.first_failing_step == null)
+                  and (.metrics.expected_token == null)
+                  and (.metrics.actual_token == null)
+                  and (.metrics.expected_token_logit == null)
+                  and (.metrics.expected_token_rank == null)
+                  and (.metrics.passed_correctness == true)
+                ' "${name}" >/dev/null 2>&1; then
+                  keep+=("${name}")
+                else
+                  echo "::notice::withholding ${name}: it did not pass the sealed-score predicate, so it may carry hidden-golden token fields"
+                fi
+                ;;
+              public-gate-report.json)
+                # Its .error can embed sandboxed-worker stderr, i.e. text the
+                # SUBMITTED code controls. Serial guards the same file on
+                # submission branches; mirror that rather than inventing a
+                # weaker rule. On a non-submission ref the report is organizer
+                # output and is kept even when it records a failure.
+                if [[ "${MLXFAST_IS_SUBMISSION_BRANCH:-0}" != "1" ]] \
+                  || jq -e '(.error // "") == ""' "${name}" >/dev/null 2>&1; then
+                  keep+=("${name}")
+                else
+                  echo "::notice::withholding ${name}: non-empty .error on a submission branch may carry submitted-code output"
+                fi
+                ;;
+              *)
+                keep+=("${name}")
+                ;;
+            esac
+          done
+          present=("${keep[@]}")
+
+          .github/scripts/deny-private-artifacts.sh "${present[@]}"
+          staged=()
+          for name in "${present[@]}"; do staged+=("${name}=${name}"); done
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/dflash-correctness-results" \
+            "${staged[@]}"
+
+      - name: Upload DFlash correctness artifacts
+        if: always() && steps.stage_dflash_correctness_artifacts.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: dflash-correctness-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/dflash-correctness-results
+          if-no-files-found: error
+          overwrite: true
+
+      # ---- ranked path (run_benchmark=true) ---------------------------------
+      # Restore the workspace to its pre-hidden snapshot BEFORE the timed
+      # phase: remove the hidden correctness golden, purge bench scratch
+      # through the bridge, allowlist-delete every gates-phase file, and
+      # re-verify weights against its pinned hash.
+      - name: Scrub hidden material from bench workspace
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          rm -f "${MLXFAST_JOB_WS}/.dflash-ranked-src/dflash_correctness_golden.json"
+          # The serial augmented golden was already removed by "Scrub serial
+          # hidden material before the DFlash gate". Repeat it explicitly here so
+          # this scrub's own *golden* leftovers backstop below stays a backstop
+          # rather than becoming the only thing that catches it.
+          rm -f "${MLXFAST_JOB_WS}/correctness_golden_ranked.json"
+          rm -rf "${MLXFAST_JOB_WS}/private"
+          mkdir -p "${MLXFAST_JOB_WS}/private"
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /usr/bin/env MJOB_WS="${MLXFAST_JOB_WS}" /bin/bash -c '
+              set -u
+              if [ -d "${MJOB_WS}/tmp" ]; then
+                find "${MJOB_WS}/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+              fi
+            '
+          manifest="${MLXFAST_PRIVATE_DIR}/post-transform-manifest.nul"
+          test -s "${manifest}"
+          scrub_failed=0
+          while IFS= read -r -d '' rel; do
+            case "${rel}" in
+              ./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
+              ./private/*) continue ;;
+            esac
+            if grep -zqxF -- "${rel}" "${manifest}"; then
+              continue
+            fi
+            target="${MLXFAST_JOB_WS}/${rel#./}"
+            rm -f -- "${target}" 2>/dev/null || true
+            if [[ -e "${target}" || -L "${target}" ]]; then
+              echo "::error::allowlist scrub could not remove gates-phase workspace file: ${rel}" >&2
+              scrub_failed=1
+            fi
+          done < <(cd "${MLXFAST_JOB_WS}" && find . -mindepth 1 \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+          if [[ "${scrub_failed}" -ne 0 ]]; then
+            echo "::error::allowlist scrub left gates-phase workspace files it could not delete" >&2
+            exit 1
+          fi
+          test -s dflash-weights.sha256
+          scrub_weights_hash="$(.github/scripts/hash-weights-directory.sh "${MLXFAST_JOB_WS}/weights")"
+          trusted_weights_hash="$(tr -d '[:space:]' < dflash-weights.sha256)"
+          if [[ "${scrub_weights_hash}" != "${trusted_weights_hash}" ]]; then
+            echo "::error::transformed DFlash weights changed before timing (hash ${scrub_weights_hash} != ${trusted_weights_hash})" >&2
+            exit 1
+          fi
+          leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::hidden-material scrub left candidates behind: ${leftovers}" >&2
+            exit 1
+          fi
+          echo "dflash-benchmark: bench workspace restored to pre-hidden snapshot before timing"
+
+      - name: Reap lingering bench processes before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+            /bin/bash "${MLXFAST_JOB_WS}/.github/scripts/reap-bench-processes.sh"
+
+      - name: Wait for quiescence before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            load="$(sysctl -n vm.loadavg | awk '{print $2}')"
+            util="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.gpu_usage[1] // 1' || true)"
+            [[ -n "${util}" ]] || util=1
+            if [[ "$(echo "${load} < 2.0" | bc -l)" == "1" && "$(echo "${util} < 0.10" | bc -l)" == "1" ]]; then
+              break
+            fi
+            sleep 15
+            waited=$((waited + 15))
+            if [[ "${waited}" -ge 900 ]]; then
+              echo "::error::machine did not reach quiescence within 900s (load=${load} gpu_util=${util})" >&2
+              exit 1
+            fi
+          done
+          temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // "?"')"
+          echo "dflash-benchmark: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); thermal gate is enforced inside measure-dflash-job"
+
+      - name: Verify trusted harness before timing
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/trusted-harness.sha256" trusted
+          .github/scripts/pin-trusted-harness.sh verify "${MLXFAST_JOB_WS}" "${MLXFAST_PRIVATE_DIR}/participant-worker.sha256" worker
+
+      # THE TIMED DFLASH MEASUREMENT -- LAST, via the box-owned wrapper with the
+      # fixed thermal contract. Per accepted pair, alternating order:
+      #   baseline: pinned DFlash baseline tree, serial K=1 target decode
+      #             (dflash-probe) over the hidden benchmark golden;
+      #   candidate: this workspace, dflash-benchmark (exact-pair) over the
+      #             SAME golden, same --tokens denominator.
+      # measure-dflash-job enforces per-phase quiescence + the 40C gate + 2 Hz
+      # telemetry acceptance, requires all_tokens_matched=true from every
+      # run, checks the baseline calibration band, and seals results.json.
+      - name: Timed paired DFlash benchmark (measure-dflash-job)
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          # RESOLVE the baseline symlink before handing it to the wrapper.
+          # measure-dflash-job.sh clones the baseline with `cp -c -R`, and on a
+          # symlink source that copies the SYMLINK, not its contents -- so the
+          # clone under /Users/Shared/bench-jobs becomes a link pointing back into
+          # /opt/bench-runner, and bench-exec.sh correctly refuses it: "workspace
+          # ... is not under the allowed job root". Measured on M5-C 2026-07-30.
+          # Passing the resolved path keeps `current` as the operator's indirection
+          # while giving the wrapper a real directory to clone.
+          MLXFAST_DFLASH_BASELINE_RESOLVED="$(readlink -f "${MLXFAST_DFLASH_BASELINE_WS}")"
+          test -d "${MLXFAST_DFLASH_BASELINE_RESOLVED}/.build/release" \
+            || { echo "::error::resolved baseline is not a built workspace: ${MLXFAST_DFLASH_BASELINE_RESOLVED}" >&2; exit 1; }
+          # --contract points at the candidate workspace's OWN fixture copy,
+          # absolute. measure-dflash-job runs as the bench/runner uid and only
+          # ${MLXFAST_JOB_WS} carries the bench read ACL; a bare relative
+          # "fixtures/..." resolved against GITHUB_WORKSPACE (no such ACL), so the
+          # wrapper's `[ -s "${CONTRACT}" ]` saw nothing and died code=8 -- run
+          # 30683909576, the first ranked dispatch to reach the timed step after
+          # go-live.
+          MEASURE_STATE_DIR="${MLXFAST_MEASURE_STATE_DIR}" \
+          BASELINE_WS="${MLXFAST_DFLASH_BASELINE_RESOLVED}" \
+          BASELINE_CALIBRATION="${MLXFAST_DFLASH_BASELINE_CALIBRATION}" \
+          DFLASH_TARGET_DIR="${MLXFAST_DFLASH_TARGET_DIR}" \
+          DFLASH_DRAFTER_DIR="${MLXFAST_DFLASH_ASSISTANT_DIR}" \
+          GPU_LOADED_UTIL=0.95 \
+            "${MLXFAST_DFLASH_MEASURE_JOB}" \
+              --candidate "${MLXFAST_JOB_WS}" \
+              --baseline "${MLXFAST_DFLASH_BASELINE_RESOLVED}" \
+              --golden "${MLXFAST_PRIVATE_DIR}/dflash_benchmark_golden.json" \
+              --contract "${MLXFAST_JOB_WS}/${MLXFAST_DFLASH_CONTRACT_PATH}" \
+              --tokens "${MLXFAST_DFLASH_DECODE_TOKENS}" \
+              --block-size "${MLXFAST_DFLASH_BLOCK_SIZE}" \
+              --min-pairs "${MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS}" \
+              --target-pairs "${MLXFAST_DFLASH_TARGET_PAIRS}" \
+              --tag "dflash-ranked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --out "${MLXFAST_MEASURE_OUT}"
+          test -s "${MLXFAST_MEASURE_OUT}/results.json"
+          jq -c '{mode, accepted_pair_count, parity_all_ok}' "${MLXFAST_MEASURE_OUT}/results.json"
+
+      # Decode-only score contract (adopted 2026-07-14 memo), applied in the
+      # trusted shell from the sealed paired results: hard bit-exact gate,
+      # minimum accepted pairs, RATIO-OF-MEANS aggregation computed HERE from
+      # the sealed per-side seconds/token means (never trusted from a
+      # pre-aggregated field), and the 1.0 floor on that aggregate. The
+      # published score.json carries the track id so the leaderboard can
+      # verify that this is the DFlash track rather than the legacy serial
+      # track.
+      - name: Compute DFlash score and enforce floor
+        if: ${{ inputs.run_benchmark }}
+        env:
+          # The sampled pool entry's sha256, from the trusted per-run selection
+          # (not the candidate). Used to look up this prompt's pinned no-op
+          # reference so the score is normalised per-prompt (Amendment 32). It is
+          # consumed only inside this trusted step and never echoed to the log,
+          # preserving the "selection recorded only in the private audit dir"
+          # posture of the selection step.
+          MLXFAST_DFLASH_SELECTED_SHA256: ${{ steps.select_dflash_target.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          # SECOND, INDEPENDENT check of the PUBLISH question, at the step that
+          # actually produces the ranked score rather than 49 steps earlier.
+          # "Enforce DFlash track enablement" already refused a ranked dispatch
+          # against a not-yet-enabled track; this is here so that stays true if
+          # these steps are ever reordered, if this one gains a path that runs
+          # without the earlier gate, or if a dry run is ever taught to reach
+          # scoring. A guard 49 steps upstream of the thing it protects is a
+          # guard whose coverage depends on step order.
+          scoring_enabled="$(jq -r '.official_scoring_enabled' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          publication_allowed="$(jq -r '.reference_baseline.publication_allowed' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          if [[ "${scoring_enabled}" != "true" || "${publication_allowed}" != "true" ]]; then
+            echo "::error::refusing to compute a ranked DFlash score for a track that is not enabled (official_scoring_enabled=${scoring_enabled}, reference_baseline.publication_allowed=${publication_allowed})" >&2
+            exit 1
+          fi
+          if [[ "${MLXFAST_DFLASH_DRY_RUN_UNENABLED:-0}" == "1" ]]; then
+            echo "::error::a gates-only dry run reached the ranked scoring step; this step must never run for a dispatch that was admitted as unenabled" >&2
+            exit 1
+          fi
+          results="${MLXFAST_MEASURE_OUT}/results.json"
+          test -s "${results}"
+          jq -e \
+            --arg track "${MLXFAST_DFLASH_TRACK_ID}" \
+            --argjson min_pairs "${MLXFAST_DFLASH_MIN_ACCEPTED_PAIRS}" \
+            '
+            .track_id == $track
+            and .parity_all_ok == true
+            and (.accepted_pair_count >= $min_pairs)
+            and ((.pairs | type) == "array")
+            and ((.pairs | length) == .accepted_pair_count)
+            and (.aggregate.baseline_serial_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.candidate_dflash_seconds_per_token_mean | type == "number" and . > 0)
+            and (.aggregate.dflash_decode_speedup_median | type == "number")
+            and (.aggregate.dflash_decode_speedup_min | type == "number")
+            ' "${results}" >/dev/null || {
+              echo "::error::paired DFlash results failed validation (bit-exact gate, pair count, or schema)" >&2
+              exit 1
+            }
+          # Ratio-of-means (RAW): mean serial s/tok over accepted pairs divided
+          # by mean DFlash s/tok over the same pairs (equivalently total serial
+          # decode time / total DFlash decode time for the fixed token total).
+          speedup_raw="$(jq -r '.aggregate.baseline_serial_seconds_per_token_mean / .aggregate.candidate_dflash_seconds_per_token_mean' "${results}")"
+          # PER-PROMPT NORMALISATION (Amendment 32). Divide the raw ratio-of-means
+          # by the sampled prompt's OWN pinned no-op reference so every pool prompt's
+          # no-op maps to 1.0 and the ranked score does not depend on which prompt
+          # the anti-lottery sampler drew (that per-prompt difficulty spread was
+          # ~2.4% across the pool, vs <0.5% measurement noise). The reference is read
+          # from the TRUSTED contract checkout (${MLXFAST_DFLASH_CONTRACT_PATH} under
+          # GITHUB_WORKSPACE, NOT the candidate-writable job workspace copy -- fixtures/
+          # is outside editablePaths), keyed by the sha256 of the per-run selection.
+          # Fail closed if the sampled sha has no single positive pinned reference.
+          if [[ ! "${MLXFAST_DFLASH_SELECTED_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::the per-run timed-target selection did not provide a sha256; cannot normalise the score (Amendment 32)" >&2
+            exit 1
+          fi
+          noop_ref="$(jq -r --arg s "${MLXFAST_DFLASH_SELECTED_SHA256}" '[.timed_prompt_pool[] | select(.sha256 == $s) | .noop_decode_speedup] | if length == 1 then (.[0] | tostring) else "MISSING" end' "${MLXFAST_DFLASH_CONTRACT_PATH}")"
+          if [[ "${noop_ref}" == "MISSING" || "${noop_ref}" == "null" || -z "${noop_ref}" ]]; then
+            echo "::error::no single pinned no-op reference (noop_decode_speedup) for the sampled timed prompt in ${MLXFAST_DFLASH_CONTRACT_PATH}; the pool and its per-prompt references must be re-pinned together (Amendment 32)" >&2
+            exit 1
+          fi
+          if [[ "$(echo "${noop_ref} > 0" | bc -l)" != "1" ]]; then
+            echo "::error::pinned no-op reference ${noop_ref} for the sampled timed prompt is not a positive number" >&2
+            exit 1
+          fi
+          # score = raw / reference (full precision via jq, not bc scale).
+          speedup="$(jq -rn --argjson raw "${speedup_raw}" --argjson ref "${noop_ref}" '$raw / $ref')"
+          floor_ok="$(echo "${speedup} >= ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" | bc -l)"
+          if [[ "${floor_ok}" != "1" ]]; then
+            echo "::error::normalised dflash_decode_speedup ${speedup} (raw ${speedup_raw} / no-op reference ${noop_ref}) is below the ${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR} floor; the normalised floor means 'within 5% of THIS prompt's own no-op' uniformly across the pool (Amendment 32), NOT parity with serial decode -- block decode spends compute per declared row, so at this pool's ~75% draft acceptance a no-op is ~12% slower than serial K=1 and normalises to 1.0" >&2
+            exit 1
+          fi
+          jq -n \
+            --arg track "${MLXFAST_DFLASH_TRACK_ID}" \
+            --arg commit "${MLXFAST_CANDIDATE_SHA}" \
+            --arg weights_hash "$(tr -d '[:space:]' < dflash-weights.sha256)" \
+            --argjson score "${speedup}" \
+            --argjson raw "${speedup_raw}" \
+            --argjson noop_ref "${noop_ref}" \
+            --argjson floor "${MLXFAST_DFLASH_DECODE_SPEEDUP_FLOOR}" \
+            --argjson decode_tokens "${MLXFAST_DFLASH_DECODE_TOKENS}" \
+            --argjson target_pairs "${MLXFAST_DFLASH_TARGET_PAIRS}" \
+            --slurpfile results "${results}" \
+            '
+            {
+              score: $score,
+              passed: true,
+              track_id: $track,
+              metrics: {
+                mode: "dflash-paired-decode-only",
+                aggregation: "ratio_of_means",
+                scoring_normalized: true,
+                commit: $commit,
+                decode_tokens: $decode_tokens,
+                decode_speedup_floor: $floor,
+                accepted_pair_count: $results[0].accepted_pair_count,
+                target_pair_count: $target_pairs,
+                parity_all_ok: $results[0].parity_all_ok,
+                dflash_decode_speedup_normalized: $score,
+                noop_reference_decode_speedup: $noop_ref,
+                dflash_decode_speedup_ratio_of_means: $raw,
+                dflash_decode_speedup_median: $results[0].aggregate.dflash_decode_speedup_median,
+                dflash_decode_speedup_min: $results[0].aggregate.dflash_decode_speedup_min,
+                baseline_serial_seconds_per_token_mean: $results[0].aggregate.baseline_serial_seconds_per_token_mean,
+                candidate_dflash_seconds_per_token_mean: $results[0].aggregate.candidate_dflash_seconds_per_token_mean,
+                dflash_weights_hash: $weights_hash
+              }
+            }
+            ' > score.json
+          shasum -a 256 score.json | awk '{print $1}' > score.json.sha256
+          jq -c '{track_id, score, passed}' score.json
+
+      - name: Check DFlash benchmark artifact paths
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          test "$(cat candidate.sha)" = "${MLXFAST_CANDIDATE_SHA}"
+          .github/scripts/deny-private-artifacts.sh \
+            candidate.sha \
+            score.json \
+            score.json.sha256 \
+            public-gate-report.json \
+            gates-score.json \
+            dflash-gates-report.json \
+            dflash-weights.sha256
+
+      - name: Stage DFlash benchmark artifacts
+        id: stage_dflash_benchmark_artifacts
+        if: ${{ inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/benchmark-results" \
+            candidate.sha=candidate.sha \
+            score.json=score.json \
+            score.sha256=score.json.sha256 \
+            public-gate-report.json=public-gate-report.json \
+            gates-score.json=gates-score.json \
+            dflash-gates-report.json=dflash-gates-report.json \
+            dflash-weights.sha256=dflash-weights.sha256
+
+      - name: Upload DFlash benchmark artifacts
+        if: ${{ inputs.run_benchmark && steps.stage_dflash_benchmark_artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/benchmark-results
+          if-no-files-found: error
+          overwrite: true
+
+      # Timing provenance for audit/disputes: sealed paired results (paths,
+      # commit ids, timings, telemetry aggregates only) and the measure
+      # verdict. Content-vetted by deny-private-artifacts.
+      - name: Stage DFlash audit artifacts
+        id: stage_dflash_audit_artifacts
+        if: ${{ always() && inputs.run_benchmark }}
+        run: |
+          set -euo pipefail
+          staged=()
+          if [[ -s "${MLXFAST_MEASURE_OUT}/results.json" ]]; then
+            cp "${MLXFAST_MEASURE_OUT}/results.json" dflash-paired-results.json
+            staged+=(dflash-paired-results.json=dflash-paired-results.json)
+          fi
+          if [[ -s "${MLXFAST_MEASURE_OUT}/verdict.txt" ]]; then
+            cp "${MLXFAST_MEASURE_OUT}/verdict.txt" dflash-measure-verdict.txt
+            staged+=(dflash-measure-verdict.txt=dflash-measure-verdict.txt)
+          fi
+          if [[ -s dflash-weights.sha256 ]]; then
+            staged+=(dflash-weights.sha256=dflash-weights.sha256)
+          fi
+          if [[ "${#staged[@]}" -eq 0 ]]; then
+            echo "dflash-benchmark: no audit artifacts to stage"
+            exit 0
+          fi
+          .github/scripts/stage-benchmark-artifacts.sh \
+            "${MLXFAST_ARTIFACT_ROOT}/dflash-benchmark-audit" \
+            "${staged[@]}"
+
+      - name: Upload DFlash audit artifacts
+        if: ${{ always() && inputs.run_benchmark && steps.stage_dflash_audit_artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: dflash-benchmark-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.MLXFAST_ARTIFACT_ROOT }}/dflash-benchmark-audit
+          if-no-files-found: ignore
+          retention-days: 90
+
+      # Failure reporting for this track must never echo reference material.
+      # The trusted parent authors "DFlash contract violation: <kind>" messages
+      # that carry no reference token ids and no reference logit values, and this
+      # script maps the KIND to an opaque category and drops the detail text --
+      # the pair of them is contract layer L6 (a validator that surfaced golden
+      # tokens would be a query oracle on the frozen hidden prompt).
+      - name: Redact DFlash benchmark failure
+        id: redact_dflash_failure
+        if: ${{ failure() && inputs.run_benchmark }}
+        env:
+          MLXFAST_BENCHMARK_MODE: dflash-paired
+        run: |
+          set -euo pipefail
+          # Give the redactor a score file it can actually categorise from. It
+          # derives every category from a score's .metrics.error, and this
+          # workflow's score.json does not exist until AFTER timing -- so on any
+          # earlier failure the redactor was handed nothing and collapsed every
+          # cause into the opaque "no_score". Prefer the timed score when it
+          # exists, otherwise the sealed serial gates score (which carries
+          # .metrics.error and the passed_correctness / semantic-GPQA verdicts,
+          # and has already been leak-validated by "Validate sealed gates
+          # score"). The third argument is the public gate report, which un-deadens
+          # the public_gate_* categories. No new categories are introduced.
+          redact_score="gates-score.json"
+          if [[ -s score.json ]]; then
+            redact_score="score.json"
+          fi
+          .github/scripts/redact-benchmark-failure.sh \
+            benchmark-failure.json \
+            "${redact_score}" \
+            public-gate-report.json
+          .github/scripts/deny-private-artifacts.sh benchmark-failure.json
+
+      # Charge the branch's rate-limit budget ONLY for failures the participant
+      # is responsible for. The redaction step above has already reduced the
+      # failure to an opaque category; infra categories (a judge API outage, a
+      # thermal reject, a nondeterministic reference) are operator faults and
+      # must be re-dispatchable at no cost, otherwise the rate limit itself
+      # becomes a denial-of-service against honest submitters.
+      - name: Record attributable DFlash ranked failure
+        if: ${{ failure() && steps.redact_dflash_failure.outcome == 'success' && startsWith(github.ref, 'refs/heads/submissions/') }}
+        run: |
+          set -euo pipefail
+          test -s benchmark-failure.json || exit 0
+          # redact-benchmark-failure.sh emits `failure_category`, never
+          # `category`. Reading the wrong key made this rate limiter INERT: the
+          # empty string fell through to the "not participant-attributable" arm
+          # on every failure, so no branch ever consumed its budget and contract
+          # layer L6's second half did nothing.
+          category="$(jq -r '.failure_category // ""' benchmark-failure.json)"
+          case "${category}" in
+            dflash_*|floor_failed|correctness_failed|prefill_token_mismatch|decode_seed_token_mismatch|decode_token_mismatch)
+              ;;
+            *)
+              echo "dflash-benchmark: category '${category}' is not participant-attributable; rate-limit budget untouched"
+              exit 0
+              ;;
+          esac
+          counts_dir="${MLXFAST_MEASURE_STATE_DIR}/failure-counts"
+          mkdir -p "${counts_dir}"
+          branch_key="$(printf '%s' "${GITHUB_REF}" | shasum -a 256 | awk '{print $1}')"
+          counter="${counts_dir}/${branch_key}.count"
+          used=0
+          if [[ -s "${counter}" ]]; then
+            used="$(tr -dc '0-9' < "${counter}")"
+            used="${used:-0}"
+          fi
+          printf '%s\n' "$((used + 1))" > "${counter}.tmp"
+          mv "${counter}.tmp" "${counter}"
+          echo "dflash-benchmark: recorded attributable failure ($((used + 1))/${MLXFAST_DFLASH_MAX_RANKED_FAILURES}) for category ${category}"
+
+      - name: Upload redacted DFlash failure
+        if: ${{ failure() && steps.redact_dflash_failure.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: dflash-benchmark-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-failure.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Cleanup bench workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+            sudo -n "${MLXFAST_BENCH_EXEC}" "${MLXFAST_JOB_WS}" \
+              /bin/sh -c 'find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; true' || true
+            rm -rf "${MLXFAST_JOB_WS}" || true
+            if [[ -d "${MLXFAST_JOB_WS}" ]]; then
+              echo "::warning::bench workspace residue left at ${MLXFAST_JOB_WS}"
+            fi
+          fi
+          private_cleanup_failed=0
+          for private_path in \
+            "${MLXFAST_PRIVATE_DIR}" \
+            "${MLXFAST_MEASURE_OUT}" \
+            "${MLXFAST_ARTIFACT_ROOT}"; do
+            if ! rm -rf -- "${private_path}"; then
+              echo "::error::could not remove runner-private artifact path: ${private_path}" >&2
+              private_cleanup_failed=1
+              continue
+            fi
+            if [[ -e "${private_path}" || -L "${private_path}" ]]; then
+              echo "::error::runner-private artifact cleanup failed: ${private_path}" >&2
+              private_cleanup_failed=1
+            fi
+          done
+          exit "${private_cleanup_failed}"
+
+      - name: Janitor reset and integrity audit
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo -n "${MLXFAST_JANITOR}"
+          if [[ -e "${MLXFAST_QUARANTINE_FLAG}" ]]; then
+            echo "::error::janitor quarantined the box after this run" >&2
+            exit 1
+          fi
+          echo "dflash-benchmark: janitor reset + integrity audit clean"

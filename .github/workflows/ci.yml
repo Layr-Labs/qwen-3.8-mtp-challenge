@@ -1,0 +1,116 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  swift:
+    runs-on: blacksmith-12vcpu-macos-26
+    # The independent participant-worker build root (.build-worker) compiles
+    # the vendored MLX C++ a second time, on top of the test build's own copy
+    # in .build; budget for both.
+    timeout-minutes: 75
+    env:
+      CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/.build/clang-module-cache
+      MLXFAST_RUN_MLX_RUNTIME_TESTS: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+            .build-worker/checkouts
+            .build-worker/repositories
+            .build-worker/artifacts
+            .build-worker/workspace-state.json
+          key: swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-trusted-v2-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Enforce contestant modifiable surface
+        if: startsWith(github.head_ref, 'submissions/') || startsWith(github.ref_name, 'submissions/')
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            export BASE_SHA="${PR_BASE_SHA}"
+            export HEAD_SHA="${PR_HEAD_SHA}"
+          else
+            BASE_SHA="$(git merge-base origin/main "${HEAD_SHA}")"
+            export BASE_SHA
+          fi
+          .github/scripts/enforce-modifiable-surface.sh
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "${script}")" in
+              '#!/usr/bin/env bash'|'#!/bin/bash')
+                bash -n "${script}"
+                ;;
+              '#!/usr/bin/env sh'|'#!/bin/sh')
+                sh -n "${script}"
+                ;;
+              '#!/usr/bin/env zsh'|'#!/bin/zsh')
+                zsh -n "${script}"
+                ;;
+              *)
+                echo "unsupported shell script interpreter: ${script}" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git ls-files -z '*.sh')
+
+      - name: Build release CLI and run unit tests without Metal runtime
+        run: |
+          mkdir -p .build/clang-module-cache
+          # Production build layout: trusted CLI in .build, participant
+          # worker in its own .build-worker SwiftPM scratch root.
+          swift build -c release --force-resolved-versions --product mlxfast-swift
+          swift build -c release --force-resolved-versions --scratch-path .build-worker --product mlxfast-runtime-worker
+          swift test -c release --force-resolved-versions
+          test -x .build/release/mlxfast-swift
+          test -x .build-worker/release/mlxfast-runtime-worker
+
+      - name: Save SwiftPM cache
+        if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+            .build-worker/checkouts
+            .build-worker/repositories
+            .build-worker/artifacts
+            .build-worker/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}

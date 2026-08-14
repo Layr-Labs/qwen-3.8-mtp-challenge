@@ -1,0 +1,63 @@
+# SHA256 manifest for EigenLabs/Qwen3.8-27B-4bit.
+# Revision: eda45ab47f465d08d6558f0353a2346e2eb9d5b3
+# Format: <sha256> <byte_count> <relative_path>
+#
+# GENERATED FROM THE PUBLISHED SNAPSHOT 2026-08-14. This file was a header-only
+# stub from the identity swap until the upload landed; the body below is
+# generated alongside the digests it has to agree with, from the published
+# revision named above, which is what the stub's own note required.
+#
+# The backbone reference checkpoint is OUR OWN mlx-0.32.0 conversion (MLX 4-bit
+# affine, group_size 64) of the official bf16 base Qwen/Qwen3.8-27B @
+# 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0. The shard split is three
+# safetensors files, which is a property of our toolchain and was measured at
+# publish rather than assumed.
+#
+# THE SHAPE PINS MOVE WITH THIS BODY, in this commit, because a count that is
+# not summed from the digests it must agree with is not a pin:
+#
+#   MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS: 10
+#   MLXFAST_QWEN_MTP_TARGET_MANIFEST_BYTES:   15153237117
+#
+# and so do the contract fixture's target.manifest_sha256 and
+# target.expected_source_bytes.
+#
+# RECORD SCOPE -- OPEN ITEM. The published repository carries an ELEVENTH file,
+# the `.gitattributes` Hugging Face generates for every repo
+# (34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930, 1570
+# bytes). It is NOT pinned below, because the pin was published as a ten-record
+# shape. The ranked workflow's `verify_cache` rejects any file in the cache
+# that the manifest does not name -- run 31665285024 died on exactly that --
+# so a stock `snapshot_download` of this revision will stage a file this
+# manifest does not cover. Either stage the ten pinned files only, or add the
+# record above and move the two shape pins to 11 / 15153238687 with it. This is
+# recorded here rather than fixed silently because the shape pins are the
+# operator's to set.
+#
+# WHAT THIS FILE NAMED BEFORE, and why it moved. On 2026-08-14 these header
+# lines named a third-party personal-account conversion of the same bf16 base,
+# adopted that morning. The adoption was TERMINATED the same day by the
+# operator's validation kill-switch: the deterministic reconversion cross-check
+# it had reserved was performed, and 994 of 1,847 tensors differ numerically
+# from our own conversion. The upstream bf16 base did not move and is the
+# lineage the records below descend from.
+#
+# THE 3.6 RECORDS WERE DELETED RATHER THAN CARRIED, one commit before this one:
+# a manifest of 3.6 bytes checked against a 3.8 cache directory reports every
+# file missing and reads as a corrupt download rather than as an unfinished
+# pin. The stub window that reasoning opened is now closed by real records.
+#
+# THE TOWER, for readers who come here for it: 1,847 tensors, every one of them
+# under the `language_model.` prefix and NONE under `mtp.`. The MTP head ships
+# separately -- see fixtures/qwen3_8_27b_mtp_head.sha256 -- exactly as it did
+# on 3.6.
+748c964f9b7e5f2c3770ce013bbc0153be7c54311d9692c343b6188eefe77ac6 81 README.md
+c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041 8952 chat_template.jinja
+558cd605a6f1c16c73f4918534d122a943e12e754d38567b3b704acc93596965 4094 config.json
+e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e 202 generation_config.json
+075eac5fbba3951bc4870c1ac65d684c32e0abb24284201bd27f49df56735963 5328325648 model-00001-of-00003.safetensors
+6c99c446987a432beb1f6ef7d6fde6db02682f1ebe1a913760953140e0fa4e47 5354185130 model-00002-of-00003.safetensors
+0e267246064a1e635077dd05e22181f5eda44a1fa8a67dcf46c903f858bbe35b 4450532735 model-00003-of-00003.safetensors
+a2161f6a6c9f7c434145f97a4a4262a74eb3e16a95088e713754eb108b198511 189789 model.safetensors.index.json
+06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523 19989325 tokenizer.json
+95c557768e6b88a7128befc7bfd3c7de50e5d51af9b8b33a9f4dee0e04f99679 1161 tokenizer_config.json

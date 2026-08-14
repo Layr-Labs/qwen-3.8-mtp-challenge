@@ -1,0 +1,39 @@
+--- a/Source/Cmlx/mlx/mlx/io/load.cpp
++++ b/Source/Cmlx/mlx/mlx/io/load.cpp
+@@ -2,6 +2,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <limits>
+ #include <sstream>
++#include <thread>
+ 
+ #ifdef _MSC_VER
+ #include <windows.h>
+@@ -335,12 +336,27 @@ namespace mlx::core {
+ namespace io {
+ 
++// Adaptive thread-pool sizing. Was hardcoded at 4. We scale with hardware
++// concurrency, capped between 4 and 16 so we don't over- or under-subscribe:
++//   - 4-core machine: 4 workers (matches old behavior)
++//   - 16-core M-series: 8 workers
++//   - >32-core: 16 cap (NVMe channel saturation)
++static unsigned int adaptive_pool_size() {
++  unsigned int hw = std::thread::hardware_concurrency();
++  if (hw == 0) hw = 4;
++  unsigned int n = hw / 2;
++  if (n < 4) n = 4;
++  if (n > 16) n = 16;
++  return n;
++}
++
+ ThreadPool& thread_pool() {
+-  static ThreadPool pool_{4};
++  static ThreadPool pool_{adaptive_pool_size()};
+   return pool_;
+ }
+ 
+ ThreadPool& ParallelFileReader::thread_pool() {
+-  static ThreadPool thread_pool{4};
++  static ThreadPool thread_pool{adaptive_pool_size()};
+   return thread_pool;
+ }

@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "poolside/Laguna-XS-2.1-NVFP4-mlx",
+    "revision": "841778bda563a36104dd521e37d99218e46f4f25"
+  },
+  "tensor_count": 912,
+  "dtype_counts": {
+    "BF16": 405,
+    "F32": 39,
+    "U32": 234,
+    "U8": 234
+  },
+  "canonical_record_format": "UTF-8 name<TAB>dtype<TAB>comma-separated-shape<LF>, sorted by name",
+  "canonical_inventory_sha256": "35ead01a7283a7adf7ef2606e409c47d11bbeb477f459b360047987a98f31142",
+  "representative_tensors": [
+    {
+      "name": "model.layers.1.mlp.switch_mlp.gate_proj.weight",
+      "dtype": "U32",
+      "shape": [256, 512, 256]
+    },
+    {
+      "name": "model.layers.1.mlp.switch_mlp.gate_proj.scales",
+      "dtype": "U8",
+      "shape": [256, 512, 128]
+    },
+    {
+      "name": "model.layers.1.mlp.switch_mlp.down_proj.weight",
+      "dtype": "U32",
+      "shape": [256, 2048, 64]
+    },
+    {
+      "name": "model.layers.1.mlp.switch_mlp.down_proj.scales",
+      "dtype": "U8",
+      "shape": [256, 2048, 32]
+    },
+    {
+      "name": "model.layers.1.mlp.shared_expert.gate_proj.weight",
+      "dtype": "U32",
+      "shape": [512, 256]
+    },
+    {
+      "name": "model.layers.1.mlp.shared_expert.gate_proj.scales",
+      "dtype": "U8",
+      "shape": [512, 128]
+    },
+    {
+      "name": "model.layers.1.mlp.shared_expert.down_proj.weight",
+      "dtype": "U32",
+      "shape": [2048, 64]
+    },
+    {
+      "name": "model.layers.1.mlp.shared_expert.down_proj.scales",
+      "dtype": "U8",
+      "shape": [2048, 32]
+    }
+  ]
+}

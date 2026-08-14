@@ -1,0 +1,61 @@
+# Build artifacts
+*.so
+build/
+dist/
+.build/
+.build-worker/
+.tools/
+.mlxfast-cache/
+.mlxfast-private/
+.cache/
+
+# Reference weights are large and downloaded by setup.sh
+reference_weights/*
+!reference_weights/.gitkeep
+
+# Participant transformed weights are gitignored by default; opt in if needed
+weights/*
+!weights/.gitkeep
+
+# Local results log
+results.tsv
+m5_artifacts/
+
+# Benchmark contract outputs
+score.json
+score.json.tmp
+# Every local run also writes a checksum sidecar and an integrity record, and
+# --local-iterate writes its own score/integrity names (benchmark.sh:112,:190).
+# Leaving them untracked-but-not-ignored made the tree permanently dirty, so a
+# `git add -A` swept repo-root artifacts into a submission diff -- which
+# enforce-modifiable-surface.sh then rejects as outside editablePaths.
+score.json.sha256
+score.local-*.json
+score.local-*.json.sha256
+score*.baseline.json
+benchmark-integrity.json
+benchmark-integrity.local-*.json
+correctness_golden.json
+correctness_golden*.json
+local_correctness_golden.json
+private_prompts.json
+private_prompts*.json
+gpqa_reference_cases.json
+gpqa_reference_cases*.json
+correctness_prompts/*correctness_golden*.json
+correctness_prompts/*golden_prompt*.json
+correctness_prompts/*golden_prompt*.txt
+correctness_prompts/*private*.json
+correctness_prompts/*private*.txt
+correctness_prompts/*gpqa_reference_cases*.json
+
+# IDE
+.vscode/
+.idea/
+.serena/
+*.swp
+*.swo
+.DS_Store
+
+# Local-only working docs (not part of the benchmark)
+local-docs/

@@ -1,0 +1,188 @@
+name: reference-cache-probe
+
+# Manual experiment for large reference checkpoint caching. This workflow is not
+# part of CI or scoring; it exists to test whether the cache backend can preserve
+# checkpoint bytes across Blacksmith macOS runs.
+on:
+  workflow_dispatch:
+    inputs:
+      cache_scope:
+        description: "Files to cache: metadata, first-shard, two-shards, or full."
+        required: false
+        default: "two-shards"
+        type: string
+      cache_key_suffix:
+        description: "Stable suffix for repeated restore/save tests. Change to force a new cache key."
+        required: false
+        default: "manual-v1"
+        type: string
+      reference_base_url:
+        description: "Optional HTTP base URL for reference checkpoint files. Defaults to the public organizer R2 mirror."
+        required: false
+        type: string
+      reference_download_jobs:
+        description: "Parallel shard downloads for setup.sh when cache_scope=full."
+        required: false
+        default: "3"
+        type: string
+      reference_min_free_gib:
+        description: "Minimum free GiB required before full reference checkpoint download."
+        required: false
+        default: "40"
+        type: string
+      restore_only:
+        description: "Only try restoring the cache; do not download or save missing files."
+        required: false
+        default: false
+        type: boolean
+      save_cache:
+        description: "Attempt to save the cache after a miss."
+        required: false
+        default: true
+        type: boolean
+      fail_on_save_error:
+        description: "Fail the workflow if cache save fails, for example because the cache is too large."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: reference-cache-probe-${{ github.ref }}-${{ inputs.cache_scope }}-${{ inputs.cache_key_suffix }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: blacksmith-12vcpu-macos-26
+    timeout-minutes: 120
+    env:
+      MLXFAST_REFERENCE_DIR: .cache/huggingface/hub/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25
+      MLXFAST_REFERENCE_MANIFEST_PATH: fixtures/reference_laguna_xs_2_1_nvfp4_mlx.sha256
+      # Secret-free by design -- this dispatch-time workflow runs setup.sh and
+      # the download script FROM THE DISPATCHED REF with no approval
+      # environment gate and no modifiable-surface guard, so it must never be
+      # handed anything that authenticates as more than "the public checkpoint
+      # mirror" (a dispatched ref with a modified setup.sh could exfiltrate any
+      # injected credential). A prior version pulled the base-URL/auth-header
+      # repo credentials in here -- the same exposure removed from the
+      # since-retired parallel-correctness probe workflows. Removed: the probe
+      # exists to test the cache backend, not the private mirror, and both setup.sh and
+      # download-reference-cache-scope.sh verify every byte against the pinned
+      # manifest, so the public organizer R2 mirror and immutable public
+      # Hugging Face fallback (neither needs an auth header) are sufficient.
+      MLXFAST_REFERENCE_BASE_URL: ${{ inputs.reference_base_url || 'https://ds4.darkbloom.ai/laguna-xs-2.1-nvfp4-mlx' }}
+      MLXFAST_REFERENCE_DOWNLOAD_JOBS: ${{ inputs.reference_download_jobs }}
+      MLXFAST_REFERENCE_MIN_FREE_GIB: ${{ inputs.reference_min_free_gib }}
+      MLXFAST_REFERENCE_POST_DOWNLOAD_FULL_VERIFY: "0"
+      MLXFAST_SKIP_MLX_METALLIB: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare cache key and paths
+        id: cache_plan
+        env:
+          CACHE_SCOPE: ${{ inputs.cache_scope }}
+          CACHE_KEY_SUFFIX: ${{ inputs.cache_key_suffix }}
+        run: |
+          set -euo pipefail
+          case "${CACHE_SCOPE}" in
+            metadata|first-shard|two-shards|full) ;;
+            *)
+              echo "reference-cache-probe: invalid cache_scope '${CACHE_SCOPE}'" >&2
+              exit 2
+              ;;
+          esac
+
+          manifest_hash="$(shasum -a 256 "${MLXFAST_REFERENCE_MANIFEST_PATH}" | awk '{print $1}')"
+          safe_suffix="$(printf '%s' "${CACHE_KEY_SUFFIX}" | tr -c 'A-Za-z0-9_.-' '-')"
+          cache_key="laguna-xs-2.1-nvfp4-mlx-${CACHE_SCOPE}-${manifest_hash}-${safe_suffix}"
+          echo "key=${cache_key}" >> "${GITHUB_OUTPUT}"
+          echo "manifest_hash=${manifest_hash}" >> "${GITHUB_OUTPUT}"
+
+          mkdir -p "${MLXFAST_REFERENCE_DIR}"
+          {
+            echo "paths<<EOF"
+            if [[ "${CACHE_SCOPE}" == "full" ]]; then
+              echo "${MLXFAST_REFERENCE_DIR}"
+            else
+              shard_limit=0
+              case "${CACHE_SCOPE}" in
+                metadata) shard_limit=0 ;;
+                first-shard) shard_limit=1 ;;
+                two-shards) shard_limit=2 ;;
+              esac
+              awk -v dir="${MLXFAST_REFERENCE_DIR}" -v shard_limit="${shard_limit}" '
+                NF >= 3 && $1 !~ /^#/ {
+                  if ($3 ~ /\.safetensors$/) {
+                    if (shards < shard_limit) {
+                      print dir "/" $3
+                      shards++
+                    }
+                  } else {
+                    print dir "/" $3
+                  }
+                }
+              ' "${MLXFAST_REFERENCE_MANIFEST_PATH}"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Restore reference cache
+        id: restore_reference_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.cache_plan.outputs.paths }}
+          key: ${{ steps.cache_plan.outputs.key }}
+
+      - name: Inspect restored reference cache
+        run: |
+          set -euo pipefail
+          echo "reference-cache-probe: cache key ${{ steps.cache_plan.outputs.key }}"
+          echo "reference-cache-probe: cache hit ${{ steps.restore_reference_cache.outputs.cache-hit }}"
+          if [[ -e "${MLXFAST_REFERENCE_DIR}" ]]; then
+            du -sh "${MLXFAST_REFERENCE_DIR}" || true
+            find "${MLXFAST_REFERENCE_DIR}" -maxdepth 1 -type f -print | sort
+          else
+            echo "reference-cache-probe: no reference directory after restore"
+          fi
+
+      - name: Download missing cache scope
+        if: ${{ !inputs.restore_only && steps.restore_reference_cache.outputs.cache-hit != 'true' }}
+        env:
+          CACHE_SCOPE: ${{ inputs.cache_scope }}
+        run: |
+          set -euo pipefail
+          if [[ "${CACHE_SCOPE}" == "full" ]]; then
+            ./setup.sh
+          else
+            .github/scripts/download-reference-cache-scope.sh "${CACHE_SCOPE}"
+          fi
+          du -sh "${MLXFAST_REFERENCE_DIR}"
+
+      - name: Save reference cache
+        id: save_reference_cache
+        if: ${{ inputs.save_cache && !inputs.restore_only && steps.restore_reference_cache.outputs.cache-hit != 'true' }}
+        continue-on-error: ${{ !inputs.fail_on_save_error }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.cache_plan.outputs.paths }}
+          key: ${{ steps.cache_plan.outputs.key }}
+
+      - name: Probe summary
+        if: always()
+        run: |
+          {
+            echo "## Reference Cache Probe"
+            echo ""
+            echo "- scope: \`${{ inputs.cache_scope }}\`"
+            echo "- key: \`${{ steps.cache_plan.outputs.key }}\`"
+            echo "- manifest: \`${{ steps.cache_plan.outputs.manifest_hash }}\`"
+            echo "- restore hit: \`${{ steps.restore_reference_cache.outputs.cache-hit }}\`"
+            echo "- save outcome: \`${{ steps.save_reference_cache.outcome || 'skipped' }}\`"
+            echo "- path: \`${MLXFAST_REFERENCE_DIR}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
