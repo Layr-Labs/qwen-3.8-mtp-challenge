@@ -238,7 +238,7 @@ public final class Qwen36MTPBlockSession {
     // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        Swift.min(offeredDepth, 3)
     }
 
     /// The shipped schedule's width. See `draftPolicy`.
