@@ -173,9 +173,13 @@ public final class Qwen36MTPBlockSession {
         }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
+            // Width > 1 + nConfirmed=1 is the keep-prefix verify shape:
+            // GDN runs M=1 per token and writes a checkpoint after each
+            // prefix. Warm width 2 and 3 so the first scored K=2 reject
+            // does not compile that graph inside the clock.
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width == 2 ? 1 : 0)
+                cache: warmCache, nConfirmed: width > 1 ? 1 : 0)
             eval(verifyLogits)
             eval(warmCache.flatMap { $0.state })
         }
@@ -224,21 +228,15 @@ public final class Qwen36MTPBlockSession {
     /// the scored window, which the worker is never told. Acceptance history is
     /// available through `acceptedDraftTotal` / `rejectedDraftTotal` /
     /// `rollbackRoundCount`.
-    // OPERATOR K-TEST VARIANT, k = 1. Draft ONE token per round at whatever
-    // width the parent offers. This is the only thing that changes: the verify
-    // block is still `[primary] + drafts`, acceptance is still the longest
-    // common prefix over the target's own argmaxes, and the snapshot / rollback
-    // / re-forward repair is untouched. The emitted stream is therefore the
-    // same greedy target chain at any offer, which is what keeps every width
-    // bit-exact.
-    //
-    // Legal by the 2026-08-14 contract for the reason the doc comment above
-    // states: the return value need only land in
-    // `0 ... min(offeredDepth, Qwen36MTPLimits.maxDepth)`, and the trusted
-    // parent derives every ledger quantity from the drafts actually proposed.
+    // K=2 keep-committed-prefix on the promoted 1.232 K=1 frontier.
+    // Stock K=2 failed because a partial accept paid a second 64-layer
+    // repair. This policy drafts two tokens so the nConfirmed=1 GDN path
+    // can keep the committed prefix (after primary, or after primary+d0)
+    // the same way the promoted K=1 path keeps the primary. A parent
+    // offer of 0 still returns 0.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        Swift.min(offeredDepth, 2)
     }
 
     /// The shipped schedule's width. See `draftPolicy`.
@@ -393,17 +391,17 @@ public final class Qwen36MTPBlockSession {
             nextToken = proposal
         }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let fastK1 = draftCount == 1
+        // 2. Keep the generic pre-verify snapshot as a fallback. When this
+        //    round drafts at least once, nConfirmed=1 asks GDN for a
+        //    checkpoint after every prefix of the verify block so a partial
+        //    accept can keep that prefix instead of re-forwarding it.
+        let keepPrefix = draftCount >= 1
         let snapshot = Self.snapshotRecurrent(cache)
         let verifyInput = committed + drafts
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(
                 tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
-            cache: cache, nConfirmed: fastK1 ? 1 : 0)
+            cache: cache, nConfirmed: keepPrefix ? 1 : 0)
         let verifyArgmax = argmaxAll(verifyLogits)
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
@@ -446,15 +444,20 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts.prefix(acceptedCount))
             committedTokenCount += acceptedCount
 
-            // K=1 rejection: the target already computed the primary's exact
-            // logits and hidden row. Restore the recurrent checkpoint written
-            // immediately after that primary, trim just the rejected draft from
-            // attention caches, and carry row 0 forward. The trusted tail row is
-            // the same post-primary distribution, so reuse its already-recorded
-            // top-2 evidence rather than running the target again.
+            // Keep the committed prefix: the target already computed the
+            // logits and hidden row after primary + accepted drafts. Restore
+            // the GDN checkpoint written at that boundary, trim only the
+            // rejected attention rows, and take verify row `acceptedCount`
+            // as the next primary. That is the same object a repair forward
+            // of the committed block would recompute. Ledger tail top-2 is
+            // that same already-forced row. Nothing beyond the committed
+            // prefix crosses the round.
             let committedOffset = base + committed.count
-            if fastK1 && Self.restoreAfterSingleDraftReject(
-                cache, to: committedOffset)
+            if keepPrefix && Self.restoreAfterPrefixReject(
+                cache,
+                acceptedCount: acceptedCount,
+                draftCount: draftCount,
+                committedOffset: committedOffset)
             {
                 pendingLogitsRow = verifyLogits[
                     0..., acceptedCount ..< (acceptedCount + 1), 0...]
@@ -556,6 +559,7 @@ public final class Qwen36MTPBlockSession {
                 // The vendored depth-1 rollback snapshot, if the GDN forward ever
                 // wrote one, describes a frame this rollback just discarded.
                 arrays.rollbackState = nil
+                arrays.rollbackCheckpoints = []
                 continue
             }
             if entry.isTrimmable, entry.offset > base {
@@ -564,36 +568,52 @@ public final class Qwen36MTPBlockSession {
         }
     }
 
-    /// Restore the checkpoint produced by a two-token verify with
-    /// `nConfirmed == 1`. The checkpoint is the recurrent state immediately
-    /// after the primary; each attention cache is exactly one rejected draft
-    /// token ahead of that same committed offset.
+    /// Restore the GDN checkpoint after verify token `acceptedCount` and trim
+    /// rejected attention rows. Preflight every layer before mutating any of
+    /// them. Returning `false` leaves the cache untouched so the caller can
+    /// use the generic snapshot and repair path.
     ///
-    /// Preflight every layer before mutating any of them. Returning `false`
-    /// leaves the cache untouched so the caller can use the generic snapshot and
-    /// repair path safely.
-    private static func restoreAfterSingleDraftReject(
+    /// Checkpoint `i` is the recurrent state after verify token `i` (0 = after
+    /// the primary). Attention must sit exactly `draftCount - acceptedCount`
+    /// rows past the committed offset.
+    private static func restoreAfterPrefixReject(
         _ cache: [any KVCache],
-        to committedOffset: Int
+        acceptedCount: Int,
+        draftCount: Int,
+        committedOffset: Int
     ) -> Bool {
+        let rejected = draftCount - acceptedCount
+        guard rejected > 0, acceptedCount >= 0 else { return false }
+        let expectedTrim = committedOffset + rejected
         for entry in cache {
             if let arrays = entry as? ArraysCache {
-                guard arrays.rollbackState != nil else { return false }
+                let hasIndexed = arrays.rollbackCheckpoints.count > acceptedCount
+                let hasLegacy = acceptedCount == 0 && arrays.rollbackState != nil
+                guard hasIndexed || hasLegacy else { return false }
             } else if entry.isTrimmable {
-                guard entry.offset == committedOffset + 1 else { return false }
+                guard entry.offset == expectedTrim else { return false }
             } else {
                 return false
             }
         }
 
         for entry in cache {
-            if let arrays = entry as? ArraysCache,
-               let saved = arrays.rollbackState
-            {
-                arrays[0] = saved.0
-                arrays[1] = saved.1
+            if let arrays = entry as? ArraysCache {
+                let saved: (MLXArray, MLXArray)?
+                if arrays.rollbackCheckpoints.count > acceptedCount {
+                    saved = arrays.rollbackCheckpoints[acceptedCount]
+                } else if acceptedCount == 0 {
+                    saved = arrays.rollbackState
+                } else {
+                    saved = nil
+                }
+                if let saved {
+                    arrays[0] = saved.0
+                    arrays[1] = saved.1
+                }
                 arrays.rollbackState = nil
-            } else if entry.isTrimmable {
+                arrays.rollbackCheckpoints = []
+            } else if entry.isTrimmable, entry.offset > committedOffset {
                 _ = entry.trim(entry.offset - committedOffset)
             }
         }
@@ -603,6 +623,7 @@ public final class Qwen36MTPBlockSession {
     private static func clearRecurrentRollback(_ cache: [any KVCache]) {
         for entry in cache {
             (entry as? ArraysCache)?.rollbackState = nil
+            (entry as? ArraysCache)?.rollbackCheckpoints = []
         }
     }
 

@@ -43,12 +43,9 @@ public protocol Qwen36MTPTarget: AnyObject {
 
     /// Backbone forward returning `(logits, PRE-norm hidden)`.
     ///
-    /// INVARIANT #7 LIVES ON THIS CALL. `nConfirmed` must be 0 on every forward
-    /// this track issues: a non-zero value installs the vendored depth-1-only
-    /// rollback (`ArraysCache.rollbackState`, written by `Qwen35GatedDeltaNet`)
-    /// AND changes the gated-delta chunk geometry, both of which fight the
-    /// snapshot/rollback this track uses instead. The requirement is identical
-    /// on both conformers because both reach the same `Qwen35TextModel` method.
+    /// `nConfirmed == 0` is the generic any-width path. `nConfirmed > 0` on a
+    /// multi-row verify asks GDN for a restoreable checkpoint after every
+    /// prefix so a partial accept can keep that prefix. Serial width-1 stays 0.
     func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)

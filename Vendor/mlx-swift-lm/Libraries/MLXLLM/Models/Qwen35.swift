@@ -331,35 +331,40 @@ final class Qwen35GatedDeltaNet: Module {
         let finalSsmState: MLXArray
 
         if nConfirmed > 0 && nConfirmed < S {
-            // Split at nConfirmed boundary for the MTP 2-token verify forward.
-            // Run confirmed prefix first, snapshot rollback state, then run draft.
-            // omlx: GatedDeltaNet.__call__ nConfirmed > 0 branch
-            let maskC = mask.map { $0[0..., 0..<nConfirmed] }
-            let maskD = mask.map { $0[0..., nConfirmed...] }
-
-            let (outC, convC, ssmC) = processChunk(
-                qkv: qkv[0..., 0..<nConfirmed, 0...],
-                a: a[0..., 0..<nConfirmed, 0...],
-                b: b[0..., 0..<nConfirmed, 0...],
-                convState: convState,
-                ssmState: ssmState,
-                mask: maskC
-            )
-            // Snapshot (conv_state, ssm_state) after confirmed prefix for rollback.
-            // omlx: cache.rollback_state = (conv_c, ssm_c)
-            cache?.rollbackState = (convC, ssmC)
-
-            let (outD, convF, ssmF) = processChunk(
-                qkv: qkv[0..., nConfirmed..., 0...],
-                a: a[0..., nConfirmed..., 0...],
-                b: b[0..., nConfirmed..., 0...],
-                convState: convC,
-                ssmState: ssmC,
-                mask: maskD
-            )
-            out = concatenated([outC, outD], axis: 1)
-            finalConvState = convF
-            finalSsmState = ssmF
+            // Token-wise mixer so every prefix of a multi-row verify has a
+            // restoreable (conv, ssm) boundary. K=1 (S=2) is the same two
+            // M=1 chunks as the old nConfirmed=1 split. K=2 (S=3) writes
+            // checkpoints after the primary and after draft 0. Projections,
+            // FA, and MLP still run once on the full S.
+            var conv = convState
+            var ssm = ssmState
+            var chunks: [MLXArray] = []
+            chunks.reserveCapacity(S)
+            var snaps: [(MLXArray, MLXArray)] = []
+            snaps.reserveCapacity(S - 1)
+            for index in 0 ..< S {
+                let sl = index ..< (index + 1)
+                let (chunkOut, nextConv, nextSsm) = processChunk(
+                    qkv: qkv[0..., sl, 0...],
+                    a: a[0..., sl, 0...],
+                    b: b[0..., sl, 0...],
+                    convState: conv,
+                    ssmState: ssm,
+                    mask: mask.map { $0[0..., sl] }
+                )
+                chunks.append(chunkOut)
+                conv = nextConv
+                ssm = nextSsm
+                if index < S - 1 {
+                    snaps.append((nextConv[.ellipsis], nextSsm[.ellipsis]))
+                }
+            }
+            out = concatenated(chunks, axis: 1)
+            finalConvState = conv
+            // S >= 2 on this branch, so the loop always wrote a last SSM.
+            finalSsmState = ssm!
+            cache?.rollbackCheckpoints = snaps
+            cache?.rollbackState = snaps.first
         } else {
             // Standard single-chunk path (nConfirmed == 0 or S == 1).
             let (o, c, s) = processChunk(

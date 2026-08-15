@@ -1240,6 +1240,12 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
+    /// Per-prefix GDN checkpoints for a multi-row verify: index `i` is the
+    /// recurrent state after verify token `i` (0 = after the primary).
+    /// `rollbackState` stays `checkpoints.first` so the K=1 restore path
+    /// still works. Not part of `state` / `copy()`.
+    public var rollbackCheckpoints: [(MLXArray, MLXArray)] = []
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
