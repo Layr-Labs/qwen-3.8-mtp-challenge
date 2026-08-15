@@ -247,21 +247,28 @@ public final class Qwen36MTPBlockSession {
         let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
-        let primedDraftLogits = model.applyDraftLMHead(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         // Warm the complete proposal-side expression used by a live draft.
         // The compact vocabulary changes the reduction shape and adds an
         // on-device ID map, so warming logits alone leaves both kernels to
         // cold-JIT inside the first scored round.
-        let primedDraftID = model.mapDraftTokenIds(
-            argMax(primedDraftLogits, axis: -1).asType(.int32))
+        //
+        // LOAD-BEARING: this must warm `draftTokenID` -- the SAME expression
+        // the scored rounds now dispatch -- not the old
+        // `mapDraftTokenIds(argMax(applyDraftLMHead(...)))` chain. 7b33621's
+        // note records that the first compact-vocabulary attempt was
+        // parity-clean and faster in steady state on all 8 prompts and STILL
+        // LOST, because its warm evaluated compact logits while the live graph
+        // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
+        // the scored window. A new selection kernel resets that hazard exactly.
+        let primedDraftID = model.draftTokenID(
+            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadHiddenForward(
             hidden: foldHidden, nextTokenIds: foldTokens,
             cache: historyWarmCache)
-        eval(model.applyDraftLMHead(
+        eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
@@ -508,19 +515,27 @@ public final class Qwen36MTPBlockSession {
     /// every promoted receipt at cap 4 survived rank. Do not raise this
     /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
     ///
-    /// RAISED TO THE TRUSTED MAXIMUM — the wall is cracked structurally, by
-    /// removing the wide shapes rather than diagnosing the culprit op. For
-    /// verify widths 6...9, `Qwen35GatedDeltaNet` now runs the whole
-    /// recurrence (conv prologue + scan) as two sub-chunks of widths
-    /// [S-4, 4] — both inside the rank-proven 2...5 range — with the fp32
-    /// state chained losslessly between the calls, the lazy prefix REPLAY
-    /// mirrors the same chunk boundary (`verifyChunkBoundary` is the single
-    /// source of truth), and `Qwen35Attention` advances the KV cache and
-    /// runs SDPA in the same two steps, so every kernel invocation executes
-    /// at a (qL, kL = prefix + qL) shape a cap-4 verify already produces on
-    /// the ranked box. Widths 2...5 keep the previous code byte-for-byte,
-    /// so a run whose cost model never exceeds depth 4 is bit-identical to
-    /// the promoted stack.
+    /// RAISED TO THE TRUSTED MAXIMUM, AND THE CULPRIT IS NOW NAMED. The op
+    /// is SDPA dispatch, in the 16 full-attention layers only. From
+    /// `mlx/backend/metal/scaled_dot_product_attention.cpp` `use_fallback`:
+    /// the fused VECTOR kernel requires `qL * gqa_factor <= 32`, the fused
+    /// FULL kernel requires `head_dim` in {64, 80, 128}. This model is 24 Q
+    /// / 4 KV heads (gqa 6) at head_dim 256 — full is never eligible, and
+    /// vector dies at `qL >= 6`, so widths 6...9 fall to a composed unfused
+    /// attention with different arithmetic. That is the entire wall, and it
+    /// reproduces exactly: at widths 6...9 a single wide SDPA call diverges
+    /// from the one-row-at-a-time serial trajectory, while a [L-4, 4] split
+    /// is bit-exact against it; at widths 2...5 both are exact.
+    /// So only `Qwen35Attention` splits: it advances the KV cache and runs
+    /// SDPA in two steps of [L-4, 4], keeping every invocation at a
+    /// (qL <= 5, kL = prefix + qL) shape a cap-4 verify already produces on
+    /// the ranked box. `Qwen35GatedDeltaNet` does NOT split — it has no
+    /// SDPA, its scan takes T as a buffer rather than a template parameter
+    /// over a T-independent grid, and one full-width pass is bit-identical
+    /// to the chained sub-chunks in both y and the fp32 state at every width
+    /// 6...9 and every split point. Widths 2...5 keep the previous code
+    /// byte-for-byte, so a run whose cost model never exceeds depth 4 is
+    /// bit-identical to the promoted stack.
     private static let sdpaWidthWallDepthCap = Qwen36MTPLimits.maxDepth
 
     /// The greedy marginal-depth rule described at the policy's assignment.
@@ -802,9 +817,7 @@ public final class Qwen36MTPBlockSession {
             cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.mapDraftTokenIds(
-            argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                .asType(.int32))
+        var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
         // before the rest of the chain is built, and unlike the per-step
@@ -817,9 +830,7 @@ public final class Qwen36MTPBlockSession {
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.mapDraftTokenIds(
-                argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                    .asType(.int32))
+            draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])

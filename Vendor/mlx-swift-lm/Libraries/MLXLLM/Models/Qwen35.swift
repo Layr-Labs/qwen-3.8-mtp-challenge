@@ -523,22 +523,32 @@ final class Qwen35GatedDeltaNet: Module {
     /// reconstruct a committed recurrent prefix after the target acceptance
     /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
     /// midpoint state tensor is produced on the hot path.
-    /// WIDTH-WALL CHUNK BOUNDARY. Verify widths 6...9 drift from the serial
-    /// trajectory in top-2 values at rank (the `sdpaWidthWallDepthCap`
-    /// receipts: drift starts at the 6th row, widths 2...5 are bit-exact),
-    /// through wide-shape kernel selection in the recurrence prologue (the
-    /// conv runs over 3+S positions and is the shape-dependent op in this
-    /// path; the recurrence's own t-loop is order-independent of T). The fix
-    /// removes the wide shapes: split S in 6...9 into [S-4, 4] — both
-    /// sub-widths inside the rank-proven 2...5 range — chaining the fp32
-    /// recurrent state losslessly between the two calls. Replay MUST mirror
-    /// the same boundary (see `replayPrefix`), which is why this is the one
-    /// shared source of truth for it. Returns nil at widths that stay on the
-    /// proven single-chunk form.
-    fileprivate static func verifyChunkBoundary(_ rows: Int) -> Int? {
-        guard rows >= 6, rows <= 9 else { return nil }
-        return rows - 4
-    }
+    ///
+    /// WIDTH-WALL SCOPE — THE RECURRENCE IS NOT PART OF IT. The width-6...9
+    /// drift that capped useful draft depth is an SDPA DISPATCH artifact and
+    /// lives entirely in the 16 full-attention layers. From
+    /// `mlx/backend/metal/scaled_dot_product_attention.cpp` `use_fallback`:
+    /// the fused vector kernel needs `qL * gqa_factor <= 32` and the fused
+    /// full kernel needs `head_dim` in {64, 80, 128}. This model is 24 Q / 4
+    /// KV heads (gqa 6) at head_dim 256, so full is NEVER eligible and vector
+    /// dies at `qL >= 6` — exactly the observed wall. `Qwen35Attention` keeps
+    /// its own [L-4, 4] split for that reason.
+    ///
+    /// The GDN recurrence has no SDPA and is width-invariant by construction:
+    /// `gatedDeltaKernel` takes T as a BUFFER, not a template parameter, over
+    /// a T-independent grid, so widths 1...9 run the SAME compiled kernel; it
+    /// loads the fp32 state into registers once, runs the whole t-loop
+    /// in-register, and stores once, and StT is fp32 so the seam round-trip
+    /// is the identity. The conv prologue is a depthwise k=4 conv over a
+    /// slice of the same concatenated `convInput`, so each output row sees an
+    /// identical 4-element window either way. Measured on mlx 0.32.0 (the
+    /// vendored version, fast math off): one full-width pass is BIT-IDENTICAL
+    /// to the chained sub-chunks in y and in the fp32 state, for every width
+    /// 6...9 and at EVERY split point 1...S-1 — the last part being what lets
+    /// `replayPrefix` replay an arbitrary committed prefix in one call.
+    /// So the 48 GDN layers run ONCE. Dropping the redundant second pass
+    /// saves 48 scan launches, 48 conv+silu, 96 rms_norm, 192 concats and
+    /// ~302 MB of fp32 state traffic per wide round, for identical bytes out.
 
     private func processChunkStashingPrefix(
         qkv: MLXArray,
@@ -613,36 +623,24 @@ final class Qwen35GatedDeltaNet: Module {
                 recurrence.0, recurrence.1, qNormed, kNormed, v, g, beta)
         }
 
-        let out: MLXArray
-        let newSsmState: MLXArray
-        let tapeQ: MLXArray
-        let tapeK: MLXArray
-        let tapeV: MLXArray
-        let tapeG: MLXArray
-        let tapeBeta: MLXArray
-        if let c1 = Self.verifyChunkBoundary(S) {
-            let (out1, seamState, q1, k1, v1, g1, beta1) =
-                prologueAndScan(0, c1, ssmState)
-            let (out2, finalState, q2, k2, v2, g2, beta2) =
-                prologueAndScan(c1, S, seamState)
-            out = concatenated([out1, out2], axis: 1)
-            newSsmState = finalState
-            tapeQ = concatenated([q1, q2], axis: 1)
-            tapeK = concatenated([k1, k2], axis: 1)
-            tapeV = concatenated([v1, v2], axis: 1)
-            tapeG = concatenated([g1, g2], axis: 1)
-            tapeBeta = concatenated([beta1, beta2], axis: 1)
-        } else {
-            let (o, s, q, k, v, g, beta) =
-                prologueAndScan(0, S, ssmState)
-            out = o
-            newSsmState = s
-            tapeQ = q
-            tapeK = k
-            tapeV = v
-            tapeG = g
-            tapeBeta = beta
-        }
+        // ONE pass over all S rows at every width. See the note above the
+        // declaration: the recurrence is width-invariant, so the widths that
+        // break SDPA do not break this, and a second sub-chunk would only
+        // re-run 48 layers of conv + scan for byte-identical output.
+        //
+        // THE COMPILED g/beta SATELLITE RIDES ALONG UNCHANGED. `g` and `beta`
+        // are elementwise over the row axis — `computeGatedDeltaG` on a row
+        // slice of `a`, and `sigmoid(b)` — so the single wide call's tape is
+        // bit-identical to the two chunk tapes concatenated on axis 1. That is
+        // measured, not argued: the same receipt that unchunked this path also
+        // ran a compiled g/beta shape-specialization check against THIS
+        // satellite on mlx 0.32.0 (S=6...9 at splits [2,4] [3,4] [4,4] [5,4],
+        // g:exact beta:exact every time), because `compile(shapeless: true)`
+        // could in principle have specialised per width. It does not.
+        // So unchunking simply produces one chunk's worth of g/beta instead of
+        // two concatenated, and `PrefixReplayTape` carries them as before.
+        let (out, newSsmState, tapeQ, tapeK, tapeV, tapeG, tapeBeta) =
+            prologueAndScan(0, S, ssmState)
 
         let tape = ArraysCache.PrefixReplayTape(
             convInput: convInput,
@@ -689,14 +687,12 @@ final class Qwen35GatedDeltaNet: Module {
         guard canReplayPrefix(cache: cache, committedRows: committedRows),
               let tape = cache.prefixReplayTape
         else { return false }
-        // Replay MUST mirror the forward's chunk boundary (width-wall fix):
-        // a wide tape's forward ran as [c1, rowCount-c1], so the state after
-        // row t is the chained two-call state. Replaying rows 0 ..< r as one
-        // call would re-introduce a wide recurrence shape AND diverge from
-        // the forward's own chaining. r <= c1 is a prefix of the forward's
-        // first call; r > c1 replays the first call in full (bitwise the
-        // same call the forward made) and a prefix of the second from the
-        // reproduced seam state.
+        // Replay mirrors the forward exactly: the forward runs the tape's
+        // rows as ONE call at every width, so the state after row r is the
+        // single call's state at r. That is the same tensor a width-r call
+        // produces — the recurrence is prefix-decomposable at every split
+        // point, measured bit-exact for r in 1...S-1 at S in 6...9 (see the
+        // note above `processChunkStashingPrefix`). One call, no seam.
         func replayRange(
             _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
         ) -> MLXArray {
@@ -725,15 +721,7 @@ final class Qwen35GatedDeltaNet: Module {
             }
             return recurrence.1
         }
-        let boundarySsm: MLXArray
-        if let c1 = Self.verifyChunkBoundary(tape.rowCount),
-           committedRows > c1
-        {
-            let seamState = replayRange(0, c1, tape.ssmPre)
-            boundarySsm = replayRange(c1, committedRows, seamState)
-        } else {
-            boundarySsm = replayRange(0, committedRows, tape.ssmPre)
-        }
+        let boundarySsm = replayRange(0, committedRows, tape.ssmPre)
         cache[0] = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -1319,6 +1307,20 @@ public class Qwen35TextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
 
+    /// asyncEval ladder rung spacing, in layers. Measured optimum is 4 on a
+    /// standalone microbench of this layer stack at real geometry; see the
+    /// sweep table at the ladder site in `callAsFunction`. Retune here.
+    private static let asyncEvalLadderStride = 4
+
+    /// Widest forward the asyncEval ladder fires on. 9 = the widest legal
+    /// verify block: `MLXFastConstants.qwenMTPMaxDraftDepth` (8) drafts plus
+    /// the pending primary. Spelled as a literal because this vendored module
+    /// does not depend on the participant constants target; if that cap ever
+    /// moves, this must move with it. Anything wider than a verify block is
+    /// the seed prefill, which is deliberately out of scope — see the ladder
+    /// site in `callAsFunction`. Independently revertible from the stride.
+    private static let asyncEvalLadderMaxWidth = 9
+
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
 
@@ -1363,15 +1365,102 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
+        // asyncEval ladder. The host builds a ~64-layer graph before anything
+        // reaches the GPU; firing asyncEval at layer boundaries lets the GPU
         // start on the early layers while the host is still building the
         // rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step).
+        //
+        // 2026-08-16 — TWO CHANGES, both from a standalone microbench that
+        // reconstructs this layer stack at real geometry (affine-4/g64,
+        // hidden 5120, intermediate 17408, 24Q/4KV, head_dim 256, fused
+        // qkv + gate_up) with random weights: 32 distinct layers, arms
+        // interleaved WITHIN one process, min-of-20 per arm, baseline = one
+        // lazy eval per forward:
+        //
+        //     asyncEval every 16 layers    -0.40%
+        //     asyncEval every  8 layers    -1.26%
+        //     asyncEval every  4 layers    -2.30%   <- optimum
+        //     asyncEval every  2 layers    -2.23%
+        //     asyncEval every  1 layer     -2.10%   <- past the optimum
+        //
+        // (1) THE WIDTH GATE IS WIDENED, 2 -> 9. It read `inputs.dim(1) <= 2`,
+        //     so the ladder was OFF for every wide verify — that is, off on
+        //     the whole medal path, where the median run sits near verify
+        //     width 6. Nothing in the mechanism is width-dependent: the host
+        //     still builds all 64 layers before the GPU sees the first one.
+        //
+        //     It is widened to 9 rather than removed outright, deliberately.
+        //     9 is `qwenMTPMaxDraftDepth`, so `<= 9` covers EVERY legal verify
+        //     width and excludes exactly one thing: the 512-row seed prefill
+        //     in `begin()`. That prefill is a regime the sweep never covered —
+        //     it is a large, already well-pipelined graph where the host is
+        //     not the bottleneck, and chopping it into 18 submissions could
+        //     plausibly move either way. It also sits inside the scored
+        //     window, so an unmeasured change there is a risk taken for no
+        //     modelled gain: the mechanism's entire value is on the medal
+        //     path at verify widths ~5.8 and ~6.4. The direct cost of either
+        //     choice is negligible (18 rungs x ~1.2 us of dispatch against a
+        //     prefill measured in hundreds of ms), so this is a question of
+        //     unmeasured regime risk, not of overhead.
+        // (2) RUNG SPACING 10 -> 4. The old schedule (0,1,9,19,29,39,49,57) is
+        //     ~every 10, which the sweep prices near -0.4%; every 4 is -2.3%.
+        //     The two front rungs are kept — the GPU is idle longest at the
+        //     start, so the earliest submissions are the valuable ones.
+        //
+        // CAVEAT, stated rather than hidden: the microbench stack is ALL
+        // FULL-ATTENTION layers. This backbone is 48/64 GatedDeltaNet, whose
+        // recurrence has a different dependency structure and may already
+        // serialise in a way that eats the overlap — so -2.3% is an upper
+        // bound until a paired real-model run confirms it.
+        //
+        // The sweep's other caveat no longer applies in this bundle. It warned
+        // that widths 6...9 run a separate [S-4, 4] GDN sub-chunk path never
+        // exercised with the ladder on. That path is GONE: the same bundle
+        // deletes `verifyChunkBoundary`, so `Qwen35GatedDeltaNet` now runs ONE
+        // pass at every width and the ladder sees the identical GDN code at
+        // width 9 as at width 1. Only `Qwen35Attention` still splits, and it
+        // splits for SDPA dispatch reasons unrelated to submission timing.
+        // The untested combination the sweep flagged does not exist here.
+        //
+        // SIZE THE PAIR TOGETHER, NOT SEPARATELY. The two mechanisms are
+        // mildly ANTI-SYNERGISTIC in magnitude, though not in correctness.
+        // Unchunking removes 48 scan launches and 48 conv prologues per wide
+        // round — and that is PRECISELY the host graph-building work the
+        // ladder exists to overlap. Shrinking the host-side graph shrinks the
+        // window the ladder has to hide GPU idle in, so the ladder's measured
+        // share at wide widths should come in under the -2.3% microbench
+        // figure for that reason alone, independent of the GDN serialisation
+        // question above. Modelled independently the two price near +5 and
+        // +6; taken together expect nearer +8 than +11. If the receipt lands
+        // in that band the cause is this overlap, not a fault.
+        //
+        // CLOSEST RANKED EVIDENCE AGAINST: a prior submission whose thesis was
+        // INTER-round host pre-issue was rejected at -1.34%, with identical
+        // effective draft lengths and uniform loss across prompts. That was
+        // between rounds rather than within the forward, so it should not
+        // govern this change — but it is direct ranked evidence that
+        // host-overlap lanes can tax rather than pay, and it is the reason
+        // this ships with a stated revert trigger instead of as a free win.
+        // If the paired run comes back under ~1%, revert. If it regresses,
+        // suspect GDN recurrence serialisation first, then the stride, and
+        // narrow the gate back to `inputs.dim(1) <= 2` before abandoning the
+        // stride change. The gate and the stride are INDEPENDENTLY
+        // REVERTIBLE: `asyncEvalLadderStride` back to 10-ish restores the old
+        // spacing, and the gate constant restores the old width coverage,
+        // and neither edit requires touching the other.
+        //
+        // FIDELITY: `asyncEval` changes only WHEN work is submitted, never
+        // what is computed. No op is added or removed, no accumulation order
+        // moves, and MLX does not fuse across ops outside `compile()`, so
+        // forcing materialisation at a layer boundary cannot move a value.
+        // The exact-token gate has nothing to catch.
+        //
+        // A verify block is at most 8 drafts + 1 pending primary = 9 rows, so
+        // this covers every verify width the session can produce. Anything
+        // wider is the seed prefill, deliberately excluded per (1) above.
+        let ladderActive = inputs.dim(1) <= Self.asyncEvalLadderMaxWidth
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1380,13 +1469,8 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
-                    asyncEval(hiddenStates)
-                default:
-                    break
-                }
+            if ladderActive, i <= 1 || (i + 1) % Self.asyncEvalLadderStride == 0 {
+                asyncEval(hiddenStates)
             }
         }
 
@@ -1421,6 +1505,90 @@ public class Qwen35TextModelInner: Module {
         return true
     }
 }
+
+// MARK: - fused compact-draft selection
+//
+// PROPOSAL SIDE ONLY. The draft argmax picks which token the MTP head
+// PROPOSES; the pinned target re-derives every emitted token from the exact
+// `lmHead` and the trusted parent replays the whole stream afterwards, so
+// nothing downstream of this kernel can reach an emitted token or a ledger
+// value. See `applyDraftLMHead`'s doc comment for the same argument applied
+// to the compact row set (promoted 7b33621).
+//
+// It replaces SIX MLX primitives that existed only to turn a 98,336-wide row
+// into one integer:
+//     padded[0..., 0..., 0 ..< 98_330]     // slice off the fast-shape padding
+//     argMax(axis: -1)                     // uint32
+//     .asType(.int32)
+//     ids .< 98_304                        // mapDraftTokenIds
+//     ids + 149_740
+//     which(...)
+// Ordering is identical to `argMax`: strictly-greater value wins, an exact tie
+// goes to the LOWER id, and a NaN never beats a non-NaN. Bounding at
+// `REAL_COUNT` in the kernel is exactly what the pre-argmax slice did, so the
+// six duplicated padding rows stay unreachable even on a tie.
+private let qwen35DraftSelectKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_select",
+    inputNames: ["logits"],
+    outputNames: ["token_id"],
+    source: """
+        uint lane = thread_position_in_threadgroup.x;
+        float best_value = 0.0f;
+        uint  best_id    = 0;
+        bool  have       = false;
+
+        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
+            float value = float(logits[index]);
+            bool value_nan = isnan(value);
+            bool take;
+            if (!have) {
+                take = true;
+            } else if (value_nan != isnan(best_value)) {
+                take = !value_nan;
+            } else if (value > best_value) {
+                take = true;
+            } else if (value < best_value) {
+                take = false;
+            } else {
+                take = index < best_id;
+            }
+            if (take) { best_value = value; best_id = index; have = true; }
+        }
+
+        threadgroup float scratch_value[TG_SIZE];
+        threadgroup uint  scratch_id[TG_SIZE];
+        scratch_value[lane] = have ? best_value : NAN;
+        scratch_id[lane]    = have ? best_id : 0xFFFFFFFFu;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                float a = scratch_value[lane];
+                float b = scratch_value[lane + stride];
+                uint  ai = scratch_id[lane];
+                uint  bi = scratch_id[lane + stride];
+                bool a_empty = (ai == 0xFFFFFFFFu);
+                bool b_empty = (bi == 0xFFFFFFFFu);
+                bool take_b;
+                if (b_empty)      { take_b = false; }
+                else if (a_empty) { take_b = true; }
+                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
+                else if (b > a)   { take_b = true; }
+                else if (b < a)   { take_b = false; }
+                else              { take_b = bi < ai; }
+                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint id = scratch_id[0];
+            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
+        }
+    """,
+    header: "",
+    ensureRowContiguous: false
+)
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
@@ -1726,6 +1894,41 @@ extension Qwen35TextModel: MTPCapable {
         return padded[0..., 0..., 0 ..< Self.compactDraftRealCount]
     }
 
+    /// One draft proposal: the compact projection's argmax, already mapped back
+    /// to the tokenizer's ID space, as a device-resident `[1, 1]` int32.
+    ///
+    /// Same value as `mapDraftTokenIds(argMax(applyDraftLMHead(x), axis: -1))`,
+    /// produced in ONE dispatch instead of six. `applyDraftLMHead` and
+    /// `mapDraftTokenIds` are unchanged and still serve the declared-head path
+    /// and the untimed warm.
+    public func draftTokenID(_ x: MLXArray) -> MLXArray {
+        // A declared `draft_lm_head` is full-vocabulary and needs no remap, so
+        // the fused path (which bakes in the compact bounds) does not apply.
+        guard _draftHeadW == nil, usesCompactDraftVocabulary else {
+            return argMax(applyDraftLMHead(x), axis: -1).asType(.int32)
+        }
+        if _compactDraftHead == nil {
+            _compactDraftHead = makeCompactDraftHead()
+        }
+        let padded = _compactDraftHead!(x)
+        let tgSize = 1024
+        let outputs = qwen35DraftSelectKernel(
+            [padded.reshaped([Self.compactDraftPaddedCount])],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                ("CONTROL_OFFSET",
+                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ("TG_SIZE", tgSize),
+            ],
+            grid: (tgSize, 1, 1),
+            threadGroup: (tgSize, 1, 1),
+            outputShapes: [[1, 1]],
+            outputDTypes: [.int32]
+        )
+        return outputs[0]
+    }
+
     /// Map compact draft IDs back to the tokenizer's full ID space without a
     /// host readback. The low 98,304 rows retain their IDs; the appended rows
     /// are Qwen's official text/control tokens 248,044 ... 248,069.
@@ -1889,6 +2092,11 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.applyDraftLMHead`.
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
         languageModel.applyDraftLMHead(x)
+    }
+
+    /// See `Qwen35TextModel.draftTokenID`.
+    public func draftTokenID(_ x: MLXArray) -> MLXArray {
+        languageModel.draftTokenID(x)
     }
 
     /// See `Qwen35TextModel.mapDraftTokenIds`.
