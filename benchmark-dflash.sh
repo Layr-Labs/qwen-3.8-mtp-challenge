@@ -181,13 +181,29 @@ fi
 # into a permanent false "stale weights" abort -- so reuse benchmark.sh's single
 # definition of source_hash() instead of copying it. Fail closed if the
 # extraction stops finding it.
-source_hash_definition="$(awk '/^source_hash\(\) \{/,/^\}/' benchmark.sh)"
+#
+# resolve_reference_path() is extracted with it because source_hash() CALLS it:
+# the digest covers the reference repo@revision and the sha256 of its
+# config.json, so a weights/ tree transformed from a different checkpoint can no
+# longer pass as fresh. Extracting source_hash() alone would abort on an
+# undefined function.
+source_hash_definition="$(
+  awk '/^resolve_reference_path\(\) \{/,/^\}/' benchmark.sh
+  awk '/^source_hash\(\) \{/,/^\}/' benchmark.sh
+)"
 if [[ "${source_hash_definition}" != *"shasum -a 256"* ]]; then
   echo "benchmark-dflash.sh: could not reuse benchmark.sh's source_hash() definition;" >&2
   echo "benchmark-dflash.sh: benchmark.sh has been refactored -- refusing to guess the transform-source digest" >&2
   exit 1
 fi
 eval "${source_hash_definition}"
+for reused_definition in resolve_reference_path source_hash; do
+  if ! declare -F "${reused_definition}" >/dev/null 2>&1; then
+    echo "benchmark-dflash.sh: could not reuse benchmark.sh's ${reused_definition}();" >&2
+    echo "benchmark-dflash.sh: benchmark.sh has been refactored -- refusing to guess the transform-source digest" >&2
+    exit 1
+  fi
+done
 
 wanted_source_hash="$(source_hash)"
 current_source_hash="$(cat "${weights_path}/.benchmark-source.sha256" 2>/dev/null | tr -d '[:space:]' || true)"

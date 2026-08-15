@@ -2223,6 +2223,95 @@ private func writeSetupVendoredFixture(at checkout: URL) throws {
     )
 }
 
+/// setup.sh derives the metadata files it downloads FROM THE SELECTED MANIFEST.
+/// It has to: one downloader provisions two artifacts, and the checked-in
+/// manifests disagree about almost every metadata file. Run the real function
+/// against the two real fixtures.
+///
+/// The hard-coded array this replaced listed `.gitattributes` and `LICENSE.md`,
+/// neither of which the backbone repository publishes, so a fresh `./setup.sh`
+/// aborted with "reference manifest has no entry for .gitattributes" before
+/// fetching a single shard; the same list demanded a README, a tokenizer and a
+/// chat template from the MTP head, which will never have any of them. It also
+/// skipped `generation_config.json`, which the backbone manifest DOES pin.
+@Test
+func setupDerivesTheMetadataDownloadListFromTheSelectedManifest() throws {
+    let script = """
+    eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+    echo "backbone: $(reference_manifest_metadata_files \\
+      fixtures/reference_qwen3_8_27b_4bit.sha256 | tr '\\n' ' ')"
+    echo "head: $(reference_manifest_metadata_files \\
+      fixtures/qwen3_8_27b_mtp_head.sha256 | tr '\\n' ' ')"
+    """
+    let result = try runSetupBash(script, environment: [
+        "REPO_ROOT": FileManager.default.currentDirectoryPath
+    ])
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    // Backbone: every pinned record except the three safetensors shards, which
+    // download_reference_shards fetches in parallel off the index instead.
+    #expect(result.stdout.contains(
+        "backbone: README.md chat_template.jinja config.json generation_config.json "
+            + "model.safetensors.index.json tokenizer.json tokenizer_config.json \n"
+    ))
+    // Head: the four-file published tree minus its one shard. No README, no
+    // tokenizer, no chat template -- and `.gitattributes` IS pinned here even
+    // though the backbone does not pin one.
+    #expect(result.stdout.contains(
+        "head: .gitattributes config.json model.safetensors.index.json \n"
+    ))
+    #expect(!result.stdout.contains("LICENSE.md"))
+    #expect(!result.stdout.contains(".safetensors "))
+}
+
+/// The derivation fails CLOSED. A manifest that names no non-shard record would
+/// otherwise turn into a download of nothing followed by a confusing "missing
+/// config.json" -- and a manifest truncated back to its header would provision
+/// an empty directory quietly. The one exception is
+/// MLXFAST_REFERENCE_HASH_VERIFY=0, where a missing manifest is legitimate
+/// (reference_file_is_current short-circuits before reading it) and the minimal
+/// required pair is used instead.
+@Test
+func metadataDerivationFailsClosedExceptWhenHashVerificationIsOff() throws {
+    let root = try setupTemporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let headerOnly = root.appendingPathComponent("header-only.sha256")
+    try "# SHA256 manifest for nothing.\n#\n".write(
+        to: headerOnly, atomically: true, encoding: .utf8)
+    let malformed = root.appendingPathComponent("malformed.sha256")
+    try "deadbeef 12 config.json trailing-column\n".write(
+        to: malformed, atomically: true, encoding: .utf8)
+
+    let script = """
+    eval "$(sed '/^ensure_swift_toolchain$/,$d' "${REPO_ROOT}/setup.sh")"
+    header_status=0
+    reference_manifest_metadata_files "${HEADER_ONLY}" || header_status=$?
+    [[ "${header_status}" != "0" ]]
+    malformed_status=0
+    reference_manifest_metadata_files "${MALFORMED}" || malformed_status=$?
+    [[ "${malformed_status}" != "0" ]]
+    # Missing manifest with verification ON is the existing manifest-missing
+    # error path and stays an error.
+    missing_status=0
+    REFERENCE_HASH_VERIFY=1 reference_manifest_metadata_files \\
+      "${MISSING}" || missing_status=$?
+    [[ "${missing_status}" != "0" ]]
+    # ...and with verification OFF it falls back to the minimal pair.
+    echo "fallback: $(REFERENCE_HASH_VERIFY=0 reference_manifest_metadata_files \\
+      "${MISSING}" | tr '\\n' ' ')"
+    """
+    let result = try runSetupBash(script, environment: [
+        "REPO_ROOT": FileManager.default.currentDirectoryPath,
+        "HEADER_ONLY": headerOnly.path,
+        "MALFORMED": malformed.path,
+        "MISSING": root.appendingPathComponent("absent.sha256").path,
+    ])
+    #expect(result.status == 0, "stdout: \(result.stdout) stderr: \(result.stderr)")
+    #expect(result.stderr.contains("names no non-shard metadata files"))
+    #expect(result.stderr.contains("malformed record in"))
+    #expect(result.stderr.contains("reference manifest missing at"))
+    #expect(result.stdout.contains("fallback: config.json model.safetensors.index.json \n"))
+}
+
 // The dependency graph is frozen by challenge policy: both build entrypoints
 // assert Package.swift/Package.resolved match the committed state before
 // building and pass --force-resolved-versions so SwiftPM fails closed instead

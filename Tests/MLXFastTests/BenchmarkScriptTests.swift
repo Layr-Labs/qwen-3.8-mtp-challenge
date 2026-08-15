@@ -30,19 +30,40 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("DEFAULT_REFERENCE_FALLBACK_BASE_URL=\"\""))
     #expect(setup.contains("REFERENCE_BASE_URL=\"${MLXFAST_REFERENCE_BASE_URL:-${DEFAULT_REFERENCE_BASE_URL}}\""))
     #expect(setup.contains("REFERENCE_MANIFEST_PATH=\"${MLXFAST_REFERENCE_MANIFEST_PATH:-fixtures/reference_qwen3_8_27b_4bit.sha256}\""))
-    for metadata in [
-        ".gitattributes",
-        "LICENSE.md",
-        "README.md",
-        "chat_template.jinja",
-        "config.json",
-        "model.safetensors.index.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ] {
-        #expect(setup.contains("  \"\(metadata)\""))
-    }
+    // The metadata download list is DERIVED FROM THE SELECTED MANIFEST, never
+    // hard-coded, because ONE downloader provisions TWO artifacts whose
+    // metadata trees legitimately disagree: the backbone pins
+    // generation_config.json and NO .gitattributes/LICENSE.md, while the MTP
+    // head (setup-qwen-mtp.sh drives this same downloader at
+    // fixtures/qwen3_8_27b_mtp_head.sha256) pins .gitattributes and carries no
+    // README, no tokenizer and no chat template at all. The hard-coded array
+    // that used to live here was wrong for BOTH of them in both directions: a
+    // fresh ./setup.sh died on "reference manifest has no entry for
+    // .gitattributes", head provisioning demanded files that will never exist,
+    // and generation_config.json -- which the backbone manifest DOES pin -- was
+    // never fetched, which the ranked workflow's both-directions verify_cache
+    // inventory then rejects the cache for.
+    #expect(!setup.contains("REFERENCE_REQUIRED_METADATA_FILES"))
     #expect(!setup.contains("REFERENCE_OPTIONAL_METADATA_FILES"))
+    #expect(setup.contains("reference_manifest_metadata_files() {"))
+    #expect(setup.contains("if ! metadata_list=\"$(reference_manifest_metadata_files)\"; then"))
+    // *.safetensors is excluded from the derived list: shards are downloaded
+    // separately and in parallel, driven by model.safetensors.index.json
+    // through list_reference_shards.
+    #expect(setup.contains("if [[ \"${relative_path}\" == *.safetensors ]]; then"))
+    // Fail closed on a derivation that yields nothing -- a header-only manifest
+    // stub, or one that is all shards -- instead of provisioning an empty
+    // directory quietly.
+    #expect(setup.contains("names no non-shard metadata files"))
+    // ...and config.json plus the index stay hard post-download requirements
+    // whatever the manifest happens to name.
+    #expect(setup.contains("downloaded checkpoint is missing config.json"))
+    #expect(setup.contains("downloaded checkpoint is missing model.safetensors.index.json"))
+    // MLXFAST_REFERENCE_HASH_VERIFY=0 is the one mode where a missing manifest
+    // is legitimate (reference_file_is_current short-circuits before reading
+    // it), so the derivation falls back to that minimal required pair rather
+    // than failing or inventing names.
+    #expect(setup.contains("printf '%s\\n' \"config.json\" \"model.safetensors.index.json\""))
     // 3 parallel shard downloads by default; env-overridable.
     #expect(setup.contains("REFERENCE_DOWNLOAD_JOBS=\"${MLXFAST_REFERENCE_DOWNLOAD_JOBS:-3}\""))
     #expect(setup.contains("DEFAULT_HF_HOME=\"${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}\""))
@@ -109,6 +130,87 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(main.contains("wait_for_mlx_metallib_build\ncheck_mlxfast_cli\nprint_setup_summary \"ready\""))
     #expect(setup.contains("is not on PATH, so"))
     #expect(setup.contains("external Yukon installer"))
+
+    // The pinned backbone repository is PUBLIC since the 2026-08-14 publish, so
+    // the documented default is an anonymous fetch and
+    // MLXFAST_REFERENCE_AUTH_HEADER is an optional fallback (private mirror,
+    // rate-limited fetch), not a prerequisite. The old text told every
+    // participant they needed a token to run ./setup.sh at all.
+    #expect(setup.contains("# The repository is PUBLIC, so the default fetch is ANONYMOUS"))
+    #expect(!setup.contains("The repository is PRIVATE, so a fetch needs credentials"))
+    #expect(setup.contains("REFERENCE_AUTH_HEADER=\"${MLXFAST_REFERENCE_AUTH_HEADER:-}\""))
+
+    // ...and the help text names the checkpoint this script actually downloads.
+    // It described the retired Poolside Laguna XS 2.1 NVFP4 target long after
+    // the repin.
+    #expect(setup.contains("builds mlx.metallib, and downloads the Qwen 3.8 27B MLX 4-bit reference"))
+    #expect(!setup.contains("Poolside Laguna XS 2.1 NVFP4 reference"))
+
+    // MLXFAST_SKIP_SWIFT_BUILD lets setup-qwen-mtp.sh's delegated download reuse
+    // the products ./setup.sh just built instead of relinking both of them
+    // (~25s of pure waste on the ordinary two-command path). It FAILS OPEN: a
+    // missing product builds anyway, so a standalone ./setup-qwen-mtp.sh on a
+    // fresh clone still works. The knob never decides whether the harness
+    // exists, only whether it is rebuilt.
+    #expect(setup.contains("if [[ \"${MLXFAST_SKIP_SWIFT_BUILD:-0}\" == \"1\" ]]; then"))
+    #expect(setup.contains("MLXFAST_SKIP_SWIFT_BUILD=1 and both products are present; reusing"))
+    #expect(setup.contains("MLXFAST_SKIP_SWIFT_BUILD=1 but a product is missing; building anyway"))
+    #expect(setup.contains("  MLXFAST_SKIP_SWIFT_BUILD=1         Reuse the Swift products from a previous"))
+
+    // MLXFAST_SETUP_SUMMARY_ROLE keeps the closing summary honest during
+    // delegated head provisioning: REFERENCE_DIR is the MTP head there, so the
+    // generic "transform --reference ... --output weights" next step would tell
+    // the reader to overwrite the target weights with a 15-tensor head. Prose
+    // only; an unrecognised value is refused rather than defaulted.
+    #expect(setup.contains("SETUP_SUMMARY_ROLE=\"${MLXFAST_SETUP_SUMMARY_ROLE:-target}\""))
+    #expect(setup.contains("MLXFAST_SETUP_SUMMARY_ROLE must be 'target' or 'mtp-head'"))
+    #expect(setup.contains("  ${checkpoint_label}: ${reference_line}"))
+    #expect(setup.contains("./benchmark-qwen-mtp.sh --local-iterate"))
+    #expect(setup.contains("head provisioning is complete; the target weights/ tree belongs to ./setup.sh"))
+}
+
+/// `setup-qwen-mtp.sh` provisions the MTP head by DELEGATING to `setup.sh`'s
+/// downloader, so its contract is the environment it hands over. Two entries
+/// were added after a QA pass measured the delegated run rebuilding the Swift
+/// harness for nothing and printing target-shaped advice over a head cache.
+@Test
+func headProvisioningDelegatesWithoutRebuildingOrMisadvising() throws {
+    let runner = try String(contentsOfFile: "setup-qwen-mtp.sh", encoding: .utf8)
+
+    // The head is provisioned through setup.sh's downloader, driven at the head
+    // manifest -- which is also why the metadata list must come FROM that
+    // manifest (see setupScriptDefaultsToFastReferenceMirror): the head tree is
+    // four files and shares almost nothing with the backbone's.
+    #expect(runner.contains("MLXFAST_REFERENCE_MANIFEST_PATH=\"${MTP_HEAD_MANIFEST}\""))
+    #expect(runner.contains("fixtures/qwen3_8_27b_mtp_head.sha256"))
+
+    // No second Swift build: ./setup.sh already built both products, and
+    // nothing about them can have changed between the two commands.
+    #expect(runner.contains("MLXFAST_SKIP_SWIFT_BUILD=1"))
+    #expect(!runner.contains("rebuilds the Swift binaries if they are stale"))
+
+    // The summary must not tell a head-provisioning reader to transform
+    // REFERENCE_DIR into weights/.
+    #expect(runner.contains("MLXFAST_SETUP_SUMMARY_ROLE=mtp-head"))
+
+    // Both pinned repositories are public as of the 2026-08-14 publish; the
+    // header claimed an unauthenticated fetch 401s and demanded a token.
+    #expect(runner.contains("# THE HEAD REPOSITORY IS PUBLIC."))
+    #expect(!runner.contains("THE HEAD REPOSITORY IS PRIVATE"))
+    #expect(!runner.contains("401"))
+
+    // Prose names the artifacts actually pinned (3.8), while the historical
+    // note about the 3.6 defaults this file used to carry stays intact.
+    #expect(runner.contains("Provision the organizer-pinned Qwen 3.8 27B MTP HEAD"))
+    #expect(runner.contains("Provision the organizer-pinned Qwen 3.8 27B MTP head."))
+    #expect(runner.contains("the Qwen 3.8 27B reference checkpoint"))
+    #expect(runner.contains("EigenLabs/Qwen3.8-27B-MTP-bf16"))
+
+    // The delegated run still must not mutate global tool state or repoint the
+    // shared reference_weights/ compatibility symlink at the head.
+    #expect(runner.contains("MLXFAST_REFERENCE_COMPAT_LINK="))
+    #expect(runner.contains("MLXFAST_SKIP_HOMEBREW_INSTALL=1"))
+    #expect(runner.contains("MLXFAST_SKIP_MLX_METALLIB=1"))
 }
 
 
@@ -151,54 +253,68 @@ func poolsideNVFP4DistributionIdentityIsPinned() throws {
         encoding: .utf8
     )
     // The three PINNED HEADER LINES keep the shape the 3.6 manifest had, so a
-    // reader (and setup.sh's own header parse) sees the same file. The
-    // repository line names our conversion; the Revision line carries the
-    // pending marker, and asserting it through the same `revision` binding as
-    // the constants above is what keeps the two from drifting apart while both
-    // are pending.
+    // reader (and setup.sh's own header parse) sees the same file. Asserting
+    // the Revision line through the same `revision` binding as the constants
+    // above is what keeps the compiled pin and the fixture from drifting apart.
     #expect(manifest.contains("# SHA256 manifest for \(repository)."))
     #expect(manifest.contains("# Revision: \(revision)"))
     #expect(manifest.contains("# Format: <sha256> <byte_count> <relative_path>"))
 
-    // THE BODY IS A DELIBERATE STUB. The per-file records are generated from
-    // the pinned snapshot on the serving box and land in a follow-up commit;
-    // until then this file pins NO records, and the whole-manifest shape pins
-    // MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS / _BYTES carry
-    // QWEN38-PENDING-RELEASE so the ranked job fails on the missing PIN rather
-    // than on a byte comparison.
-    //
-    // The 3.6 records were deleted rather than carried. The cutover commit kept
-    // them, reasoning that a zero-record manifest verifies zero files and
-    // reports success -- true, and it stopped being the relevant risk when the
-    // checkpoint resolved: 3.6 records checked against a 3.8 cache directory
-    // report every file missing, which reads as a corrupt download rather than
-    // as an unfinished pin.
-    //
-    // WHEN THE BODY LANDS, this assertion inverts and the record-level checks
-    // it replaced come back: every file of the published revision pinned,
-    // including .gitattributes, because the ranked workflow's `verify_cache`
-    // rejects any cache file the manifest does not name (run 31665285024 died
-    // on exactly that). The file count and byte total are not predicted here --
-    // the 11-file / ~15.2 GB figures this comment once carried described the
-    // terminated third-party conversion, and our own shard split is measured at
-    // publish.
+    // THE BODY LANDED with the 2026-08-14 publish, and this assertion inverted
+    // with it: it previously required an EMPTY record body plus the
+    // QWEN38-PENDING-RELEASE / "BODY PLACEHOLDER" stub markers, which is what
+    // the file looked like while the upload was outstanding. Those three
+    // assertions were left behind by the publish commit and were failing
+    // against the shipped fixture; the record-level checks below are what they
+    // were always meant to become.
     let records = manifest
         .split(separator: "\n")
         .filter { !$0.hasPrefix("#") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+    let recordPaths = records.compactMap { $0.split(separator: " ").last.map(String.init) }
+    // Field-safe on purpose: a malformed record must fail the byte assertion,
+    // not trap on an index.
+    let recordBytes = records.reduce(0) { total, line in
+        total + (line.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0)
+    }
+    // The shape pins are summed from the digests they have to agree with, and
+    // they are the same numbers the ranked workflow carries as
+    // MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS / _BYTES. A manifest that LOSES
+    // a record cannot be caught by per-file hashing -- it would verify fewer
+    // files and report success -- which is why the count is pinned here too.
+    #expect(records.count == 10, "manifest carries \(records.count) records, not 10")
+    #expect(recordBytes == 15_153_237_117, "manifest sums to \(recordBytes) bytes")
     #expect(
-        records.isEmpty,
-        """
-        fixtures/reference_qwen3_8_27b_4bit.sha256 has grown \(records.count) \
-        record(s). If the 3.8 manifest body has been generated, restore the \
-        per-file assertions here and resolve \
-        MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS / _BYTES and the contract \
-        fixture's target.expected_source_bytes in the same commit.
-        """
+        recordPaths == [
+            "README.md",
+            "chat_template.jinja",
+            "config.json",
+            "generation_config.json",
+            "model-00001-of-00003.safetensors",
+            "model-00002-of-00003.safetensors",
+            "model-00003-of-00003.safetensors",
+            "model.safetensors.index.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ],
+        "manifest names \(recordPaths)"
     )
-    // The stub says so in as many words, so a reader who opens the file learns
-    // what is missing rather than inferring it from an absence.
-    #expect(manifest.contains("QWEN38-PENDING-RELEASE"))
-    #expect(manifest.contains("BODY PLACEHOLDER"))
+    // Every non-shard record here is a file setup.sh downloads, because the
+    // metadata download list is DERIVED from this body rather than hard-coded
+    // (see setupScriptDefaultsToFastReferenceMirror). generation_config.json is
+    // the reason that matters: the old hard-coded list never fetched it even
+    // though it is pinned, and the ranked workflow's `verify_cache` runs a
+    // strict inventory in BOTH directions.
+    //
+    // KNOWN OPEN ITEM, recorded rather than asserted: the published repository
+    // also carries the `.gitattributes` Hugging Face generates for every repo,
+    // and this manifest deliberately does NOT pin it -- the pin was published
+    // as a ten-record shape and moving it to eleven is the operator's call, so
+    // the fixture's own header carries the item. Do not "fix" that here; a
+    // stock snapshot_download of this revision stages a file the manifest does
+    // not name, which is what run 31665285024 died on.
+    #expect(!recordPaths.contains(".gitattributes"))
+    #expect(!manifest.contains("QWEN38-PENDING-RELEASE"))
+    #expect(!manifest.contains("BODY PLACEHOLDER"))
 }
 
 @Test
@@ -4989,12 +5105,12 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let refWeights = root.appendingPathComponent("reference_weights")
     try FileManager.default.createDirectory(at: refWeights, withIntermediateDirectories: true)
     try FileManager.default.createSymbolicLink(
-        atPath: refWeights.appendingPathComponent("laguna-xs-2.1-nvfp4-mlx").path,
+        atPath: refWeights.appendingPathComponent("Qwen3.8-27B-4bit").path,
         withDestinationPath: root.appendingPathComponent("does-not-exist").path
     )
 
     // A real cache directory holding the checkpoint.
-    let cache = root.appendingPathComponent("hfcache/models--poolside--Laguna-XS-2.1-NVFP4-mlx/snapshots/841778bda563a36104dd521e37d99218e46f4f25")
+    let cache = root.appendingPathComponent("hfcache/models--EigenLabs--Qwen3.8-27B-4bit/snapshots/eda45ab47f465d08d6558f0353a2346e2eb9d5b3")
     try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
     try "{}".write(to: cache.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
 
@@ -5071,7 +5187,7 @@ func benchmarkScriptFallsBackToCacheWhenReferenceSymlinkIsBroken() throws {
     let recorded = (try? String(contentsOf: reflog, encoding: .utf8)) ?? ""
     // The transform was handed the real cache dir, not the broken symlink.
     #expect(recorded.contains(cache.path))
-    #expect(!recorded.contains("reference_weights/laguna-xs-2.1-nvfp4-mlx"))
+    #expect(!recorded.contains("reference_weights/Qwen3.8-27B-4bit"))
 }
 
 @Test
@@ -5536,4 +5652,379 @@ func residentModelGuardPatternCoversTheDFlashSubcommands() throws {
             """
         )
     }
+}
+
+// MARK: - The transform cache must be keyed on WHICH model it transformed
+
+/// benchmark.sh's reference defaults were still the retired Poolside Laguna
+/// checkpoint long after setup.sh, `MLXFastConstants` and the track contract
+/// had moved to the Qwen 3.8 27B target. The three values below are one
+/// identity spelled in four places; these assertions hold benchmark.sh's copy
+/// against the other three, and `resolve_reference_path` is where they now
+/// live (a single self-contained resolver, so the top-level REFERENCE_PATH and
+/// the transform-cache key cannot drift apart).
+@Test
+func benchmarkScriptResolvesThePinnedQwenReference() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    #expect(
+        script.contains(
+            #"reference_repo="${MLXFAST_REFERENCE_MODEL_REPO:-EigenLabs/Qwen3.8-27B-4bit}""#),
+        """
+        benchmark.sh does not default to the pinned Qwen 3.8 27B reference \
+        repository. A stale default here transforms (and caches) a different \
+        model than setup.sh downloaded.
+        """
+    )
+    #expect(
+        script.contains(
+            #"reference_revision="${MLXFAST_REFERENCE_REVISION:-eda45ab47f465d08d6558f0353a2346e2eb9d5b3}""#))
+    #expect(script.contains(#"reference_default_dir="reference_weights/Qwen3.8-27B-4bit""#))
+    // The compatibility symlink setup.sh creates, and MLXFastConstants'
+    // defaultReferencePath, are that same directory.
+    #expect(MLXFastConstants.defaultReferencePath == "reference_weights/Qwen3.8-27B-4bit")
+    #expect(MLXFastConstants.referenceModelRepository == "EigenLabs/Qwen3.8-27B-4bit")
+    #expect(
+        MLXFastConstants.referenceModelRevision == "eda45ab47f465d08d6558f0353a2346e2eb9d5b3")
+    // One resolver, one caller: the top-level path must be the function's
+    // output, not a second copy of the same if/elif chain.
+    #expect(script.contains("REFERENCE_PATH=\"$(resolve_reference_path)\""))
+}
+
+/// The sibling track runners reuse benchmark.sh's definitions by extracting
+/// them with `awk '/^name\(\) \{/,/^\}/'`. That only works while the name sits
+/// at column 0 with `() {`, the closing `}` sits at column 0, and no column-0
+/// `}` appears inside the body (the range ends at the FIRST one). Since
+/// `source_hash` now calls `resolve_reference_path`, a runner that extracts
+/// only `source_hash` aborts on an undefined function -- so both scripts must
+/// pull both names.
+@Test
+func theTransformCacheDefinitionsStayExtractable() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    for name in ["resolve_reference_path", "source_hash", "config_model_family"] {
+        let start = try #require(
+            script.range(of: "\n\(name)() {\n"),
+            "benchmark.sh lost the column-0 `\(name)() {` the runners extract"
+        )
+        let body = script[start.upperBound...]
+        let end = try #require(
+            body.range(of: "\n}\n"),
+            "\(name)() has no column-0 closing brace"
+        )
+        // What awk hands the runner: everything up to the FIRST column-0 `}`.
+        // If a column-0 `}` ever appears inside the body, that slice stops
+        // early -- so require each function's own last statement to still be
+        // inside it.
+        let extracted = String(body[..<end.lowerBound])
+        let tail: String
+        switch name {
+        case "resolve_reference_path":
+            tail = #"printf '%s\n' "${reference_default_dir}""#
+        case "source_hash":
+            tail = "} | shasum -a 256 | awk '{print $1}'"
+        default:
+            tail = #"printf '%s\n' "${family}""#
+        }
+        #expect(
+            extracted.contains(tail),
+            """
+            the awk extraction of \(name)() stops before its last statement, so \
+            a column-0 `}` has appeared inside the body and the track runners \
+            would evaluate a truncated function.
+            """
+        )
+    }
+    // The sanity string both runners check the extraction for.
+    #expect(script.contains("shasum -a 256"))
+
+    for runner in ["benchmark-qwen-mtp.sh", "benchmark-dflash.sh"] {
+        let body = try String(contentsOfFile: runner, encoding: .utf8)
+        for name in ["resolve_reference_path", "source_hash"] {
+            #expect(
+                body.contains(#"awk '/^\#(name)\(\) \{/,/^\}/' benchmark.sh"#),
+                """
+                \(runner) does not extract benchmark.sh's \(name)(). \
+                source_hash() calls resolve_reference_path(), so extracting \
+                one without the other aborts the runner on an undefined \
+                function -- or, worse, computes a different digest and reports \
+                a permanent false "stale weights".
+                """
+            )
+            #expect(
+                body.contains("could not reuse benchmark.sh's ${reused_definition}()"),
+                "\(runner) does not fail closed per extracted name")
+        }
+    }
+    // The Qwen runner additionally reuses the family normalization.
+    let qwen = try String(contentsOfFile: "benchmark-qwen-mtp.sh", encoding: .utf8)
+    #expect(qwen.contains(#"awk '/^config_model_family\(\) \{/,/^\}/' benchmark.sh"#))
+}
+
+/// P0.5: the transform-cache key covered the transform CODE and nothing about
+/// the transform INPUT, so a `weights/` tree produced from the retired Laguna
+/// checkpoint matched the Qwen track's key exactly and was reused. The run then
+/// hashed ~15 GB of the wrong model and died in the worker with a null score.
+@Test
+func theTransformCacheKeyCoversTheReferenceIdentity() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    let start = try #require(script.range(of: "\nsource_hash() {\n"))
+    let body = String(script[start.upperBound...])
+    let end = try #require(body.range(of: "\n}\n"))
+    let digestBody = String(body[..<end.lowerBound])
+
+    #expect(digestBody.contains(#"printf 'reference-repository\0%s\0' "${reference_repo}""#))
+    #expect(digestBody.contains(#"printf 'reference-revision\0%s\0' "${reference_revision}""#))
+    #expect(
+        digestBody.contains(
+            #"printf 'reference-config-sha256\0%s\0' "${reference_config_digest}""#),
+        """
+        source_hash() no longer folds the reference config.json digest into the \
+        key, so a weights/ tree transformed from a different checkpoint can pass \
+        as fresh again.
+        """
+    )
+    #expect(digestBody.contains("reference_dir=\"$(resolve_reference_path)\""))
+    // Absent reference and empty-config reference must not collide.
+    #expect(digestBody.contains(#"reference_config_digest="MISSING""#))
+    // The code stream keeps BOTH branches.
+    #expect(digestBody.contains("git ls-files --cached --others --exclude-standard -z"))
+    #expect(digestBody.contains(#"find "${paths[@]}" -type f"#))
+}
+
+/// P0.3: setup.sh provisions the reference checkpoint and never transforms it,
+/// so `./setup.sh && ./setup-qwen-mtp.sh` followed by the track runner reached
+/// an empty `weights/` on every fresh machine. `--transform-only` is the step
+/// that fills it: everything up to and including the transform and its stamp,
+/// then exit 0 BEFORE any measurement.
+@Test
+func benchmarkScriptTransformOnlyStopsBeforeAnyMeasurement() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let gitInit = Process()
+    gitInit.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    gitInit.arguments = ["init", "-q", root.path]
+    try gitInit.run()
+    gitInit.waitUntilExit()
+
+    let reference = root.appendingPathComponent("reference")
+    try FileManager.default.createDirectory(at: reference, withIntermediateDirectories: true)
+    try #"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"}}"#
+        .write(to: reference.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+
+    let weights = root.appendingPathComponent("weights")
+    let golden = root.appendingPathComponent("golden.json")
+    try "{}".write(to: golden, atomically: true, encoding: .utf8)
+
+    let calls = root.appendingPathComponent("calls.txt")
+    let fakeSwift = root.appendingPathComponent("mlxfast-swift")
+    try """
+    #!/bin/sh
+    printf '%s\\n' "$1" >> "\(calls.path)"
+    cmd="$1"
+    shift
+    if [ "$cmd" = "transform" ]; then
+      out=""
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--output" ]; then shift; out="$1"; fi
+        shift
+      done
+      if [ -n "$out" ]; then
+        mkdir -p "$out"
+        printf '%s' '{"model_type":"qwen3_5_text","num_hidden_layers":64,"vocab_size":248320,"hidden_size":5120}' > "$out/config.json"
+        printf '%s\\n' '{"weight_map":{"tensor":"model.safetensors"}}' > "$out/model.safetensors.index.json"
+        printf '\\100\\000\\000\\000\\000\\000\\000\\000' > "$out/model.safetensors"
+        printf '%s' '{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}      ' >> "$out/model.safetensors"
+        printf '\\001' >> "$out/model.safetensors"
+      fi
+      exit 0
+    fi
+    exit 9
+    """.write(to: fakeSwift, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755], ofItemAtPath: fakeSwift.path)
+
+    let score = root.appendingPathComponent("score.json")
+    func runTransformOnly() throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("benchmark.sh").path,
+            "--transform-only",
+        ]
+        process.currentDirectoryURL = root
+        process.environment = benchmarkTestEnvironment([
+            "MLXFAST_NO_SANDBOX": "1",
+            "MLXFAST_SWIFT_BIN": fakeSwift.path,
+            "MLXFAST_WEIGHTS_PATH": weights.path,
+            "MLXFAST_REFERENCE_DIR": reference.path,
+            "MLXFAST_CORRECTNESS_GOLDEN_PATH": golden.path,
+            "MLXFAST_SCORE_PATH": score.path,
+            "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
+        ])
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let output = String(
+            decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        return (process.terminationStatus, output)
+    }
+
+    let first = try runTransformOnly()
+    #expect(first.status == 0, "--transform-only failed: \(first.output)")
+    #expect(first.output.contains("regenerating weights with Swift transform"))
+    #expect(first.output.contains("--transform-only complete"))
+    #expect(first.output.contains("no measurement was run"))
+    #expect(
+        FileManager.default.fileExists(
+            atPath: weights.appendingPathComponent(".benchmark-source.sha256").path),
+        "--transform-only did not stamp the transform-source digest")
+    #expect(
+        !FileManager.default.fileExists(atPath: score.path),
+        "--transform-only wrote a score; it must exit before every measured phase")
+    let invoked = (try? String(contentsOf: calls, encoding: .utf8)) ?? ""
+    #expect(
+        !invoked.contains("benchmark"),
+        """
+        --transform-only invoked `mlxfast-swift benchmark`. It exists precisely \
+        so a caller that only needs weights/ does not pay for a measurement.
+        """
+    )
+
+    // Already fresh: the reuse path, still exit 0, still no measurement.
+    let second = try runTransformOnly()
+    #expect(second.status == 0, "--transform-only failed on the reuse path: \(second.output)")
+    #expect(second.output.contains("reusing \(weights.path)/ for unchanged transform source"))
+    #expect(second.output.contains("--transform-only complete"))
+
+    // Defense in depth: a cached tree whose stamp still matches but whose
+    // config declares a different model family is stale, not fresh.
+    try #"{"model_type":"laguna","num_hidden_layers":48}"#
+        .write(
+            to: weights.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+    let third = try runTransformOnly()
+    #expect(third.status == 0, "--transform-only failed after the family swap: \(third.output)")
+    #expect(
+        third.output.contains("declares model family laguna"),
+        """
+        benchmark.sh reused a weights/ tree declaring a different model family \
+        than the reference it would transform. The digest catches a stale tree; \
+        this check is what catches a stamp collision written by an older, \
+        code-only cache key. Output: \(third.output)
+        """
+    )
+    #expect(third.output.contains("treating the cached weights as stale"))
+    #expect(third.output.contains("regenerating weights with Swift transform"))
+}
+
+/// `--transform-only` is a MODE, not a modifier: pairing it with anything that
+/// measures would silently drop the measurement the caller asked for.
+@Test
+func transformOnlyRefusesEveryMeasuringCombination() throws {
+    let script = try String(contentsOfFile: "benchmark.sh", encoding: .utf8)
+    // Consumed in the arg-parse case like --official, never forwarded to the
+    // Swift CLI (which does not declare it) ...
+    let argCase = try #require(script.range(of: "    --transform-only)\n"))
+    let caseBody = String(script[argCase.upperBound...].prefix(900))
+    let caseEnd = try #require(caseBody.range(of: "\n      ;;"))
+    let consumed = String(caseBody[..<caseEnd.lowerBound])
+    #expect(consumed.contains("TRANSFORM_ONLY=1"))
+    #expect(
+        consumed.contains("continue"),
+        """
+        --transform-only is no longer consumed with `continue`, so it would be \
+        appended to FORWARD_ARGS and handed to `mlxfast-swift benchmark`, which \
+        does not declare it.
+        """
+    )
+    // ... but re-added by name on the legacy sandbox re-exec, or the child
+    // would run a full local benchmark instead of a transform.
+    #expect(script.contains("RESOLVED_ARGS+=(\"--transform-only\")"))
+    for conflicting in ["--official", "--local-submit", "--local-cool-gate-only"] {
+        #expect(
+            script.contains("benchmark.sh: --transform-only cannot be combined with \(conflicting)"),
+            "benchmark.sh does not refuse --transform-only \(conflicting) by name")
+    }
+    // It is a LOCAL run for every downstream purpose: the run lock and the
+    // resident-model scan must cover a step that rewrites weights/ underneath
+    // whatever else is running. LOCAL_ITERATE is raised AFTER the refusals
+    // above, so `--transform-only --official` reports the conflict it has
+    // rather than one for a flag the caller never typed.
+    let refusal = try #require(
+        script.range(of: "benchmark.sh: --transform-only cannot be combined with --local-cool-gate-only"))
+    let afterRefusals = String(script[refusal.upperBound...].prefix(600))
+    #expect(
+        afterRefusals.contains("  LOCAL_ITERATE=1\n"),
+        "--transform-only no longer joins the local-mode branch that takes the run lock")
+}
+
+/// P0.3/P1.1 on the runner side: the Qwen MTP runner must refresh the transform
+/// itself (the manifest's benchmarkCommand has no manual step in front of it)
+/// and must reject a wrong-model `weights/` tree BEFORE the drift tripwire,
+/// any weight hashing, or a worker start.
+@Test
+func theQwenMTPRunnerRefreshesTheTransformAndGatesTheModelFamily() throws {
+    let runner = try String(contentsOfFile: "benchmark-qwen-mtp.sh", encoding: .utf8)
+
+    #expect(
+        runner.contains(#"transform_command=("./benchmark.sh" "--transform-only")"#),
+        """
+        benchmark-qwen-mtp.sh no longer refreshes the transform itself. \
+        benchmark.json's benchmarkCommand runs this script straight after \
+        setup, and setup never creates weights/, so an abort here is a manual \
+        step the published sequence does not contain.
+        """
+    )
+    #expect(
+        !runner.contains("Produce (or refresh) it first"),
+        "benchmark-qwen-mtp.sh still tells the reader to produce weights/ by hand")
+    #expect(
+        !runner.contains("./benchmark.sh --local-iterate\n"),
+        """
+        benchmark-qwen-mtp.sh still points at a full local benchmark for its \
+        side effect; --transform-only is the step that only transforms.
+        """
+    )
+    // The refresh happens before this script takes its own lock, and
+    // --transform-only takes benchmark.sh's lock in its own process.
+    #expect(runner.contains("NO DEADLOCK, and the ordering is the reason"))
+    let refreshIndex = try #require(runner.range(of: "transform_command[*]}"))
+    let lockIndex = try #require(runner.range(of: "\nacquire_local_run_lock\n"))
+    #expect(
+        refreshIndex.lowerBound < lockIndex.lowerBound,
+        """
+        the transform refresh now runs after acquire_local_run_lock, so \
+        ./benchmark.sh --transform-only would block forever on the per-user \
+        lock this script already holds.
+        """
+    )
+    // Still fails closed when the refresh did not help, and says with what.
+    #expect(runner.contains("is STILL not usable after"))
+    #expect(runner.contains("expected transform-source digest ${wanted_source_hash}"))
+
+    // The track gate: family first, then the pinned geometry, both before the
+    // tripwire.
+    #expect(runner.contains(#"weights_model_family="$(config_model_family "${weights_path}/config.json")""#))
+    #expect(runner.contains(#"if [[ "${weights_model_family}" != "qwen3_5" ]]; then"#))
+    #expect(runner.contains("is not this track's target"))
+    #expect(runner.contains("num_hidden_layers=\\(.num_hidden_layers) (expected 64)"))
+    #expect(runner.contains("vocab_size=\\(.vocab_size) (expected 248320)"))
+    #expect(runner.contains("hidden_size=\\(.hidden_size) (expected 5120)"))
+    #expect(runner.contains("MLXFAST_FORCE_TRANSFORM=1 ${transform_command[*]}"))
+    let gateIndex = try #require(runner.range(of: "is not this track's target"))
+    let tripwireIndex = try #require(runner.range(of: "public drift tripwire (correctness against"))
+    #expect(
+        gateIndex.lowerBound < tripwireIndex.lowerBound,
+        """
+        the wrong-model gate now runs after the drift tripwire. Its whole point \
+        is to abort before ~15 GB is hashed and a worker is started against a \
+        model that is not this track's target.
+        """
+    )
+    // The pinned geometry is the contract fixture's, not a second opinion.
+    #expect(MLXFastConstants.numHiddenLayers == 64)
+    #expect(MLXFastConstants.vocabSize == 248_320)
+    #expect(MLXFastConstants.hiddenSize == 5_120)
 }

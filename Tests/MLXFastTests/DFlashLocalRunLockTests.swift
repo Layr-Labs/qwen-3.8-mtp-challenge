@@ -706,9 +706,19 @@ private struct GuardSandbox {
 
     /// Stamp weights/.benchmark-source.sha256 with the digest benchmark-dflash.sh
     /// will compute for this sandbox, using the same extraction it uses itself.
+    ///
+    /// Both halves of that extraction: source_hash() folds the resolved
+    /// reference's identity into the digest and therefore CALLS
+    /// resolve_reference_path(), so sealing with source_hash() alone would
+    /// abort on an undefined function and stamp an empty digest -- a permanent
+    /// false "stale weights" in every test that uses this sandbox.
     private func sealWeights() throws {
         let digest = try bash(
-            #"eval "$(awk '/^source_hash\(\) \{/,/^\}/' benchmark.sh)"; source_hash"#
+            #"""
+            eval "$(awk '/^resolve_reference_path\(\) \{/,/^\}/' benchmark.sh
+                    awk '/^source_hash\(\) \{/,/^\}/' benchmark.sh)"
+            source_hash
+            """#
         )
         try write(digest, to: "weights/.benchmark-source.sha256")
     }
@@ -723,6 +733,17 @@ private struct GuardSandbox {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["-c", program]
         process.currentDirectoryURL = root
+        // Same stripping runGuard does. The transform-source digest now covers
+        // the resolved reference identity, so a developer's exported
+        // MLXFAST_REFERENCE_* would be seen by this seal and NOT by the run
+        // under test (or the reverse), and the two would disagree.
+        var environment = ProcessInfo.processInfo.environment
+        for key in environment.keys.filter({
+            $0.hasPrefix("MLXFAST_") || $0.hasPrefix("DARKBLOOM_")
+        }) {
+            environment.removeValue(forKey: key)
+        }
+        process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice

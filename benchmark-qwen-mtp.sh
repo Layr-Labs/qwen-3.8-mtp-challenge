@@ -5,6 +5,19 @@
 # Every gate and every measurement below is an EXISTING harness entrypoint; this
 # script only wires them together in the right order. In order:
 #
+#   0. transformed weights     `./benchmark.sh --transform-only` when weights/ is
+#                              missing or stale, then a track gate on the tree it
+#                              produced (Qwen family + pinned geometry). setup.sh
+#                              provisions the reference checkpoint and never
+#                              transforms it, so the manifest's own sequence --
+#                              ./setup.sh && ./setup-qwen-mtp.sh, then this
+#                              script -- reaches this point with an empty
+#                              weights/ on every fresh machine. It used to abort
+#                              here and name a full local benchmark as the
+#                              manual step; now it runs the transform step alone.
+#                              This happens BEFORE this script takes its run
+#                              lock, and --transform-only takes benchmark.sh's
+#                              lock in its own process, so the two never contend.
 #   1. public drift tripwire   `mlxfast-swift correctness` against the checked-in
 #                              public fixture -- the same subcommand and the same
 #                              fixture the base local loop uses.
@@ -49,10 +62,12 @@ writes a directional Yukon score payload to MLXFAST_SCORE_PATH
 
 Prerequisites (all reused, never rebuilt here):
   ./setup.sh                     builds mlxfast-swift + the MLX metallib and
-                                 provisions the pinned Qwen 3.6 27B checkpoint
+                                 provisions the pinned Qwen 3.8 27B checkpoint
   ./setup-qwen-mtp.sh            provisions the pinned MTP head
-  ./benchmark.sh --local-iterate produces and caches the transformed weights/
-                                 tree this script consumes
+
+The transformed weights/ tree is NOT a prerequisite: when it is missing or
+stale this script runs ./benchmark.sh --transform-only itself (the transform
+step only -- no measurement) and then re-checks it.
 
 Environment:
   MLXFAST_SCORE_PATH                      score payload path (default score.json)
@@ -210,31 +225,162 @@ fi
 #
 # The staleness test has to be the SAME digest benchmark.sh stamps into
 # weights/.benchmark-source.sha256, and two implementations of it would drift
-# into a permanent false "stale weights" abort -- so reuse benchmark.sh's single
-# definition of source_hash() instead of copying it. Fail closed if the
-# extraction stops finding it.
-source_hash_definition="$(awk '/^source_hash\(\) \{/,/^\}/' benchmark.sh)"
-if [[ "${source_hash_definition}" != *"shasum -a 256"* ]]; then
+# into a permanent false "stale weights" abort -- so reuse benchmark.sh's own
+# definitions instead of copying them. THREE functions are extracted by the same
+# awk idiom, and each is then checked BY NAME (a sentinel string contributed by
+# one arm must not mask another arm's failure):
+#
+#   source_hash             the digest that decides staleness;
+#   resolve_reference_path  source_hash() CALLS it -- the digest now covers the
+#                           reference repo@revision and the sha256 of its
+#                           config.json, so weights transformed from a different
+#                           model can no longer pass as fresh, and extracting
+#                           source_hash() without this one would abort on an
+#                           undefined function;
+#   config_model_family     the single normalization of a config.json's declared
+#                           model family, reused by the track gate below so this
+#                           script cannot disagree with benchmark.sh about what
+#                           "the Qwen family" means.
+reused_transform_definitions="$(
+  awk '/^resolve_reference_path\(\) \{/,/^\}/' benchmark.sh
+  awk '/^source_hash\(\) \{/,/^\}/' benchmark.sh
+  awk '/^config_model_family\(\) \{/,/^\}/' benchmark.sh
+)"
+if [[ "${reused_transform_definitions}" != *"shasum -a 256"* ]]; then
   echo "benchmark-qwen-mtp.sh: could not reuse benchmark.sh's source_hash() definition;" >&2
   echo "benchmark-qwen-mtp.sh: benchmark.sh has been refactored -- refusing to guess the transform-source digest" >&2
   exit 1
 fi
-eval "${source_hash_definition}"
+if ! eval "${reused_transform_definitions}"; then
+  echo "benchmark-qwen-mtp.sh: could not evaluate benchmark.sh's transform-cache definitions;" >&2
+  echo "benchmark-qwen-mtp.sh: benchmark.sh has been refactored -- refusing to guess the transform-source digest" >&2
+  exit 1
+fi
+for reused_definition in \
+  resolve_reference_path \
+  source_hash \
+  config_model_family
+do
+  if ! declare -F "${reused_definition}" >/dev/null 2>&1; then
+    echo "benchmark-qwen-mtp.sh: could not reuse benchmark.sh's ${reused_definition}();" >&2
+    echo "benchmark-qwen-mtp.sh: benchmark.sh has been refactored -- refusing to guess the transform-source digest" >&2
+    exit 1
+  fi
+done
 
-wanted_source_hash="$(source_hash)"
-current_source_hash="$(cat "${weights_path}/.benchmark-source.sha256" 2>/dev/null | tr -d '[:space:]' || true)"
-if [[ ! -f "${weights_path}/config.json" || "${current_source_hash}" != "${wanted_source_hash}" ]]; then
+# The one command that fills weights/ and nothing else. setup.sh provisions the
+# REFERENCE checkpoint but never transforms it, so on a fresh machine the
+# manifest's own sequence -- ./setup.sh && ./setup-qwen-mtp.sh, then this script
+# -- reaches here with an empty weights/ every time. Telling the reader to go
+# run a full local benchmark for its side effect was a manual step the manifest
+# does not contain and minutes of measurement nobody asked for.
+transform_command=("./benchmark.sh" "--transform-only")
+
+# Recomputed rather than cached: it is called again after a refresh, and the
+# refresh is exactly what changes the answer.
+weights_transform_is_fresh() {
+  wanted_source_hash="$(source_hash)"
+  current_source_hash="$(cat "${weights_path}/.benchmark-source.sha256" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -f "${weights_path}/config.json" && "${current_source_hash}" == "${wanted_source_hash}" ]]
+}
+
+if ! weights_transform_is_fresh; then
   cat >&2 <<EOF
 benchmark-qwen-mtp.sh: no usable transformed weights at ${weights_path}/.
 The MTP track's target is the base reference checkpoint, so this script reuses
-the weights/ tree benchmark.sh produces and caches. It does not run the ~16 GB
-transform itself.
-
-Produce (or refresh) it first, then rerun this script:
-
-  ./benchmark.sh --local-iterate
-
+the weights/ tree benchmark.sh produces and caches; it does not implement the
+~15 GB transform itself. Refreshing it now with ${transform_command[*]}
 (expected transform-source digest ${wanted_source_hash}; found ${current_source_hash:-none})
+EOF
+  # NO DEADLOCK, and the ordering is the reason: this runs BEFORE this script
+  # takes its own run lock (acquire_local_run_lock is called further down, after
+  # the guard extraction below), and ./benchmark.sh --transform-only takes and
+  # releases benchmark.sh's lock inside its own process. The two never hold, or
+  # wait on, the lock at the same time. Moving this call below this script's
+  # acquire_local_run_lock would self-deadlock against the same per-user lock.
+  if ! "${transform_command[@]}"; then
+    echo "benchmark-qwen-mtp.sh: ${transform_command[*]} failed; the transformed weights could not be produced" >&2
+    exit 1
+  fi
+  if ! weights_transform_is_fresh; then
+    cat >&2 <<EOF
+benchmark-qwen-mtp.sh: ${weights_path}/ is STILL not usable after ${transform_command[*]}.
+This is not a stale-cache problem: the transform ran and the result does not
+match the digest this script computes, so the two sides disagree about what the
+transform input is (a MLXFAST_REFERENCE_* / MLXFAST_WEIGHTS_PATH override that
+differs between the two invocations is the usual cause).
+
+  expected transform-source digest ${wanted_source_hash}
+  found                            ${current_source_hash:-none}
+  weights config.json              $(if [[ -f "${weights_path}/config.json" ]]; then echo present; else echo MISSING; fi)
+
+Force a clean rebuild with:
+
+  MLXFAST_FORCE_TRANSFORM=1 ${transform_command[*]}
+EOF
+    exit 1
+  fi
+fi
+
+# --- the transformed weights must be THIS track's target ----------------------
+# Checked here: after the tree is known fresh, and BEFORE the drift tripwire,
+# any weight hashing, or a worker start. Without it, a weights/ tree holding
+# some other model reached the worker and the run died there -- ~15 GB hashed,
+# an unexplained worker exit status, and a null score, with nothing in the
+# output naming the actual problem. The digest above catches a STALE tree; this
+# catches a tree that is fresh by digest and simply the wrong model (an operator
+# override pointing at another checkpoint, a hand-copied weights/ directory).
+#
+# Family first, then geometry. `config_model_family` is benchmark.sh's own
+# normalization: the transformed Qwen tree declares qwen3_5_text at the root
+# (Transform.swift promotes the reference's text_config to the root for this
+# family) and the raw reference declares qwen3_5, and both normalize to the same
+# token. Geometry is asserted only where the fields are PRESENT, so a future
+# config that stops publishing them degrades to the family check instead of
+# failing a correct tree.
+weights_model_family="$(config_model_family "${weights_path}/config.json")"
+if [[ "${weights_model_family}" != "qwen3_5" ]]; then
+  cat >&2 <<EOF
+benchmark-qwen-mtp.sh: ${weights_path}/config.json is not this track's target.
+The ${TRACK_ID} track measures the Qwen 3.8 27B text tower, whose transformed
+config declares model_type qwen3_5_text (raw: qwen3_5); this tree declares
+"${weights_model_family:-none}".
+
+Fix it by rebuilding the transform from the pinned reference:
+
+  rm -rf ${weights_path} && ${transform_command[*]}
+
+or, keeping the directory:
+
+  MLXFAST_FORCE_TRANSFORM=1 ${transform_command[*]}
+EOF
+  exit 1
+fi
+qwen_geometry_error="$(jq -r '
+    [
+      (if has("num_hidden_layers") and (.num_hidden_layers != 64)
+        then "num_hidden_layers=\(.num_hidden_layers) (expected 64)" else empty end),
+      (if has("vocab_size") and (.vocab_size != 248320)
+        then "vocab_size=\(.vocab_size) (expected 248320)" else empty end),
+      (if has("hidden_size") and (.hidden_size != 5120)
+        then "hidden_size=\(.hidden_size) (expected 5120)" else empty end)
+    ] | join(", ")
+  ' "${weights_path}/config.json" 2>/dev/null || true)"
+if [[ -n "${qwen_geometry_error}" ]]; then
+  cat >&2 <<EOF
+benchmark-qwen-mtp.sh: ${weights_path}/config.json declares the Qwen family but not
+this track's pinned geometry: ${qwen_geometry_error}.
+The pinned target is 64 layers, vocab 248320, hidden 5120; a tree with other
+geometry is a different checkpoint and every number measured against it would be
+meaningless.
+
+Rebuild the transform from the pinned reference:
+
+  rm -rf ${weights_path} && ${transform_command[*]}
+
+or, keeping the directory:
+
+  MLXFAST_FORCE_TRANSFORM=1 ${transform_command[*]}
 EOF
   exit 1
 fi
