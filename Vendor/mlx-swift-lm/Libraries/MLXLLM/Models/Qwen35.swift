@@ -454,6 +454,118 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
+    /// Single-chunk verify twin that retains only the ingredients needed to
+    /// reconstruct a committed recurrent prefix after the target acceptance
+    /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
+    /// midpoint state tensor is produced on the hot path.
+    private func processChunkStashingPrefix(
+        qkv: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        convState: MLXArray,
+        ssmState: MLXArray?,
+        mask: MLXArray?
+    ) -> (
+        out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
+        tape: ArraysCache.PrefixReplayTape
+    ) {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let nKeep = convKernelSize - 1
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(
+            convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (out, newSsmState) = gatedDeltaUpdate(
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            aLog: aLog,
+            dtBias: dtBias,
+            state: ssmState,
+            mask: mask
+        )
+        let tape = ArraysCache.PrefixReplayTape(
+            convInput: convInput,
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            ssmPre: ssmState.map { $0[.ellipsis] },
+            mask: mask.map { $0[.ellipsis] },
+            rowCount: S,
+            convStateRows: nKeep)
+        return (out, newConvState, newSsmState, tape)
+    }
+
+    fileprivate func canReplayPrefix(
+        cache: MambaCache, committedRows: Int
+    ) -> Bool {
+        guard let tape = cache.prefixReplayTape,
+              committedRows > 0,
+              committedRows < tape.rowCount,
+              tape.convStateRows == convKernelSize - 1,
+              tape.convInput.dim(1)
+                  >= committedRows + tape.convStateRows,
+              tape.q.dim(1) == tape.rowCount,
+              tape.k.dim(1) == tape.rowCount,
+              tape.v.dim(1) == tape.rowCount,
+              tape.a.dim(1) == tape.rowCount,
+              tape.b.dim(1) == tape.rowCount
+        else { return false }
+        return true
+    }
+
+    /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
+    /// from the exact pre-verify state and transformed recurrence inputs.
+    /// Call only after every GDN layer has passed `canReplayPrefix`.
+    fileprivate func replayPrefix(
+        cache: MambaCache, committedRows: Int
+    ) -> Bool {
+        guard canReplayPrefix(cache: cache, committedRows: committedRows),
+              let tape = cache.prefixReplayTape
+        else { return false }
+        let rows = 0 ..< committedRows
+        let (_, boundarySsm) = gatedDeltaUpdate(
+            q: tape.q[0..., rows, 0...],
+            k: tape.k[0..., rows, 0...],
+            v: tape.v[0..., rows, 0...],
+            a: tape.a[0..., rows, 0...],
+            b: tape.b[0..., rows, 0...],
+            aLog: aLog,
+            dtBias: dtBias,
+            state: tape.ssmPre,
+            mask: tape.mask.map { $0[0..., rows] }
+        )
+        cache[0] = tape.convInput[
+            0...,
+            committedRows ..< (committedRows + tape.convStateRows),
+            0...]
+        cache[1] = boundarySsm
+        cache.prefixReplayTape = nil
+        cache.rollbackState = nil
+        cache.rollbackCheckpoints = []
+        return true
+    }
+
     // MARK: - callAsFunction
 
     func callAsFunction(
@@ -499,8 +611,21 @@ final class Qwen35GatedDeltaNet: Module {
         let out: MLXArray
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
+        var pendingPrefixTape: ArraysCache.PrefixReplayTape?
 
-        if nConfirmed == 1 && S >= 2 && mask == nil,
+        if nConfirmed == 1 && S >= 3 && mask == nil {
+            // K>=2 verify: keep the ordinary single-chunk recurrence and a
+            // compact replay tape. This avoids writing one 3 MiB fp32 state per
+            // boundary per GDN layer on every round. K=1 deliberately remains
+            // on the already-promoted eager-checkpoint kernel below.
+            let (o, c, s, tape) = processChunkStashingPrefix(
+                qkv: qkv, a: a, b: b,
+                convState: convState, ssmState: ssmState, mask: mask)
+            out = o
+            finalConvState = c
+            finalSsmState = s
+            pendingPrefixTape = tape
+        } else if nConfirmed == 1 && S == 2 && mask == nil,
            let midKernel = qwen35GatedDeltaMidKernel
         {
             // Width-2 MTP verify, single-launch form. The old split path ran
@@ -621,6 +746,13 @@ final class Qwen35GatedDeltaNet: Module {
         if let cache {
             cache[0] = finalConvState
             cache[1] = finalSsmState
+            // A forward that did not request replay must erase any prior tape;
+            // otherwise a later partial miss could restore a stale frame.
+            cache.prefixReplayTape = pendingPrefixTape
+            if pendingPrefixTape != nil {
+                cache.rollbackState = nil
+                cache.rollbackCheckpoints = []
+            }
         }
 
         let normedOut = norm(out, gate: z)
@@ -735,6 +867,12 @@ final class Qwen35Attention: Module {
     private var _qkvMode = QuantizationMode.affine
     private var _qOut = 0
     private var _kOut = 0
+    // Dense (bf16) Q/K/V pack for the MTP head layers, same concat-on-N
+    // argument as the quantized pack above: rows are independent, so one
+    // GEMM over concatenated weights is bit-exact with three separate
+    // launches — and this is the proposal side regardless. Cuts two
+    // launches and two host ops from every head chain step.
+    private var _qkvDenseW: MLXArray?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -778,6 +916,12 @@ final class Qwen35Attention: Module {
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
         }
+        if let w = _qkvDenseW {
+            let y = matmul(x, w.transposed(1, 0))
+            let qEnd = _qOut
+            let kEnd = _qOut + _kOut
+            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+        }
         if let q = qProj as? QuantizedLinear,
            let k = kProj as? QuantizedLinear,
            let v = vProj as? QuantizedLinear,
@@ -794,6 +938,17 @@ final class Qwen35Attention: Module {
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
+            return qkv(x)
+        }
+        if !(qProj is QuantizedLinear), !(kProj is QuantizedLinear),
+           !(vProj is QuantizedLinear),
+           qProj.bias == nil, kProj.bias == nil, vProj.bias == nil
+        {
+            _qkvDenseW = concatenated(
+                [qProj.weight, kProj.weight, vProj.weight], axis: 0
+            ).contiguous()
+            _qOut = qProj.weight.dim(0)
+            _kOut = kProj.weight.dim(0)
             return qkv(x)
         }
         return (qProj(x), kProj(x), vProj(x))
@@ -1041,6 +1196,33 @@ public class Qwen35TextModelInner: Module {
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
     }
+
+    /// Atomically rebuild every linear-attention layer at the same committed
+    /// verify prefix. The first pass is read-only; a failure leaves the entire
+    /// mixed recurrent/attention cache available to the session's generic
+    /// snapshot-and-repair fallback.
+    func replayRecurrentPrefix(
+        cache: [KVCache?], committedRows: Int
+    ) -> Bool {
+        guard cache.count == layers.count, committedRows > 0 else {
+            return false
+        }
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  let linear = layer.linearAttn,
+                  linear.canReplayPrefix(
+                    cache: mamba, committedRows: committedRows)
+            else { return false }
+        }
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  let linear = layer.linearAttn,
+                  linear.replayPrefix(
+                    cache: mamba, committedRows: committedRows)
+            else { return false }
+        }
+        return true
+    }
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -1222,6 +1404,15 @@ extension Qwen35TextModel: MTPCapable {
         // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
         // is the normalization step — it expects the raw backbone output as input.
         return (logits, hidden)
+    }
+
+    /// Rebuild the target's recurrent cache after an accepted verify prefix.
+    public func replayRecurrentPrefix(
+        cache: [any KVCache], committedRows: Int
+    ) -> Bool {
+        model.replayRecurrentPrefix(
+            cache: cache.map { Optional($0) },
+            committedRows: committedRows)
     }
 
     /// Apply the backbone's final `model.norm` to a hidden state.
@@ -1461,6 +1652,14 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.replayRecurrentPrefix`.
+    public func replayRecurrentPrefix(
+        cache: [any KVCache], committedRows: Int
+    ) -> Bool {
+        languageModel.replayRecurrentPrefix(
+            cache: cache, committedRows: committedRows)
     }
 
     public func mtpForward(

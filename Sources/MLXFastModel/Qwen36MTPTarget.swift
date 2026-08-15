@@ -43,15 +43,20 @@ public protocol Qwen36MTPTarget: AnyObject {
 
     /// Backbone forward returning `(logits, PRE-norm hidden)`.
     ///
-    /// INVARIANT #7 LIVES ON THIS CALL. `nConfirmed` must be 0 on every forward
-    /// this track issues: a non-zero value installs the vendored depth-1-only
-    /// rollback (`ArraysCache.rollbackState`, written by `Qwen35GatedDeltaNet`)
-    /// AND changes the gated-delta chunk geometry, both of which fight the
-    /// snapshot/rollback this track uses instead. The requirement is identical
-    /// on both conformers because both reach the same `Qwen35TextModel` method.
+    /// Ordinary and repair forwards pass `nConfirmed == 0`. A speculative
+    /// verify passes 1: width two uses the promoted eager primary-boundary
+    /// checkpoint, while wider blocks retain an exact prefix-replay tape. Both
+    /// conformers reach the same `Qwen35TextModel` implementation.
     func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
+
+    /// Rebuild every recurrent layer after the committed prefix of a fused
+    /// multi-draft verify. Returns false without mutation when the replay tape
+    /// is incomplete, allowing the session to use its generic repair path.
+    func replayRecurrentPrefix(
+        cache: [any KVCache], committedRows: Int
+    ) -> Bool
 
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
