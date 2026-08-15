@@ -1240,6 +1240,61 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
+    /// LAZY counterpart of `rollbackState`, for a verify forward that ran the
+    /// gated-delta stack as ONE fused chunk (`nConfirmed == 0`) instead of
+    /// splitting at the confirmed prefix.
+    ///
+    /// The fused chunk never materialises the post-primary recurrent state --
+    /// the gated-delta Metal kernel carries it in thread registers across its
+    /// `for t` loop and writes only the final state. This slot instead records
+    /// the *ingredients* needed to reproduce that boundary on demand, and only
+    /// on the ~1/3 of rounds that actually reject:
+    ///
+    /// - `conv` is the post-row-0 convolution state, ALREADY EXACT. It is a
+    ///   slice of the same `concat(convState, qkv)` array the fused chunk
+    ///   convolved, so no arithmetic is redone and none can drift (the
+    ///   convolution window is associative under concatenation).
+    /// - `q`/`k`/`v` are the row-0 tensors AFTER conv1d + silu + rmsNorm, and
+    ///   `a`/`b` the row-0 gate projections. Replaying them through
+    ///   `gatedDeltaUpdate` at `T == 1` from `ssmPre` re-executes the exact
+    ///   `t == 0` body of the fused kernel from the exact same fp32 state, so
+    ///   the reproduced boundary is bit-identical to the registers the fused
+    ///   call held after its first row. Nothing upstream of the recurrence is
+    ///   recomputed.
+    ///
+    /// Transient by contract, exactly like `rollbackState`: the round that
+    /// requested it consumes or clears it, and any forward that did not request
+    /// it clears it, so a stale boundary can never be restored as if current.
+    public var fusedPrimaryBoundary: FusedPrimaryBoundary? = nil
+
+    /// Ingredients recorded by a fused (unsplit) multi-row gated-delta forward
+    /// so the post-row-0 recurrent boundary can be rebuilt with a single
+    /// recurrence step. See ``ArraysCache/fusedPrimaryBoundary``.
+    public struct FusedPrimaryBoundary {
+        public let conv: MLXArray
+        public let q: MLXArray
+        public let k: MLXArray
+        public let v: MLXArray
+        public let a: MLXArray
+        public let b: MLXArray
+        public let ssmPre: MLXArray?
+        public let mask: MLXArray?
+
+        public init(
+            conv: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray,
+            a: MLXArray, b: MLXArray, ssmPre: MLXArray?, mask: MLXArray?
+        ) {
+            self.conv = conv
+            self.q = q
+            self.k = k
+            self.v = v
+            self.a = a
+            self.b = b
+            self.ssmPre = ssmPre
+            self.mask = mask
+        }
+    }
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }

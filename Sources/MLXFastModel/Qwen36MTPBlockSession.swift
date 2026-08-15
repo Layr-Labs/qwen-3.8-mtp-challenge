@@ -173,10 +173,22 @@ public final class Qwen36MTPBlockSession {
         }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width == 2 ? 1 : 0)
+            let tokens = LMInput.Text(
+                tokens: MLXArray(block).reshaped([1, width]))
+            // Width 2 warms whichever geometry the scored K=1 round will use, so
+            // its kernels compile outside every timed window. Under the fused
+            // flag that also warms the reject-path rebuild, which is a shape the
+            // split path never dispatches.
+            let (verifyLogits, _) = width == 2 && qwenMTPFusedAcceptVerifyEnabled
+                ? model.callWithHiddenStashingPrimaryBoundary(
+                    input: tokens, cache: warmCache)
+                : model.callWithHidden(
+                    input: tokens, cache: warmCache,
+                    nConfirmed: width == 2 ? 1 : 0)
             eval(verifyLogits)
+            if width == 2 && qwenMTPFusedAcceptVerifyEnabled {
+                _ = model.recomputeFusedPrimaryBoundary(cache: warmCache)
+            }
             eval(warmCache.flatMap { $0.state })
         }
     }
@@ -187,15 +199,38 @@ public final class Qwen36MTPBlockSession {
     /// primary. The primary's own KV row is deliberately NOT written yet: the
     /// round-top invariant is "every emitted token is in the cache and the
     /// pending primary is not", and the verify forward writes it.
+    ///
+    /// SEED-TAIL VOCABULARY PROJECTION (guarded by
+    /// `MLXFAST_QWEN_MTP_SEED_TAIL_PROJECTION`, default on). This method is the
+    /// only place in the session that bulk-forwards a long block and then keeps
+    /// ONLY its tail: two lines below, 511 of the 512 `[1, V]` logit rows the
+    /// baseline just computed are dropped on the floor, and nothing downstream
+    /// -- not the accept walk, not the row ledger, not the caches -- can ever
+    /// read them. `callWithLastTokenHidden` runs the identical backbone forward
+    /// and narrows only the final-norm + LM-head epilogue to the surviving row.
+    /// The seed prefill is INSIDE the timed window by contract
+    /// (`QwenRuntime.qwenMTPTimedDecode` starts its clock immediately before the
+    /// begin request "so the seed cost cannot be hidden outside the window"), so
+    /// this is charged work, not setup.
+    ///
+    /// The two branches converge immediately: both hand back a `[1, S, V]` /
+    /// `[1, S, H]` pair whose LAST row is what the session keeps, with `S == 1`
+    /// on the narrowed path. Every line after the call is therefore shared and
+    /// index-generic, which is what makes the flag a true ablation rather than
+    /// two divergent prefills.
     @discardableResult
     public func begin(seedTokens: [Int]) throws -> Int {
         guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         cache = model.newCache(parameters: nil)
-        let (logits, hidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
-            cache: cache, nConfirmed: 0)
+        let seedInput = LMInput.Text(
+            tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count]))
+        let (logits, hidden) =
+            qwenMTPSeedTailProjectionEnabled
+            ? model.callWithLastTokenHidden(
+                input: seedInput, cache: cache, nConfirmed: 0)
+            : model.callWithHidden(
+                input: seedInput, cache: cache, nConfirmed: 0)
         pendingLogitsRow = logits[0..., (logits.dim(1) - 1) ..< logits.dim(1), 0...]
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         eval(cache.flatMap { $0.state })
@@ -398,12 +433,29 @@ public final class Qwen36MTPBlockSession {
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
         let fastK1 = draftCount == 1
+        let fusedK1 = fastK1 && qwenMTPFusedAcceptVerifyEnabled
         let snapshot = Self.snapshotRecurrent(cache)
         let verifyInput = committed + drafts
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
-            cache: cache, nConfirmed: fastK1 ? 1 : 0)
+        // FUSED ACCEPT PATH (default). `nConfirmed: 1` makes the gated-delta
+        // stack run the two verify rows as two chunks so it can write the
+        // post-primary checkpoint eagerly -- on ALL 48 recurrent layers, every
+        // round, including the ~2/3 that fully accept and never read it. The
+        // fused call runs them as one chunk (the geometry every submission
+        // before the checkpoint used) and instead records the ingredients for
+        // rebuilding that boundary with a single recurrence step, paid for only
+        // on the rounds that reject. Both calls run the same rows through the
+        // same epilogue -- final norm and the vocabulary projection over EVERY
+        // row in one matmul -- and the acceptance walk below is untouched.
+        // (Narrowing the head to row 0 and projecting the bonus row separately
+        // afterwards turns one ~715 MB weight stream into two on the accept
+        // path; that is a regression, and is deliberately not done here.)
+        let verifyTokens = LMInput.Text(
+            tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count]))
+        let (verifyLogits, verifyHidden) = fusedK1
+            ? model.callWithHiddenStashingPrimaryBoundary(
+                input: verifyTokens, cache: cache)
+            : model.callWithHidden(
+                input: verifyTokens, cache: cache, nConfirmed: fastK1 ? 1 : 0)
         let verifyArgmax = argmaxAll(verifyLogits)
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
@@ -453,7 +505,15 @@ public final class Qwen36MTPBlockSession {
             // the same post-primary distribution, so reuse its already-recorded
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
-            if fastK1 && Self.restoreAfterSingleDraftReject(
+            if fusedK1 && Self.restoreAfterFusedSingleDraftReject(
+                model, cache, to: committedOffset)
+            {
+                pendingLogitsRow = verifyLogits[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
+                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
+                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
+            } else if fastK1 && Self.restoreAfterSingleDraftReject(
                 cache, to: committedOffset)
             {
                 pendingLogitsRow = verifyLogits[
@@ -554,8 +614,10 @@ public final class Qwen36MTPBlockSession {
                     arrays[1] = saved[1]
                 }
                 // The vendored depth-1 rollback snapshot, if the GDN forward ever
-                // wrote one, describes a frame this rollback just discarded.
+                // wrote one, describes a frame this rollback just discarded. So
+                // does a fused verify's lazy boundary stash.
                 arrays.rollbackState = nil
+                arrays.fusedPrimaryBoundary = nil
                 continue
             }
             if entry.isTrimmable, entry.offset > base {
@@ -600,9 +662,49 @@ public final class Qwen36MTPBlockSession {
         return true
     }
 
+    /// FUSED-VERIFY counterpart of `restoreAfterSingleDraftReject`.
+    ///
+    /// The fused verify wrote no checkpoint, so the post-primary recurrent state
+    /// is rebuilt from the stash each gated-delta layer recorded: the
+    /// convolution half is a slice already taken at forward time, and the SSM
+    /// half is one `T == 1` recurrence step over the row-0 tensors that forward
+    /// had already computed. The attention side is unchanged -- exactly one
+    /// rejected position to trim, same as the checkpoint path.
+    ///
+    /// Fail-closed in the same order as the path it replaces: the attention
+    /// preflight runs first, then the model's own per-layer preflight, and only
+    /// then is anything mutated. A `false` from either leaves the cache
+    /// untouched for the generic snapshot-and-repair fallback.
+    private static func restoreAfterFusedSingleDraftReject(
+        _ model: any Qwen36MTPTarget,
+        _ cache: [any KVCache],
+        to committedOffset: Int
+    ) -> Bool {
+        for entry in cache {
+            if entry is ArraysCache { continue }
+            guard entry.isTrimmable, entry.offset == committedOffset + 1 else {
+                return false
+            }
+        }
+        guard model.recomputeFusedPrimaryBoundary(cache: cache) else {
+            return false
+        }
+        for entry in cache where !(entry is ArraysCache) {
+            if entry.isTrimmable, entry.offset > committedOffset {
+                _ = entry.trim(entry.offset - committedOffset)
+            }
+        }
+        return true
+    }
+
     private static func clearRecurrentRollback(_ cache: [any KVCache]) {
         for entry in cache {
-            (entry as? ArraysCache)?.rollbackState = nil
+            guard let arrays = entry as? ArraysCache else { continue }
+            arrays.rollbackState = nil
+            // The accepted frame moved past the boundary this described; a
+            // surviving stash could otherwise be restored on a later round as
+            // though it belonged to that round's verify.
+            arrays.fusedPrimaryBoundary = nil
         }
     }
 
