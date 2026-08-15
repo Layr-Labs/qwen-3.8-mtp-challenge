@@ -173,16 +173,30 @@ public final class Qwen36MTPBlockSession {
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
-        // Streak-gated schedule: draft 1 by default, widen to 2 while the
-        // head is on a full-acceptance streak. With per-boundary checkpoints
-        // a partial accept at depth 2 is as cheap as a K=1 reject, so the
-        // only marginal cost of the second draft is one extra head step —
-        // and the streak gate withdraws even that on cold prompts.
+        // Cost-model schedule (replaces the streak ladder). Choose the depth
+        // that maximizes expected committed tokens per unit round time under
+        // the round's measured economics:
+        //
+        //   T(d) = V + d·H        one width-(d+1) verify + d head steps
+        //   E[tokens](d) = 1 + Σ_{k=1..d} Π_{i<k} p_i
+        //
+        // where p_i is the EMA-estimated acceptance of draft position i GIVEN
+        // the prefix before it was accepted, and h = H/V is the head step's
+        // cost relative to the weight-stream-bound verify forward (near-flat
+        // in width up to the qmv limit). Greedy marginal rule: extend to
+        // position k+1 exactly while
+        //
+        //   Π_{i<=k+1} p_i  >  h · (1 + S_k) / (1 + k·h)
+        //
+        // which is f(k+1) > f(k) rearranged. On hot prose (p→0.9) this runs
+        // straight to the offer; on cold prompts it collapses to 1, and to a
+        // free adaptive skip (0) only when even the first draft's odds are
+        // below h. The streak ladder's behavior is the degenerate one-EMA
+        // version of this; the per-position EMAs let depth 5-8 pay where the
+        // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return Swift.min(
-                offeredDepth,
-                Swift.min(1 + self.fullAcceptStreak, Self.streakDepthCap))
+            return self.costModelDepth(offeredDepth: offeredDepth)
         }
     }
 
@@ -263,6 +277,33 @@ public final class Qwen36MTPBlockSession {
             eval(verifyLogits, warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
         }
+
+        // SEED-PREFILL SHAPE WARM (M=512 backbone). The phase trace measured
+        // `begin` at ~0.9 s of eval wall for a 512-token seed — mostly
+        // first-touch pipeline compilation and allocator growth for the
+        // M=512 shapes, charged inside the timed window because this warm
+        // path previously exercised only M=8 and the decode widths. One
+        // input-independent 512-zero forward on a throwaway cache moves that
+        // first-touch out here, into the untimed warm, replaying `begin`'s
+        // exact op sequence: full-seed forward whose full logits are a dead
+        // lazy graph (never evaluated, exactly as `begin` leaves them), the
+        // final-norm over the priming rows, and the single-row lm_head
+        // readout. Zero tokens in, nothing read out — pure shape warm, the
+        // same contract as every warm above.
+        let seedWarmCache = model.newCache(parameters: nil)
+        let seedWarmTokens = Array(repeating: 0, count: 512)
+        let (seedWarmLogits, seedWarmHidden) = model.callWithHidden(
+            input: LMInput.Text(
+                tokens: MLXArray(seedWarmTokens).reshaped([1, 512])),
+            cache: seedWarmCache, nConfirmed: 0)
+        _ = seedWarmLogits
+        let seedWarmRow = hiddenRow(seedWarmHidden, seedWarmHidden.dim(1) - 1)
+        let seedWarmNorm = model.applyFinalNorm(
+            seedWarmHidden[0..., 0 ..< 511, 0...])
+        let (seedWarmIDs, seedWarmValues) =
+            Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
+        eval(seedWarmCache.flatMap { $0.state }
+            + [seedWarmIDs, seedWarmValues, seedWarmNorm])
     }
 
     // MARK: - begin
@@ -275,11 +316,13 @@ public final class Qwen36MTPBlockSession {
     public func begin(seedTokens: [Int]) throws -> Int {
         guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
+        let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         cache = model.newCache(parameters: nil)
         let (seedLogits, hidden) = model.callWithHidden(
             input: LMInput.Text(
                 tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
             cache: cache, nConfirmed: 0)
+        let tBeginBuilt = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         // Seed vocabulary trim: `seedLogits` projects lm_head over all 512
         // seed rows but only the last row is ever used. It is deliberately
         // NEVER evaluated — a dead lazy graph costs nothing — and the one row
@@ -299,6 +342,12 @@ public final class Qwen36MTPBlockSession {
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
         eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
                                            pendingHidden!, hidden])
+        if Self.traceRounds {
+            let tBeginDone = DispatchTime.now().uptimeNanoseconds
+            Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
+                + "build_us=\((tBeginBuilt - tBegin0) / 1000) "
+                + "eval_wall_us=\((tBeginDone - tBeginBuilt) / 1000)\n")
+        }
         let readTail = (
             tailIDs.asArray(Int32.self).map { Int($0) },
             tailValues.asArray(Float.self).map { Double($0) }
@@ -347,15 +396,140 @@ public final class Qwen36MTPBlockSession {
         Swift.min(offeredDepth, 1)
     }
 
-    /// Consecutive fully-accepted DRAFTING rounds. The streak-gated schedule
-    /// widens by one draft per full acceptance (1 -> 2 -> 3, capped), and
-    /// collapses back to 1 after any miss, so a prompt the head reads poorly
-    /// degrades to plain K=1 instead of paying wasted head steps per round.
+    /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
+    /// telemetry counter; the cost-model schedule below reads the per-position
+    /// EMAs, not this.
     private var fullAcceptStreak = 0
-    /// Cap on the streak ladder. The verify row is nearly free (weight-bound
-    /// forward), so the cap prices the marginal HEAD step against its
-    /// acceptance odds; 3 keeps the wasted-work tail short on mixed prose.
-    private static let streakDepthCap = 4
+
+    /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
+    /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
+    /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
+    /// file because the local worker spawn path does not forward worker
+    /// stderr to the wrapper's log.
+    private static let traceRounds =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+    private static func traceWrite(_ line: String) {
+        // stderr: the worker sandbox denies file-write*, and the parent's
+        // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
+        // `forwardsWorkerStderr` on the local mtp-timed verb.
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    /// Exact-value row dump for the LOCAL width-wall gate: hexfloat (`%a`)
+    /// per declared top-2 value so the serial leg's rows and a wide round's
+    /// rows can be compared BIT-FOR-BIT by position — the comparison the
+    /// local argmax-only reference check does not do and the ranked ledger
+    /// replay does. Same env gate as the phase trace; never on at rank.
+    private static func traceRow(pos: Int, ids: [Int], values: [Double]) {
+        guard traceRounds else { return }
+        let hex = values.map { String(format: "%a", $0) }.joined(separator: ",")
+        traceWrite("mtp-row: pos=\(pos) ids=\(ids[0]),\(ids[1]) v=\(hex)\n")
+    }
+
+    // MARK: - cost-model depth schedule
+
+    /// Per-position acceptance EMAs: `positionAcceptEMA[i]` estimates
+    /// P(draft i accepted | drafts 0..<i accepted). Seeded with an optimistic,
+    /// gently decaying prior so the first rounds draft rather than stall; the
+    /// EMA half-life (~9 observed rounds at 0.15) adapts well inside a
+    /// 512-token window while surviving one unlucky reject.
+    private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
+        .map { 0.85 * pow(0.98, Double($0)) }
+    private static let acceptEMAAlpha = 0.15
+
+    /// h = (one head draft step) / (one batched verify forward), the only
+    /// constant the marginal rule needs. Derivation from the campaign's
+    /// measured budgets: the verify forward is weight-stream bound on the
+    /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
+    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
+    /// carries the chained-launch overhead of the committed-history path.
+    /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
+    /// (arm 2) both divided total window time by rounds WITHOUT subtracting
+    /// the ~0.9 s seed prologue charged inside the local window — a prologue
+    /// artifact that made depth look nearly free. Steady-state regression on
+    /// the phase-traced receipts (draft_build ≈ 2.4 ms/step CPU, eval_wall
+    /// 79→89→106 ms for widths 7→8→9) puts the TRUE marginal cost of an
+    /// extra draft at ~10-16 ms against a ~24-40 ms round base: h ≈ 0.6 on
+    /// the bf16-head (pinned) stack. Underpricing h over-drafts d=6-8 on
+    /// hard hidden prompts — invisible on degenerate local prose at accept
+    /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
+    /// forced-depth arms after every head-variant change.
+    ///
+    /// THIRD FIT, from the capped-regime phase trace (rounds at d=2/3/4:
+    /// 49 / 59.4 / 70.5 ms): marginal ≈ 10.75 ms per extra draft against a
+    /// ~27 ms base → h ≈ 0.20 at verify widths 3-5. The earlier 0.6
+    /// estimate folded in the width>=6 rounds, whose 10-17 ms/row jump is
+    /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
+    /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
+    /// cap in ~3 rounds and still prices a real skip at p < 0.2.
+    private static let headStepCostRatio = 0.20
+
+    /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
+    /// stack, by bitwise measurement (hexfloat row gate, two attempts):
+    /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
+    /// (ids hold) even with (a) <= 5-row query chunking and (b) per-row
+    /// prefix-sliced sdpa at exactly the serial kL — identical mismatch
+    /// pattern both times, so the attention was never the (only) source;
+    /// the gated-delta scan's internal chunk geometry changes above S=5
+    /// (the invariant-#7 note warned about exactly this). Worse, the
+    /// drifted K/V rows the wide forwards write CONTAMINATE every later
+    /// round — a single wide round poisons the whole window under the
+    /// ranked exact-value replay, while staying invisible to the local
+    /// argmax-only check. Width 5 measured 5/5 bit-exact, which is why
+    /// every promoted receipt at cap 4 survived rank. Do not raise this
+    /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
+    private static let sdpaWidthWallDepthCap = 4
+
+    /// The greedy marginal-depth rule described at the policy's assignment.
+    private func costModelDepth(offeredDepth: Int) -> Int {
+        let cap = Swift.min(
+            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
+            Self.sdpaWidthWallDepthCap)
+        guard cap > 0 else { return 0 }
+        let h = Self.headStepCostRatio
+        var reach = 1.0
+        var expected = 0.0
+        var depth = 0
+        while depth < cap {
+            reach *= positionAcceptEMA[depth]
+            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            guard reach > threshold else { break }
+            expected += reach
+            depth += 1
+        }
+        return depth
+    }
+
+    /// Fold one round's acceptance outcome into the per-position EMAs.
+    /// Positions before the accepted count observed a success; the position
+    /// AT the accepted count observed a failure only if the walk actually
+    /// rejected there (not when it ended early on a committed stop token);
+    /// deeper positions were never reached and observe nothing.
+    private func recordAcceptOutcome(acceptedCount: Int, drafts: [Int]) {
+        let alpha = Self.acceptEMAAlpha
+        for index in 0 ..< acceptedCount where index < positionAcceptEMA.count {
+            positionAcceptEMA[index] += alpha * (1.0 - positionAcceptEMA[index])
+        }
+        let stoppedEarly = acceptedCount > 0 && acceptedCount <= drafts.count
+            && stopTokens.contains(drafts[acceptedCount - 1])
+        if acceptedCount < drafts.count, !stoppedEarly,
+           acceptedCount < positionAcceptEMA.count
+        {
+            positionAcceptEMA[acceptedCount] +=
+                alpha * (0.0 - positionAcceptEMA[acceptedCount])
+        } else if acceptedCount == drafts.count, !drafts.isEmpty,
+                  acceptedCount < positionAcceptEMA.count
+        {
+            // Optimism transfer: a FULLY accepted round is evidence about the
+            // position just past the round's depth too — the chain was hot and
+            // only the schedule ended it. Without this the first unreached
+            // position keeps its cold prior and the product-of-EMAs reach can
+            // never clear the deep threshold inside a short window; this is
+            // the streak ladder's widening step, recast as evidence.
+            positionAcceptEMA[acceptedCount] +=
+                alpha * (1.0 - positionAcceptEMA[acceptedCount])
+        }
+    }
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -393,6 +567,12 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
+        // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
+        // split a round into head-chain graph build, verify graph build, and
+        // the single blocking eval's GPU wall. Never on in a ranked run.
+        let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
+        var tDraftBuilt: UInt64 = 0
+        var tVerifyBuilt: UInt64 = 0
 
         // Round-top invariant, kept as a THROW rather than a comment: every
         // emitted token is in the trimmable caches and the pending primary is
@@ -497,6 +677,9 @@ public final class Qwen36MTPBlockSession {
             pendingPrimary = readTail.0[0]
             pendingTop2 = readTail
             let (tailTokens, tailLogits) = readTail
+            Self.traceRow(
+                pos: seedTokenCount + committedTokenCount,
+                ids: tailTokens, values: tailLogits)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -567,6 +750,9 @@ public final class Qwen36MTPBlockSession {
         // verify block; the ledger reads the values from the round's single
         // batched eval afterwards). `asyncEval` submits the head chain so the
         // GPU works while the host builds the 64-layer verify graph.
+        // (Per-step asyncEval was tried here and measured NEUTRAL — the
+        // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
+        // idea.md V6 journal. Single submission after the loop, as before.)
         var draftIdArrays: [MLXArray] = []
         var headHidden = model.mtpHeadHiddenForward(
             hidden: draftInputHidden, nextTokenIds: draftInputTokens,
@@ -577,6 +763,12 @@ public final class Qwen36MTPBlockSession {
             argMax(model.applyDraftLMHead(draftHidden), axis: -1)
                 .asType(.int32))
         draftIdArrays.append(draftId)
+        // Early submission of the FIRST head step: its graph exists ~2.4 ms
+        // before the rest of the chain is built, and unlike the per-step
+        // variant (measured neutral — nothing but build time between steps)
+        // the first step carries the history flush, which IS real GPU work
+        // the device can start while the host builds steps 2..d.
+        asyncEval(draftId)
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
@@ -588,6 +780,7 @@ public final class Qwen36MTPBlockSession {
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
@@ -603,6 +796,7 @@ public final class Qwen36MTPBlockSession {
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
+        if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
@@ -615,6 +809,14 @@ public final class Qwen36MTPBlockSession {
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
         eval(cache.flatMap { $0.state } + bundle)
+        if Self.traceRounds {
+            let tEvalDone = DispatchTime.now().uptimeNanoseconds
+            let line = "mtp-trace: round=\(roundCount) d=\(draftCount) "
+                + "draft_build_us=\((tDraftBuilt - tRound0) / 1000) "
+                + "verify_build_us=\((tVerifyBuilt - tDraftBuilt) / 1000) "
+                + "eval_wall_us=\((tEvalDone - tVerifyBuilt) / 1000)\n"
+            Self.traceWrite(line)
+        }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
@@ -725,6 +927,18 @@ public final class Qwen36MTPBlockSession {
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+        recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        if Self.traceRounds {
+            // Row i's distribution follows (primary + drafts[0..<i]); only
+            // rows on the accepted trajectory align with the serial leg.
+            let rowBase = expected + 1
+            for index in 0 ... acceptedCount where index < perRowTop2Tokens.count {
+                Self.traceRow(
+                    pos: rowBase + index,
+                    ids: perRowTop2Tokens[index],
+                    values: perRowTop2Logits[index])
+            }
+        }
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
