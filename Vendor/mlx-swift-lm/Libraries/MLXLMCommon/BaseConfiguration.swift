@@ -94,6 +94,13 @@ public struct BaseConfiguration: Codable, Sendable {
                 case .quantize(let quantization):
                     return quantization
                 }
+            } else if layer.hasPrefix("mtp.") {
+                // MTP head modules carry load-time affine-8/group-64 triples
+                // staged by the model's sanitize (the checkpoint's own config
+                // never lists `mtp.` layers, so without this rule they would
+                // resolve to the backbone's global 4-bit config and be sized
+                // wrong for the 8-bit packed weights).
+                return Quantization(groupSize: 64, bits: 8)
             } else {
                 return quantization
             }

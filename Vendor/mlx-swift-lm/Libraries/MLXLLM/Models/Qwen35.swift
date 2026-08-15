@@ -529,15 +529,17 @@ final class Qwen35GatedDeltaNet: Module {
     /// through wide-shape kernel selection in the recurrence prologue (the
     /// conv runs over 3+S positions and is the shape-dependent op in this
     /// path; the recurrence's own t-loop is order-independent of T). The fix
-    /// removes the wide shapes: split S in 6...9 into [S-4, 4] — both
-    /// sub-widths inside the rank-proven 2...5 range — chaining the fp32
-    /// recurrent state losslessly between the two calls. Replay MUST mirror
+    /// removes the wide shapes: split S in 6...9 into [ceil(S/2), floor(S/2)]
+    /// — both sub-widths inside the rank-proven 2...5 range — chaining the
+    /// fp32 recurrent state losslessly between the two calls. Balanced halves
+    /// (vs the earlier [S-4, 4]) change only widths 6 and 7, to [3,3] and
+    /// [4,3]; widths 8 and 9 already split balanced. Replay MUST mirror
     /// the same boundary (see `replayPrefix`), which is why this is the one
     /// shared source of truth for it. Returns nil at widths that stay on the
     /// proven single-chunk form.
     fileprivate static func verifyChunkBoundary(_ rows: Int) -> Int? {
         guard rows >= 6, rows <= 9 else { return nil }
-        return rows - 4
+        return (rows + 1) / 2
     }
 
     private func processChunkStashingPrefix(
@@ -1017,7 +1019,15 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
+        // Width guard raised 2 -> 5: rows 3-5 still dispatch the per-row
+        // qmv kernel (get_qmv_batch_limit >= 12 at these D/O on every
+        // supported arch), and row-concat on N changes which launch a row
+        // rides in, not its dot-product order — so the fuse stays exact
+        // through the full single-chunk verify range while saving one
+        // quantized projection launch per dense MLP. Widths >= 6 (the
+        // wide-verify projections, which run unchunked) keep the separate
+        // gate/up calls and the pinned baseline's reduction order.
+        if x.dim(-2) <= 5, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -1567,6 +1577,35 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             {
                 weights[k] = v + MLXArray(1, dtype: v.dtype)
             }
+        }
+
+        // Load-time quantization of the merged float MTP head: any 2-D bf16
+        // `mtp.*` projection that arrived from an additional source without
+        // scales is quantized to affine-8/group-64 triples in the staging
+        // dict, before the quantize walk sizes modules from shapes (the walk
+        // resolves these paths via the `mtp.` rule in
+        // `PerLayerQuantization.quantization(layer:)`). This is a
+        // deterministic, input-independent transform of the pinned head
+        // weights — nothing input-dependent is cached — and it halves
+        // head-step weight traffic versus running the head in bf16 while
+        // keeping the draft argmax profile effectively intact (the head only
+        // proposes; the verify pass stays on the backbone's own path).
+        let headQuantGroupSize = 64
+        let headQuantBits = 8
+        for key in weights.keys
+        where key.hasPrefix("mtp.") && key.hasSuffix(".weight") {
+            let w = weights[key]!
+            let base = String(key.dropLast(".weight".count))
+            guard w.ndim == 2, w.dtype == .bfloat16,
+                weights["\(base).scales"] == nil,
+                w.dim(1) % headQuantGroupSize == 0
+            else { continue }
+            let q = MLX.quantized(
+                w, groupSize: headQuantGroupSize, bits: headQuantBits)
+            guard let biases = q.biases else { continue }
+            weights[key] = q.wq
+            weights["\(base).scales"] = q.scales
+            weights["\(base).biases"] = biases
         }
 
         return weights
