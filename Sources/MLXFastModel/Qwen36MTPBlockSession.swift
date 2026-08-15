@@ -714,8 +714,16 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
+        // Soft reset only. Cap stays 4 — official 1.9546 already saturates
+        // easy prompts at draft 3.67 against that cap, and a previous cap-8
+        // isolate crashed the untimed correctness gate (no report payload),
+        // consistent with a width-9 hole in the per-row checkpoint path.
+        // A partial accept of `a` drafts now schedules min(4, 1+a) next,
+        // instead of collapsing to 1. A total miss still returns to K=1.
         fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+            acceptedCount == drafts.count
+            ? fullAcceptStreak + 1
+            : acceptedCount
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
