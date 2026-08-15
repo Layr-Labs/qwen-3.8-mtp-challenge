@@ -906,7 +906,14 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
+        // Decode AND verify widths (S <= 9): the same fused gate/up matmul
+        // the S <= 2 guard already shipped, extended to every MTP verify
+        // width — the exact analogue of the promoted S <= 9 GDN in_proj
+        // fuse lift. Row-concat on N is bit-exact per output element at any
+        // M (groups along K; each row's qmv reduction order is independent
+        // of the launch it rides in), and on the ranked box every M <= 9
+        // stays on qmv_fast. Prefill keeps the separate calls.
+        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -934,6 +941,7 @@ final class Qwen35Attention: Module {
     // Packed Q/K/V concat on N. Underscore so it is not a Module parameter.
     // Built once from already-quantized q/k/v; never attached as a child.
     private var _qkvW: MLXArray?
+    private var _qkvBFW: MLXArray?
     private var _qkvS: MLXArray?
     private var _qkvZ: MLXArray?
     private var _qkvGS = 64
@@ -974,12 +982,22 @@ final class Qwen35Attention: Module {
 
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
-    /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
+    /// separate qmv_fast launches. Unquantized (the MTP head's bf16 layer)
+    /// fuses the plain weights the same way — one matmul instead of three
+    /// launches per draft step; the head only PROPOSES, so that path is
+    /// outside the exactness surface by construction (and row-concat on N
+    /// is per-row exact for plain matmul regardless).
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            let qEnd = _qOut
+            let kEnd = _qOut + _kOut
+            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+        }
+        if let w = _qkvBFW {
+            let y = matmul(x, w.T)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
@@ -1000,6 +1018,17 @@ final class Qwen35Attention: Module {
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
+            return qkv(x)
+        }
+        if !(qProj is QuantizedLinear), !(kProj is QuantizedLinear),
+           !(vProj is QuantizedLinear),
+           qProj.bias == nil, kProj.bias == nil, vProj.bias == nil
+        {
+            _qkvBFW = concatenated(
+                [qProj.weight, kProj.weight, vProj.weight], axis: 0
+            ).contiguous()
+            _qOut = qProj.weight.dim(0)
+            _kOut = kProj.weight.dim(0)
             return qkv(x)
         }
         return (qProj(x), kProj(x), vProj(x))
@@ -1260,7 +1289,13 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        //
+        // EXTENDED TO EVERY MTP VERIFY WIDTH (S <= 9): the wide verifies
+        // are where the graph-build stall is largest (sealed phase traces
+        // measured eval_wall 79→106 ms at widths 7→9), and the ladder is
+        // scheduling only — the same bit-exactness argument as at S <= 2.
+        // Prefill (S = 512) stays ladder-free as before.
+        let ladderActive = inputs.dim(1) <= 9
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
