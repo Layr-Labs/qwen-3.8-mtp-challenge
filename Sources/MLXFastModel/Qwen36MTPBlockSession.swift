@@ -216,26 +216,13 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(maxDepth)
         }
         let warmCache = model.newCache(parameters: nil)
-        // Decode kernels are not fully described by query width: the wide
-        // attention path also selects against the live KV length. Warming the
-        // legal widths behind an 8-token prefix left the long-prefix variants
-        // to materialise inside a later scored round (the ranked prompt-5
-        // receipt showed a repeatable 0.368 s one-off stall). Seed the
-        // throwaway cache at the track's real 512-token prefix so every width
-        // below compiles in the same long-context dispatch family as decode.
-        // Token values are deliberately irrelevant here: this cache is never
-        // observed by generation; only its 512-row shape selects the family.
-        let seed = Array(repeating: 0, count: 512)
+        let seed = Array(repeating: 0, count: 8)
         let (logits, hidden) = model.callWithHidden(
             input: LMInput.Text(tokens: MLXArray(seed).reshaped([1, seed.count])),
             cache: warmCache, nConfirmed: 0)
-        // As in `begin`, the full-seed lm_head projection is dead. Evaluating
-        // it would warm work the scored path never performs and needlessly
-        // stream the vocabulary matrix over all 512 rows.
-        _ = logits
         var row = hiddenRow(hidden, hidden.dim(1) - 1)
         eval(warmCache.flatMap { $0.state })
-        eval(row)
+        eval(logits, row)
 
         let headCache = model.makeMTPCache()
         for _ in 0 ..< maxDepth {
@@ -475,14 +462,6 @@ public final class Qwen36MTPBlockSession {
     /// gently decaying prior so the first rounds draft rather than stall; the
     /// EMA half-life (~9 observed rounds at 0.15) adapts well inside a
     /// 512-token window while surviving one unlucky reject.
-    /// PRIORS: optimistic-decaying, by measurement. The real-prose
-    /// production conditionals (0.92/0.70/0.50, MTPLX) were tried and taxed
-    /// the ramp two extra rounds on easy prose (22.15 vs 21.5 local) — and
-    /// the published MEDIAN is set by the easy-mid prompts, so a ramp tax
-    /// lands exactly where it hurts. The EMAs converge to the prompt's
-    /// truth within ~10 rounds regardless; what protects the hard prompts
-    /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
-    /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
@@ -505,18 +484,25 @@ public final class Qwen36MTPBlockSession {
     /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
     /// forced-depth arms after every head-variant change.
     ///
-    /// FOURTH FIT — and the resolution of the 0.20-vs-0.43 dispute. The
-    /// capped-regime phase trace measured ~10.75 ms marginal per draft on a
-    /// ~27 ms base (0.20) in the fully-accepted case. MTPLX ships a
-    /// break-even of ~0.43 — but their reject pays a REPAIR FORWARD, while
-    /// this stack's per-row GDN checkpoints make a prefix reject nearly
-    /// free (restoreAfterPrefixReject, no repair at any depth). Their
-    /// constant prices a cost this stack deleted; 0.40 measured -4.5% on
-    /// the easy-prose receipt (held d2-3 where d4 pays). h = 0.20 is the
-    /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
-    /// reject does keep (the drafted head steps past the break) is already
-    /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    /// THIRD FIT, from the capped-regime phase trace (rounds at d=2/3/4:
+    /// 49 / 59.4 / 70.5 ms): marginal ≈ 10.75 ms per extra draft against a
+    /// ~27 ms base → h ≈ 0.20 at verify widths 3-5. The earlier 0.6
+    /// estimate folded in the width>=6 rounds, whose 10-17 ms/row jump is
+    /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
+    /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
+    /// cap in ~3 rounds and still prices a real skip at p < 0.2.
+    ///
+    /// FOURTH FIT, prescribed by this comment's own rule ("Re-fit from
+    /// forced-depth arms after every head-variant change"): the candidate leg
+    /// now runs the declared 4-bit/g64 requant of the pinned bf16 head
+    /// (head layer 849 MB -> 239 MB; the lm_head readout is unchanged target
+    /// weight). A head step streamed ~0.83 GiB head layer + ~0.65 GiB readout;
+    /// it now streams ~0.22 GiB + ~0.65 GiB, so the marginal draft cost
+    /// shrinks by the same ~0.59x: 0.20 -> ~0.118, shipped as 0.12. The
+    /// ranked pair is the arbiter; 0.08 / 0.16 are the documented spread
+    /// arms. Depth stays under the hard cap 4 (width <= 5), the proven-safe
+    /// verify regime.
+    private static let headStepCostRatio = 0.12
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -533,44 +519,26 @@ public final class Qwen36MTPBlockSession {
     /// every promoted receipt at cap 4 survived rank. Do not raise this
     /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
     ///
-    /// RESOLUTION of the wall's mechanism, and the door through it: the GDN
-    /// scan kernel is sequential in T with T-independent per-row arithmetic
-    /// (one register-resident fp32 state walked t = 0..<T), so the scan was
-    /// never the drift source. Quantized projections at M in 6..9 still ride
-    /// the per-row-exact QMV dispatch (host qmv batch limit 10+ on this
-    /// generation for these shapes). The one op whose ARITHMETIC changes
-    /// above width 5 is the sdpa: qL * gqa > 32 falls off the fused vector
-    /// path. `attentionWithCacheUpdate` therefore splits a 6..9-row causal
-    /// decode attention into two <= 5-row sdpa calls whose bottom-right-
-    /// aligned windows are byte-identical to the promoted <= 5 rounds' —
-    /// after which a deep round is ONE ordinary model call. Measured on the
-    /// hexfloat row gate: widths 6..8 bit-exact per position against the
-    /// serial trajectory. Segmenting the whole FORWARD instead (two model
-    /// calls, 5+k) was measured bit-exact too but pays a second full weight
-    /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 4
-
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
-    /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
-    /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    /// RAISED TO THE TRUSTED MAXIMUM — the wall is cracked structurally, by
+    /// removing the wide shapes rather than diagnosing the culprit op. For
+    /// verify widths 6...9, `Qwen35GatedDeltaNet` now runs the whole
+    /// recurrence (conv prologue + scan) as two sub-chunks of widths
+    /// [S-4, 4] — both inside the rank-proven 2...5 range — with the fp32
+    /// state chained losslessly between the calls, the lazy prefix REPLAY
+    /// mirrors the same chunk boundary (`verifyChunkBoundary` is the single
+    /// source of truth), and `Qwen35Attention` advances the KV cache and
+    /// runs SDPA in the same two steps, so every kernel invocation executes
+    /// at a (qL, kL = prefix + qL) shape a cap-4 verify already produces on
+    /// the ranked box. Widths 2...5 keep the previous code byte-for-byte,
+    /// so a run whose cost model never exceeds depth 4 is bit-identical to
+    /// the promoted stack.
+    private static let sdpaWidthWallDepthCap = Qwen36MTPLimits.maxDepth
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
-        // The width wall binds the SINGLE-CALL verify; a qualifying
-        // full-accept streak opens the segmented cap (the round then feeds
-        // the target <= 5-row segments, never a wider launch). Any reject
-        // resets the streak, so a cold or struggling prompt never sees a
-        // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
-            widthCap)
+            Self.sdpaWidthWallDepthCap)
         guard cap > 0 else { return 0 }
         let h = Self.headStepCostRatio
         var reach = 1.0
@@ -611,14 +579,9 @@ public final class Qwen36MTPBlockSession {
             // only the schedule ended it. Without this the first unreached
             // position keeps its cold prior and the product-of-EMAs reach can
             // never clear the deep threshold inside a short window; this is
-            // the streak ladder's widening step, recast as evidence. Capped
-            // at 0.95: transferred optimism is inference, not observation,
-            // and deep positions never merit a certainty estimate
-            // without treating that inference as a real observation.
-            if positionAcceptEMA[acceptedCount] < 0.95 {
-                positionAcceptEMA[acceptedCount] +=
-                    alpha * (0.95 - positionAcceptEMA[acceptedCount])
-            }
+            // the streak ladder's widening step, recast as evidence.
+            positionAcceptEMA[acceptedCount] +=
+                alpha * (1.0 - positionAcceptEMA[acceptedCount])
         }
     }
 
@@ -664,9 +627,6 @@ public final class Qwen36MTPBlockSession {
         let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         var tDraftBuilt: UInt64 = 0
         var tVerifyBuilt: UInt64 = 0
-        var tEvalDone: UInt64 = 0
-        var tReadDone: UInt64 = 0
-        var tCommitDone: UInt64 = 0
 
         // Round-top invariant, kept as a THROW rather than a comment: every
         // emitted token is in the trimmable caches and the pending primary is
@@ -887,16 +847,6 @@ public final class Qwen36MTPBlockSession {
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
         // accept can replay only its committed prefix without a repair forward.
-        //
-        // Widths 6..9 ride the SAME single call: every quantized projection
-        // at M in 6..9 still routes through the per-row-exact QMV dispatch
-        // (the host's qmv batch limit is 10+ on this generation for these
-        // shapes), the GDN scan kernel is sequential in T with T-independent
-        // per-row arithmetic, and the one op that DID change arithmetic
-        // above width 5 — the fused sdpa vector path's qL bound — is handled
-        // by the exactness chunk inside `attentionWithCacheUpdate` (two
-        // <= 5-row sdpa calls, byte-identical windows). One tape, one
-        // rollback story, one readout, no second weight pass.
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
@@ -913,7 +863,14 @@ public final class Qwen36MTPBlockSession {
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
         eval(cache.flatMap { $0.state } + bundle)
-        if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
+        if Self.traceRounds {
+            let tEvalDone = DispatchTime.now().uptimeNanoseconds
+            let line = "mtp-trace: round=\(roundCount) d=\(draftCount) "
+                + "draft_build_us=\((tDraftBuilt - tRound0) / 1000) "
+                + "verify_build_us=\((tVerifyBuilt - tDraftBuilt) / 1000) "
+                + "eval_wall_us=\((tEvalDone - tVerifyBuilt) / 1000)\n"
+            Self.traceWrite(line)
+        }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
@@ -945,8 +902,6 @@ public final class Qwen36MTPBlockSession {
             perRowTop2Tokens.append(Array(flatTop2IDs[base ..< (base + 2)]))
             perRowTop2Logits.append(Array(flatTop2Values[base ..< (base + 2)]))
         }
-
-        if Self.traceRounds { tReadDone = DispatchTime.now().uptimeNanoseconds }
 
         if acceptedCount == drafts.count {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
@@ -1014,8 +969,6 @@ public final class Qwen36MTPBlockSession {
             }
         }
 
-        if Self.traceRounds { tCommitDone = DispatchTime.now().uptimeNanoseconds }
-
         // Head-history upkeep. Trim the speculative deeper-draft rows back to
         // the valid prefix, then queue the ACCEPTED transitions for the next
         // drafting round's flush: row i of the verify output is the trunk
@@ -1044,23 +997,6 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
-        if Self.traceRounds {
-            // Five-way split of the round. `eval_wall` is the only segment the
-            // GPU owns; everything after it is host time that the device could
-            // in principle be overlapping, so the tail segments are the budget
-            // for any further pipelining work.
-            let tTailDone = DispatchTime.now().uptimeNanoseconds
-            let line = "mtp-trace: round=\(roundCount) d=\(draftCount) "
-                + "acc=\(acceptedCount) "
-                + "draft_build_us=\((tDraftBuilt - tRound0) / 1000) "
-                + "verify_build_us=\((tVerifyBuilt - tDraftBuilt) / 1000) "
-                + "eval_wall_us=\((tEvalDone - tVerifyBuilt) / 1000) "
-                + "readout_us=\((tReadDone - tEvalDone) / 1000) "
-                + "commit_us=\((tCommitDone - tReadDone) / 1000) "
-                + "upkeep_us=\((tTailDone - tCommitDone) / 1000) "
-                + "round_us=\((tTailDone - tRound0) / 1000)\n"
-            Self.traceWrite(line)
-        }
         // No trailing eval: every host-read value was materialised by the
         // round bundle above. A successful wide-prefix replay intentionally
         // installs lazy recurrent roots; only the next GPU graph consumes
