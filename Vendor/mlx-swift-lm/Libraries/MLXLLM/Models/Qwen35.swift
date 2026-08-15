@@ -1025,6 +1025,15 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
 
 }
 
+// Compiled FA output gate for multi-row verify. Same x * sigmoid(gate).
+// L=1 stays eager so the scored denominator is unchanged.
+private let qwen35CompiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { output, gate in
+        output * sigmoid(gate)
+    }
+    return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -1183,7 +1192,11 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        let gated =
+            L >= 2
+            ? qwen35CompiledSigmoidMultiply(output, gate)
+            : sigmoidMultiply(output, gate)
+        return oProj(gated)
     }
 }
 
