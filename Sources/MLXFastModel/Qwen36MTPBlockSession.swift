@@ -245,11 +245,11 @@ public final class Qwen36MTPBlockSession {
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
-            // Every drafting width verifies with nConfirmed: 1 (per-boundary
-            // checkpoints); warm the same shapes the scored rounds dispatch.
+            // The candidate intentionally avoids per-boundary GDN checkpoints;
+            // warm the same ordinary width-S target shapes the scored rounds use.
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
+                cache: warmCache, nConfirmed: 0)
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
@@ -580,20 +580,20 @@ public final class Qwen36MTPBlockSession {
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
+        // 2. Keep the generic pre-verify snapshot. The ordinary fused target
+        //    forward below emits no per-boundary recurrent states; on the rare
+        //    rejection the existing fallback restores this snapshot and replays
+        //    only the accepted prefix.
         let snapshot = Self.snapshotRecurrent(cache)
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
-        // nConfirmed: 1 at every drafting width — the fused GDN verify writes
-        // a per-boundary checkpoint for EVERY row, so a partial accept at any
-        // depth restores its boundary without a repair forward.
+        // nConfirmed: 0 avoids writing one full fp32 GDN checkpoint per possible
+        // acceptance boundary. Full-accept rounds need none; rejects use the
+        // generic snapshot/replay path below.
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(tokens: verifyTokens),
-            cache: cache, nConfirmed: 1)
+            cache: cache, nConfirmed: 0)
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
