@@ -1052,6 +1052,9 @@ final class Qwen35Attention: Module {
     private var _qkvMode = QuantizationMode.affine
     private var _qOut = 0
     private var _kOut = 0
+    // bf16 / unquantized packed Q+gate|K|V. The MTP head is bf16 and
+    // currently takes the three-launch fallback. Proposal-only.
+    private var _qkvBfW: MLXArray?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1085,12 +1088,19 @@ final class Qwen35Attention: Module {
 
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
-    /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
+    /// separate qmv_fast launches. Unquantized (MTP bf16) uses the same
+    /// N-concat packing as one dense matmul — proposal-only.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            let qEnd = _qOut
+            let kEnd = _qOut + _kOut
+            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+        }
+        if let w = _qkvBfW {
+            let y = matmul(x, w.T)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
@@ -1111,6 +1121,17 @@ final class Qwen35Attention: Module {
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
+            return qkv(x)
+        }
+        if !(qProj is QuantizedLinear),
+           !(kProj is QuantizedLinear),
+           !(vProj is QuantizedLinear)
+        {
+            _qkvBfW = concatenated(
+                [qProj.weight, kProj.weight, vProj.weight], axis: 0
+            ).contiguous()
+            _qOut = qProj.weight.dim(0)
+            _kOut = kProj.weight.dim(0)
             return qkv(x)
         }
         return (qProj(x), kProj(x), vProj(x))
