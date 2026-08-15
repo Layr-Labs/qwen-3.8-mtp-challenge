@@ -631,7 +631,7 @@ final class Qwen35GatedDeltaNet: Module {
 // MARK: - Fused MLP
 
 /// Decode-width fused gate/up MLP. Same math as the vendored `Qwen3NextMLP` —
-/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 2) the
+/// `down(silu(gate(x)) * up(x))` — but at exact decode/verify widths (S <= 5) the
 /// gate and up projections run as ONE matmul over concatenated output rows
 /// (N = 34816), halving the biggest per-layer launch count on the hot path.
 ///
@@ -639,7 +639,7 @@ final class Qwen35GatedDeltaNet: Module {
 /// K, every N here (17408 and 34816) keeps the fast-kernel eligibility
 /// (N%8==0 at K%512==0), and a row's dot-product arithmetic in `qmv_fast`
 /// does not depend on which launch it rides in — the in-tree precedent is
-/// the promoted FA QKV fuse below. Prefill (S > 2) keeps the two separate
+/// the promoted FA QKV fuse below. Wider prefill (S > 5) keeps the two separate
 /// calls so the qmm/split-k reduction order of the pinned baseline is
 /// preserved byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
@@ -700,7 +700,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
+        if x.dim(-2) <= 5, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
