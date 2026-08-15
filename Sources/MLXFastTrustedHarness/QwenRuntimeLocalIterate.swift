@@ -964,7 +964,7 @@ extension QwenRuntime {
     /// payload whose timings were still measured (the common case: the public
     /// gate's teacher-forced check failed -- e.g. the deterministic non-M5
     /// near-tie divergence -- but prefill/decode completed). The Yukon
-    /// participant CLI (`mlxfast run`) validates the contract scorePath as
+    /// participant CLI (`yukon run`) validates the contract scorePath as
     /// `{ "score": <finite number>, ... }`, so a `score: null` failure payload
     /// makes every local run on non-M5 hardware error at the contract layer
     /// instead of reporting the measured timings. `passed` stays false and
@@ -1030,7 +1030,7 @@ extension QwenRuntime {
         // Local modes publish the ESTIMATED score: the same decode_speedup^0.75
         // * prefill_speedup^0.25 estimate against the pinned officialBaseline*
         // constants that the live progress stream and shell summary already
-        // print. The Yukon participant CLI (`mlxfast run`) executes
+        // print. The Yukon participant CLI (`yukon run`) executes
         // benchmarkCommand and then validates the contract scorePath as
         // `{ "score": <finite number>, ... }` -- `score: null` is rejected --
         // so local modes must carry a numeric score to be consumable at all.

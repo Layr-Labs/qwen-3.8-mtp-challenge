@@ -335,7 +335,7 @@ if [[ -n "${review_base}" ]]; then
     fi
   done < "${deleted_paths_file}"
   if (( deleted_path_count > 0 )); then
-    stale_clone_hint=". Note: this submission deletes ${deleted_path_count} editable file(s) that exist on the trusted base (first: ${first_deleted_path}); that usually means it was packaged from a stale clone that predates the current editablePaths surface, not deliberate deletion. Re-sync the clone with current main (mlxfast sync, or re-clone), rebase the changes, and resubmit"
+    stale_clone_hint=". Note: this submission deletes ${deleted_path_count} editable file(s) that exist on the trusted base (first: ${first_deleted_path}); that usually means it was packaged from a stale clone that predates the current editablePaths surface, not deliberate deletion. Re-sync the clone with current main (yukon sync, or re-clone), rebase the changes, and resubmit"
     echo "submission-review: ${deleted_path_count} editable file(s) deleted versus base ${review_base} (first: ${first_deleted_path}); if unintentional, the submission likely came from a stale clone" >&2
   fi
 

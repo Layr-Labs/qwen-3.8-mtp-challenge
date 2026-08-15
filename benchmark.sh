@@ -37,6 +37,7 @@ LOCAL_ITERATE=0
 LOCAL_SUBMIT=0
 OFFICIAL=0
 LOCAL_COOL_GATE_ONLY=0
+TRANSFORM_ONLY=0
 FAN_SPEED_NORMAL=0
 # Arguments forwarded to `mlxfast-swift benchmark`. --official is a shell-level
 # mode selector only, so it is filtered out here; the Swift CLI does not know it.
@@ -54,6 +55,17 @@ for arg in "$@"; do
       ;;
     --local-cool-gate-only)
       LOCAL_COOL_GATE_ONLY=1
+      continue
+      ;;
+    --transform-only)
+      # Shell-level mode selector, consumed here exactly like --official and
+      # --local-cool-gate-only: the Swift CLI does not know it, and this mode
+      # never reaches `mlxfast-swift benchmark` anyway. LOCAL_ITERATE is NOT
+      # set here -- it is set after the mutual-exclusion checks below, so
+      # `--transform-only --official` reports the conflict it actually has
+      # instead of the "--official cannot be combined with --local-iterate"
+      # message for a flag the caller never typed.
+      TRANSFORM_ONLY=1
       continue
       ;;
     --fan-speed-normal)
@@ -78,6 +90,33 @@ fi
 if [[ "${LOCAL_ITERATE}" == "1" && "${LOCAL_SUBMIT}" == "1" ]]; then
   echo "benchmark.sh: --local-iterate and --local-submit cannot be used together" >&2
   exit 1
+fi
+
+# --transform-only produces (or refreshes) the transformed weights/ tree and
+# then exits BEFORE any measurement. It is a mode, not a modifier: pairing it
+# with a mode that measures would silently drop the measurement the caller
+# asked for, so every such combination is refused by name rather than resolved
+# by precedence.
+if [[ "${TRANSFORM_ONLY}" == "1" ]]; then
+  if [[ "${OFFICIAL}" == "1" ]]; then
+    echo "benchmark.sh: --transform-only cannot be combined with --official (it exits before any measurement)" >&2
+    exit 1
+  fi
+  if [[ "${LOCAL_SUBMIT}" == "1" ]]; then
+    echo "benchmark.sh: --transform-only cannot be combined with --local-submit (it exits before any measurement)" >&2
+    exit 1
+  fi
+  if [[ "${LOCAL_COOL_GATE_ONLY}" == "1" ]]; then
+    echo "benchmark.sh: --transform-only cannot be combined with --local-cool-gate-only (the cool gate returns before the transform)" >&2
+    exit 1
+  fi
+  # Set only now, and for the same reason --local-cool-gate-only sets it at its
+  # own branch: everything downstream that asks "is this a local run?" must say
+  # yes. That is what makes the bare-invocation defaulting below leave this
+  # mode alone, and what puts the transform behind the per-user run lock and
+  # the resident-model scan -- a transform is not model-resident, but it does
+  # rewrite weights/ underneath any run that is.
+  LOCAL_ITERATE=1
 fi
 
 # --fan-speed-normal undoes the cool gate's optional 70% fan boost: it hands
@@ -160,22 +199,50 @@ fi
 # else use reference_weights/ only when it actually holds a checkpoint, resolved to
 # its real target so the transform never opens a symlinked directory; else fall
 # back to the Hugging Face cache setup.sh downloads into.
-REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-poolside/Laguna-XS-2.1-NVFP4-mlx}"
-REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-841778bda563a36104dd521e37d99218e46f4f25}"
-REFERENCE_DEFAULT_DIR="reference_weights/laguna-xs-2.1-nvfp4-mlx"
-REFERENCE_HF_HOME="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
-REFERENCE_HF_HUB_CACHE="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${REFERENCE_HF_HOME}/hub}}"
-REFERENCE_CACHE_DIR="${MLXFAST_REFERENCE_CACHE_DIR:-${REFERENCE_HF_HUB_CACHE}/models--${REFERENCE_MODEL_REPO//\//--}/snapshots/${REFERENCE_REVISION//\//--}}"
-if [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
-  REFERENCE_PATH="${MLXFAST_REFERENCE_DIR}"
-elif [[ -f "${REFERENCE_DEFAULT_DIR}/config.json" ]]; then
-  REFERENCE_PATH="$(cd -P "${REFERENCE_DEFAULT_DIR}" 2>/dev/null && pwd -P)" \
-    || REFERENCE_PATH="${REFERENCE_DEFAULT_DIR}"
-elif [[ -f "${REFERENCE_CACHE_DIR}/config.json" ]]; then
-  REFERENCE_PATH="${REFERENCE_CACHE_DIR}"
-else
-  REFERENCE_PATH="${REFERENCE_DEFAULT_DIR}"
-fi
+#
+# DELIBERATELY SELF-CONTAINED: every input is an environment variable or a
+# literal default, and nothing here reads a variable this script set earlier.
+# Two callers depend on that. (1) source_hash() below folds the resolved
+# reference's identity into the transform-cache digest, and source_hash() is
+# EXTRACTED by the sibling track runners (benchmark-qwen-mtp.sh,
+# benchmark-dflash.sh) with `awk '/^source_hash\(\) \{/,/^\}/'` and evaluated in
+# a shell that has none of this script's state. (2) those runners extract this
+# function by the same idiom to resolve the reference themselves. So: keep the
+# name at column 0 with `() {`, keep the closing `}` at column 0, and never let
+# a column-0 `}` appear inside the body -- the extraction range ends at the
+# first one.
+#
+# The pins are the Qwen 3.8 27B 4-bit target and must move in lockstep with
+# setup.sh's REFERENCE_MODEL_REPO/REFERENCE_REVISION and
+# MLXFastConstants.referenceModelRepository/referenceModelRevision/defaultReferencePath.
+resolve_reference_path() {
+  local reference_repo reference_revision reference_default_dir
+  local reference_hf_home reference_hf_hub_cache reference_cache_dir resolved
+  reference_repo="${MLXFAST_REFERENCE_MODEL_REPO:-EigenLabs/Qwen3.8-27B-4bit}"
+  reference_revision="${MLXFAST_REFERENCE_REVISION:-eda45ab47f465d08d6558f0353a2346e2eb9d5b3}"
+  reference_default_dir="reference_weights/Qwen3.8-27B-4bit"
+  reference_hf_home="${MLXFAST_HF_HOME:-${HF_HOME:-${HOME:-${PWD}}/.cache/huggingface}}"
+  reference_hf_hub_cache="${MLXFAST_HF_HUB_CACHE:-${HF_HUB_CACHE:-${reference_hf_home}/hub}}"
+  reference_cache_dir="${MLXFAST_REFERENCE_CACHE_DIR:-${reference_hf_hub_cache}/models--${reference_repo//\//--}/snapshots/${reference_revision//\//--}}"
+  if [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]]; then
+    printf '%s\n' "${MLXFAST_REFERENCE_DIR}"
+    return 0
+  fi
+  if [[ -f "${reference_default_dir}/config.json" ]]; then
+    resolved="$(cd -P "${reference_default_dir}" 2>/dev/null && pwd -P)" || resolved=""
+    printf '%s\n' "${resolved:-${reference_default_dir}}"
+    return 0
+  fi
+  if [[ -f "${reference_cache_dir}/config.json" ]]; then
+    printf '%s\n' "${reference_cache_dir}"
+    return 0
+  fi
+  # Nothing found: name the default dir so the caller's "reference weights not
+  # found at ..." error points at the path setup.sh provisions.
+  printf '%s\n' "${reference_default_dir}"
+}
+
+REFERENCE_PATH="$(resolve_reference_path)"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 # The participant runtime worker builds under its own SwiftPM scratch root
 # (.build-worker) so a participant-code build never writes into the trusted
@@ -263,7 +330,7 @@ report_local_baseline_context() {
 # does not have to be dug out of the JSON payload. The estimated score uses the
 # official formula against the official baseline constants carried inside the
 # score payload; local modes publish that estimate as the payload's score so
-# the Yukon participant CLI (`mlxfast run`), which requires a finite numeric
+# the Yukon participant CLI (`yukon run`), which requires a finite numeric
 # score at the contract scorePath, can consume local runs. It is a directional
 # local estimate (metrics.runtime marks the mode), never the official score,
 # which only the ranked runner produces. When a same-machine baseline snapshot
@@ -413,7 +480,7 @@ FAN_BOOST_ABORT_HANDLED=0
 # PID of the in-flight `mlxfast-swift benchmark` child. Local modes launch it
 # as a monitored background child (see the invocation site) so the INT/TERM
 # abort handler and the EXIT cleanup can reap the model-holding process tree
-# instead of leaving a ~21.6 GB runtime worker behind on an aborted run.
+# instead of leaving a ~15.2 GB runtime worker behind on an aborted run.
 BENCHMARK_CHILD_PID=""
 
 fan_boost_recorded() {
@@ -471,7 +538,7 @@ EOF
 # INT/TERM handler for the run that owns the abort traps. Two duties:
 # 1) Reap the in-flight benchmark process tree. Local modes run the Swift
 #    benchmark as a monitored background child (see the invocation site), and
-#    that child's runtime worker holds the ~21.6 GB model. An aborted run that
+#    that child's runtime worker holds the ~15.2 GB model. An aborted run that
 #    leaves the worker behind makes the NEXT run load a second copy of the
 #    model and can out-of-memory the machine, so the tree is torn down here
 #    on every abort.
@@ -503,7 +570,7 @@ handle_benchmark_abort_signal() {
 }
 
 # --- Local run memory guard and worker teardown --------------------------------
-# The Poolside Laguna XS 2.1 NVFP4 text tower is ~21.6 GB and RAM-resident: it lives inside the
+# The pinned Qwen 3.8 27B 4-bit text tower is ~15.2 GB and RAM-resident: it lives inside the
 # sibling `mlxfast-runtime-worker runtime-worker` subprocess that the trusted
 # `mlxfast-swift benchmark` process spawns. ONE resident copy needs roughly a
 # 40 GiB machine once KV and workspace are included; TWO do not fit locally.
@@ -520,7 +587,7 @@ handle_benchmark_abort_signal() {
 #   3. reap the spawned benchmark process tree (the Swift benchmark child
 #      and its runtime worker) on INT/TERM and on EXIT
 #      (terminate_benchmark_child_tree), so an interrupted edit-loop run
-#      cannot orphan a 21.6 GB process in the first place.
+#      cannot orphan a 15.2 GB process in the first place.
 # Local modes only: the ranked --official path is operator-supervised and is
 # not touched by any of this.
 #
@@ -539,7 +606,7 @@ LOCAL_RUN_LOCK_OWNED=""
 # workers launched by an older checkout), plus the trusted mlxfast-swift
 # subcommands that own an imminent worker. The trusted binary never holds
 # the model in-process, but a run in its pre-worker phase (validation,
-# weights digest) is about to spawn a ~21.6 GB worker and would otherwise be
+# weights digest) is about to spawn a ~15.2 GB worker and would otherwise be
 # invisible to this scan until that load has already started. The dflash-*
 # subcommands are listed for the same reason: a DFlash residency is the same
 # target plus the drafter.
@@ -597,7 +664,7 @@ acquire_local_run_lock() {
     if [[ "${holder_pid}" =~ ^[0-9]+$ ]] && ps -p "${holder_pid}" >/dev/null 2>&1; then
       cat >&2 <<EOF
 benchmark.sh: ERROR: another local benchmark run (pid ${holder_pid}) already holds ${lock_path}.
-benchmark.sh: two overlapping local runs would hold two ~21.6 GB copies of the model, which can
+benchmark.sh: two overlapping local runs would hold two ~15.2 GB copies of the model, which can
 benchmark.sh: out-of-memory this machine (and they would share one GPU, invalidating both timings).
 benchmark.sh: wait for that run to finish and rerun. If pid ${holder_pid} is not a benchmark run,
 benchmark.sh: remove the stale lock with: rm -rf "${lock_path}"
@@ -659,7 +726,7 @@ abort_if_model_already_resident() {
     echo "benchmark.sh: ERROR: a model-holding mlxfast process is already running (pid ppid rss_kb command):"
     printf '%s\n' "${resident}" | sed 's/^/benchmark.sh:   /'
     cat <<EOF
-benchmark.sh: the Poolside Laguna NVFP4 model is ~21.6 GB RAM-resident per process; starting another local run
+benchmark.sh: the pinned Qwen 3.8 27B 4-bit model is ~15.2 GB RAM-resident per process; starting another local run
 benchmark.sh: now would load a second copy and can out-of-memory this machine.
 benchmark.sh: - a ppid of 1 usually means an orphan left by a previous aborted run: verify with
 benchmark.sh:   'ps -p <pid> -o pid,ppid,rss,command' and stop it with 'kill <pid>'.
@@ -1254,32 +1321,110 @@ run_offline_writable_command() {
 source_hash() {
   # This hash gates regeneration of weights/. Keep it limited to the transform
   # target and shared core code so runtime/model-only edits stay fast locally.
+  #
+  # It ALSO covers the transform's INPUT identity, not just the code that
+  # transforms it. A digest over code alone answers "was weights/ produced by
+  # this transform?" and calls that freshness -- so when the pinned reference
+  # moved from one model to another, a weights/ tree transformed from the OLD
+  # checkpoint matched the new key exactly and was reused. The run then hashed
+  # ~15 GB of the wrong model, started the worker against it, and died with an
+  # unexplained worker exit and a null score. The reference repo@revision (as
+  # this run resolves them, defaults included) and the sha256 of the resolved
+  # reference's own config.json are folded into the same digest, so changing
+  # the target model invalidates every cached transform of the previous one.
+  #
+  # The resolved reference DIRECTORY is deliberately NOT hashed: it is an
+  # absolute path on the HF cache branch, which would make the digest
+  # machine-specific and force a pointless re-transform on every box. What
+  # matters is which checkpoint it is, which the identity strings and the
+  # config digest already say.
+  #
+  # EXTRACTION CONTRACT: benchmark-qwen-mtp.sh and benchmark-dflash.sh extract
+  # this function with `awk '/^source_hash\(\) \{/,/^\}/'`, so the body must
+  # never contain a column-0 `}`, and the "shasum -a 256" substring they
+  # sanity-check for must survive any refactor. Both also extract
+  # resolve_reference_path(), which this function calls -- keep those
+  # extractions in lockstep or the two sides compute different digests and the
+  # runners abort with a permanent false "stale weights".
   local paths=(
     "Package.swift"
     "Package.resolved"
     "Sources/MLXFastCore"
     "Sources/MLXFastTransform"
   )
-  local hash_status
+  local reference_repo reference_revision reference_dir reference_config_digest
 
-  if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git ls-files --cached --others --exclude-standard -z "${paths[@]}" \
-      | while IFS= read -r -d '' path; do
-      if [[ -f "${path}" ]]; then
-        printf '%s\0' "${path}"
-        shasum -a 256 "${path}"
-      else
-        printf '%s\0MISSING\0' "${path}"
-      fi
-    done | shasum -a 256 | awk '{print $1}'
-    hash_status="$?"
-    return "${hash_status}"
+  reference_repo="${MLXFAST_REFERENCE_MODEL_REPO:-EigenLabs/Qwen3.8-27B-4bit}"
+  reference_revision="${MLXFAST_REFERENCE_REVISION:-eda45ab47f465d08d6558f0353a2346e2eb9d5b3}"
+  reference_dir="$(resolve_reference_path)"
+  if [[ -f "${reference_dir}/config.json" ]]; then
+    reference_config_digest="$(shasum -a 256 "${reference_dir}/config.json" | awk '{print $1}')"
+  else
+    # An explicit marker, never an empty string: "no reference present" and
+    # "reference present with an empty config" must not collide.
+    reference_config_digest="MISSING"
   fi
 
-  find "${paths[@]}" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r path; do
-    printf '%s\0' "${path}"
-    shasum -a 256 "${path}"
-  done | shasum -a 256 | awk '{print $1}'
+  {
+    printf 'reference-repository\0%s\0' "${reference_repo}"
+    printf 'reference-revision\0%s\0' "${reference_revision}"
+    printf 'reference-config-sha256\0%s\0' "${reference_config_digest}"
+
+    if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      git ls-files --cached --others --exclude-standard -z "${paths[@]}" \
+        | while IFS= read -r -d '' path; do
+        if [[ -f "${path}" ]]; then
+          printf '%s\0' "${path}"
+          shasum -a 256 "${path}"
+        else
+          printf '%s\0MISSING\0' "${path}"
+        fi
+      done
+    else
+      find "${paths[@]}" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r path; do
+        printf '%s\0' "${path}"
+        shasum -a 256 "${path}"
+      done
+    fi
+  } | shasum -a 256 | awk '{print $1}'
+}
+
+# The model family a config.json declares, normalized to ONE token per family,
+# or the empty string when the file is absent or declares nothing recognizable.
+#
+# Both shapes this repository produces are covered by one expression. The
+# pinned Qwen reference declares `qwen3_5` at the root and `qwen3_5_text`
+# inside `text_config`; the TRANSFORMED tree Transform.swift writes for that
+# family IS the source's `text_config` promoted to the root, so it declares
+# `qwen3_5_text` at the root. The `qwen3_5*` prefix is collapsed to a single
+# token so those two spellings compare equal -- exactly the prefix match
+# Transform.detectModelFamily uses. A Laguna checkpoint declares root
+# `model_type: laguna` and its transformed tree keeps it.
+#
+# The empty string means UNKNOWN, and every caller treats unknown as "cannot
+# decide" rather than "mismatch": a fixture config of `{}` must not be
+# mistaken for a wrong model. Same extraction contract as the two functions
+# above -- benchmark-qwen-mtp.sh reuses this definition rather than spelling a
+# second normalization that could drift from this one.
+config_model_family() {
+  local config_path="$1"
+  local family
+  if [[ ! -f "${config_path}" ]]; then
+    printf '%s\n' ""
+    return 0
+  fi
+  family="$(jq -r '(.model_type // .text_config.model_type // "") | tostring' \
+    "${config_path}" 2>/dev/null || true)"
+  if [[ -z "${family}" || "${family}" == "null" ]]; then
+    printf '%s\n' ""
+    return 0
+  fi
+  case "${family}" in
+    qwen3_5*)
+      family="qwen3_5"
+      ;;
+  esac
+  printf '%s\n' "${family}"
 }
 
 publish_new_staged_metadata_file() {
@@ -1583,12 +1728,12 @@ if [[ ! -s "${MLX_METALLIB}" ]]; then
   # Fail fast when setup never completed (fresh checkout) or completed only
   # partially: without mlx.metallib the runtime worker cannot run, so stop
   # before the automatic `swift build` below spends minutes producing an
-  # unusable worker. MLXFAST_CLI_COMMAND only renames the CLI printed in
+  # unusable worker. YUKON_CLI_COMMAND only renames the CLI printed in
   # this guidance (wrapper CLIs that drive benchmark.sh under another name
   # set it); it never changes behavior. The Yukon CLI's `setup` subcommand
   # runs this repository's benchmark.json setupCommand, which is ./setup.sh,
   # so both suggested commands are equivalent.
-  cli_command="${MLXFAST_CLI_COMMAND:-mlxfast}"
+  cli_command="${YUKON_CLI_COMMAND:-yukon}"
   echo "benchmark.sh: setup is incomplete; MLX metallib is missing at ${MLX_METALLIB}" >&2
   echo "Run setup before benchmarking:" >&2
   echo "  ${cli_command} setup" >&2
@@ -1724,6 +1869,13 @@ if [[ "${USE_RUNTIME_WORKER}" != "1" && "${MLXFAST_IN_SANDBOX:-0}" != "1" && "${
   if [[ "${OFFICIAL}" == "1" ]]; then
     RESOLVED_ARGS+=("--official")
   fi
+  # --transform-only is consumed above and never forwarded to the Swift CLI,
+  # so it has to be re-added by name here for the same reason --official is:
+  # without it the sandboxed child would not know it was asked for a transform
+  # and would run a full local benchmark instead.
+  if [[ "${TRANSFORM_ONLY}" == "1" ]]; then
+    RESOLVED_ARGS+=("--transform-only")
+  fi
   exec sandbox-exec -f "${SANDBOX_PROFILE}" env \
     MLXFAST_IN_SANDBOX=1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
@@ -1779,7 +1931,7 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   # forced through the timed phases) or restores automatic control on
   # INT/TERM so an aborted run is not left pinned at 70%.
   setup_fan_boost_run_tracking
-  # Memory guard for the ~21.6 GB RAM-resident model (local modes only, before
+  # Memory guard for the ~15.2 GB RAM-resident model (local modes only, before
   # any transform/model work): serialize local runs behind a per-user lock,
   # then refuse to start while a model-holding process from a previous or
   # parallel run is still alive. See the guard section above for the policy.
@@ -1788,8 +1940,40 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
 fi
 
 safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}" >/dev/null || exit 1
+
+# jq becomes load-bearing HERE, not only at the score seal further down: the
+# cached-weights family cross-check below reads two config.json files with it,
+# and --transform-only exits before the seal's own jq check would ever run.
+# Asserting it now keeps the diagnostic "jq is missing" instead of "the family
+# check silently decided it could not tell".
+if ! command -v jq >/dev/null 2>&1; then
+  echo "benchmark.sh: jq is required to validate the transformed weights against the reference checkpoint" >&2
+  exit 1
+fi
+
 wanted_hash="$(source_hash)"
 current_hash="$(cat "${SOURCE_HASH_PATH}" 2>/dev/null || true)"
+
+# Defense in depth behind the digest above. The digest now covers the reference
+# identity, so a weights/ tree transformed from a different model no longer
+# matches -- but a stamp written by an OLDER benchmark.sh (one whose key was
+# code-only) can still collide with a current key by accident, and that is
+# precisely the case that used to hash the wrong ~15 GB model and die in the
+# worker. So ask the artifacts themselves: does the cached weights/config.json
+# declare the same model family as the reference this run would transform?
+# Unknown on either side means "cannot decide" and never blocks reuse -- test
+# fixtures legitimately ship a `{}` config.
+stale_family_reason=""
+if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" != "1" \
+    && -f "${WEIGHTS_PATH}/config.json" \
+    && -f "${REFERENCE_PATH}/config.json" ]]; then
+  reference_model_family="$(config_model_family "${REFERENCE_PATH}/config.json")"
+  weights_model_family="$(config_model_family "${WEIGHTS_PATH}/config.json")"
+  if [[ -n "${reference_model_family}" && -n "${weights_model_family}" \
+      && "${reference_model_family}" != "${weights_model_family}" ]]; then
+    stale_family_reason="cached ${WEIGHTS_PATH}/ declares model family ${weights_model_family}, but the reference at ${REFERENCE_PATH} declares ${reference_model_family}"
+  fi
+fi
 
 if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" == "1" ]]; then
   if [[ ! -f "${WEIGHTS_PATH}/config.json" ]]; then
@@ -1797,7 +1981,10 @@ if [[ "${MLXFAST_SKIP_TRANSFORM:-0}" == "1" ]]; then
     exit 1
   fi
   echo "benchmark.sh: reusing ${WEIGHTS_PATH}/ because MLXFAST_SKIP_TRANSFORM=1"
-elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" ]]; then
+elif [[ "${MLXFAST_FORCE_TRANSFORM:-0}" == "1" || ! -f "${WEIGHTS_PATH}/config.json" || "${current_hash}" != "${wanted_hash}" || -n "${stale_family_reason}" ]]; then
+  if [[ -n "${stale_family_reason}" ]]; then
+    echo "benchmark.sh: ${stale_family_reason}; treating the cached weights as stale" >&2
+  fi
   if [[ -f "${REFERENCE_PATH}/config.json" ]]; then
     echo "benchmark.sh: regenerating weights with Swift transform"
     safe_weights_path="$(safe_clear_directory_path "${WEIGHTS_PATH}" "weights path" "${REFERENCE_PATH}")" || exit 1
@@ -1851,6 +2038,20 @@ if [[ "${MLXFAST_VERIFY_TRANSFORM:-0}" == "1" ]]; then
   fi
 fi
 
+# --transform-only stops here: everything above produced (or proved fresh) the
+# transformed weights/ tree and its .benchmark-source.sha256 stamp, and
+# everything below measures. Its reason to exist is that setup.sh provisions
+# the REFERENCE checkpoint but never runs the transform, so a track runner that
+# consumes weights/ (benchmark-qwen-mtp.sh) had no way to ask for just that
+# step: the only published way to fill weights/ was a full local benchmark,
+# minutes of measurement nobody wanted for its side effect. The EXIT trap
+# releases the local run lock this mode took, exactly as it does for a measured
+# run.
+if [[ "${TRANSFORM_ONLY}" == "1" ]]; then
+  echo "benchmark.sh: --transform-only complete: ${WEIGHTS_PATH}/ is ready (transform-source digest ${wanted_hash}); no measurement was run"
+  exit 0
+fi
+
 rm -f "${SCORE_PATH}"
 
 # The Swift benchmark process links the editable model code paths, so any
@@ -1874,7 +2075,7 @@ if [[ "${LOCAL_ITERATE}" == "1" || "${LOCAL_SUBMIT}" == "1" ]]; then
   #    plain `kill` of an in-flight local run used to be silently ignored
   #    until the whole run finished on its own;
   # 2. on INT/TERM the abort handler must reap the model-holding process tree
-  #    (the Swift benchmark and its ~21.6 GB runtime worker) so an aborted
+  #    (the Swift benchmark and its ~15.2 GB runtime worker) so an aborted
   #    edit-loop run cannot orphan a resident model and out-of-memory the
   #    next run. The ranked --official invocation below keeps its original
   #    foreground semantics, unchanged.

@@ -2117,7 +2117,7 @@ func localIterateSummaryEmitsSpeedupsAndEstimatedScore() {
     #expect(!joined.contains("expert_hit_rate="))
 }
 
-// The Yukon participant CLI (`mlxfast run`) executes benchmarkCommand and then
+// The Yukon participant CLI (`yukon run`) executes benchmarkCommand and then
 // validates the contract scorePath as `{ "score": <finite number>, ... }`;
 // `score: null` fails its schema. Local modes therefore publish the estimated
 // score (the same decode_speedup^0.75 * prefill_speedup^0.25 estimate the
@@ -2352,7 +2352,7 @@ func firstTokenMismatchReportIncludesNonM5GoldenCaveat() {
 // were measured (the deterministic non-M5 near-tie divergence is exactly this
 // shape) must still publish the finite estimated score: the Yukon CLI
 // validates scorePath as `{ "score": <finite number>, ... }`, and score: null
-// used to make `mlxfast run` error at the contract layer on every non-M5 box.
+// used to make `yukon run` error at the contract layer on every non-M5 box.
 // passed stays false and every failure field survives, so the failure remains
 // unmistakable.
 @Test

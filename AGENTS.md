@@ -264,7 +264,8 @@ goldens are not part of the public repo or submission payload.
 
 Python is not part of the challenge runtime. Setup, transform, correctness, and
 benchmark run through the Swift package. Account login, clone, and submission
-use the Yukon CLI (`mlxfast`).
+use the Yukon CLI (`yukon`). Always use `yukon` for every participant CLI
+operation.
 
 ## Correctness Gates
 
@@ -405,7 +406,7 @@ flag makes SwiftPM fail closed instead.
 Use it to compare the current working tree against the latest-tip baseline you
 recorded above, not against a result from an older branch.
 `./benchmark-dflash.sh --local-submit` is the recommended manual pre-submit
-check (`mlxfast submit` does not run it for you) and is intended to be longer
+check (`yukon submit` does not run it for you) and is intended to be longer
 and closer to the official path; like `--local-iterate` it publishes only a
 local estimated score (never the official ranked score). The DFlash local
 wrapper drives both the serial K=1 control and the block-decode pass; it
@@ -540,19 +541,19 @@ change touches MLX runtime behavior and the machine can run those tests.
 
 ## Submission Workflow
 
-Use Yukon/Darkbloom submit commands through the Yukon CLI:
+Use the Yukon CLI for all account and submission commands:
 
 ```bash
 export PATH="${HOME}/.local/bin:${PATH}"
-mlxfast login <api-key> --api <url>
-mlxfast clone <benchmark-id-or-name>
-mlxfast submit --model "<model name>" --note "describe optimization"
-mlxfast submissions
+yukon login <api-key> --api <url>
+yukon clone <benchmark-id-or-name>
+yukon submit --model "<exact model name>" --note-file submission-note.md
+yukon submissions
 ```
 
 Submit packages only `editablePaths`. It rejects generated artifacts, symlinks,
 local scores, reference checkpoints, and source changes outside the editable
-surface. `mlxfast submit` uploads the editable-path archive directly for
+surface. `yukon submit` uploads the editable-path archive directly for
 official validation; it does not run a local benchmark first, and no local run
 blocks the upload. Run `./benchmark-dflash.sh --local-submit` yourself before
 submitting — the official M5 run is the gate that ranks the submission.

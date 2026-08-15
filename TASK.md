@@ -131,24 +131,24 @@ static review reads.
 
 ## Submitting
 
-Account and submission management run through the Yukon CLI (`mlxfast`), not
+Account and submission management run through the Yukon CLI (`yukon`), not
 through `mlxfast-swift`. The installer defaults to `~/.local/bin`, so expose
 that directory first:
 
 ```bash
 export PATH="${HOME}/.local/bin:${PATH}"
-mlxfast login <api-key> --api <url>
-mlxfast clone <benchmark-id-or-name>
-mlxfast submit --model "<model name>" --note "..."
-mlxfast submissions
+yukon login <api-key> --api <url>
+yukon clone <benchmark-id-or-name>
+yukon submit --model "<model name>" --note "..."
+yukon submissions
 ```
 
-`mlxfast submit` reads `benchmark.json` and uploads only `editablePaths` as a
+`yukon submit` reads `benchmark.json` and uploads only `editablePaths` as a
 gzip tar archive. The backend applies it to the frozen benchmark checkout and
 re-enforces the editable surface server-side before running hidden
 validation. Submission has replace semantics over `editablePaths`, and
 `mtp-head.manifest.json` and `mtp-head/` are optional: an archive that omits
-them keeps the organizer-pinned head. `mlxfast submit` does not run
+them keeps the organizer-pinned head. `yukon submit` does not run
 `preSubmitCommand` for you.
 
 ## Useful commands
