@@ -196,7 +196,12 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            let depth = self.costModelDepth(offeredDepth: offeredDepth)
+            if depth == 0, offeredDepth > 0, self.nonDraftingRounds >= 32 {
+                self.nonDraftingRounds = 0
+                return 1
+            }
+            return depth
         }
     }
 
@@ -465,6 +470,7 @@ public final class Qwen36MTPBlockSession {
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
+    private var nonDraftingRounds: Int = 0
 
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
@@ -569,8 +575,10 @@ public final class Qwen36MTPBlockSession {
             // position keeps its cold prior and the product-of-EMAs reach can
             // never clear the deep threshold inside a short window; this is
             // the streak ladder's widening step, recast as evidence.
-            positionAcceptEMA[acceptedCount] +=
-                alpha * (1.0 - positionAcceptEMA[acceptedCount])
+            if positionAcceptEMA[acceptedCount] < 0.95 {
+                positionAcceptEMA[acceptedCount] +=
+                    alpha * (0.95 - positionAcceptEMA[acceptedCount])
+            }
         }
     }
 
@@ -643,6 +651,11 @@ public final class Qwen36MTPBlockSession {
                 && draftCount <= Qwen36MTPLimits.maxDepth,
             "draftPolicy returned \(draftCount) for an offer of \(depth); a "
                 + "round may propose 0 ... min(offer, maxDepth) drafts")
+        if draftCount == 0 && depth > 0 {
+            nonDraftingRounds += 1
+        } else if draftCount >= 1 {
+            nonDraftingRounds = 0
+        }
 
         // A stop token as the primary ends the run BEFORE any drafting: there is
         // nothing after it to predict, and drafting past it would charge the
