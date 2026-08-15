@@ -1063,17 +1063,6 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftHeadS: MLXArray?
     private var _draftHeadZ: MLXArray?
 
-    // Input-independent compact copy of the loaded exact lm_head, used only
-    // for draft proposals when no declared draft_lm_head is present. It is not
-    // ModuleInfo because it is derived during warmup, not checkpoint state.
-    private var _compactDraftHead: Linear?
-    private static let compactDraftPrefixCount = 98_304
-    private static let compactDraftControlStart = 248_044
-    private static let compactDraftControlEnd = 248_070
-    private static let compactDraftRealCount =
-        compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
-    private static let compactDraftPaddedCount = 98_336
-
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
@@ -1328,60 +1317,7 @@ extension Qwen35TextModel: MTPCapable {
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: 64, bits: bits, mode: .affine)
         }
-        guard usesCompactDraftVocabulary else { return applyLMHead(x) }
-        if _compactDraftHead == nil {
-            _compactDraftHead = makeCompactDraftHead()
-        }
-        let padded = _compactDraftHead!(x)
-        // Padding exists only to retain qmv_fast's N % 8 shape. Removing it
-        // before argmax makes the duplicate rows semantically unreachable.
-        return padded[0..., 0..., 0 ..< Self.compactDraftRealCount]
-    }
-
-    /// Map compact draft IDs back to the tokenizer's full ID space without a
-    /// host readback. The low 98,304 rows retain their IDs; the appended rows
-    /// are Qwen's official text/control tokens 248,044 ... 248,069.
-    public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        guard usesCompactDraftVocabulary else { return ids }
-        return which(
-            ids .< Self.compactDraftPrefixCount,
-            ids,
-            ids + (Self.compactDraftControlStart - Self.compactDraftPrefixCount))
-    }
-
-    private var usesCompactDraftVocabulary: Bool {
-        configuration.vocabularySize == 248_320
-            && lmHead != nil && _draftHeadW == nil
-    }
-
-    private func makeCompactDraftHead() -> Linear {
-        guard let full = lmHead else {
-            fatalError("compact draft vocabulary requires an untied lm_head")
-        }
-
-        func compactRows(_ array: MLXArray) -> MLXArray {
-            let prefix = array[0 ..< Self.compactDraftPrefixCount]
-            let controls = array[
-                Self.compactDraftControlStart ..< Self.compactDraftControlEnd]
-            let paddingCount =
-                Self.compactDraftPaddedCount - Self.compactDraftRealCount
-            let padding = array[0 ..< paddingCount]
-            return concatenated([prefix, controls, padding], axis: 0)
-        }
-
-        if let quantized = full as? QuantizedLinear {
-            return QuantizedLinear(
-                weight: compactRows(quantized.weight),
-                bias: quantized.bias.map(compactRows),
-                scales: compactRows(quantized.scales),
-                biases: quantized.biases.map(compactRows),
-                groupSize: quantized.groupSize,
-                bits: quantized.bits,
-                mode: quantized.mode)
-        }
-        return Linear(
-            weight: compactRows(full.weight),
-            bias: full.bias.map(compactRows))
+        return applyLMHead(x)
     }
 
 
@@ -1493,11 +1429,6 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.applyDraftLMHead`.
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
         languageModel.applyDraftLMHead(x)
-    }
-
-    /// See `Qwen35TextModel.mapDraftTokenIds`.
-    public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        languageModel.mapDraftTokenIds(ids)
     }
 
 
