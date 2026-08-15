@@ -45,7 +45,38 @@ import MLXLMCommon
 //     two config semantics the loader actually keys on, so a head tree whose
 //     config drifted away from the backbone's family fails loudly.
 //
-//  4. PYTHON HAZARD, CARRIED FORWARD. mlx-lm's `qwen3_5` `sanitize()` treats any
+//  4. WHAT THE HEAD'S SHAPE GUARANTEES BUY DOWNSTREAM (added with the fused
+//     head-projection change; NO behaviour of this file changes). The pinned
+//     head declared by `mtp-head.manifest.json` is 15 BF16 tensors under BARE
+//     names, carrying NO `.scales`. Two consequences that the head's forward
+//     path now depends on, and that are ASSERTED HERE rather than assumed:
+//
+//       * because no `<path>.scales` key exists for any head submodule, the
+//         `quantize(model:)` walk described in (2) leaves every head projection
+//         a plain BF16 `MLXNN.Linear` -- it never becomes a `QuantizedLinear`
+//         whose `weight` is packed `uint32`. That is also what makes the head
+//         the ONLY unquantized attention in the tree, and therefore the only
+//         module that reaches the BF16 fallback inside `Qwen35Attention.qkv(_:)`
+//         (`Vendor/.../Models/Qwen35.swift`) which submission `088f763` left
+//         open with the comment "Unquantized (MTP bf16) falls back". The head's
+//         same-input projections -- `q`/`k`/`v` on that branch, `gate`/`up` in
+//         `Qwen35MTP.swift` -- are concatenated into single GEMV dispatches
+//         there, guarded by `MLXFAST_QWEN_MTP_FUSED_HEAD_PROJECTIONS`
+//         (default on).
+//       * `expectedHeadTensorCount` and `verifyHeadIndex` are what keep that a
+//         CHECKED fact: a head tree that arrived quantized, or short a tensor,
+//         fails the load rather than reaching a fusion that would misread it.
+//         The fusion itself re-checks the same properties per layer and falls
+//         back to the original per-projection path if any of them does not
+//         hold, so the two guards are independent rather than one trusting the
+//         other.
+//
+//     Note what is deliberately NOT done: the head is not requantized, at any
+//     width. 0xkydo's `5205c88` measured all-linear 4-bit on this head dropping
+//     the accept rate 0.641 -> 0.600. Head precision is load-bearing for
+//     acceptance; launch COUNT is not. Only the latter is touched.
+//
+//  5. PYTHON HAZARD, CARRIED FORWARD. mlx-lm's `qwen3_5` `sanitize()` treats any
 //     `mtp.*` key as a signal to +1-shift every trunk norm weight, which corrupts
 //     the model. That hazard belongs to Python consumers of a MERGED directory
 //     (QWEN36-BOX3-MTP-RESPONSE.md §3.2); the Swift loader is unaffected, and this

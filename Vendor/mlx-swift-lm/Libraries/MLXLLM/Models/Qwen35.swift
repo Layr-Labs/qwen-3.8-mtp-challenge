@@ -411,6 +411,15 @@ final class Qwen35Attention: Module {
     private var _qOut = 0
     private var _kOut = 0
 
+    // BF16 twin of the packing above, for the MTP head's own (unquantized)
+    // attention layer. Held as plain ivars for symmetry with the four lines
+    // directly above; both are nil/false while `Module` caches `items()` at
+    // load, so neither ever enters the parameter or quantization walks.
+    private var _qkvDenseW: MLXArray?
+    private var _qkvDenseAttempted = false
+    private var _qkvDenseQOut = 0
+    private var _qkvDenseKOut = 0
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -470,6 +479,68 @@ final class Qwen35Attention: Module {
             _qOut = q.shape.0
             _kOut = k.shape.0
             return qkv(x)
+        }
+        // BF16 TWIN OF THE PACKING ABOVE, one branch lower, for the ONLY
+        // unquantized attention in the tree: the MTP head's own layer. The
+        // backbone's 16 full-attention layers are affine-4-bit and are already
+        // served by the branch above, so they never reach this one -- which is
+        // what makes this head-only by construction rather than by a flag.
+        //
+        // Same shape of change (concatenate on N, one dispatch, slice the row
+        // back apart), same absence of any precision change: `concatenated`
+        // preserves dtype, so BF16 in, BF16 out. This is deliberately NOT a
+        // requantization -- 0xkydo's `5205c88` measured all-linear 4-bit on
+        // this head dropping the accept rate 0.641 -> 0.600, so head precision
+        // is load-bearing and only launch COUNT is touched here.
+        //
+        // The single-row restriction is what makes the bit-exactness claim a
+        // GEMV claim: at `[1, 1, K]` the vendored `matmul` routes to `gemv`
+        // (`metal/matmul.cpp`, `std::min(M, N) == 1`) whose K-reduction
+        // geometry is fixed by `(BN, SN, TN, K)` and whose only N-dependent
+        // parameter, `BM`, selects output rows and never enters the K loop or
+        // the simdgroup reduction. A wider call would be a Steel GEMM whose
+        // tiling does depend on N, so it falls through to the original three
+        // launches. This track's head only ever runs one row
+        // (`Qwen36MTPBlockSession.generateRound` drafts one token at a time),
+        // so the restriction costs nothing. Full argument in
+        // `Qwen35MTP.swift`'s `Qwen35MTPFusedGateUp`.
+        //
+        // Guarded by `MLXFAST_QWEN_MTP_FUSED_HEAD_PROJECTIONS` (default on;
+        // `"0"` restores the exact three-launch return below), and fail-open on
+        // every precondition: bias-free, same dtype, same input width.
+        if qwen35MTPFusedHeadProjectionsEnabled,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1
+        {
+            if let w = _qkvDenseW {
+                let y = matmul(x, w.T)
+                let qEnd = _qkvDenseQOut
+                let kEnd = _qkvDenseQOut + _qkvDenseKOut
+                return (
+                    y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd],
+                    y[.ellipsis, kEnd...]
+                )
+            }
+            if !_qkvDenseAttempted {
+                _qkvDenseAttempted = true
+                let legs = [qProj, kProj, vProj]
+                let fusable = legs.allSatisfy { leg in
+                    !(leg is QuantizedLinear) && leg.bias == nil
+                        && leg.weight.ndim == 2
+                        && leg.weight.dtype == qProj.weight.dtype
+                        && leg.weight.dim(1) == qProj.weight.dim(1)
+                }
+                if fusable {
+                    _qkvDenseQOut = qProj.weight.dim(0)
+                    _qkvDenseKOut = kProj.weight.dim(0)
+                    let w = concatenated(legs.map { $0.weight }, axis: 0)
+                        .contiguous()
+                    // Materialise once, here: the first head forward is the
+                    // untimed warm-up draft step, not a scored round.
+                    eval(w)
+                    _qkvDenseW = w
+                    return qkv(x)
+                }
+            }
         }
         return (qProj(x), kProj(x), vProj(x))
     }
@@ -850,6 +921,58 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// SEED-PREFILL VARIANT of `callWithHidden`: identical backbone forward, but
+    /// the final norm and the vocabulary projection are applied to the LAST ROW
+    /// ONLY.
+    ///
+    /// WHY THIS EXISTS. `Qwen36MTPBlockSession.begin` bulk-forwards the whole
+    /// 512-token seed and then keeps exactly two things: the last logit row
+    /// (whose argmax is the first pending primary) and the last pre-norm hidden
+    /// row (the context the first draft is chained from). `callWithHidden`
+    /// nevertheless projects ALL 512 hidden rows through the untied 248,320-way
+    /// head, so 511 of the 512 `[1, V]` logit rows are computed and immediately
+    /// discarded. MLX will not elide that: slicing the last row of a lazily
+    /// built matmul still forces the whole matmul, because a slice does not push
+    /// down through a `quantized_matmul` node.
+    ///
+    /// WHAT IS AND IS NOT SHARED WITH `callWithHidden`. The backbone call is
+    /// byte-identical -- same token tensor, same cache array, same `nConfirmed`
+    /// -- so all 64 layers still run over every seed position and every
+    /// recurrent/attention cache ends in the same state at the same offset. Only
+    /// the epilogue narrows. `RMSNorm` reduces over the last axis and the LM head
+    /// is a per-row projection, so both are row-independent and the surviving row
+    /// is mathematically the same vector `callWithHidden` would have put at index
+    /// `S - 1`.
+    ///
+    /// THE ONE REAL RISK, STATED PLAINLY: `[1, 1, H]` and `[1, S, H]` select
+    /// different quantized-matmul geometries (GEMV vs GEMM), which can differ in
+    /// the last ulp. That cannot change the mathematics but could in principle
+    /// flip an exact near-tie in the seed argmax. `Qwen36MTPReferenceSession` is
+    /// deliberately NOT moved onto this seam, so a local exactness run compares
+    /// the narrowed candidate decision against the original full-projection
+    /// frame instead of letting both sides adopt the same change.
+    ///
+    /// Additive: `callWithHidden` above is untouched and remains the path every
+    /// other caller (verify, serial rounds, repair forwards, the reference
+    /// session, the parity tests) uses.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let last = hidden.dim(1) - 1
+        let tail = hidden[0..., last ..< (last + 1), 0...]
+        let normed = model.norm(tail)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        // Pre-norm hidden, exactly as `callWithHidden` returns -- one row.
+        return (logits, tail)
+    }
+
     /// Apply the backbone's final `model.norm` to a hidden state.
     ///
     /// `callWithHidden` returns the PRE-norm hidden by design. MTPLX -- the exactness
@@ -987,6 +1110,15 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithLastTokenHidden`. Pure pass-through, exactly
+    /// like `callWithHidden` above -- no wrapper-level arithmetic.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithLastTokenHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     public func mtpForward(

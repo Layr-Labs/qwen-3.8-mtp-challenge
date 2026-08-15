@@ -187,15 +187,38 @@ public final class Qwen36MTPBlockSession {
     /// primary. The primary's own KV row is deliberately NOT written yet: the
     /// round-top invariant is "every emitted token is in the cache and the
     /// pending primary is not", and the verify forward writes it.
+    ///
+    /// SEED-TAIL VOCABULARY PROJECTION (guarded by
+    /// `MLXFAST_QWEN_MTP_SEED_TAIL_PROJECTION`, default on). This method is the
+    /// only place in the session that bulk-forwards a long block and then keeps
+    /// ONLY its tail: two lines below, 511 of the 512 `[1, V]` logit rows the
+    /// baseline just computed are dropped on the floor, and nothing downstream
+    /// -- not the accept walk, not the row ledger, not the caches -- can ever
+    /// read them. `callWithLastTokenHidden` runs the identical backbone forward
+    /// and narrows only the final-norm + LM-head epilogue to the surviving row.
+    /// The seed prefill is INSIDE the timed window by contract
+    /// (`QwenRuntime.qwenMTPTimedDecode` starts its clock immediately before the
+    /// begin request "so the seed cost cannot be hidden outside the window"), so
+    /// this is charged work, not setup.
+    ///
+    /// The two branches converge immediately: both hand back a `[1, S, V]` /
+    /// `[1, S, H]` pair whose LAST row is what the session keeps, with `S == 1`
+    /// on the narrowed path. Every line after the call is therefore shared and
+    /// index-generic, which is what makes the flag a true ablation rather than
+    /// two divergent prefills.
     @discardableResult
     public func begin(seedTokens: [Int]) throws -> Int {
         guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         cache = model.newCache(parameters: nil)
-        let (logits, hidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
-            cache: cache, nConfirmed: 0)
+        let seedInput = LMInput.Text(
+            tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count]))
+        let (logits, hidden) =
+            qwenMTPSeedTailProjectionEnabled
+            ? model.callWithLastTokenHidden(
+                input: seedInput, cache: cache, nConfirmed: 0)
+            : model.callWithHidden(
+                input: seedInput, cache: cache, nConfirmed: 0)
         pendingLogitsRow = logits[0..., (logits.dim(1) - 1) ..< logits.dim(1), 0...]
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         eval(cache.flatMap { $0.state })
