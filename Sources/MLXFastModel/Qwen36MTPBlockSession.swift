@@ -233,15 +233,8 @@ public final class Qwen36MTPBlockSession {
         let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
-        let primedDraftLogits = model.applyDraftLMHead(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
-        // Warm the complete proposal-side expression used by a live draft.
-        // The compact vocabulary changes the reduction shape and adds an
-        // on-device ID map, so warming logits alone leaves both kernels to
-        // cold-JIT inside the first scored round.
-        let primedDraftID = model.mapDraftTokenIds(
-            argMax(primedDraftLogits, axis: -1).asType(.int32))
-        eval(primedDraftID)
+        eval(model.applyDraftLMHead(
+            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]))
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadHiddenForward(
@@ -252,16 +245,23 @@ public final class Qwen36MTPBlockSession {
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
-            // Every drafting width verifies with nConfirmed: 1 (per-boundary
-            // checkpoints); warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
-            // Compile the two top-2 reduction kernels outside the scored window
-            // at every row count a round can dispatch.
-            let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
-            eval(warmCache.flatMap { $0.state })
+            // Adaptive checkpointing dispatches both verify kernels: cold
+            // acceptance streaks request per-boundary rollback states, while
+            // established streaks use the ordinary single-chunk recurrence.
+            // Compile both outside the scored window at every legal width.
+            let confirmationModes = width >= 2 ? [0, 1] : [0]
+            for nConfirmed in confirmationModes {
+                let (verifyLogits, _) = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: nConfirmed)
+                // Compile the two top-2 reduction kernels outside the scored
+                // window at every row count a round can dispatch.
+                let (warmTop2IDs, warmTop2Values) =
+                    Self.linearTopTwoRows(verifyLogits)
+                eval(verifyLogits, warmTop2IDs, warmTop2Values)
+                eval(warmCache.flatMap { $0.state })
+            }
         }
     }
 
@@ -356,6 +356,13 @@ public final class Qwen36MTPBlockSession {
     /// forward), so the cap prices the marginal HEAD step against its
     /// acceptance odds; 3 keeps the wasted-work tail short on mixed prose.
     private static let streakDepthCap = 4
+
+    /// Keep per-boundary recurrent checkpoints while the head's recent
+    /// acceptance evidence is cold. After this many consecutive fully accepted
+    /// drafting rounds, omit the large auxiliary checkpoint tensors; a rare
+    /// miss still takes the exact snapshot/trim/replay fallback and resets the
+    /// streak, so the next round automatically restores checkpoint coverage.
+    private static let checkpointColdStreakThreshold = 2
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -573,18 +580,16 @@ public final class Qwen36MTPBlockSession {
             cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.mapDraftTokenIds(
-            argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                .asType(.int32))
+        var draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+            .asType(.int32)
         draftIdArrays.append(draftId)
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.mapDraftTokenIds(
-                argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                    .asType(.int32))
+            draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                .asType(.int32)
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
@@ -597,12 +602,18 @@ public final class Qwen36MTPBlockSession {
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
-        // nConfirmed: 1 at every drafting width — the fused GDN verify writes
-        // a per-boundary checkpoint for EVERY row, so a partial accept at any
-        // depth restores its boundary without a repair forward.
+        // Boundary checkpoints are valuable while acceptance is uncertain, but
+        // expensive once the committed-history head is on a stable streak: each
+        // GDN layer otherwise writes a full fp32 recurrent state for every
+        // possible acceptance boundary. After two consecutive full accepts,
+        // dispatch the mathematically identical ordinary recurrence and rely on
+        // the existing exact snapshot/trim/replay fallback for a rare miss.
+        // Any miss resets `fullAcceptStreak`, restoring checkpoints next round.
+        let usesRollbackCheckpoints =
+            fullAcceptStreak < Self.checkpointColdStreakThreshold
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(tokens: verifyTokens),
-            cache: cache, nConfirmed: 1)
+            cache: cache, nConfirmed: usesRollbackCheckpoints ? 1 : 0)
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
@@ -674,7 +685,7 @@ public final class Qwen36MTPBlockSession {
             // the same post-primary distribution, so reuse its already-recorded
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
-            if Self.restoreAfterPrefixReject(
+            if usesRollbackCheckpoints && Self.restoreAfterPrefixReject(
                 cache, acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {

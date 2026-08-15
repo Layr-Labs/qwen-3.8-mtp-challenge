@@ -17,6 +17,25 @@ import MLXNN
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
+/// Quantization carried by a separately declared proposal-only MTP head.
+///
+/// The backbone configuration describes the target tower's representation,
+/// not necessarily the competitor-supplied head's. The head attachment reads
+/// the declared safetensors geometry before model construction and sets this
+/// for the duration of the load. A nil value preserves the pinned bf16 head.
+public struct Qwen35MTPQuantizationSpec: Equatable, Sendable {
+    public let groupSize: Int
+    public let bits: Int
+
+    public init(groupSize: Int, bits: Int) {
+        self.groupSize = groupSize
+        self.bits = bits
+    }
+}
+
+public nonisolated(unsafe) var _qwen35MTPQuantization:
+    Qwen35MTPQuantizationSpec?
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -96,6 +115,20 @@ final class Qwen35MTPModule: Module {
         }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         super.init()
+
+        // A declared head may use a different affine bit width from the fixed
+        // target tower. Wire its Linear leaves to matching QuantizedLinear
+        // modules before loadWeights performs the strict parameter update.
+        // The ordinary loader quantization walk then sees that these leaves are
+        // already quantized and leaves them in this representation.
+        if let spec = _qwen35MTPQuantization {
+            quantize(
+                model: self,
+                groupSize: spec.groupSize,
+                bits: spec.bits,
+                mode: .affine
+            )
+        }
     }
 
     func callAsFunction(

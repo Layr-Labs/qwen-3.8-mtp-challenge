@@ -175,19 +175,23 @@ public enum Qwen36MTPHeadAttachment {
     ) throws -> T {
         let layout = try backboneLayout(directory: backboneDirectory)
         try verifyHeadTree(headDirectory)
+        let headQuantization = try headQuantizationSpec(headDirectory)
         let previousSources = _additionalWeightSources
         let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
+        let previousHeadQuantization = _qwen35MTPQuantization
         _additionalWeightSources = [
             AdditionalWeightSource(
                 directory: headDirectory, keyPrefix: headKeyPrefix)
         ]
         _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
         _qwen35MTPEnabled = true
+        _qwen35MTPQuantization = headQuantization
         defer {
             _additionalWeightSources = previousSources
             _primaryWeightKeyPrefixStrip = previousStrip
             _qwen35MTPEnabled = previousEnabled
+            _qwen35MTPQuantization = previousHeadQuantization
         }
         return try body(layout)
     }
@@ -268,6 +272,122 @@ public enum Qwen36MTPHeadAttachment {
     /// header length, then a JSON object whose keys are the tensor names plus
     /// an optional `__metadata__`).
     static func safetensorsTensorNames(_ url: URL) throws -> Set<String> {
+        Set(try safetensorsHeader(url).keys.filter { $0 != "__metadata__" })
+    }
+
+    /// Infer one uniform affine representation from a declared head's tensor
+    /// geometry. The pinned bf16 head has no scales and returns nil. A
+    /// quantized head must carry complete weight/scales/biases triples with one
+    /// group size and bit width across all eight matrices; mixed or malformed
+    /// declarations fail closed before model construction.
+    public static func headQuantizationSpec(
+        _ headDirectory: URL
+    ) throws -> Qwen35MTPQuantizationSpec? {
+        let files = try FileManager.default.contentsOfDirectory(
+            at: headDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "safetensors" }
+        guard files.count == 1, let file = files.first else {
+            throw MLXFastError.invalidInput(
+                "the declared Qwen MTP head must carry exactly one safetensors "
+                    + "file, found \(files.count)"
+            )
+        }
+        let header = try safetensorsHeader(file)
+
+        func record(_ name: String) throws -> [String: Any] {
+            guard let value = header[name] as? [String: Any] else {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head safetensors is missing \(name)"
+                )
+            }
+            return value
+        }
+
+        func shape(_ name: String) throws -> [Int] {
+            let value = try record(name)
+            guard let raw = value["shape"] as? [Any],
+                  raw.allSatisfy({ $0 is Int })
+            else {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head tensor \(name) has no integer shape"
+                )
+            }
+            return raw.map { $0 as! Int }
+        }
+
+        let matrixNames = header.keys.filter { name in
+            name.hasSuffix(".weight")
+                && ((try? shape(name).count) == 2)
+        }.sorted()
+        let scaleNames = Set(header.keys.filter { $0.hasSuffix(".scales") })
+        if scaleNames.isEmpty {
+            return nil
+        }
+        guard let metadata = header["__metadata__"] as? [String: Any],
+              let groupRaw = metadata["group_size"] as? String,
+              let bitsRaw = metadata["bits"] as? String,
+              let groupSize = Int(groupRaw), [32, 64, 128].contains(groupSize),
+              let bits = Int(bitsRaw), [2, 3, 4, 5, 6, 8].contains(bits)
+        else {
+            throw MLXFastError.invalidInput(
+                "a quantized Qwen MTP head must declare legal group_size and "
+                    + "bits strings in its safetensors metadata"
+            )
+        }
+        let declared = Qwen35MTPQuantizationSpec(
+            groupSize: groupSize, bits: bits)
+        guard matrixNames.count == 8 else {
+            throw MLXFastError.invalidInput(
+                "a quantized Qwen MTP head must carry 8 matrix weights, found "
+                    + "\(matrixNames.count)"
+            )
+        }
+
+        var inferred: Qwen35MTPQuantizationSpec?
+        for weightName in matrixNames {
+            let stem = String(weightName.dropLast(".weight".count))
+            let scalesName = stem + ".scales"
+            let biasesName = stem + ".biases"
+            guard scaleNames.contains(scalesName), header[biasesName] != nil else {
+                throw MLXFastError.invalidInput(
+                    "quantized Qwen MTP matrix \(weightName) is missing its "
+                        + "scales/biases companions"
+                )
+            }
+            let weightShape = try shape(weightName)
+            let scalesShape = try shape(scalesName)
+            let weightDType = (try record(weightName))["dtype"] as? String
+            guard weightShape.count == 2, scalesShape.count == 2,
+                  weightShape[0] == scalesShape[0],
+                  weightDType == "U32", scalesShape[1] > 0
+            else {
+                throw MLXFastError.invalidInput(
+                    "quantized Qwen MTP matrix \(weightName) has incompatible "
+                        + "packed-weight/scales geometry"
+                )
+            }
+
+            let logicalInput = scalesShape[1] * declared.groupSize
+            guard logicalInput > 0,
+                  logicalInput * declared.bits == weightShape[1] * 32
+            else {
+                throw MLXFastError.invalidInput(
+                    "quantized Qwen MTP matrix \(weightName) does not match its "
+                        + "declared affine group-size/bit-width"
+                )
+            }
+            if let inferred, inferred != declared {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head mixes affine quantization formats"
+                )
+            }
+            inferred = declared
+        }
+        return inferred
+    }
+
+    static func safetensorsHeader(_ url: URL) throws -> [String: Any] {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         guard let lengthData = try handle.read(upToCount: 8),
@@ -293,7 +413,7 @@ public enum Qwen36MTPHeadAttachment {
             throw MLXFastError.invalidInput(
                 "the Qwen MTP head safetensors header is not readable JSON")
         }
-        return Set(header.keys.filter { $0 != "__metadata__" })
+        return header
     }
 
     /// The head index must name exactly the pinned tensor set, under BARE names.
