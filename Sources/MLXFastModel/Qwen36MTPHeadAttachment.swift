@@ -224,76 +224,17 @@ public enum Qwen36MTPHeadAttachment {
         }
         let indexURL = headDirectory.appendingPathComponent(
             "model.safetensors.index.json")
-        if let indexData = try? Data(contentsOf: indexURL) {
-            try verifyHeadIndex(indexData)
-            let configURL = headDirectory.appendingPathComponent("config.json")
-            guard let configData = try? Data(contentsOf: configURL) else {
-                throw MLXFastError.invalidInput(
-                    "the Qwen MTP head tree carries no config.json")
-            }
-            try verifyHeadConfiguration(configData)
-            return
-        }
-        // DECLARED-HEAD STAGING. The ranked runner resolves a `remote` head
-        // declaration by fetching exactly `model.safetensors` — no config, no
-        // index — and digest-verifies it against the manifest before the
-        // sandbox opens. The byte identity is therefore already enforced
-        // upstream of this check; what the loader still needs is the same
-        // STRUCTURAL shape it asserts on the pinned tree, read from the
-        // safetensors header itself: bare (un-prefixed) names and the tensors
-        // the merge cannot do without.
-        let safetensorsURL = headDirectory.appendingPathComponent(
-            "model.safetensors")
-        guard fileManager.fileExists(atPath: safetensorsURL.path) else {
+        guard let indexData = try? Data(contentsOf: indexURL) else {
             throw MLXFastError.invalidInput(
-                "the Qwen MTP head tree carries neither "
-                    + "model.safetensors.index.json nor model.safetensors")
+                "the Qwen MTP head tree carries no model.safetensors.index.json")
         }
-        let names = try safetensorsTensorNames(safetensorsURL)
-        if let prefixed = names.first(where: { $0.hasPrefix(headKeyPrefix) }) {
+        try verifyHeadIndex(indexData)
+        let configURL = headDirectory.appendingPathComponent("config.json")
+        guard let configData = try? Data(contentsOf: configURL) else {
             throw MLXFastError.invalidInput(
-                "the Qwen MTP head tree already carries prefixed tensor names "
-                    + "(e.g. \(prefixed)); this loader merges a BARE head tree and "
-                    + "would double-prefix a pre-merged one")
+                "the Qwen MTP head tree carries no config.json")
         }
-        for required in ["fc.weight", "norm.weight", "pre_fc_norm_hidden.weight"] {
-            guard names.contains(required) else {
-                throw MLXFastError.invalidInput(
-                    "the Qwen MTP head safetensors is missing \(required)")
-            }
-        }
-    }
-
-    /// Tensor names from a safetensors file header (8-byte little-endian
-    /// header length, then a JSON object whose keys are the tensor names plus
-    /// an optional `__metadata__`).
-    static func safetensorsTensorNames(_ url: URL) throws -> Set<String> {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        guard let lengthData = try handle.read(upToCount: 8),
-              lengthData.count == 8
-        else {
-            throw MLXFastError.invalidInput(
-                "the Qwen MTP head safetensors is too short to carry a header")
-        }
-        var headerLength: UInt64 = 0
-        for (index, byte) in lengthData.enumerated() {
-            headerLength |= UInt64(byte) << (8 * UInt64(index))
-        }
-        guard headerLength > 0, headerLength < 100_000_000 else {
-            throw MLXFastError.invalidInput(
-                "the Qwen MTP head safetensors declares an implausible header "
-                    + "length \(headerLength)")
-        }
-        guard let headerData = try handle.read(upToCount: Int(headerLength)),
-              headerData.count == Int(headerLength),
-              let header = try? JSONSerialization.jsonObject(with: headerData)
-                  as? [String: Any]
-        else {
-            throw MLXFastError.invalidInput(
-                "the Qwen MTP head safetensors header is not readable JSON")
-        }
-        return Set(header.keys.filter { $0 != "__metadata__" })
+        try verifyHeadConfiguration(configData)
     }
 
     /// The head index must name exactly the pinned tensor set, under BARE names.
@@ -312,17 +253,10 @@ public enum Qwen36MTPHeadAttachment {
             throw MLXFastError.invalidInput(
                 "the Qwen MTP head index is not a JSON object with a weight_map")
         }
-        // The organizer-pinned head carries exactly `expectedHeadTensorCount`
-        // tensors; a DECLARED head (2026-08-14 contract: the head weights are
-        // competitive surface, digest-pinned by mtp-head.manifest.json) may
-        // carry a different count — e.g. a quantized head's weight/scales/
-        // biases triples. The stale-pinned-tree hazard the exact-count check
-        // guarded against is enforced upstream by the ranked verify_cache and
-        // setup's digest check, so here the structural requirements are the
-        // bare namespace and the required tensors below.
-        guard weightMap.count >= 3 else {
+        guard weightMap.count == expectedHeadTensorCount else {
             throw MLXFastError.invalidInput(
-                "the Qwen MTP head index names only \(weightMap.count) tensors")
+                "the Qwen MTP head index names \(weightMap.count) tensors; the "
+                    + "pinned head revision carries \(expectedHeadTensorCount)")
         }
         if let prefixed = weightMap.keys.first(where: {
             $0.hasPrefix(headKeyPrefix)

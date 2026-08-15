@@ -43,44 +43,20 @@ public protocol Qwen36MTPTarget: AnyObject {
 
     /// Backbone forward returning `(logits, PRE-norm hidden)`.
     ///
-    /// Ordinary and repair forwards pass `nConfirmed == 0`. A speculative
-    /// verify passes 1: width two uses the promoted eager primary-boundary
-    /// checkpoint, while wider blocks retain an exact prefix-replay tape. Both
-    /// conformers reach the same `Qwen35TextModel` implementation.
+    /// INVARIANT #7 LIVES ON THIS CALL. `nConfirmed` must be 0 on every forward
+    /// this track issues: a non-zero value installs the vendored depth-1-only
+    /// rollback (`ArraysCache.rollbackState`, written by `Qwen35GatedDeltaNet`)
+    /// AND changes the gated-delta chunk geometry, both of which fight the
+    /// snapshot/rollback this track uses instead. The requirement is identical
+    /// on both conformers because both reach the same `Qwen35TextModel` method.
     func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
-
-    /// Rebuild every recurrent layer after the committed prefix of a fused
-    /// multi-draft verify. Returns false without mutation when the replay tape
-    /// is incomplete, allowing the session to use its generic repair path.
-    func replayRecurrentPrefix(
-        cache: [any KVCache], committedRows: Int
-    ) -> Bool
 
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> (MLXArray, MLXArray)
-
-    /// MTP head module forward WITHOUT the lm_head projection: appends the
-    /// fused positions to `cache`, returns post-`mtp.norm` hidden rows.
-    /// Committed-history maintenance primitive; the head only PROPOSES, so
-    /// nothing routed through this call can affect an emitted token.
-    func mtpHeadHiddenForward(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray
-
-    /// The backbone's lm_head applied to hidden rows (draft sampling side).
-    func applyLMHead(_ x: MLXArray) -> MLXArray
-
-    /// Draft-only vocabulary projection (the declared head's coarser lm_head
-    /// copy when present, exact lm_head otherwise). Proposal side only.
-    func applyDraftLMHead(_ x: MLXArray) -> MLXArray
-
-    /// Map IDs from a proposal-only compact vocabulary back to the target
-    /// tokenizer. Full-vocabulary proposal heads return the input unchanged.
-    func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray
 
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
