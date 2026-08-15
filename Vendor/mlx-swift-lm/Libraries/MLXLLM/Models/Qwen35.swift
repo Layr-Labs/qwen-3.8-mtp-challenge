@@ -1088,9 +1088,10 @@ final class Qwen35Attention: Module {
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: z, transpose: true,
-                groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            let y = Qwen35BatchedVerifyBridge.quantizedMMHook?(x, w, s, z, _qkvGS, _qkvBits)
+                ?? quantizedMM(
+                    x, w, scales: s, biases: z, transpose: true,
+                    groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
