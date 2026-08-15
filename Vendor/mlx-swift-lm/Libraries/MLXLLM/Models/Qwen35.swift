@@ -1199,6 +1199,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35TextModel: MTPCapable {
     public var hasMTPHead: Bool { mtp != nil }
 
+    /// Re-represent the proposal-only MTP module as affine INT4/group-64.
+    /// The organizer-pinned target and its exact vocabulary projection are
+    /// untouched; this module only proposes rows that the target verifies.
+    public func prepareQuantizedMTPHeadForDrafting() {
+        guard let mtp else { return }
+        quantize(model: mtp, groupSize: 64, bits: 4, mode: .affine)
+        eval(mtp)
+    }
+
     /// Run a backbone forward that also returns pre-norm hidden states.
     ///
     /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw backbone output
@@ -1456,6 +1465,11 @@ extension Qwen35Model: LoRAModel {
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
     public var hasMTPHead: Bool { languageModel.hasMTPHead }
+
+    /// See `Qwen35TextModel.prepareQuantizedMTPHeadForDrafting`.
+    public func prepareQuantizedMTPHeadForDrafting() {
+        languageModel.prepareQuantizedMTPHeadForDrafting()
+    }
 
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int

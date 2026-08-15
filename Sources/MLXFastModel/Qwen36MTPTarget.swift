@@ -37,6 +37,10 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// True when the MTP head is attached and operational.
     var hasMTPHead: Bool { get }
 
+    /// Convert only the proposal-side MTP module to affine INT4/group-64.
+    /// Called during untimed session construction before any warm or decode.
+    func prepareQuantizedMTPHeadForDrafting()
+
     /// The hybrid cache stack: `MambaCache` on the gated-delta layers,
     /// `KVCacheSimple` on the full-attention layers.
     func newCache(parameters: GenerateParameters?) -> [KVCache]

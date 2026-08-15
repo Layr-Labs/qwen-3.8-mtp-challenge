@@ -170,6 +170,7 @@ public final class Qwen36MTPBlockSession {
         postNorm: Bool = true
     ) throws {
         guard model.hasMTPHead else { throw Qwen36MTPSessionError.headNotAttached }
+        model.prepareQuantizedMTPHeadForDrafting()
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
