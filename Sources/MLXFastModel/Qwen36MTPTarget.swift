@@ -104,6 +104,28 @@ public protocol Qwen36MTPTarget: AnyObject {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> (MLXArray, MLXArray)
 
+    /// Same MTP body as `mtpForwardWithHidden`, but the vocabulary projection
+    /// runs on the LAST row only. Used when a committed-history prefix and the
+    /// live draft share one head forward: the prefix rows must write KV without
+    /// paying the 248,320-way head.
+    func mtpForwardLastTokenWithHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray)
+
+    /// Run the MTP module (fuse + layer + norm) and update `cache` without
+    /// projecting logits. History upkeep only proposes; it must not stream the
+    /// vocabulary weights.
+    func mtpUpdateCache(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    )
+
+    /// Seed prefill returning `(last logit row, FULL pre-norm hidden [1, S, H])`.
+    /// Same last-row vocabulary projection as `callWithLastTokenHidden`; the
+    /// extra full hidden is what committed MTP history streams through the head.
+    func callWithLastTokenLogitsAndFullHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray)
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
@@ -160,4 +182,14 @@ let qwenMTPSeedTailProjectionEnabled =
 /// environment lookup ever happens inside the timed window.
 let qwenMTPFusedAcceptVerifyEnabled =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_FUSED_ACCEPT_VERIFY"]
+        != "0"
+
+/// `MLXFAST_QWEN_MTP_COMMITTED_HISTORY` (DEFAULT ON; set "0" to disable):
+/// keep one persistent MTP-head KV cache across rounds and stream the seed
+/// (then every committed token) through it, matching MTPLX's production
+/// `mtp_history_policy="committed"`. The shipped session used a fresh empty
+/// head cache every round, so the head drafted from one position of context.
+/// A head only proposes; history moves accept rate, never the emitted stream.
+let qwenMTPCommittedHistoryEnabled =
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_COMMITTED_HISTORY"]
         != "0"

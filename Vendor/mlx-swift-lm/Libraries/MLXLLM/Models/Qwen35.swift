@@ -1166,6 +1166,64 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, mtpOut)
     }
 
+    /// Vocabulary-narrowed MTP forward: same fuse + layer + cache write as
+    /// `mtpForwardWithHidden`, but `lm_head` sees only the last row.
+    public func mtpForwardLastTokenWithHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        guard let mtp else {
+            fatalError("mtpForwardLastTokenWithHidden called but MTP head is not attached. "
+                + "Set _qwen35MTPEnabled = true before loading the model.")
+        }
+        let mtpOut = mtp(
+            hidden: hidden,
+            nextTokenIds: nextTokenIds,
+            embedTokens: model.embedTokens,
+            cache: cache)
+        let last = mtpOut.dim(1) - 1
+        let tail = mtpOut[0..., last ..< (last + 1), 0...]
+        let logits: MLXArray
+        if configuration.tieWordEmbeddings {
+            logits = model.embedTokens.asLinear(tail)
+        } else {
+            logits = lmHead!(tail)
+        }
+        return (logits, tail)
+    }
+
+    /// History-only MTP step: write the fused rows into `cache`, no logits.
+    public func mtpUpdateCache(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) {
+        guard let mtp else {
+            fatalError("mtpUpdateCache called but MTP head is not attached. "
+                + "Set _qwen35MTPEnabled = true before loading the model.")
+        }
+        _ = mtp(
+            hidden: hidden,
+            nextTokenIds: nextTokenIds,
+            embedTokens: model.embedTokens,
+            cache: cache)
+    }
+
+    /// Seed prefill: last-row logits plus the full pre-norm hidden sequence.
+    public func callWithLastTokenLogitsAndFullHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let last = hidden.dim(1) - 1
+        let tail = hidden[0..., last ..< (last + 1), 0...]
+        let normed = model.norm(tail)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden)
+    }
+
     /// Run the MTP head forward.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.mtp_forward
     public func mtpForward(
@@ -1287,6 +1345,30 @@ extension Qwen35Model: MTPCapable {
     ) -> (MLXArray, MLXArray) {
         languageModel.mtpForwardWithHidden(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.mtpForwardLastTokenWithHidden`.
+    public func mtpForwardLastTokenWithHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        languageModel.mtpForwardLastTokenWithHidden(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.mtpUpdateCache`.
+    public func mtpUpdateCache(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) {
+        languageModel.mtpUpdateCache(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.callWithLastTokenLogitsAndFullHidden`.
+    public func callWithLastTokenLogitsAndFullHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithLastTokenLogitsAndFullHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.applyFinalNorm`.

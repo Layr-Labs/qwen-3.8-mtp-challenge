@@ -113,6 +113,12 @@ public final class Qwen36MTPBlockSession {
     private let postNorm: Bool
 
     private var cache: [any KVCache] = []
+    /// Persistent MTP-head KV cache. Empty until the first drafting round.
+    private var headCache: [any KVCache] = []
+    private var headHistoryReady = false
+    /// Full pre-norm seed hidden `[1, S, H]`, consumed by the first draft fold.
+    private var seedHiddenForHistory: MLXArray?
+    private var seedTokenIds: [Int] = []
     /// Logits of the row that produces the next primary. One row, `[1, 1, V]`.
     private var pendingLogitsRow: MLXArray?
     /// The (post-norm) trunk hidden that seeds the next draft round.
@@ -163,6 +169,21 @@ public final class Qwen36MTPBlockSession {
         eval(logits, row)
 
         let headCache = model.makeMTPCache()
+        if qwenMTPCommittedHistoryEnabled {
+            // Compile the folded first-draft shape (511 history + 1 live) and
+            // the subsequent T=1 append outside the timed window. Ranked seeds
+            // are 512 tokens.
+            let hist = 511
+            let hDim = row.dim(-1)
+            let prefixH = MLXArray.zeros([1, hist, hDim], dtype: row.dtype)
+            let prefixT = MLXArray.zeros([1, hist], dtype: .int32)
+            let foldedH = concatenated([prefixH, row], axis: 1)
+            let foldedT = concatenated(
+                [prefixT, MLXArray([0]).reshaped([1, 1])], axis: 1)
+            let (foldedLogits, foldedHidden) = model.mtpForwardLastTokenWithHidden(
+                hidden: foldedH, nextTokenIds: foldedT, cache: headCache)
+            eval(foldedLogits, foldedHidden)
+        }
         for _ in 0 ..< maxDepth {
             let (draftLogits, draftHidden) = model.mtpForwardWithHidden(
                 hidden: row,
@@ -226,16 +247,26 @@ public final class Qwen36MTPBlockSession {
         cache = model.newCache(parameters: nil)
         let seedInput = LMInput.Text(
             tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count]))
-        let (logits, hidden) =
-            qwenMTPSeedTailProjectionEnabled
-            ? model.callWithLastTokenHidden(
+        let (logits, hidden): (MLXArray, MLXArray)
+        if qwenMTPCommittedHistoryEnabled && qwenMTPSeedTailProjectionEnabled {
+            // Last-row vocab projection (unchanged cost) plus the full hidden
+            // sequence the first draft folds into the persistent head cache.
+            (logits, hidden) = model.callWithLastTokenLogitsAndFullHidden(
                 input: seedInput, cache: cache, nConfirmed: 0)
-            : model.callWithHidden(
+            seedHiddenForHistory = hidden
+            seedTokenIds = seedTokens
+        } else if qwenMTPSeedTailProjectionEnabled {
+            (logits, hidden) = model.callWithLastTokenHidden(
                 input: seedInput, cache: cache, nConfirmed: 0)
+        } else {
+            (logits, hidden) = model.callWithHidden(
+                input: seedInput, cache: cache, nConfirmed: 0)
+        }
         pendingLogitsRow = logits[0..., (logits.dim(1) - 1) ..< logits.dim(1), 0...]
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         eval(cache.flatMap { $0.state })
         eval(pendingLogitsRow!, pendingHidden!)
+        if let seedHidden = seedHiddenForHistory { eval(seedHidden) }
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
         began = true
@@ -410,19 +441,15 @@ public final class Qwen36MTPBlockSession {
             )
         }
 
-        // 1. DRAFT. One fresh head cache per round, shared across the sub-steps;
-        //    each sub-step chains the head's OWN post-`mtp.norm` hidden, never
-        //    the trunk hidden again — re-feeding the trunk hidden would draft
-        //    every level from the same state.
-        let headCache = model.makeMTPCache()
+        // 1. DRAFT. Persistent committed-history cache (MTPLX production
+        //    default). The first live draft folds the seed prefix into the same
+        //    head forward so the 248,320-way projection still runs once.
         var drafts: [Int] = []
         var draftHidden = hidden
         var nextToken = primary
         for _ in 0 ..< draftCount {
-            let (draftLogits, chained) = model.mtpForwardWithHidden(
-                hidden: draftHidden,
-                nextTokenIds: MLXArray([nextToken]).reshaped([1, 1]),
-                cache: headCache)
+            let (draftLogits, chained) = draftFromHead(
+                hidden: draftHidden, nextToken: nextToken)
             let proposal = argmaxLast(draftLogits)
             drafts.append(proposal)
             draftHidden = chained[0..., (chained.dim(1) - 1) ..< chained.dim(1), 0...]
@@ -457,28 +484,24 @@ public final class Qwen36MTPBlockSession {
                 input: verifyTokens, cache: cache)
             : model.callWithHidden(
                 input: verifyTokens, cache: cache, nConfirmed: fastK1 ? 1 : 0)
+        // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount.
+        //    The hierarchical top-2 reducer already emits the exact top-1 ID
+        //    (larger logit, then lower token ID on a tie — the same rule as
+        //    MLX `argMax`). Reusing it deletes a second vocabulary reduction.
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         eval(top2IDs, top2Values)
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
-        // The reducer's first ID uses the target argmax ordering: larger logit,
-        // then lower token ID on an exact tie. Reuse it for acceptance instead of
-        // launching a second vocabulary-wide argMax over the same rows.
         let verifyArgmax = stride(from: 0, to: flatTop2IDs.count, by: 2).map {
             flatTop2IDs[$0]
         }
 
-        // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
-        //    is the target's greedy continuation of verify input i, i.e. the
-        //    truth for draft i. Row `draftCount` is the BONUS row and is only
-        //    used on full acceptance.
         var acceptedCount = 0
         for index in 0 ..< drafts.count {
             guard verifyArgmax[index] == drafts[index] else { break }
             acceptedCount += 1
             if stopTokens.contains(drafts[index]) { break }
         }
-
         var perRowTop2Tokens: [[Int]] = []
         var perRowTop2Logits: [[Double]] = []
         perRowTop2Tokens.reserveCapacity(draftCount + 1)
@@ -551,8 +574,33 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
-        eval(cache.flatMap { $0.state })
+        if qwenMTPCommittedHistoryEnabled && draftCount > 1 {
+            // k>1 live drafts after the primary wrote speculative head rows
+            // chained from the head hidden, not the trunk. Trim them; accepted
+            // drafts are re-appended below from trunk hiddens.
+            let extra = draftCount - 1
+            for entry in headCache where entry.isTrimmable {
+                _ = entry.trim(extra)
+            }
+        }
+        if qwenMTPCommittedHistoryEnabled && acceptedCount > 0 {
+            // Draft already wrote fused(embed(primary), pendingHidden). Append
+            // one history row per accepted draft: fused(embed(draft_i),
+            // hidden_after_verify_input_i). Rejected drafts are never written.
+            for index in 0 ..< acceptedCount {
+                model.mtpUpdateCache(
+                    hidden: hiddenRow(verifyHidden, index),
+                    nextTokenIds: MLXArray([drafts[index]]).reshaped([1, 1]),
+                    cache: headCache)
+            }
+        }
+        // Speculative path: the top-2 host read already synchronized the verify
+        // graph. Materialize only the live pending rows and the small head
+        // cache — not the ~130-array target stack.
         if let row = pendingLogitsRow, let h = pendingHidden { eval(row, h) }
+        if qwenMTPCommittedHistoryEnabled {
+            eval(headCache.flatMap { $0.state })
+        }
 
         // Truncate after the first committed stop token, keeping the stop token
         // itself — the same rule the serial reference applies.
@@ -934,6 +982,49 @@ public final class Qwen36MTPBlockSession {
         let values = scores.asArray(Float.self).map { Double($0) }
         let ordered = zip(ids, values).sorted { $0.1 > $1.1 }
         return (ordered.map(\.0), ordered.map(\.1))
+    }
+
+    /// One persistent-cache draft step. The first call folds leftover seed
+    /// history into the same forward so the vocabulary head still runs once.
+    private func draftFromHead(
+        hidden: MLXArray, nextToken: Int
+    ) -> (MLXArray, MLXArray) {
+        let token = MLXArray([nextToken]).reshaped([1, 1])
+        if qwenMTPCommittedHistoryEnabled && !headHistoryReady {
+            headCache = model.makeMTPCache()
+            if let full = seedHiddenForHistory, seedTokenIds.count >= 2 {
+                let lastHist = full.dim(1) - 1
+                let prefixHidden = hiddenRowSequence(full, 0, lastHist)
+                let prefixTokens = Array(seedTokenIds.dropFirst())
+                let allHidden = concatenated([prefixHidden, hidden], axis: 1)
+                let allTokens = MLXArray(prefixTokens + [nextToken])
+                    .reshaped([1, prefixTokens.count + 1])
+                seedHiddenForHistory = nil
+                headHistoryReady = true
+                return model.mtpForwardLastTokenWithHidden(
+                    hidden: allHidden, nextTokenIds: allTokens, cache: headCache)
+            }
+            headHistoryReady = true
+        } else if qwenMTPCommittedHistoryEnabled && headCache.isEmpty {
+            headCache = model.makeMTPCache()
+            headHistoryReady = true
+        }
+        if qwenMTPCommittedHistoryEnabled {
+            return model.mtpForwardWithHidden(
+                hidden: hidden, nextTokenIds: token, cache: headCache)
+        }
+        // Ablation: original fresh-cache cycle.
+        let cycle = model.makeMTPCache()
+        return model.mtpForwardWithHidden(
+            hidden: hidden, nextTokenIds: token, cache: cycle)
+    }
+
+    /// Post-norm (when enabled) over a contiguous hidden slice `[start, end)`.
+    private func hiddenRowSequence(
+        _ hidden: MLXArray, _ start: Int, _ end: Int
+    ) -> MLXArray {
+        let slice = hidden[0..., start ..< end, 0...]
+        return postNorm ? model.applyFinalNorm(slice) : slice
     }
 
     /// One hidden row `[1, 1, H]` in MTPLX's default `post_norm` variant.
