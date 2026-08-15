@@ -2499,6 +2499,15 @@ jobs:
               chmod -R a+rX "${staged}"
               head_dir="${staged}"
               echo "qwen-mtp-ranked-benchmark: candidate MTP head resolved from ${source} (${got_bytes} bytes, sha256 ${got_sha})"
+              # Pin the verified digest RUNNER-SIDE for the pre-timing
+              # re-check. The workspace inherits an ACL that grants bench full
+              # write, so both the staged head and the workspace copy of
+              # mtp-head.manifest.json are writable by gates-phase participant
+              # code; the scrub-time re-verification must therefore compare
+              # against values bench can never touch, and GITHUB_ENV lives
+              # outside the workspace.
+              echo "MLXFAST_QWEN_MTP_DECLARED_HEAD_SHA256=${got_sha}" >> "${GITHUB_ENV}"
+              echo "MLXFAST_QWEN_MTP_DECLARED_HEAD_BYTES=${got_bytes}" >> "${GITHUB_ENV}"
               ;;
             *)
               echo "::error::unknown head declaration source '${source}'; expected pinned, remote or in_branch" >&2
@@ -2807,6 +2816,45 @@ jobs:
           if [[ "${scrub_weights_hash}" != "${trusted_weights_hash}" ]]; then
             echo "::error::transformed Qwen weights changed before timing (hash ${scrub_weights_hash} != ${trusted_weights_hash})" >&2
             exit 1
+          fi
+          # The declared candidate head survived the allowlist scrub above,
+          # and the workspace ACL makes it bench-writable -- so like the
+          # builds and the weights, it must be RE-VERIFIED before any timed
+          # work runs. Gates-phase participant code that swapped the head,
+          # planted a README.md (the one name the tree-digest rule exempts),
+          # or left a symlink under the allowlisted path would otherwise
+          # carry state across the scrub. Compared against the digests the
+          # resolve step pinned into GITHUB_ENV, never against workspace
+          # files.
+          if [[ "${MLXFAST_QWEN_MTP_HEAD_SOURCE:-pinned}" != "pinned" ]]; then
+            declared_head="${MLXFAST_JOB_WS}/.qwen-mtp-declared-head"
+            if [[ ! -d "${declared_head}" ]]; then
+              echo "::error::declared MTP head tree vanished before timing" >&2
+              exit 1
+            fi
+            if find "${declared_head}" ! -type f ! -type d -print -quit | grep -q .; then
+              echo "::error::declared MTP head tree carries non-regular files before timing" >&2
+              exit 1
+            fi
+            if find "${declared_head}" -name README.md -print -quit | grep -q .; then
+              echo "::error::declared MTP head tree grew a digest-exempt README.md before timing" >&2
+              exit 1
+            fi
+            rescrub_bytes="$(find "${declared_head}" -type f -print0 \
+              | xargs -0 -n1 wc -c | awk '{ total += $1 } END { print total + 0 }')"
+            rescrub_sha="$( (cd "${declared_head}" \
+              && find . -type f \
+              | sed 's|^\./||' \
+              | LC_ALL=C sort \
+              | while read -r f; do
+                  printf '%s  %s\n' "$(shasum -a 256 "${f}" | awk '{print $1}')" "${f}"
+                done) | shasum -a 256 | awk '{print $1}')"
+            if [[ "${rescrub_sha}" != "${MLXFAST_QWEN_MTP_DECLARED_HEAD_SHA256:?}" \
+               || "${rescrub_bytes}" != "${MLXFAST_QWEN_MTP_DECLARED_HEAD_BYTES:?}" ]]; then
+              echo "::error::declared MTP head changed between resolve and timing (sha256 ${rescrub_sha}, ${rescrub_bytes} bytes); refusing to time tampered head material" >&2
+              exit 1
+            fi
+            echo "qwen-mtp-ranked-benchmark: declared MTP head re-verified before timing (${rescrub_bytes} bytes, sha256 ${rescrub_sha})"
           fi
           leftovers="$(find "${MLXFAST_JOB_WS}" -maxdepth 2 -name '*golden*' ! -path "*/correctness_prompts/*" | grep -v '^$' || true)"
           if [[ -n "${leftovers}" ]]; then
