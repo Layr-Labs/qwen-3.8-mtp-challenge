@@ -1318,15 +1318,19 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
+        // Decode-width asyncEval ladder: at decode widths (serial step /
+        // MTP verify up to the contract's max depth 8, i.e. S <= 9) the host
+        // otherwise builds a ~64-layer graph before anything reaches the
+        // GPU. Firing asyncEval at a few layer boundaries lets the GPU
         // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // rest — most valuable when the head chain is cheap (the declared
+        // 4-bit proposal head), because a fast chain leaves more of the
+        // verify-build host time exposed. Pure enqueue-timing change — no
+        // op is added, no reduction order moves, so the emitted stream is
+        // bit-identical (Laguna receipt for the same schedule shape: off
+        // 10.37 ms vs ladder 9.45 ms/step; schedule scaled from 40 to 64
+        // layers, front rungs kept).
+        let ladderActive = inputs.dim(1) <= 9
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
