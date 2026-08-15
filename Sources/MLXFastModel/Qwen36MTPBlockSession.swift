@@ -516,7 +516,15 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// PR135/Q4 DIAGNOSTIC ARM: 0.14 prices the compact head aggressively on
+    /// the promoted single-forward SDPA bridge. The cold width cap stays at 4;
+    /// with an all-full-accept trajectory, three cold depth-4 rounds update
+    /// the EMAs enough for the first streak-qualified round to choose depth 6.
+    /// This remains above the historically prologue-contaminated 0.12 fit.
+    /// Treat the eight-prompt receipt as a same-base bracket measurement, not
+    /// proof that artifact-byte shrinkage scales the whole chained head step.
+    private static let headStepCostRatio = 0.14
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
