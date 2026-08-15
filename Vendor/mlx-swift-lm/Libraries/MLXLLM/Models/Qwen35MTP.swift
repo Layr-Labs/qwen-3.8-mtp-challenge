@@ -85,6 +85,13 @@ final class Qwen35MTPModule: Module {
     let layers: [Qwen35MTPDecoderLayer]
     let norm: RMSNorm
 
+    // The MTP tower only proposes tokens; the exact target verifies every one.
+    // Repack its eight bf16 matrices once, after checkpoint loading and during
+    // the existing untimed warmup, instead of streaming ~849 MB of proposal
+    // weights at every draft step. Three-bit/group-64 is the measured quality
+    // knee for this pinned head (97.1% public-trajectory draft acceptance).
+    private var proposalWeightsQuantized = false
+
     init(_ args: Qwen35TextConfiguration) {
         _preFcNormHidden.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -104,6 +111,19 @@ final class Qwen35MTPModule: Module {
         embedTokens: Embedding,
         cache: [any KVCache]
     ) -> MLXArray {
+        if !proposalWeightsQuantized {
+            proposalWeightsQuantized = true
+            quantize(
+                model: self,
+                groupSize: 64,
+                bits: 3,
+                mode: .affine
+            )
+            // Materialize the packed representation while warmup is untimed
+            // and release the dense source arrays before scored decoding.
+            eval(self)
+        }
+
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)

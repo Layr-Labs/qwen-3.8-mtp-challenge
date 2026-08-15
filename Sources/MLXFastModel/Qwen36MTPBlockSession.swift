@@ -266,9 +266,8 @@ public final class Qwen36MTPBlockSession {
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
-            // Every drafting width verifies with nConfirmed: 1. Width two uses
-            // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the same shapes the scored rounds dispatch.
+            // Every drafting width verifies with nConfirmed: 1 (per-boundary
+            // checkpoints); warm the same shapes the scored rounds dispatch.
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
                 cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
@@ -277,37 +276,9 @@ public final class Qwen36MTPBlockSession {
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
             eval(verifyLogits, warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
-            if width >= 3 {
-                // Warm arbitrary-prefix replay T=2...8. Restore all but the
-                // final verify row and trim that same row from attention so the
-                // throwaway cache remains aligned for the next width.
-                precondition(model.replayRecurrentPrefix(
-                    cache: warmCache, committedRows: width - 1))
-                for entry in warmCache where !(entry is ArraysCache) {
-                    if entry.isTrimmable { _ = entry.trim(1) }
-                }
-                eval(warmCache.flatMap { $0.state })
-            } else {
-                Self.clearRecurrentRollback(warmCache)
-            }
         }
 
-        // A K>=2 round can reject its very first draft, which replays T=1.
-        // Width 2 stays on the validated eager K1 path, so compile this last
-        // missing replay shape with one extra throwaway width-3 verify.
-        let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
-            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-            cache: oneRowReplayCache, nConfirmed: 1)
-        eval(oneRowReplayLogits)
-        eval(oneRowReplayCache.flatMap { $0.state })
-        precondition(model.replayRecurrentPrefix(
-            cache: oneRowReplayCache, committedRows: 1))
-        eval(oneRowReplayCache.flatMap { $0.state })
-
-        // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
-        // warm so the promoted allocator/pipeline end state is preserved.
-        // The phase trace measured
+        // SEED-PREFILL SHAPE WARM (M=512 backbone). The phase trace measured
         // `begin` at ~0.9 s of eval wall for a 512-token seed — mostly
         // first-touch pipeline compilation and allocator growth for the
         // M=512 shapes, charged inside the timed window because this warm
@@ -819,9 +790,9 @@ public final class Qwen36MTPBlockSession {
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
-        // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
-        // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
-        // accept can replay only its committed prefix without a repair forward.
+        // nConfirmed: 1 at every drafting width — the fused GDN verify writes
+        // a per-boundary checkpoint for EVERY row, so a partial accept at any
+        // depth restores its boundary without a repair forward.
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
@@ -906,8 +877,7 @@ public final class Qwen36MTPBlockSession {
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
             if Self.restoreAfterPrefixReject(
-                model, cache,
-                acceptedCount: acceptedCount, draftCount: draftCount,
+                cache, acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
@@ -972,11 +942,10 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
-        // No trailing eval: every host-read value was materialised by the
-        // round bundle above. A successful wide-prefix replay intentionally
-        // installs lazy recurrent roots; only the next GPU graph consumes
-        // them. The rare generic-repair path ran its own second eval.
-        // `pendingHidden` is likewise device-only until the next round.
+        // No trailing eval: the cache roots and every host-read value were
+        // materialised by the round's single bundle eval above (the rare
+        // generic-repair path ran its own second eval). `pendingHidden` stays
+        // lazy — its only consumer is the next round's GPU graph.
 
         // Truncate after the first committed stop token, keeping the stop token
         // itself — the same rule the serial reference applies.
@@ -1051,7 +1020,6 @@ public final class Qwen36MTPBlockSession {
                 // wrote them, describe a frame this rollback just discarded.
                 arrays.rollbackState = nil
                 arrays.rollbackCheckpoints = []
-                arrays.prefixReplayTape = nil
                 continue
             }
             if entry.isTrimmable, entry.offset > base {
@@ -1060,16 +1028,16 @@ public final class Qwen36MTPBlockSession {
         }
     }
 
-    /// Restore the committed boundary from a width-S verify with
-    /// `nConfirmed == 1`. K=1 consumes its eager checkpoint. K>=2 replays
-    /// `acceptedCount + 1` target rows from the exact pre-verify recurrent
-    /// state. Both paths then trim exactly the rejected attention rows.
+    /// Restore the per-boundary checkpoint written by a fused width-S verify
+    /// with `nConfirmed == 1`. Checkpoint t is the recurrent state after
+    /// verify row t, so a partial acceptance of `acceptedCount` drafts
+    /// restores checkpoint `acceptedCount` and trims exactly the rejected
+    /// rows from the attention caches — no repair forward at any depth.
     ///
     /// Preflight every layer before mutating any of them. Returning `false`
     /// leaves the cache untouched so the caller can use the generic snapshot
     /// and repair path safely.
     private static func restoreAfterPrefixReject(
-        _ model: any Qwen36MTPTarget,
         _ cache: [any KVCache],
         acceptedCount: Int,
         draftCount: Int,
@@ -1077,27 +1045,6 @@ public final class Qwen36MTPBlockSession {
     ) -> Bool {
         let rejected = draftCount - acceptedCount
         guard rejected > 0 else { return false }
-
-        // Preserve the officially validated eager K=1 path byte-for-byte.
-        // Wider verifies retain a compact recurrence tape instead of eagerly
-        // materialising one fp32 state at every possible boundary.
-        if draftCount > 1 {
-            for entry in cache where !(entry is ArraysCache) {
-                guard entry.isTrimmable,
-                      entry.offset == committedOffset + rejected
-                else { return false }
-            }
-            guard model.replayRecurrentPrefix(
-                cache: cache, committedRows: acceptedCount + 1)
-            else { return false }
-            for entry in cache where !(entry is ArraysCache) {
-                if entry.isTrimmable, entry.offset > committedOffset {
-                    _ = entry.trim(entry.offset - committedOffset)
-                }
-            }
-            return true
-        }
-
         for entry in cache {
             if let arrays = entry as? ArraysCache {
                 guard arrays.rollbackCheckpoints.count > acceptedCount
@@ -1117,7 +1064,6 @@ public final class Qwen36MTPBlockSession {
                 arrays[1] = saved.1
                 arrays.rollbackState = nil
                 arrays.rollbackCheckpoints = []
-                arrays.prefixReplayTape = nil
             } else if entry.isTrimmable {
                 _ = entry.trim(entry.offset - committedOffset)
             }
@@ -1130,7 +1076,6 @@ public final class Qwen36MTPBlockSession {
             if let arrays = entry as? ArraysCache {
                 arrays.rollbackState = nil
                 arrays.rollbackCheckpoints = []
-                arrays.prefixReplayTape = nil
             }
         }
     }
