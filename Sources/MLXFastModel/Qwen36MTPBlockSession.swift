@@ -491,7 +491,15 @@ public final class Qwen36MTPBlockSession {
     /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
     /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// PROMOTED-Q4 AGGRESSIVE BRACKET ARM: the declared group-64 4-bit head
+    /// cuts the artifact payload from 849 MB to 239 MB. This isolated h =
+    /// 0.08 arm asks whether the h = 0.10 candidate still overprices chained
+    /// proposals once the compact head is resident. Both values seed at depth
+    /// 6, but 0.08 holds a lower marginal threshold as prompt evidence adapts,
+    /// so the official eight-prompt receipt distinguishes their steady-state
+    /// schedules. No kernel, verify-width, EMA, or head change is bundled.
+    private static let headStepCostRatio = 0.08
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
