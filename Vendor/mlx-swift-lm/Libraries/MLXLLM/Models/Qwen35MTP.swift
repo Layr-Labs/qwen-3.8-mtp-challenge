@@ -34,7 +34,10 @@ final class Qwen35MTPDecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            // Same fused gate/up MLP as the backbone layers; here the linears
+            // stay bf16 and the fuse takes the plain-weight path. Head side —
+            // proposal-only, no exactness constraint.
+            _mlp.wrappedValue = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
@@ -121,4 +124,5 @@ final class Qwen35MTPModule: Module {
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
     }
+
 }
