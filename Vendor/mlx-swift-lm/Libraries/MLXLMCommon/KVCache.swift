@@ -1248,6 +1248,25 @@ public class ArraysCache: BaseKVCache {
     /// `rollbackState` (consumed or cleared by the round that requested it).
     public var rollbackCheckpoints: [(MLXArray, MLXArray)] = []
 
+    /// DEFERRED pre-verify recurrent snapshot: `(conv_state, ssm_state)` as the
+    /// slots held them at the START of a verify forward, captured by
+    /// `Qwen35GatedDeltaNet` ONLY on a verify that does NOT write
+    /// `rollbackCheckpoints` — i.e. exactly the case in which the caller's
+    /// generic rollback + re-forward fallback can still be reached.
+    ///
+    /// This is the lazy counterpart of `Qwen36MTPBlockSession.snapshotRecurrent`,
+    /// which built the same information eagerly on EVERY verify round for a
+    /// fallback the shipped per-boundary-checkpoint path no longer reaches. Both
+    /// legs are `[.ellipsis]` slice EXPRESSIONS for the same load-bearing reason
+    /// the eager snapshot's are: `MLXArray` is a reference type, so a bare
+    /// reference would be rewritten by any future in-place cache writer.
+    ///
+    /// Optional-of-optionals is deliberate. `nil` means "no deferred capture was
+    /// taken on the last verify forward" (per-boundary checkpoints were written
+    /// instead); a PRESENT tuple may still carry `nil` legs, which is what an
+    /// empty slot looks like and exactly what the eager snapshot recorded for it.
+    public var preVerifyRecurrentState: (MLXArray?, MLXArray?)? = nil
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }

@@ -78,6 +78,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case alreadyBegun
     case invalidDepth(Int)
     case emptySeed
+    case deferredSnapshotUnavailable(round: Int, layer: Int)
 
     public var description: String {
         switch self {
@@ -94,6 +95,10 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
             return "MTP draft depth \(depth) is out of range"
         case .emptySeed:
             return "MTP seed prefill requires a non-empty seed"
+        case .deferredSnapshotUnavailable(let round, let layer):
+            return "MTP generic rollback at round \(round) found no deferred "
+                + "pre-verify recurrent state on cache layer \(layer); rerun "
+                + "with MLXFAST_QWEN_MTP_DEFER_ROLLBACK_SNAPSHOT=0"
         }
     }
 }
@@ -408,6 +413,35 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
+    /// DEFERRED ROLLBACK SNAPSHOT. Default ON; "0" restores the eager
+    /// `snapshotRecurrent` build at the top of every verify round.
+    ///
+    /// `snapshotRecurrent` allocates a 48-entry dictionary of 96 fresh slice
+    /// expressions on EVERY round, and its ONLY consumer is the generic
+    /// rollback + re-forward fallback below — which the fused per-boundary
+    /// checkpoint verify has made unreachable in the shipped configuration.
+    /// With this on, the capture is taken inside `Qwen35GatedDeltaNet` and only
+    /// on a verify forward that does not write those checkpoints, i.e. exactly
+    /// when the fallback can still be reached.
+    private static let deferRollbackSnapshot =
+        ProcessInfo.processInfo.environment[
+            "MLXFAST_QWEN_MTP_DEFER_ROLLBACK_SNAPSHOT"] != "0"
+
+    /// One-time cache-shape eligibility for the deferral, cached for the
+    /// session. `restoreAfterPrefixReject` refuses outright on any cache entry
+    /// that is neither an `ArraysCache` nor trimmable, and such an entry would
+    /// route every round into the fallback; that shape is decided when the
+    /// cache is built, so it is checked once rather than per round.
+    private var deferSnapshotEligibleCache: Bool?
+
+    private func deferSnapshotEligible() -> Bool {
+        guard Self.deferRollbackSnapshot else { return false }
+        if let cached = deferSnapshotEligibleCache { return cached }
+        let eligible = cache.allSatisfy { $0 is ArraysCache || $0.isTrimmable }
+        deferSnapshotEligibleCache = eligible
+        return eligible
+    }
     private static func traceWrite(_ line: String) {
         // stderr: the worker sandbox denies file-write*, and the parent's
         // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
@@ -786,7 +820,14 @@ public final class Qwen36MTPBlockSession {
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        //    DEFERRED (default): the eager dict build is skipped entirely and
+        //    the equivalent capture is taken inside the GDN forward, only on a
+        //    verify that writes no per-boundary checkpoints. Nothing on the
+        //    accept path or the checkpoint-restore path ever reads `snapshot`,
+        //    so an empty dict here is not observable by either.
+        let deferSnapshot = deferSnapshotEligible()
+        let snapshot: [Int: [MLXArray?]] =
+            deferSnapshot ? [:] : Self.snapshotRecurrent(cache)
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
@@ -892,8 +933,11 @@ public final class Qwen36MTPBlockSession {
                 // Generic K>1 / defensive fallback: undo the whole verify window
                 // and re-forward the committed block. This rare path pays a
                 // second blocking eval for its own readout.
+                let restoreSnapshot = try Self.fallbackSnapshot(
+                    cache, eager: snapshot, deferred: deferSnapshot,
+                    round: roundCount)
                 Self.rollbackAfterVerify(
-                    cache, snapshot, verifiedTokens: draftCount + 1, to: base)
+                    cache, restoreSnapshot, verifiedTokens: draftCount + 1, to: base)
                 let (repairLogits, repairHidden) = model.callWithHidden(
                     input: LMInput.Text(
                         tokens: MLXArray(committed).reshaped([1, committed.count])),
@@ -993,6 +1037,37 @@ public final class Qwen36MTPBlockSession {
         for (index, entry) in cache.enumerated() {
             guard let arrays = entry as? ArraysCache else { continue }
             snapshot[index] = [arrays[0]?[.ellipsis], arrays[1]?[.ellipsis]]
+        }
+        return snapshot
+    }
+
+    /// The pre-verify recurrent state for the generic fallback, under either
+    /// capture strategy.
+    ///
+    /// Eager: the caller's own `snapshotRecurrent` dict, returned unchanged.
+    ///
+    /// Deferred: the per-cache `preVerifyRecurrentState` slots, written by the
+    /// GDN forward of this very round and only when that forward wrote no
+    /// per-boundary checkpoints — which is the same condition that sends the
+    /// caller down this fallback in the first place. Every recurrent layer must
+    /// be covered before anything is restored; a partial restore would leave
+    /// some layers at their post-verify state, so the incomplete case is
+    /// reported as an error rather than applied.
+    private static func fallbackSnapshot(
+        _ cache: [any KVCache],
+        eager: [Int: [MLXArray?]],
+        deferred: Bool,
+        round: Int
+    ) throws -> [Int: [MLXArray?]] {
+        guard deferred else { return eager }
+        var snapshot: [Int: [MLXArray?]] = [:]
+        for (index, entry) in cache.enumerated() {
+            guard let arrays = entry as? ArraysCache else { continue }
+            guard let saved = arrays.preVerifyRecurrentState else {
+                throw Qwen36MTPSessionError.deferredSnapshotUnavailable(
+                    round: round, layer: index)
+            }
+            snapshot[index] = [saved.0, saved.1]
         }
         return snapshot
     }

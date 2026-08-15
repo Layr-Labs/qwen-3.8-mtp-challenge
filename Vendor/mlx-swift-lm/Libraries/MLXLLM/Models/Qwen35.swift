@@ -166,6 +166,26 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+// MARK: - Deferred rollback snapshot
+
+/// DEFAULT ON; set `MLXFAST_QWEN_MTP_DEFER_ROLLBACK_SNAPSHOT=0` to restore the
+/// caller's eager per-round `snapshotRecurrent` build.
+///
+/// The MTP session used to build a 48-entry dictionary of 96 fresh slice
+/// expressions before EVERY verify forward, purely so a generic
+/// rollback + re-forward fallback could restore the recurrent state. Since the
+/// fused width-S verify below started writing a per-boundary checkpoint for
+/// every row at every width, that fallback is only reachable when the fused
+/// branch does NOT run — so the capture belongs here, inside the one place that
+/// knows whether checkpoints are being written, rather than unconditionally on
+/// the caller's hot path.
+///
+/// Read once as a module-level `let` so the hot path never touches the
+/// environment.
+private let qwen35DeferRollbackSnapshotEnabled =
+    ProcessInfo.processInfo.environment[
+        "MLXFAST_QWEN_MTP_DEFER_ROLLBACK_SNAPSHOT"] != "0"
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -500,9 +520,31 @@ final class Qwen35GatedDeltaNet: Module {
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
 
-        if nConfirmed == 1 && S >= 2 && mask == nil,
-           let midKernel = qwen35GatedDeltaMidKernel
-        {
+        // Per-boundary-checkpoint eligibility hoisted to ONE `let`, so the
+        // deferred-snapshot capture immediately below and the branch it guards
+        // can never disagree about whether checkpoints will exist. Identical
+        // predicate and identical evaluation order to the inlined form.
+        let boundaryCheckpointKernel: MLXFast.MLXFastKernel? =
+            (nConfirmed == 1 && S >= 2 && mask == nil)
+            ? qwen35GatedDeltaMidKernel : nil
+
+        // DEFERRED PRE-VERIFY SNAPSHOT (see `qwen35DeferRollbackSnapshotEnabled`).
+        // Only verify forwards (`nConfirmed > 0`) can be rolled back, so serial
+        // decode, prefill and the repair forward are untouched. When the fused
+        // branch below runs, its per-boundary checkpoints subsume this capture
+        // and the slot is left empty — the caller's fallback is unreachable in
+        // that case by the same argument that lets it restore checkpoint
+        // `acceptedCount`. When it does NOT run, the capture is taken here,
+        // BEFORE any write to the cache slots (they are rebound at the very end
+        // of this function), so it holds exactly what the eager snapshot held.
+        if qwen35DeferRollbackSnapshotEnabled, nConfirmed > 0, let cache {
+            cache.preVerifyRecurrentState =
+                boundaryCheckpointKernel == nil
+                ? (cache[0]?[.ellipsis], cache[1]?[.ellipsis])
+                : nil
+        }
+
+        if let midKernel = boundaryCheckpointKernel {
             // Width-2 MTP verify, single-launch form. The old split path ran
             // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
             // sigmoid, g) and paid two recurrence launches with a full fp32
