@@ -3172,29 +3172,29 @@ EOF
   return "${operation_status}"
 }
 
-check_mlxfast_cli() {
-  # Submissions use the Yukon CLI (mlxfast) for login/clone/submit (see
+check_yukon_cli() {
+  # Submissions use the Yukon CLI (`yukon`) for login/clone/submit (see
   # README.md "Submitting"). That CLI is distributed by the external Yukon
   # installer, not by this repository, so setup.sh cannot install it. This
   # check only surfaces the common onboarding gap where the CLI was installed
   # but its directory never made it onto PATH, which otherwise shows up much
-  # later as "command not found: mlxfast" at submit time. Informational only;
+  # later as "command not found: yukon" at submit time. Informational only;
   # never fails setup.
   local candidate
   local install_dir
 
-  if command -v mlxfast >/dev/null 2>&1; then
-    echo "setup.sh: mlxfast (Yukon submission CLI) found at $(command -v mlxfast)"
+  if command -v yukon >/dev/null 2>&1; then
+    echo "setup.sh: Yukon CLI found at $(command -v yukon)"
     return 0
   fi
 
-  for candidate in "${HOME}/.local/bin/mlxfast" "${HOME}/bin/mlxfast"; do
+  for candidate in "${HOME}/.local/bin/yukon" "${HOME}/bin/yukon"; do
     if [[ -x "${candidate}" ]]; then
       install_dir="$(dirname "${candidate}")"
       cat >&2 <<EOF
-setup.sh: warning: mlxfast (Yukon submission CLI) is installed at
+setup.sh: warning: the Yukon CLI is installed at
 ${candidate} but ${install_dir} is not on PATH, so
-'mlxfast clone/submit' will not work in this shell. Activate it with:
+'yukon clone/submit' will not work in this shell. Activate it with:
 
   echo 'export PATH="${install_dir}:\$PATH"' >> ~/.zshrc
 
@@ -3205,7 +3205,7 @@ EOF
     fi
   done
 
-  echo "setup.sh: note: mlxfast (Yukon submission CLI) is not on PATH; it is installed by the external Yukon installer, not by setup.sh. Build, transform, correctness, and local benchmarks work without it, but install it (and put its bin directory on PATH) before 'mlxfast submit' -- see README.md 'Submitting'."
+  echo "setup.sh: note: use the Yukon CLI ('yukon') for account and submission commands. It is not on PATH and is installed by the external Yukon installer, not by setup.sh. Build, transform, correctness, and local benchmarks work without it, but install it (and put its bin directory on PATH) before 'yukon submit' -- see README.md 'Submitting'."
   return 0
 }
 
@@ -3218,7 +3218,7 @@ if [[ "${MLXFAST_SKIP_WEIGHTS_DOWNLOAD:-0}" == "1" || "${SKIP_MODEL_DOWNLOAD:-0}
   start_mlx_metallib_build
   wait_for_mlx_metallib_build
   echo "setup.sh: skipping reference weight download"
-  check_mlxfast_cli
+  check_yukon_cli
   print_setup_summary "skipped"
   exit 0
 fi
@@ -3227,5 +3227,5 @@ build_swift_harness
 start_mlx_metallib_build
 download_reference_weights "${REFERENCE_DIR}"
 wait_for_mlx_metallib_build
-check_mlxfast_cli
+check_yukon_cli
 print_setup_summary "ready"
