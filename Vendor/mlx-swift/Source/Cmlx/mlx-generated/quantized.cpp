@@ -882,7 +882,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     uint simd_gid,
     uint simd_lid) {
   static_assert(M >= 2 && M <= 9, "multi-row QMV supports M in [2, 9]");
-  constexpr int inputs_per_group = 2;
+  constexpr int inputs_per_group = 4;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
@@ -897,12 +897,23 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   const int in_vec_size_w = in_vec_size / in_vec_bytes_per_row_divisor;
   const int in_vec_size_g = in_vec_size / 64;
 
-  const bool has_pair = first_m + 1 < M;
-  thread float2 pair_result[rows_per_simd];
-  thread float single_result[rows_per_simd];
-  for (int r = 0; r < rows_per_simd; r++) {
-    pair_result[r] = 0.0f;
-    single_result[r] = 0.0f;
+  int m_count = M - first_m;
+  if (m_count > inputs_per_group) {
+    m_count = inputs_per_group;
+  }
+
+  // acc[j][r]: partial dot for input row (first_m + j), output row (out_row + r).
+  // The weight tile for the four output rows is read once per k-block below and
+  // reused across all m_count input rows this group owns, so a wider group reads
+  // the bandwidth-dominant weights fewer times for the same multi-row verify.
+  // m_count is uniform across the simdgroup (M and first_m are threadgroup
+  // uniforms), so every `j >= m_count` break and every simd_sum below is taken
+  // by all lanes together -- no simd reduction runs on a divergent lane set.
+  thread float acc[inputs_per_group][rows_per_simd];
+  for (int j = 0; j < inputs_per_group; j++) {
+    for (int r = 0; r < rows_per_simd; r++) {
+      acc[j][r] = 0.0f;
+    }
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
@@ -926,44 +937,31 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
       bias_local[r] = biases[group_index];
     }
 
-    thread float x0[values_per_thread];
-    const device T* xm0 =
-        x + first_m * in_vec_size + k + simd_lid * values_per_thread;
-    const float sum0 =
-        load_vector<T, float, values_per_thread, 4>(xm0, x0);
-    if (has_pair) {
-      thread float x1[values_per_thread];
-      const device T* xm1 = xm0 + in_vec_size;
-      const float sum1 =
-          load_vector<T, float, values_per_thread, 4>(xm1, x1);
-      for (int r = 0; r < rows_per_simd; r++) {
-        pair_result[r] += qdot_affine4_loaded_pair(
-            packed[r], x0, x1, scale_local[r], bias_local[r],
-            float2(sum0, sum1));
+    for (int j = 0; j < inputs_per_group; j++) {
+      if (j >= m_count) {
+        break;
       }
-    } else {
+      thread float xj[values_per_thread];
+      const device T* xmj =
+          x + (first_m + j) * in_vec_size + k + simd_lid * values_per_thread;
+      const float sumj =
+          load_vector<T, float, values_per_thread, 4>(xmj, xj);
       for (int r = 0; r < rows_per_simd; r++) {
-        single_result[r] += qdot_affine4_loaded<float>(
-            packed[r], x0, scale_local[r], bias_local[r], sum0);
+        acc[j][r] += qdot_affine4_loaded<float>(
+            packed[r], xj, scale_local[r], bias_local[r], sumj);
       }
     }
   }
 
-  if (has_pair) {
-    for (int r = 0; r < rows_per_simd; r++) {
-      const float reduced0 = simd_sum(pair_result[r].x);
-      const float reduced1 = simd_sum(pair_result[r].y);
-      if (simd_lid == 0) {
-        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced0);
-        y[(first_m + 1) * out_vec_size + out_row + r] =
-            static_cast<T>(reduced1);
-      }
+  for (int j = 0; j < inputs_per_group; j++) {
+    if (j >= m_count) {
+      break;
     }
-  } else {
     for (int r = 0; r < rows_per_simd; r++) {
-      const float reduced = simd_sum(single_result[r]);
+      const float reduced = simd_sum(acc[j][r]);
       if (simd_lid == 0) {
-        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+        y[(first_m + j) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced);
       }
     }
   }
