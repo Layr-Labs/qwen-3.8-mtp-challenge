@@ -34,7 +34,7 @@ final class Qwen35MTPDecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            _mlp.wrappedValue = Qwen35SwiGLUMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )

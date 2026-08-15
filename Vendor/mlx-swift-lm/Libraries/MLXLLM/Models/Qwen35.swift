@@ -706,6 +706,22 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+final class Qwen35SwiGLUMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    init(dimensions: Int, hiddenDimensions: Int) {
+        _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+        _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+        _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        downProj(compiledSiluProduct(gateProj(x), upProj(x)))
+    }
+}
+
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
@@ -731,7 +747,7 @@ final class Qwen35DecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            _mlp.wrappedValue = Qwen35SwiGLUMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
