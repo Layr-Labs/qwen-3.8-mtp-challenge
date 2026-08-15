@@ -489,9 +489,10 @@ public final class Qwen36MTPBlockSession {
     /// ~27 ms base → h ≈ 0.20 at verify widths 3-5. The earlier 0.6
     /// estimate folded in the width>=6 rounds, whose 10-17 ms/row jump is
     /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
-    /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
+    /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.18 is the remote
+    /// exploration point below the prior 0.20 setting and reaches the
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
-    private static let headStepCostRatio = 0.20
+    private static let headStepCostRatio = 0.18
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
