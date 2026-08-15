@@ -185,6 +185,80 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "in_proj_b") var inProjB: Linear
     @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+    // Packed QKV|Z|B|A concat on N (mechanism class of the promoted attention
+    // QKV fuse). Underscore so it is not a Module parameter; built once from
+    // already-quantized projections; M-GATED (decode widths only).
+    private var _inW: MLXArray?
+    private var _inS: MLXArray?
+    private var _inZ: MLXArray?
+    private var _inGS = 64
+    private var _inBits = 4
+    private var _inMode = QuantizationMode.affine
+    private var _qkvOut = 0
+    private var _zOut = 0
+    private var _bOut = 0
+
+    /// One affine-4 GEMM for the four GDN input projections (QKV, Z, B, A).
+    /// Concat-on-N is bit-exact ONLY on the qmv kernel family (M below the
+    /// batch limit): qmv's grid is (M, N/8, B) with per-row arithmetic
+    /// independent of the N partition. The qmm kernel (large M, e.g. the
+    /// M=512 seed prefill) tiles N differently and drifts logits 1-2 bf16
+    //  ULP — so large-M calls stay on the stock path. Verified by full
+    /// golden logit-value diff: zero differences post-gate.
+    private func fusedInProjections(
+        _ x: MLXArray
+    ) -> (qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray) {
+        let M = x.size / max(x.dim(-1), 1)
+        if M <= 8 {
+            if _inW == nil {
+                guard let qkv = inProjQKV as? QuantizedLinear,
+                      let z = inProjZ as? QuantizedLinear,
+                      let b = inProjB as? QuantizedLinear,
+                      let a = inProjA as? QuantizedLinear,
+                      qkv.groupSize == z.groupSize, z.groupSize == b.groupSize,
+                      b.groupSize == a.groupSize,
+                      qkv.bits == z.bits, z.bits == b.bits, b.bits == a.bits,
+                      qkv.mode == z.mode, z.mode == b.mode, b.mode == a.mode,
+                      qkv.mode == .affine,
+                      let qkvBias = qkv.biases, let zBias = z.biases,
+                      let bBias = b.biases, let aBias = a.biases
+                else {
+                    return (inProjQKV(x), inProjZ(x), inProjB(x), inProjA(x))
+                }
+                _inW = concatenated(
+                    [qkv.weight, z.weight, b.weight, a.weight], axis: 0
+                ).contiguous()
+                _inS = concatenated(
+                    [qkv.scales, z.scales, b.scales, a.scales], axis: 0
+                ).contiguous()
+                _inZ = concatenated(
+                    [qkvBias, zBias, bBias, aBias], axis: 0
+                ).contiguous()
+                _inGS = qkv.groupSize
+                _inBits = qkv.bits
+                _inMode = qkv.mode
+                _qkvOut = qkv.shape.0
+                _zOut = z.shape.0
+                _bOut = b.shape.0
+            }
+            if let w = _inW, let s = _inS, let zBias = _inZ {
+                let y = quantizedMM(
+                    x, w, scales: s, biases: zBias, transpose: true,
+                    groupSize: _inGS, bits: _inBits, mode: _inMode)
+                let qkvEnd = _qkvOut
+                let zEnd = _qkvOut + _zOut
+                let bEnd = zEnd + _bOut
+                return (
+                    qkv: y[.ellipsis, ..<qkvEnd].contiguous(),
+                    z: y[.ellipsis, qkvEnd ..< zEnd].contiguous(),
+                    b: y[.ellipsis, zEnd ..< bEnd].contiguous(),
+                    a: y[.ellipsis, bEnd...].contiguous()
+                )
+            }
+        }
+        return (inProjQKV(x), inProjZ(x), inProjB(x), inProjA(x))
+    }
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -421,10 +495,9 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        let (qkvRaw, zRaw, b, a) = fusedInProjections(inputs)
+        var qkv = qkvRaw
+        let z = zRaw.reshaped(B, S, numVHeads, headVDim)
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
