@@ -221,15 +221,16 @@ public final class Qwen36MTPBlockSession {
         }
 
         // Committed-history head shapes: the first drafting round primes the
-        // whole 512-token seed through the head in one forward, and an
+        // retained seed suffix plus its live row through the head, and an
         // accept-fold round runs a 2-row head forward. Compile both (plus the
         // single-row lm_head slice they sample) on throwaway state here,
         // outside every scored window.
         let hDim = row.dim(-1)
         let historyWarmCache = model.makeMTPCache()
-        let primeHidden = MLXArray.zeros([1, 512, hDim], dtype: row.dtype)
+        let primeWidth = Self.headPrimeHistoryLimit + 1
+        let primeHidden = MLXArray.zeros([1, primeWidth, hDim], dtype: row.dtype)
         let primeTokens = MLXArray(
-            Array(repeating: Int32(0), count: 512)).reshaped([1, 512])
+            Array(repeating: Int32(0), count: primeWidth)).reshaped([1, primeWidth])
         let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
@@ -349,6 +350,9 @@ public final class Qwen36MTPBlockSession {
     /// forward), so the cap prices the marginal HEAD step against its
     /// acceptance odds; 3 keeps the wasted-work tail short on mixed prose.
     private static let streakDepthCap = 4
+    /// Recent seed transitions retained when the proposal-only head cache is
+    /// first primed. The full 512-token seed remains in the target cache.
+    private static let headPrimeHistoryLimit = 384
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -526,9 +530,14 @@ public final class Qwen36MTPBlockSession {
                 // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
                 // tokens 1..L-1 (hidden at t predicts alongside token t+1).
                 let primeCount = seedTokensForPriming.count - 1
+                let retainedCount = Swift.min(
+                    primeCount, Self.headPrimeHistoryLimit)
+                let retainedStart = primeCount - retainedCount
                 flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
+                    model.applyFinalNorm(
+                        seedHidden[0..., retainedStart ..< primeCount, 0...]))
+                flushTokens.append(
+                    contentsOf: seedTokensForPriming[(retainedStart + 1)...])
             }
             seedHiddenForPriming = nil
             seedTokensForPriming = []
