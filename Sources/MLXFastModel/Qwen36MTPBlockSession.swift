@@ -175,7 +175,7 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: 0)
+                cache: warmCache, nConfirmed: width == 2 ? 1 : 0)
             eval(verifyLogits)
             eval(warmCache.flatMap { $0.state })
         }
@@ -238,7 +238,7 @@ public final class Qwen36MTPBlockSession {
     // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 0)
+        Swift.min(offeredDepth, 1)
     }
 
     /// The shipped schedule's width. See `draftPolicy`.
@@ -393,16 +393,17 @@ public final class Qwen36MTPBlockSession {
             nextToken = proposal
         }
 
-        // 2. Snapshot the recurrent (non-trimmable) state, then verify in ONE
-        //    batched forward. `nConfirmed` stays 0 deliberately: a non-zero value
-        //    installs the vendored depth-1-only rollback AND changes the GDN
-        //    chunk geometry, both of which fight the snapshot/rollback below.
+        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
+        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
+        //    rejected single draft can then retain the primary's target work and
+        //    discard only the draft token instead of re-forwarding the primary.
+        let fastK1 = draftCount == 1
         let snapshot = Self.snapshotRecurrent(cache)
         let verifyInput = committed + drafts
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(
                 tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
-            cache: cache, nConfirmed: 0)
+            cache: cache, nConfirmed: fastK1 ? 1 : 0)
         let verifyArgmax = argmaxAll(verifyLogits)
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
@@ -430,6 +431,7 @@ public final class Qwen36MTPBlockSession {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
             // rollback, no repair forward; the bonus row carries the next primary
             // and the last hidden row seeds the next draft.
+            Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             let bonus = verifyLogits[
@@ -440,28 +442,41 @@ public final class Qwen36MTPBlockSession {
             perRowTop2Tokens.append(ids)
             perRowTop2Logits.append(values)
         } else {
-            // PARTIAL: undo the WHOLE verify window — restore the recurrent
-            // snapshot and trim all `1 + draftCount` positions from the trimmable
-            // caches — then re-forward only the committed block. The correction
-            // token (the target's own row-`acceptedCount` argmax) is NEVER
-            // emitted here; it arrives as the next round's primary, out of the
-            // repair forward, which is what keeps the emitted stream identical to
-            // the serial trajectory.
             rollbackRoundCount += 1
             committed.append(contentsOf: drafts.prefix(acceptedCount))
             committedTokenCount += acceptedCount
-            Self.rollbackAfterVerify(
-                cache, snapshot, verifiedTokens: verifyInput.count, to: base)
-            let (repairLogits, repairHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray(committed).reshaped([1, committed.count])),
-                cache: cache, nConfirmed: 0)
-            pendingLogitsRow = repairLogits[
-                0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
-            pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
-            let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
-            perRowTop2Tokens.append(ids)
-            perRowTop2Logits.append(values)
+
+            // K=1 rejection: the target already computed the primary's exact
+            // logits and hidden row. Restore the recurrent checkpoint written
+            // immediately after that primary, trim just the rejected draft from
+            // attention caches, and carry row 0 forward. The trusted tail row is
+            // the same post-primary distribution, so reuse its already-recorded
+            // top-2 evidence rather than running the target again.
+            let committedOffset = base + committed.count
+            if fastK1 && Self.restoreAfterSingleDraftReject(
+                cache, to: committedOffset)
+            {
+                pendingLogitsRow = verifyLogits[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
+                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
+                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
+            } else {
+                // Generic K>1 / defensive fallback: undo the whole verify window
+                // and re-forward the committed block.
+                Self.rollbackAfterVerify(
+                    cache, snapshot, verifiedTokens: verifyInput.count, to: base)
+                let (repairLogits, repairHidden) = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(committed).reshaped([1, committed.count])),
+                    cache: cache, nConfirmed: 0)
+                pendingLogitsRow = repairLogits[
+                    0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
+                pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
+                let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
+                perRowTop2Tokens.append(ids)
+                perRowTop2Logits.append(values)
+            }
         }
 
         acceptedDraftTotal += acceptedCount
@@ -546,6 +561,48 @@ public final class Qwen36MTPBlockSession {
             if entry.isTrimmable, entry.offset > base {
                 _ = entry.trim(Swift.min(verifiedTokens, entry.offset - base))
             }
+        }
+    }
+
+    /// Restore the checkpoint produced by a two-token verify with
+    /// `nConfirmed == 1`. The checkpoint is the recurrent state immediately
+    /// after the primary; each attention cache is exactly one rejected draft
+    /// token ahead of that same committed offset.
+    ///
+    /// Preflight every layer before mutating any of them. Returning `false`
+    /// leaves the cache untouched so the caller can use the generic snapshot and
+    /// repair path safely.
+    private static func restoreAfterSingleDraftReject(
+        _ cache: [any KVCache],
+        to committedOffset: Int
+    ) -> Bool {
+        for entry in cache {
+            if let arrays = entry as? ArraysCache {
+                guard arrays.rollbackState != nil else { return false }
+            } else if entry.isTrimmable {
+                guard entry.offset == committedOffset + 1 else { return false }
+            } else {
+                return false
+            }
+        }
+
+        for entry in cache {
+            if let arrays = entry as? ArraysCache,
+               let saved = arrays.rollbackState
+            {
+                arrays[0] = saved.0
+                arrays[1] = saved.1
+                arrays.rollbackState = nil
+            } else if entry.isTrimmable {
+                _ = entry.trim(entry.offset - committedOffset)
+            }
+        }
+        return true
+    }
+
+    private static func clearRecurrentRollback(_ cache: [any KVCache]) {
+        for entry in cache {
+            (entry as? ArraysCache)?.rollbackState = nil
         }
     }
 
