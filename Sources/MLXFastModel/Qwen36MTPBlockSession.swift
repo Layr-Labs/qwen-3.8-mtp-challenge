@@ -566,16 +566,18 @@ public final class Qwen36MTPBlockSession {
             cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-            .asType(.int32)
+        var draftId = model.mapDraftTokenIds(
+            argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                .asType(.int32))
         draftIdArrays.append(draftId)
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                .asType(.int32)
+            draftId = model.mapDraftTokenIds(
+                argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                    .asType(.int32))
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
