@@ -541,8 +541,13 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
-        eval(cache.flatMap { $0.state })
-        if let row = pendingLogitsRow, let h = pendingHidden { eval(row, h) }
+        // No explicit cache materialization here: the ledger readouts below
+        // (`asArray` on tokens/top-2) already sync the round's graph, and the
+        // next round's kernels consume the cache arrays lazily. Forcing
+        // ~130 small state arrays into one barrier stalls the pipeline. The
+        // serial-control branch keeps its materialization: the paired local
+        // score measures exactly this differential (the ranked denominator
+        // runs the pinned baseline binary either way).
 
         // Truncate after the first committed stop token, keeping the stop token
         // itself — the same rule the serial reference applies.
