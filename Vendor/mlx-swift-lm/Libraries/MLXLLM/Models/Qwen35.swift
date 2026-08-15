@@ -166,6 +166,71 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+// MARK: - GatedDelta verify helpers
+
+/// Fuse the ordinary elementwise primitives that form the recurrence's
+/// fp32 `g` and `beta` inputs. `compile` preserves every typed bf16 temporary
+/// in these expressions while removing their dispatch and materialization
+/// overhead. Shapeless compilation shares one trace across verify widths.
+private let qwen35CompiledGatedDeltaGBeta:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
+{
+    let body: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (
+        MLXArray, MLXArray
+    ) = { a, b, aLog, dtBias in
+        let g = computeGatedDeltaG(aLog, a, dtBias)
+        let beta = sigmoid(b).asType(.float32)
+        return (g, beta)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+/// Run the existing recurrence kernel from already-computed fp32 `g`/`beta`.
+/// The official M5 path uses this after the compiled helper; callers retain the
+/// original `gatedDeltaUpdate` fallback when compiled decode is disabled.
+private func qwen35GatedDeltaPrepared(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray?,
+    mask: MLXArray?
+) -> (MLXArray, MLXArray) {
+    let B = q.dim(0)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var preparedState = state
+        ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if preparedState.dtype != .float32 {
+        preparedState = preparedState.asType(.float32)
+    }
+    return gatedDeltaKernel(
+        q: q, k: k, v: v, g: g, beta: beta,
+        state: preparedState, mask: mask)
+}
+
+/// Fuse the precise fp32 SiLU gate and product after the existing RMS norm.
+/// The explicit casts mirror `Qwen3NextRMSNormGated` and keep the RMS reduction
+/// itself on the unchanged MLXFast path.
+private let qwen35CompiledGatedDeltaPostNorm:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
+        let gate32 = gate.asType(.float32)
+        let activated = gate32 * sigmoid(gate32)
+        return (activated * x.asType(.float32)).asType(x.dtype)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -491,17 +556,20 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: ssmState,
-            mask: mask
-        )
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+            a, b, aLog, dtBias)
+        let recurrence: (MLXArray, MLXArray)
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            recurrence = qwen35GatedDeltaPrepared(
+                q: qNormed, k: kNormed, v: v,
+                g: g, beta: beta, state: ssmState, mask: mask)
+        } else {
+            recurrence = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v,
+                a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: ssmState, mask: mask)
+        }
+        let (out, newSsmState) = recurrence
         let tape = ArraysCache.PrefixReplayTape(
             convInput: convInput,
             q: qNormed,
@@ -509,6 +577,8 @@ final class Qwen35GatedDeltaNet: Module {
             v: v,
             a: a,
             b: b,
+            g: g,
+            beta: beta,
             ssmPre: ssmState.map { $0[.ellipsis] },
             mask: mask.map { $0[.ellipsis] },
             rowCount: S,
@@ -529,7 +599,9 @@ final class Qwen35GatedDeltaNet: Module {
               tape.k.dim(1) == tape.rowCount,
               tape.v.dim(1) == tape.rowCount,
               tape.a.dim(1) == tape.rowCount,
-              tape.b.dim(1) == tape.rowCount
+              tape.b.dim(1) == tape.rowCount,
+              tape.g.dim(1) == tape.rowCount,
+              tape.beta.dim(1) == tape.rowCount
         else { return false }
         return true
     }
@@ -544,17 +616,29 @@ final class Qwen35GatedDeltaNet: Module {
               let tape = cache.prefixReplayTape
         else { return false }
         let rows = 0 ..< committedRows
-        let (_, boundarySsm) = gatedDeltaUpdate(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
-        )
+        let recurrence: (MLXArray, MLXArray)
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            recurrence = qwen35GatedDeltaPrepared(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                g: tape.g[0..., rows],
+                beta: tape.beta[0..., rows],
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] })
+        } else {
+            recurrence = gatedDeltaUpdate(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] })
+        }
+        let (_, boundarySsm) = recurrence
         cache[0] = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -657,8 +741,8 @@ final class Qwen35GatedDeltaNet: Module {
 
             // Replicates gatedDeltaUpdate's prologue exactly (fp32 beta/g,
             // fp32 state init).
-            let beta = sigmoid(b).asType(.float32)
-            let g = computeGatedDeltaG(aLog, a, dtBias)
+            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+                a, b, aLog, dtBias)
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
@@ -755,7 +839,13 @@ final class Qwen35GatedDeltaNet: Module {
             }
         }
 
-        let normedOut = norm(out, gate: z)
+        let normedOut: MLXArray
+        if nConfirmed == 1 && S >= 2 {
+            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+        } else {
+            normedOut = norm(out, gate: z)
+        }
         return outProj(normedOut.reshaped(B, S, -1))
     }
 }
