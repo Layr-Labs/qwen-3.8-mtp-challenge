@@ -507,7 +507,21 @@ public final class Qwen36MTPBlockSession {
     /// argmax-only check. Width 5 measured 5/5 bit-exact, which is why
     /// every promoted receipt at cap 4 survived rank. Do not raise this
     /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
-    private static let sdpaWidthWallDepthCap = 4
+    ///
+    /// RAISED TO THE TRUSTED MAXIMUM — the wall is cracked structurally, by
+    /// removing the wide shapes rather than diagnosing the culprit op. For
+    /// verify widths 6...9, `Qwen35GatedDeltaNet` now runs the whole
+    /// recurrence (conv prologue + scan) as two sub-chunks of widths
+    /// [S-4, 4] — both inside the rank-proven 2...5 range — with the fp32
+    /// state chained losslessly between the calls, the lazy prefix REPLAY
+    /// mirrors the same chunk boundary (`verifyChunkBoundary` is the single
+    /// source of truth), and `Qwen35Attention` advances the KV cache and
+    /// runs SDPA in the same two steps, so every kernel invocation executes
+    /// at a (qL, kL = prefix + qL) shape a cap-4 verify already produces on
+    /// the ranked box. Widths 2...5 keep the previous code byte-for-byte,
+    /// so a run whose cost model never exceeds depth 4 is bit-identical to
+    /// the promoted stack.
+    private static let sdpaWidthWallDepthCap = Qwen36MTPLimits.maxDepth
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {

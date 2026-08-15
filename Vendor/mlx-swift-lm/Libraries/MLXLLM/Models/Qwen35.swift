@@ -458,6 +458,23 @@ final class Qwen35GatedDeltaNet: Module {
     /// reconstruct a committed recurrent prefix after the target acceptance
     /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
     /// midpoint state tensor is produced on the hot path.
+    /// WIDTH-WALL CHUNK BOUNDARY. Verify widths 6...9 drift from the serial
+    /// trajectory in top-2 values at rank (the `sdpaWidthWallDepthCap`
+    /// receipts: drift starts at the 6th row, widths 2...5 are bit-exact),
+    /// through wide-shape kernel selection in the recurrence prologue (the
+    /// conv runs over 3+S positions and is the shape-dependent op in this
+    /// path; the recurrence's own t-loop is order-independent of T). The fix
+    /// removes the wide shapes: split S in 6...9 into [S-4, 4] — both
+    /// sub-widths inside the rank-proven 2...5 range — chaining the fp32
+    /// recurrent state losslessly between the two calls. Replay MUST mirror
+    /// the same boundary (see `replayPrefix`), which is why this is the one
+    /// shared source of truth for it. Returns nil at widths that stay on the
+    /// proven single-chunk form.
+    fileprivate static func verifyChunkBoundary(_ rows: Int) -> Int? {
+        guard rows >= 6, rows <= 9 else { return nil }
+        return rows - 4
+    }
+
     private func processChunkStashingPrefix(
         qkv: MLXArray,
         a: MLXArray,
@@ -474,39 +491,74 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-        let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(
-            convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        // The conv prologue and the recurrence for one row range. `lo ..< hi`
+        // rows of the verify block; the conv window for those rows is the
+        // matching slice of the SAME concatenated conv input the single-chunk
+        // form builds, so per-position conv windows are identical and the
+        // chunked conv length (3 + rows) stays in the rank-proven regime.
+        func prologueAndScan(
+            _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
+        ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
+            let rows = hi - lo
+            let convOut = silu(
+                conv1d(convInput[0..., lo ..< (hi + nKeep), 0...]))
+            let convSplit = MLX.split(
+                convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = convSplit[0].reshaped(B, rows, numKHeads, headKDim)
+            let k = convSplit[1].reshaped(B, rows, numKHeads, headKDim)
+            let v = convSplit[2].reshaped(B, rows, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: ssmState,
-            mask: mask
-        )
+            let (out, newState) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a[0..., lo ..< hi, 0...],
+                b: b[0..., lo ..< hi, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: stateIn,
+                mask: mask.map { $0[0..., lo ..< hi] }
+            )
+            return (out, newState, qNormed, kNormed, v)
+        }
+
+        let out: MLXArray
+        let newSsmState: MLXArray
+        let tapeQ: MLXArray
+        let tapeK: MLXArray
+        let tapeV: MLXArray
+        if let c1 = Self.verifyChunkBoundary(S) {
+            let (out1, seamState, q1, k1, v1) = prologueAndScan(0, c1, ssmState)
+            let (out2, finalState, q2, k2, v2) = prologueAndScan(c1, S, seamState)
+            out = concatenated([out1, out2], axis: 1)
+            newSsmState = finalState
+            tapeQ = concatenated([q1, q2], axis: 1)
+            tapeK = concatenated([k1, k2], axis: 1)
+            tapeV = concatenated([v1, v2], axis: 1)
+        } else {
+            let (o, s, q, k, v) = prologueAndScan(0, S, ssmState)
+            out = o
+            newSsmState = s
+            tapeQ = q
+            tapeK = k
+            tapeV = v
+        }
+
         let tape = ArraysCache.PrefixReplayTape(
             convInput: convInput,
-            q: qNormed,
-            k: kNormed,
-            v: v,
+            q: tapeQ,
+            k: tapeK,
+            v: tapeV,
             a: a,
             b: b,
             ssmPre: ssmState.map { $0[.ellipsis] },
@@ -543,18 +595,40 @@ final class Qwen35GatedDeltaNet: Module {
         guard canReplayPrefix(cache: cache, committedRows: committedRows),
               let tape = cache.prefixReplayTape
         else { return false }
-        let rows = 0 ..< committedRows
-        let (_, boundarySsm) = gatedDeltaUpdate(
-            q: tape.q[0..., rows, 0...],
-            k: tape.k[0..., rows, 0...],
-            v: tape.v[0..., rows, 0...],
-            a: tape.a[0..., rows, 0...],
-            b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
-            state: tape.ssmPre,
-            mask: tape.mask.map { $0[0..., rows] }
-        )
+        // Replay MUST mirror the forward's chunk boundary (width-wall fix):
+        // a wide tape's forward ran as [c1, rowCount-c1], so the state after
+        // row t is the chained two-call state. Replaying rows 0 ..< r as one
+        // call would re-introduce a wide recurrence shape AND diverge from
+        // the forward's own chaining. r <= c1 is a prefix of the forward's
+        // first call; r > c1 replays the first call in full (bitwise the
+        // same call the forward made) and a prefix of the second from the
+        // reproduced seam state.
+        func replayRange(
+            _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
+        ) -> MLXArray {
+            let rows = lo ..< hi
+            let (_, state) = gatedDeltaUpdate(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: stateIn,
+                mask: tape.mask.map { $0[0..., rows] }
+            )
+            return state
+        }
+        let boundarySsm: MLXArray
+        if let c1 = Self.verifyChunkBoundary(tape.rowCount),
+           committedRows > c1
+        {
+            let seamState = replayRange(0, c1, tape.ssmPre)
+            boundarySsm = replayRange(c1, committedRows, seamState)
+        } else {
+            boundarySsm = replayRange(0, committedRows, tape.ssmPre)
+        }
         cache[0] = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -952,16 +1026,51 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let attended: MLXArray
+        if L >= 6, L <= 9, case .causal = mask, cache is KVCacheSimple {
+            // WIDTH-WALL FIX, attention half (verify widths 6...9): split
+            // the query rows into [L-4, 4] — both sub-widths in the 2...5
+            // range the ranked replay has proven bit-exact — and advance
+            // the KV cache in the same two steps, so each SDPA call sees
+            // exactly the (qL, kL = prefix + qL) shape a cap-4 verify
+            // produces. `.causal` alignment is exact on both calls: chunk
+            // one's row i attends keys <= prefix + i, chunk two's row i
+            // attends keys <= prefix + (L-4) + i, which is the serial
+            // trajectory's key set for those positions. RoPE above is
+            // per-position and already applied to all L rows; per-row
+            // attention accumulation over the key axis is order-identical
+            // to the single call, so this is a shape change only.
+            let c1 = L - 4
+            let out1 = attentionWithCacheUpdate(
+                queries: queries[0..., 0..., ..<c1, 0...],
+                keys: keys[0..., 0..., ..<c1, 0...],
+                values: values[0..., 0..., ..<c1, 0...],
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+            let out2 = attentionWithCacheUpdate(
+                queries: queries[0..., 0..., c1..., 0...],
+                keys: keys[0..., 0..., c1..., 0...],
+                values: values[0..., 0..., c1..., 0...],
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+            attended = concatenated([out1, out2], axis: 2)
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
+        let output = attended
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
