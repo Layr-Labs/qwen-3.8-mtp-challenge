@@ -307,6 +307,67 @@ final class Qwen35GatedDeltaNet: Module {
     private var _inBits = 4
     private var _inMode = QuantizationMode.affine
 
+    // Input-independent per-layer memo of `-exp(A_log)` in fp32 — the only
+    // input-independent factor of the decay gate `g = exp(-exp(A_log) *
+    // softplus(a + dt_bias))`. `computeGatedDeltaG` rebuilt it (astype, exp,
+    // negate — three launches per layer per recurrence call) every round;
+    // the multiply and outer exp that consume it are unchanged, and
+    // `-exp(x) * s` was already `negative(exp(x)) * s`, so g is
+    // arithmetically identical. Pure weight-derived cache, the allowed
+    // input-independent kind.
+    private var _negExpALog: MLXArray?
+    private var negExpALog: MLXArray {
+        if let cached = _negExpALog { return cached }
+        let value = -exp(aLog.asType(.float32))
+        _negExpALog = value
+        return value
+    }
+
+    /// `gatedDeltaUpdate` with the g-gate's input-independent factor served
+    /// from `negExpALog`. The prologue replicates the vendored function's
+    /// arithmetic exactly (fp32 beta and g, fp32 state coercion) and the
+    /// dispatch reuses the same internal kernel/ops pair. Guarded on the
+    /// same kernel-availability condition class as the S == 2 mid-kernel:
+    /// when custom kernels are unavailable we fall back to the untouched
+    /// vendored `gatedDeltaUpdate`, never to a mismatched dispatch.
+    ///
+    /// GATED TO S >= 2 on purpose: the serial control leg (S = 1, 64
+    /// forwards per 64 tokens) is the ratio's DENOMINATOR, and a per-forward
+    /// saving is worth ~5x more per token there than on the ~13-round
+    /// candidate leg — an ungated version of this memo would make the
+    /// serial leg faster than it makes the candidate leg and LOWER the
+    /// score. Verify widths (2..5) and the prefill chunk (charged equally
+    /// inside both legs' windows) take the memo; the S = 1 step keeps the
+    /// vendored path bit-for-bit, exactly like the in-tree width-gated
+    /// projection fuses.
+    private func gatedDeltaUpdateMemoG(
+        q: MLXArray,
+        k: MLXArray,
+        v: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        state: MLXArray?,
+        mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        guard qwen35GatedDeltaMidKernel != nil, q.dim(1) >= 2 else {
+            return gatedDeltaUpdate(
+                q: q, k: k, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+        }
+        let beta = sigmoid(b).asType(.float32)
+        let g = exp(negExpALog * softplus(a + dtBias))
+        let B = q.dim(0)
+        let Dk = q.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+        if state.dtype != .float32 {
+            state = state.asType(.float32)
+        }
+        return gatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -440,14 +501,12 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = gatedDeltaUpdateMemoG(
             q: qNormed,
             k: kNormed,
             v: v,
             a: a,
             b: b,
-            aLog: aLog,
-            dtBias: dtBias,
             state: ssmState,
             mask: mask
         )
@@ -491,14 +550,12 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = gatedDeltaUpdateMemoG(
             q: qNormed,
             k: kNormed,
             v: v,
             a: a,
             b: b,
-            aLog: aLog,
-            dtBias: dtBias,
             state: ssmState,
             mask: mask
         )
@@ -544,14 +601,12 @@ final class Qwen35GatedDeltaNet: Module {
               let tape = cache.prefixReplayTape
         else { return false }
         let rows = 0 ..< committedRows
-        let (_, boundarySsm) = gatedDeltaUpdate(
+        let (_, boundarySsm) = gatedDeltaUpdateMemoG(
             q: tape.q[0..., rows, 0...],
             k: tape.k[0..., rows, 0...],
             v: tape.v[0..., rows, 0...],
             a: tape.a[0..., rows, 0...],
             b: tape.b[0..., rows, 0...],
-            aLog: aLog,
-            dtBias: dtBias,
             state: tape.ssmPre,
             mask: tape.mask.map { $0[0..., rows] }
         )
@@ -656,9 +711,10 @@ final class Qwen35GatedDeltaNet: Module {
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             // Replicates gatedDeltaUpdate's prologue exactly (fp32 beta/g,
-            // fp32 state init).
+            // fp32 state init), with the g gate's input-independent
+            // -exp(A_log) factor served from the per-layer memo.
             let beta = sigmoid(b).asType(.float32)
-            let g = computeGatedDeltaG(aLog, a, dtBias)
+            let g = exp(negExpALog * softplus(a + dtBias))
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
@@ -763,7 +819,7 @@ final class Qwen35GatedDeltaNet: Module {
 // MARK: - Fused MLP
 
 /// Decode-width fused gate/up MLP. Same math as the vendored `Qwen3NextMLP` —
-/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 2) the
+/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 9) the
 /// gate and up projections run as ONE matmul over concatenated output rows
 /// (N = 34816), halving the biggest per-layer launch count on the hot path.
 ///
@@ -771,9 +827,13 @@ final class Qwen35GatedDeltaNet: Module {
 /// K, every N here (17408 and 34816) keeps the fast-kernel eligibility
 /// (N%8==0 at K%512==0), and a row's dot-product arithmetic in `qmv_fast`
 /// does not depend on which launch it rides in — the in-tree precedent is
-/// the promoted FA QKV fuse below. Prefill (S > 2) keeps the two separate
-/// calls so the qmm/split-k reduction order of the pinned baseline is
-/// preserved byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
+/// the promoted FA QKV fuse below. The guard covers exactly the widths the
+/// host still serves through the per-row-exact QMV dispatch (crossrow for
+/// M <= 5, per-row qmv_fast above it; the qmv batch limit is 10+ for these
+/// shapes on this generation — the same coverage the S <= 9 GDN in-proj
+/// fuse gate relies on); prefill (S > 9) keeps the two separate calls so
+/// the qmm/split-k reduction order of the pinned baseline is preserved
+/// byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
 /// side carries no exactness constraint at all.
 final class Qwen35FusedMLP: Module, UnaryLayer {
@@ -832,7 +892,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
+        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -867,6 +927,12 @@ final class Qwen35Attention: Module {
     private var _qkvMode = QuantizationMode.affine
     private var _qOut = 0
     private var _kOut = 0
+    // Dense (bf16) Q/K/V pack for the MTP head layers, same concat-on-N
+    // argument as the quantized pack above: rows are independent, so one
+    // GEMM over concatenated weights is bit-exact with three separate
+    // launches — and this is the proposal side regardless. Cuts two
+    // launches and two host ops from every head chain step.
+    private var _qkvDenseW: MLXArray?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -910,6 +976,12 @@ final class Qwen35Attention: Module {
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
         }
+        if let w = _qkvDenseW {
+            let y = matmul(x, w.transposed(1, 0))
+            let qEnd = _qOut
+            let kEnd = _qOut + _kOut
+            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+        }
         if let q = qProj as? QuantizedLinear,
            let k = kProj as? QuantizedLinear,
            let v = vProj as? QuantizedLinear,
@@ -926,6 +998,17 @@ final class Qwen35Attention: Module {
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
+            return qkv(x)
+        }
+        if !(qProj is QuantizedLinear), !(kProj is QuantizedLinear),
+           !(vProj is QuantizedLinear),
+           qProj.bias == nil, kProj.bias == nil, vProj.bias == nil
+        {
+            _qkvDenseW = concatenated(
+                [qProj.weight, kProj.weight, vProj.weight], axis: 0
+            ).contiguous()
+            _qOut = qProj.weight.dim(0)
+            _kOut = kProj.weight.dim(0)
             return qkv(x)
         }
         return (qProj(x), kProj(x), vProj(x))
@@ -1226,6 +1309,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     // for draft proposals when no declared draft_lm_head is present. It is not
     // ModuleInfo because it is derived during warmup, not checkpoint state.
     private var _compactDraftHead: Linear?
+    // Prefix 98_304, the promoted trim. A 49_152 halving was measured on the
+    // public longcopy gate and REGRESSED: three of its committed argmax ids
+    // live in [49_152, 248_044), the head could no longer propose them, and
+    // the forced rejects cost more round-bases than the halved compact-head
+    // read saved (accept 1.00 -> 0.877, 21.1 -> 22.8 ms/token). The read is
+    // ~315 MB of affine-4 rows per draft step (~0.6 ms), so the ceiling of
+    // any further trim is small and the acceptance downside is not.
     private static let compactDraftPrefixCount = 98_304
     private static let compactDraftControlStart = 248_044
     private static let compactDraftControlEnd = 248_070
@@ -1507,8 +1597,9 @@ extension Qwen35TextModel: MTPCapable {
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
-    /// host readback. The low 98,304 rows retain their IDs; the appended rows
-    /// are Qwen's official text/control tokens 248,044 ... 248,069.
+    /// host readback. The low `compactDraftPrefixCount` rows retain their
+    /// IDs; the appended rows are Qwen's official text/control tokens
+    /// 248,044 ... 248,069.
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
         guard usesCompactDraftVocabulary else { return ids }
         return which(
