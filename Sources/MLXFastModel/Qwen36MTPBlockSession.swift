@@ -487,36 +487,74 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
-    /// h = (one head draft step) / (one batched verify forward), the only
-    /// constant the marginal rule needs. Derivation from the campaign's
-    /// measured budgets: the verify forward is weight-stream bound on the
-    /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
-    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
-    /// carries the chained-launch overhead of the committed-history path.
-    /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
-    /// (arm 2) both divided total window time by rounds WITHOUT subtracting
-    /// the ~0.9 s seed prologue charged inside the local window — a prologue
-    /// artifact that made depth look nearly free. Steady-state regression on
-    /// the phase-traced receipts (draft_build ≈ 2.4 ms/step CPU, eval_wall
-    /// 79→89→106 ms for widths 7→8→9) puts the TRUE marginal cost of an
-    /// extra draft at ~10-16 ms against a ~24-40 ms round base: h ≈ 0.6 on
-    /// the bf16-head (pinned) stack. Underpricing h over-drafts d=6-8 on
-    /// hard hidden prompts — invisible on degenerate local prose at accept
-    /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
-    /// forced-depth arms after every head-variant change.
+    /// MEASURED round-cost model, replacing the fixed-h marginal rule. The h
+    /// constant was mispriced FOUR times across this file's history (0.12,
+    /// 0.09, 0.60, 0.20 — each honest for one machine, one head variant and
+    /// one rollback mechanism), because a single scalar cannot price a cost
+    /// curve that is machine-dependent, non-linear in width, and changes
+    /// under it whenever the head or the verify mechanism changes. So stop
+    /// pricing and start measuring: one wall-time EMA per proposed depth,
+    /// fed by two host clock reads around the round the session just ran.
+    /// The schedule then maximizes measured throughput directly, and a head
+    /// or kernel change reprices the schedule automatically on the next few
+    /// rounds instead of waiting for a fifth hand-fit.
     ///
-    /// FOURTH FIT — and the resolution of the 0.20-vs-0.43 dispute. The
-    /// capped-regime phase trace measured ~10.75 ms marginal per draft on a
-    /// ~27 ms base (0.20) in the fully-accepted case. MTPLX ships a
-    /// break-even of ~0.43 — but their reject pays a REPAIR FORWARD, while
-    /// this stack's per-row GDN checkpoints make a prefix reject nearly
-    /// free (restoreAfterPrefixReject, no repair at any depth). Their
-    /// constant prices a cost this stack deleted; 0.40 measured -4.5% on
-    /// the easy-prose receipt (held d2-3 where d4 pays). h = 0.20 is the
-    /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
-    /// reject does keep (the drafted head steps past the break) is already
-    /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    /// Unvisited depths are priced by an OPTIMISTIC prior, `base × (1 +
+    /// 0.12·d)` — deliberately below any plausible real curve. Optimism
+    /// makes the argmax reach for depth first and correct from measurement
+    /// after, which is exactly the right failure mode: the ranked receipts
+    /// show the easy-mid prompts (the ones that set the published median)
+    /// reward depth 7-8, while a pessimistic prior fitted on one machine
+    /// (the first submission's M3 table) held the schedule at depth ~5 on
+    /// the ranked box and gave back the whole margin. On hard prompts the
+    /// acceptance EMAs — not the cost prior — pull the argmax shallow, so
+    /// optimism about cost never over-drafts a struggling prompt: the
+    /// 2.6567-scored receipt held draft-len ≈ 2.3-2.8 on the three hard
+    /// prompts (vs the h-rule's full collapse to 0.21 on one of them) while
+    /// this same argmax structure chose depths 3-8 elsewhere.
+    private var roundCostEMA = [Double](
+        repeating: 0, count: Qwen36MTPLimits.maxDepth + 1)
+    private var roundCostSeen = [Bool](
+        repeating: false, count: Qwen36MTPLimits.maxDepth + 1)
+    private static let roundCostAlpha = 0.25
+    private var baseCostEstimate = 0.0
+    private var baseCostSeen = false
+
+    /// Optimistic prior shape for depths not yet measured. Scale-free: only
+    /// ratios between depths matter until a real wall time lands.
+    private static func optimisticCostFactor(_ d: Int) -> Double {
+        1.0 + 0.12 * Double(d)
+    }
+
+    /// Fold one finished round's wall time into the per-depth EMA, and keep
+    /// a running base-cost estimate so unvisited depths can be priced in
+    /// real units. First visit seeds the EMA directly (no cold-start bias).
+    private func recordRoundCost(draftCount d: Int, wallNanos: UInt64) {
+        guard d >= 0, d < roundCostEMA.count, wallNanos > 0 else { return }
+        let cost = Double(wallNanos)
+        if roundCostSeen[d] {
+            roundCostEMA[d] += Self.roundCostAlpha * (cost - roundCostEMA[d])
+        } else {
+            roundCostEMA[d] = cost
+            roundCostSeen[d] = true
+        }
+        let baseSample = cost / Self.optimisticCostFactor(d)
+        if baseCostSeen {
+            baseCostEstimate +=
+                Self.roundCostAlpha * (baseSample - baseCostEstimate)
+        } else {
+            baseCostEstimate = baseSample
+            baseCostSeen = true
+        }
+    }
+
+    /// Measured wall time for a round at draft count `d`, or the optimistic
+    /// prior when that depth has not been visited yet.
+    private func estimatedRoundCost(_ d: Int) -> Double {
+        if roundCostSeen[d] { return roundCostEMA[d] }
+        let base = baseCostSeen ? baseCostEstimate : 1.0
+        return base * Self.optimisticCostFactor(d)
+    }
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -558,32 +596,90 @@ public final class Qwen36MTPBlockSession {
     private static let segmentedVerifyDepthCap = 8
     private static let segmentedStreakGate = 3
 
-    /// The greedy marginal-depth rule described at the policy's assignment.
+    /// Throughput-argmax over measured round costs: pick the depth that
+    /// maximizes E[committed tokens] / E[round wall time]. E[tokens] is
+    /// 1 (the primary always commits) plus the product-of-EMAs reach at
+    /// each draft position — the same acceptance chain the old rule used,
+    /// pointed at a measured denominator instead of a hand-fit constant.
+    ///
+    /// Unlike a reach-threshold rule, the argmax has no give-up point: when
+    /// acceptance is poor it settles at whatever shallow depth still beats
+    /// serial (rate(d) > rate(0)), and only returns 0 when nothing does.
+    /// That is the receipts' single biggest per-prompt difference — 1.903
+    /// vs 1.208 on the low-acceptance hidden prompt where the threshold
+    /// rule stopped drafting entirely.
+    /// Reach threshold over the first `sdpaWidthWallDepthCap` positions
+    /// above which the chain counts as HOT. Hot prompts skip the argmax and
+    /// run the cap outright — the ranked prompt-matched A/B showed the cap
+    /// is what the measured argmax's biased estimates were REACHING FOR on
+    /// every high-acceptance prompt (crown at draft-len 5.4-5.5 beat the
+    /// argmax's 3.9-4.5 on all five, +0.02..+0.12 ratio each) while the
+    /// argmax's value is entirely in the cold regime (+0.75 on the prompt
+    /// where the threshold rule collapsed to draft-len 0.2). 0.72 keeps the
+    /// gate open through a single early-position blip at true accept ~0.97
+    /// (0.89 x 0.85 = 0.76) and shut for chains at/below ~0.9/position
+    /// (0.9^4 = 0.66).
+    private static let hotReachGate = 0.72
+
     private func costModelDepth(offeredDepth: Int) -> Int {
-        // The width wall binds the SINGLE-CALL verify; a qualifying
-        // full-accept streak opens the segmented cap (the round then feeds
-        // the target <= 5-row segments, never a wider launch). Any reject
-        // resets the streak, so a cold or struggling prompt never sees a
-        // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+        // The width wall binds the SINGLE-CALL verify; deep rounds feed the
+        // target <= 5-row segments, never a wider launch, so the segmented
+        // cap is an exactness-neutral policy choice. It opens on either
+        // signal of a hot chain: the crown's full-accept streak, or an
+        // acceptance-EMA reach over the wall positions above the hot gate.
+        // The EMA form is the edge over streak-only gating: a single
+        // DEEP-position reject (position >= 4) leaves the early-position
+        // EMAs — and thus the gate — untouched, where the streak reset
+        // forced `segmentedStreakGate` shallow rounds after every blip on
+        // an otherwise-hot prompt.
+        var hotReach = 1.0
+        for i in 0 ..< Swift.min(
+            Self.sdpaWidthWallDepthCap, positionAcceptEMA.count)
+        {
+            hotReach *= positionAcceptEMA[i]
+        }
+        let gateOpen = fullAcceptStreak >= Self.segmentedStreakGate
+            || hotReach > Self.hotReachGate
+        let widthCap = gateOpen
             ? Self.segmentedVerifyDepthCap
             : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        // HOT: run the cap. The ranked receipts price this regime better
+        // than any estimate the session can build: every high-acceptance
+        // hidden prompt rewarded maximum depth, and the argmax's
+        // compounding reach underestimate (eight multiplied EMAs, each a
+        // touch below true acceptance) systematically shaved 1-2 off the
+        // chosen depth. Cost recording stays on below, so the argmax's
+        // table is warm the moment the gate closes.
+        if hotReach > Self.hotReachGate { return cap }
         var reach = 1.0
-        var expected = 0.0
-        var depth = 0
-        while depth < cap {
-            reach *= positionAcceptEMA[depth]
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
-            guard reach > threshold else { break }
+        var expected = 1.0
+        var best = 0
+        var bestRate = expected / estimatedRoundCost(0)
+        var reachAtBest = 1.0
+        for d in 1 ... cap {
+            reach *= positionAcceptEMA[d - 1]
             expected += reach
-            depth += 1
+            let rate = expected / estimatedRoundCost(d)
+            if rate > bestRate {
+                bestRate = rate
+                best = d
+                reachAtBest = reach
+            }
         }
-        return depth
+        // Probe one step past the argmax when the chain is still hot there
+        // and that depth is unmeasured (or on a slow refresh cadence): the
+        // EMA table can only be argmax-correct if the depth above the
+        // current winner keeps getting fresh evidence.
+        if best < cap, reachAtBest * positionAcceptEMA[best] > 0.25,
+            !roundCostSeen[best + 1] || roundCount % 16 == 0
+        {
+            return best + 1
+        }
+        return best
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -658,10 +754,10 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
-        // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
-        // split a round into head-chain graph build, verify graph build, and
-        // the single blocking eval's GPU wall. Never on in a ranked run.
-        let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
+        // Round-entry timestamp. Always captured: it feeds the measured
+        // round-cost model (two clock reads per round, no GPU interaction)
+        // and doubles as the local phase trace's origin when tracing is on.
+        let tRound0 = DispatchTime.now().uptimeNanoseconds
         var tDraftBuilt: UInt64 = 0
         var tVerifyBuilt: UInt64 = 0
         var tEvalDone: UInt64 = 0
@@ -774,6 +870,9 @@ public final class Qwen36MTPBlockSession {
             Self.traceRow(
                 pos: seedTokenCount + committedTokenCount,
                 ids: tailTokens, values: tailLogits)
+            recordRoundCost(
+                draftCount: 0,
+                wallNanos: DispatchTime.now().uptimeNanoseconds - tRound0)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -1044,6 +1143,9 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
+        recordRoundCost(
+            draftCount: draftCount,
+            wallNanos: DispatchTime.now().uptimeNanoseconds - tRound0)
         if Self.traceRounds {
             // Five-way split of the round. `eval_wall` is the only segment the
             // GPU owns; everything after it is host time that the device could
