@@ -82,6 +82,13 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// tokenizer. Full-vocabulary proposal heads return the input unchanged.
     func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray
 
+    /// One draft proposal as a device-resident `[1, 1]` int32 token id: the
+    /// compact projection's argmax already mapped back to the tokenizer's ID
+    /// space. Equivalent to
+    /// `mapDraftTokenIds(argMax(applyDraftLMHead(x), axis: -1))`, one dispatch
+    /// instead of six. Proposal side only.
+    func draftTokenID(_ x: MLXArray) -> MLXArray
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
