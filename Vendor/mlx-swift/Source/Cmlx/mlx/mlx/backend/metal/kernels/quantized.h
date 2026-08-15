@@ -757,7 +757,8 @@ METAL_FUNC void qmv_fast_impl(
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 ntg) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
@@ -783,6 +784,7 @@ METAL_FUNC void qmv_fast_impl(
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  if (ntg.x != 2) {
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
@@ -809,6 +811,52 @@ METAL_FUNC void qmv_fast_impl(
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
       y[row] = static_cast<T>(result[row]);
+    }
+  }
+  } else {
+    constexpr int RM = 2;
+    if (((int)tid.x % RM) != 0) {
+      return;
+    }
+    const int m0 = (int)tid.x;
+    thread U Xrm[RM][values_per_thread];
+    thread U Acc[RM][results_per_simdgroup];
+    thread U sums[RM];
+    for (int mi = 0; mi < RM; mi++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        Acc[mi][row] = 0;
+      }
+    }
+    const device T* x_base = x + simd_lid * values_per_thread;
+    device T* y_base = y + out_row;
+    for (int k = 0; k < in_vec_size; k += block_size) {
+      for (int mi = 0; mi < RM; mi++) {
+        sums[mi] = load_vector<T, U, values_per_thread, bits>(
+            x_base + (m0 + mi) * in_vec_size, Xrm[mi]);
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T* sl = scales + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        for (int mi = 0; mi < RM; mi++) {
+          Acc[mi][row] +=
+              qdot<U, values_per_thread, bits>(wl, Xrm[mi], s, b, sums[mi]);
+        }
+      }
+      ws += block_size * bytes_per_pack / pack_factor;
+      scales += block_size / group_size;
+      biases += block_size / group_size;
+      x_base += block_size;
+    }
+    for (int mi = 0; mi < RM; mi++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        Acc[mi][row] = simd_sum(Acc[mi][row]);
+        if (simd_lid == 0) {
+          y_base[(m0 + mi) * out_vec_size + row] = static_cast<T>(Acc[mi][row]);
+        }
+      }
     }
   }
 }
@@ -1512,7 +1560,8 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* b_strides [[buffer(14)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 ntg [[threadgroups_per_grid]]) {
   if (batched) {
     int M = x_shape[x_batch_ndims];
     adjust_matrix_offsets<T>(
@@ -1542,7 +1591,8 @@ template <typename T, int group_size, int bits, bool batched>
       out_vec_size,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      ntg);
 }
 
 template <typename T, const int group_size, const int bits, bool batched>
@@ -1961,7 +2011,8 @@ template <typename T, int group_size, int bits>
       out_vec_size,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      uint3(1));
 }
 
 template <typename T, int group_size, int bits>
