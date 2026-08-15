@@ -35,7 +35,7 @@ A benchmark arena for compute-optimal LLM inference on Apple Silicon.
 >
 > Values still carrying a **3.6 measurement** behind
 > that closed gate are marked `QWEN38-VERIFY-AT-RELEASE` and must be
-> re-derived, not re-read. See [`docs/CUTOVER.md`](docs/CUTOVER.md);
+> re-derived, not re-read.
 > [`docs/qwen-mtp-go-live-runbook.md`](docs/qwen-mtp-go-live-runbook.md) is
 > the record of the **3.6** go-live and its ids and numbers are 3.6-era
 > throughout.
@@ -48,8 +48,7 @@ the longest correct prefix. `benchmark.json` IS the Qwen-MTP manifest
 [`.github/workflows/qwen-mtp-ranked-benchmark.yml`](.github/workflows/qwen-mtp-ranked-benchmark.yml),
 and the track contract is `fixtures/qwen3_8_27b_mtp_track.json`. See
 [`docs/qwen-mtp-go-live-runbook.md`](docs/qwen-mtp-go-live-runbook.md) for
-the go-live procedure and [`docs/CUTOVER.md`](docs/CUTOVER.md) for the
-operator cutover state.
+the go-live procedure.
 
 > **CONTRACT CHANGE — 2026-08-14 (operator-ratified).** Two things moved
 > together and they are one change. **(1) The editable surface is now the UNION**

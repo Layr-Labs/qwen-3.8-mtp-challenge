@@ -184,9 +184,8 @@ Correctness-only dispatches (`run_benchmark=false`) fetch no private
 material at all. The 2026-07 Poolside Laguna XS 2.1 re-pin rotated these
 object keys from their former `-gemma` names: the correctness objects are
 regenerated from the Laguna reference — new tokenizer, vocab 100352 —
-through the same organizer-controlled offline process that
-`docs/gemma-migration-r2-checklist.md` records for the previous Gemma
-migration (that checklist is the template for this pass).
+through the same organizer-controlled offline process used for the
+previous Gemma migration.
 
 Raw private bytes land only in a runner-only `0700` per-run directory; all
 three objects are independently verified against SHA-256 and byte-count pins
@@ -410,9 +409,8 @@ speedups/score) are currently full-precision, which widens this channel:
 submitted code can drive data-dependent timing and read it back at high
 resolution. Coarsening them is a scoring-backend publishing decision (the
 harness must keep full precision internally to rank and to check the speedup
-floors), so it is written up as a recommendation rather than fixed in-repo —
-see
-[`docs/ranked-timing-covert-channel-recommendation.md`](ranked-timing-covert-channel-recommendation.md).
+floors), so it is left as a scoring-backend publishing recommendation rather
+than fixed in-repo.
 
 No prompt manifest or generated correctness golden should be committed to
 the public repository.
