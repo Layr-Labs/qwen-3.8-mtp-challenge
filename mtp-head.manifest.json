@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:lowskillcoding/qwen38-mtp-head-4bit-g64@0966ddaff972fd3ca2be08f3640603b47e9ce70a",
-  "sha256": "cc209e30d8a7def1fc4d785be22b0ec40e16ae6763f9591255a1996a34f08f0d",
-  "bytes": 238934093,
+  "source_url": "hf:dusterbloom/Qwen3.8-27B-MTP-4bit-g64-mlx@18ef521896ae547b72827b19634c9d4915ee3574",
+  "sha256": "6aab6f1d59468112e7290f89d9d4467f438db9edaa48c58721e380a5757cc7d0",
+  "bytes": 238934145,
   "max_bytes": 2147483648,
-  "note": "4-bit/group-64 MLX-affine requantization of the pinned bf16 head; matches the backbone quantization geometry so the stock scales-keyed walk loads it with zero code changes. rev2 post-#56 (f2be121)."
+  "note": "4-bit group-64 MLX-native affine requantization (mlx.core.quantize, matching backbone geometry) of the pinned EigenLabs/Qwen3.8-27B-MTP-bf16 head. rev3: single-file remote declaration digest."
 }
