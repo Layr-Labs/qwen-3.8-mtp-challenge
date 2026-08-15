@@ -53,6 +53,26 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// SEED-PREFILL FORWARD returning `(last logit row, last PRE-norm hidden
+    /// row)`, both shaped `[1, 1, ...]`.
+    ///
+    /// Same backbone forward as `callWithHidden` -- same tokens, same cache, same
+    /// `nConfirmed`, so every cache ends in the same state at the same offset --
+    /// with the final norm and the vocabulary projection narrowed to the last row.
+    /// `Qwen36MTPBlockSession.begin` is the ONLY caller: it is the only site that
+    /// bulk-forwards a long block and then keeps just the tail row, so it is the
+    /// only site where the other `S - 1` vocabulary rows are pure waste.
+    ///
+    /// DELIBERATELY A REQUIREMENT AND NOT A DEFAULTED PROTOCOL EXTENSION. A
+    /// default that fell back to `callWithHidden` would make a signature drift on
+    /// a conformer compile clean and silently un-optimize the seed prefill, which
+    /// is precisely the failure mode nobody would notice. Both conformers below
+    /// implement it in the editable `Vendor/.../Qwen35.swift`, and a mismatch
+    /// there is a build error.
+    func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray)
+
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
@@ -83,3 +103,20 @@ public protocol Qwen36MTPTarget: AnyObject {
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
 extension Qwen35TextModel: Qwen36MTPTarget {}
 extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}
+
+/// `MLXFAST_QWEN_MTP_SEED_TAIL_PROJECTION` (DEFAULT ON; set "0" to disable):
+/// route `Qwen36MTPBlockSession.begin`'s seed prefill through
+/// `callWithLastTokenHidden` instead of `callWithHidden`, so the untied
+/// 248,320-way vocabulary head is applied to the one seed row the session keeps
+/// rather than to all 512.
+///
+/// Read ONCE, at first use, from the process environment -- not per call -- so
+/// the guarded and unguarded paths differ by a branch on a `let`, never by an
+/// environment lookup inside the timed window. Flipping it to "0" restores the
+/// exact pre-change call, which is the ablation this submission's claim rests
+/// on. The flag is a build-time-equivalent switch over an ADDITIVE seam: the
+/// old `callWithHidden` path is fully intact and still serves every other
+/// caller unconditionally.
+let qwenMTPSeedTailProjectionEnabled =
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_SEED_TAIL_PROJECTION"]
+        != "0"

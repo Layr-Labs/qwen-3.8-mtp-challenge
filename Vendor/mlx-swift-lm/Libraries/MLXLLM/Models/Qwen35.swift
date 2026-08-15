@@ -806,6 +806,58 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// SEED-PREFILL VARIANT of `callWithHidden`: identical backbone forward, but
+    /// the final norm and the vocabulary projection are applied to the LAST ROW
+    /// ONLY.
+    ///
+    /// WHY THIS EXISTS. `Qwen36MTPBlockSession.begin` bulk-forwards the whole
+    /// 512-token seed and then keeps exactly two things: the last logit row
+    /// (whose argmax is the first pending primary) and the last pre-norm hidden
+    /// row (the context the first draft is chained from). `callWithHidden`
+    /// nevertheless projects ALL 512 hidden rows through the untied 248,320-way
+    /// head, so 511 of the 512 `[1, V]` logit rows are computed and immediately
+    /// discarded. MLX will not elide that: slicing the last row of a lazily
+    /// built matmul still forces the whole matmul, because a slice does not push
+    /// down through a `quantized_matmul` node.
+    ///
+    /// WHAT IS AND IS NOT SHARED WITH `callWithHidden`. The backbone call is
+    /// byte-identical -- same token tensor, same cache array, same `nConfirmed`
+    /// -- so all 64 layers still run over every seed position and every
+    /// recurrent/attention cache ends in the same state at the same offset. Only
+    /// the epilogue narrows. `RMSNorm` reduces over the last axis and the LM head
+    /// is a per-row projection, so both are row-independent and the surviving row
+    /// is mathematically the same vector `callWithHidden` would have put at index
+    /// `S - 1`.
+    ///
+    /// THE ONE REAL RISK, STATED PLAINLY: `[1, 1, H]` and `[1, S, H]` select
+    /// different quantized-matmul geometries (GEMV vs GEMM), which can differ in
+    /// the last ulp. That cannot change the mathematics but could in principle
+    /// flip an exact near-tie in the seed argmax. `Qwen36MTPReferenceSession` is
+    /// deliberately NOT moved onto this seam, so a local exactness run compares
+    /// the narrowed candidate decision against the original full-projection
+    /// frame instead of letting both sides adopt the same change.
+    ///
+    /// Additive: `callWithHidden` above is untouched and remains the path every
+    /// other caller (verify, serial rounds, repair forwards, the reference
+    /// session, the parity tests) uses.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let last = hidden.dim(1) - 1
+        let tail = hidden[0..., last ..< (last + 1), 0...]
+        let normed = model.norm(tail)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        // Pre-norm hidden, exactly as `callWithHidden` returns -- one row.
+        return (logits, tail)
+    }
+
     /// Apply the backbone's final `model.norm` to a hidden state.
     ///
     /// `callWithHidden` returns the PRE-norm hidden by design. MTPLX -- the exactness
@@ -943,6 +995,15 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithLastTokenHidden`. Pure pass-through, exactly
+    /// like `callWithHidden` above -- no wrapper-level arithmetic.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithLastTokenHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     public func mtpForward(
