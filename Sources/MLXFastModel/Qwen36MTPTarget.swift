@@ -73,6 +73,10 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// copy when present, exact lm_head otherwise). Proposal side only.
     func applyDraftLMHead(_ x: MLXArray) -> MLXArray
 
+    /// Map IDs from a proposal-only compact vocabulary back to the target
+    /// tokenizer. Full-vocabulary proposal heads return the input unchanged.
+    func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 

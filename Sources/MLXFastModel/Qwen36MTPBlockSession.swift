@@ -233,8 +233,15 @@ public final class Qwen36MTPBlockSession {
         let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
-        eval(model.applyDraftLMHead(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]))
+        let primedDraftLogits = model.applyDraftLMHead(
+            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
+        // Warm the complete proposal-side expression used by a live draft.
+        // The compact vocabulary changes the reduction shape and adds an
+        // on-device ID map, so warming logits alone leaves both kernels to
+        // cold-JIT inside the first scored round.
+        let primedDraftID = model.mapDraftTokenIds(
+            argMax(primedDraftLogits, axis: -1).asType(.int32))
+        eval(primedDraftID)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadHiddenForward(
@@ -566,16 +573,18 @@ public final class Qwen36MTPBlockSession {
             cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-            .asType(.int32)
+        var draftId = model.mapDraftTokenIds(
+            argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                .asType(.int32))
         draftIdArrays.append(draftId)
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                .asType(.int32)
+            draftId = model.mapDraftTokenIds(
+                argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                    .asType(.int32))
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
