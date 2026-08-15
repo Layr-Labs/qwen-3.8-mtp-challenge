@@ -956,6 +956,164 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 }
 
+// Exact-order affine4/g64 QUAD-row QMV. Same contract as the pair kernel, one
+// level wider: one threadgroup computes FOUR adjacent input rows against a
+// single weight-tile read. float4 is component-wise IEEE in Metal, so each
+// row's dot keeps the stock `qmv_fast_impl` arithmetic bit-for-bit (same
+// load_vector, same qdot term order, same affine epilogue, same simd_sum
+// reduction); the vector form only shares the weight loads. Groups whose
+// first row is outside M return before reading weights; a partial tail group
+// zero-fills the inactive x rows (never read OOB) and writes only the active
+// outputs, so every width M in [3, 9] reads each packed weight tile at most
+// ceil(M/4) times instead of once per row.
+template <typename U>
+inline U qdot_affine4_loaded_quad(
+    const thread uint16_t* ws,
+    const thread float4* xq,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  for (int i = 0; i < 4; i++) {
+    accum +=
+        (xq[4 * i] * (ws[i] & 0x000f) +
+         xq[4 * i + 1] * (ws[i] & 0x00f0) +
+         xq[4 * i + 2] * (ws[i] & 0x0f00) +
+         xq[4 * i + 3] * (ws[i] & 0xf000));
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename T, int M>
+METAL_FUNC void qmv_fast_quadrow_affine4_g64(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M >= 3 && M <= 9, "quad-row QMV supports M in [3, 9]");
+  constexpr int inputs_per_group = 4;
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int in_vec_bytes_per_row_divisor = 2;
+  constexpr int bytes_per_lane = 8;
+
+  const int first_m = int(tid.x) * inputs_per_group;
+  if (first_m >= M) {
+    return;
+  }
+  const int active = min(inputs_per_group, M - first_m);
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int in_vec_size_w = in_vec_size / in_vec_bytes_per_row_divisor;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  thread float4 result[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    result[r] = 0.0f;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint8_t* wb =
+          reinterpret_cast<const device uint8_t*>(w) +
+          row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
+      const device uint16_t* ws =
+          reinterpret_cast<const device uint16_t*>(wb);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index =
+          row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    thread float x0[values_per_thread];
+    thread float x1[values_per_thread];
+    thread float x2[values_per_thread];
+    thread float x3[values_per_thread];
+    const device T* xm0 =
+        x + first_m * in_vec_size + k + simd_lid * values_per_thread;
+    const float sum0 =
+        load_vector<T, float, values_per_thread, 4>(xm0, x0);
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    if (active >= 2) {
+      sum1 = load_vector<T, float, values_per_thread, 4>(
+          xm0 + in_vec_size, x1);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        x1[i] = 0.0f;
+      }
+    }
+    if (active >= 3) {
+      sum2 = load_vector<T, float, values_per_thread, 4>(
+          xm0 + 2 * in_vec_size, x2);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        x2[i] = 0.0f;
+      }
+    }
+    if (active >= 4) {
+      sum3 = load_vector<T, float, values_per_thread, 4>(
+          xm0 + 3 * in_vec_size, x3);
+    } else {
+      for (int i = 0; i < values_per_thread; i++) {
+        x3[i] = 0.0f;
+      }
+    }
+
+    thread float4 xq[values_per_thread];
+    for (int i = 0; i < values_per_thread; i++) {
+      xq[i] = float4(x0[i], x1[i], x2[i], x3[i]);
+    }
+    const float4 sum = float4(sum0, sum1, sum2, sum3);
+    for (int r = 0; r < rows_per_simd; r++) {
+      result[r] += qdot_affine4_loaded_quad<float4>(
+          packed[r], xq, scale_local[r], bias_local[r], sum);
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    const float4 reduced = simd_sum(result[r]);
+    if (simd_lid == 0) {
+      if (active == 4) {
+        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced.x);
+        y[(first_m + 1) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced.y);
+        y[(first_m + 2) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced.z);
+        y[(first_m + 3) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced.w);
+      } else if (active == 3) {
+        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced.x);
+        y[(first_m + 1) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced.y);
+        y[(first_m + 2) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced.z);
+      } else if (active == 2) {
+        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced.x);
+        y[(first_m + 1) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced.y);
+      } else {
+        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced.x);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1684,17 +1842,17 @@ template <typename T, int group_size, int bits, bool batched>
             tid, simd_gid, simd_lid);
         return;
       case 3:
-        qmv_fast_crossrow_affine4_g64<T, 3>(
+        qmv_fast_quadrow_affine4_g64<T, 3>(
             w, scales, biases, x, y, in_vec_size, out_vec_size,
             tid, simd_gid, simd_lid);
         return;
       case 4:
-        qmv_fast_crossrow_affine4_g64<T, 4>(
+        qmv_fast_quadrow_affine4_g64<T, 4>(
             w, scales, biases, x, y, in_vec_size, out_vec_size,
             tid, simd_gid, simd_lid);
         return;
       case 5:
-        qmv_fast_crossrow_affine4_g64<T, 5>(
+        qmv_fast_quadrow_affine4_g64<T, 5>(
             w, scales, biases, x, y, in_vec_size, out_vec_size,
             tid, simd_gid, simd_lid);
         return;
