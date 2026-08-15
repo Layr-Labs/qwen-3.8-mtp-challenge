@@ -217,7 +217,7 @@ public final class Qwen36MTPBlockSession {
         }
         let warmCache = model.newCache(parameters: nil)
         let seed = Array(repeating: 0, count: 8)
-        let (logits, hidden) = model.callWithHidden(
+        let (logits, hidden) = callTarget(
             input: LMInput.Text(tokens: MLXArray(seed).reshaped([1, seed.count])),
             cache: warmCache, nConfirmed: 0)
         var row = hiddenRow(hidden, hidden.dim(1) - 1)
@@ -269,7 +269,7 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
+            let (verifyLogits, _) = callTarget(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
                 cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
             // Compile the two top-2 reduction kernels outside the scored window
@@ -296,7 +296,7 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
+        let (oneRowReplayLogits, _) = callTarget(
             input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
             cache: oneRowReplayCache, nConfirmed: 1)
         eval(oneRowReplayLogits)
@@ -321,14 +321,13 @@ public final class Qwen36MTPBlockSession {
         // same contract as every warm above.
         let seedWarmCache = model.newCache(parameters: nil)
         let seedWarmTokens = Array(repeating: 0, count: 512)
-        let (seedWarmLogits, seedWarmHidden) = model.callWithHidden(
+        let (seedWarmLogits, seedWarmHidden) = callTarget(
             input: LMInput.Text(
                 tokens: MLXArray(seedWarmTokens).reshaped([1, 512])),
             cache: seedWarmCache, nConfirmed: 0)
         _ = seedWarmLogits
         let seedWarmRow = hiddenRow(seedWarmHidden, seedWarmHidden.dim(1) - 1)
-        let seedWarmNorm = model.applyFinalNorm(
-            seedWarmHidden[0..., 0 ..< 511, 0...])
+        let seedWarmNorm = seedWarmHidden[0..., 0 ..< 511, 0...]
         let (seedWarmIDs, seedWarmValues) =
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
@@ -347,7 +346,7 @@ public final class Qwen36MTPBlockSession {
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
+        let (seedLogits, hidden) = callTarget(
             input: LMInput.Text(
                 tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
             cache: cache, nConfirmed: 0)
@@ -361,7 +360,7 @@ public final class Qwen36MTPBlockSession {
         _ = seedLogits
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
-        // Retain the full pre-norm seed hidden for lazy head-history priming.
+        // Retain the selected seed hidden variant for lazy head-history priming.
         // ~5 MB at 512x5120 bf16; released at the first drafting round. The
         // eval below materialises it so no seed graph is kept alive.
         seedHiddenForPriming = hidden
@@ -699,7 +698,7 @@ public final class Qwen36MTPBlockSession {
             // this backlog (the head cache is never created).
             headHistoryBacklogHidden.append(hidden)
             headHistoryBacklogTokens.append(primary)
-            let (serialLogits, serialHidden) = model.callWithHidden(
+            let (serialLogits, serialHidden) = callTarget(
                 input: LMInput.Text(
                     tokens: MLXArray([primary]).reshaped([1, 1])),
                 cache: cache, nConfirmed: 0)
@@ -759,8 +758,7 @@ public final class Qwen36MTPBlockSession {
                 // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
                 // tokens 1..L-1 (hidden at t predicts alongside token t+1).
                 let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+                flushHidden.append(seedHidden[0..., 0 ..< primeCount, 0...])
                 flushTokens.append(contentsOf: seedTokensForPriming[1...])
             }
             seedHiddenForPriming = nil
@@ -836,7 +834,7 @@ public final class Qwen36MTPBlockSession {
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
         // accept can replay only its committed prefix without a repair forward.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
+        let (verifyLogits, verifyHidden) = callTarget(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
@@ -938,7 +936,7 @@ public final class Qwen36MTPBlockSession {
                 // second blocking eval for its own readout.
                 Self.rollbackAfterVerify(
                     cache, snapshot, verifiedTokens: draftCount + 1, to: base)
-                let (repairLogits, repairHidden) = model.callWithHidden(
+                let (repairLogits, repairHidden) = callTarget(
                     input: LMInput.Text(
                         tokens: MLXArray(committed).reshaped([1, committed.count])),
                     cache: cache, nConfirmed: 0)
@@ -1406,16 +1404,23 @@ public final class Qwen36MTPBlockSession {
         return (ordered.map(\.0), ordered.map(\.1))
     }
 
-    /// One hidden row `[1, 1, H]` in MTPLX's default `post_norm` variant.
-    ///
-    /// `callWithHidden` returns the PRE-norm hidden by design, so the backbone's
-    /// final `model.norm` is applied here via `applyFinalNorm`. Getting this wrong
-    /// does NOT break exactness — the target still decides every emitted token —
-    /// it collapses ACCEPTANCE. Any validation of this path has to read the accept
-    /// rate, not just the match verdict.
+    /// Select the hidden variant at the target API boundary. The ranked
+    /// post-norm path returns the exact tensor already consumed by target
+    /// lm_head; the compatibility pre-norm path retains the original API.
+    private func callTarget(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        if postNorm {
+            return model.callWithPostNormHidden(
+                input: input, cache: cache, nConfirmed: nConfirmed)
+        }
+        return model.callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// One hidden row `[1, 1, H]` in the variant selected by `callTarget`.
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
-        let row = hidden[0..., index ..< (index + 1), 0...]
-        return postNorm ? model.applyFinalNorm(row) : row
+        hidden[0..., index ..< (index + 1), 0...]
     }
 
     private func lastRow(_ logits: MLXArray) -> MLXArray {

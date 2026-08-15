@@ -1492,6 +1492,22 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// Return the exact normalized tensor already supplied to lm_head.
+    public func callWithPostNormHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, normed)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -1738,6 +1754,13 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func callWithPostNormHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithPostNormHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

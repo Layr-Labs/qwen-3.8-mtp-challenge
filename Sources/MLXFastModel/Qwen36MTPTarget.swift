@@ -51,6 +51,12 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Backbone forward returning the exact post-final-norm tensor already
+    /// consumed by the target lm_head, avoiding a duplicate proposal-side norm.
+    func callWithPostNormHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
