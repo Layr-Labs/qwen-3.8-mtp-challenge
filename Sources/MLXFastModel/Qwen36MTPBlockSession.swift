@@ -497,7 +497,16 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
-        return depth
+        // Keep a one-token probe when an offered speculative round is
+        // available. A rejected probe still supplies the target's correction
+        // token, while a serial skip forgoes that acceptance opportunity and
+        // immediately returns to the same target-forward cadence. The EMA
+        // model therefore continues to select the *additional* depth (2...4)
+        // only when its marginal value clears the measured head-step cost,
+        // but does not turn a transient cold estimate into a run of serial
+        // rounds. This is proposal-only: the trusted target still verifies
+        // every row and chooses every emitted token.
+        return Swift.max(1, depth)
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
