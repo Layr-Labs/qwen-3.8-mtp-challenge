@@ -307,6 +307,13 @@ final class Qwen35GatedDeltaNet: Module {
     private var _inBits = 4
     private var _inMode = QuantizationMode.affine
 
+    /// fp32 exp of the loaded `a_log`, materialized once (input-independent
+    /// weight cache) so the verify's fused GDN path skips the per-layer
+    /// cast+exp launches the stock `computeGatedDeltaG` pays every round.
+    /// Bit-identical: same kernel, same input, deterministic output; the
+    /// surrounding expression is unchanged.
+    private var _expALog: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -523,17 +530,41 @@ final class Qwen35GatedDeltaNet: Module {
 
             let dtype = q.dtype
             let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            // Fold the post-norm scale into the rms_norm weight: the forward
+            // rms kernel computes `w[i] * (x * inv_mean)` for every output, so
+            // a stride-0 broadcast of the bf16 scale yields exactly the same
+            // bits as the separate elementwise multiply (same operands, same
+            // order, same fp32 product, same bf16 store) for two fewer
+            // launches per GDN layer.
+            let qNormed = MLXFast.rmsNorm(
+                q,
+                weight: MLX.broadcast(
+                    MLXArray(pow(invScale, 2)).asType(dtype),
+                    to: [headKDim]),
+                eps: 1e-6)
+            let kNormed = MLXFast.rmsNorm(
+                k,
+                weight: MLX.broadcast(
+                    MLXArray(invScale).asType(dtype),
+                    to: [headKDim]),
+                eps: 1e-6)
 
             // Replicates gatedDeltaUpdate's prologue exactly (fp32 beta/g,
-            // fp32 state init).
+            // fp32 state init). `exp(a_log)` is a one-time input-independent
+            // fold (same kernel, same input, deterministic bits), so the
+            // per-layer cast+exp launches the stock helper pays every round
+            // are replaced by one materialized [Hv] array; the expression
+            // `exp(-expA * softplus(a + dtBias))` is unchanged.
             let beta = sigmoid(b).asType(.float32)
-            let g = computeGatedDeltaG(aLog, a, dtBias)
+            let expALog: MLXArray
+            if let cached = _expALog {
+                expALog = cached
+            } else {
+                let value = exp(aLog.asType(.float32))
+                _expALog = value
+                expALog = value
+            }
+            let g = exp(-expALog * softplus(a + dtBias))
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
