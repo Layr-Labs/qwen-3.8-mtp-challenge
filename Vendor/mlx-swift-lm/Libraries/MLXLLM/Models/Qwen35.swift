@@ -231,6 +231,47 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Fuse SiLU activation and elementwise product in SwiGLU: `silu(g) * u`.
+private let qwen35CompiledSwiGLU:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { g, u in
+        silu(g) * u
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+/// Slices fused gate-up projection output and computes `silu(g) * u` in a single fused Metal kernel pass.
+private let qwen35CompiledFusedSwiGLU:
+    @Sendable (MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray) -> MLXArray = { y in
+        let half = y.dim(-1) / 2
+        return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+/// Fuse Sigmoid gate and product in Attention output: `x * sigmoid(gate)`.
+private let qwen35CompiledSigmoidMultiply:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
+        x * sigmoid(gate)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -981,16 +1022,14 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
+    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            let y = quantizedMM(
+            return quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let w = _fbfW {
-            let y = matmul(x, w.T)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
+            return matmul(x, w.T)
         }
         if let g = gateProj as? QuantizedLinear,
            let u = upProj as? QuantizedLinear,
@@ -1017,10 +1056,10 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
-            return downProj(silu(g) * u)
+        if x.dim(-2) <= 9, let y = fusedGateUp(x) {
+            return downProj(qwen35CompiledFusedSwiGLU(y))
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
+        return downProj(qwen35CompiledSwiGLU(gateProj(x), upProj(x)))
     }
 
 }
@@ -1183,7 +1222,7 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
     }
 }
 
@@ -1363,15 +1402,12 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
+        // Decode-width asyncEval ladder: at S <= 9 (serial step / MTP
         // verify) the host builds a ~64-layer graph before anything reaches
         // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
         // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // rest.
+        let ladderActive = inputs.dim(1) <= 9
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =

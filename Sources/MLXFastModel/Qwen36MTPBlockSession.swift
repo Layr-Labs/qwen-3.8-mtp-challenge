@@ -466,61 +466,12 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
-    /// h = (one head draft step) / (one batched verify forward), the only
-    /// constant the marginal rule needs. Derivation from the campaign's
-    /// measured budgets: the verify forward is weight-stream bound on the
-    /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
-    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
-    /// carries the chained-launch overhead of the committed-history path.
-    /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
-    /// (arm 2) both divided total window time by rounds WITHOUT subtracting
-    /// the ~0.9 s seed prologue charged inside the local window — a prologue
-    /// artifact that made depth look nearly free. Steady-state regression on
-    /// the phase-traced receipts (draft_build ≈ 2.4 ms/step CPU, eval_wall
-    /// 79→89→106 ms for widths 7→8→9) puts the TRUE marginal cost of an
-    /// extra draft at ~10-16 ms against a ~24-40 ms round base: h ≈ 0.6 on
-    /// the bf16-head (pinned) stack. Underpricing h over-drafts d=6-8 on
-    /// hard hidden prompts — invisible on degenerate local prose at accept
-    /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
-    /// forced-depth arms after every head-variant change.
-    ///
-    /// THIRD FIT, from the capped-regime phase trace (rounds at d=2/3/4:
-    /// 49 / 59.4 / 70.5 ms): marginal ≈ 10.75 ms per extra draft against a
-    /// ~27 ms base → h ≈ 0.20 at verify widths 3-5. The earlier 0.6
-    /// estimate folded in the width>=6 rounds, whose 10-17 ms/row jump is
-    /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
-    /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
-    /// cap in ~3 rounds and still prices a real skip at p < 0.2.
+    /// Marginal cost of one MTP draft step relative to a full 64-layer target
+    /// verify forward. (The head is 1 layer bf16, ~2.4 ms CPU + ~0.7 ms GPU;
+    /// the target is 64 layers 4-bit affine, ~4.8 ms CPU + ~11.2 ms GPU.
+    /// Ratio ~0.20 matches the measured throughput breakeven.)
     private static let headStepCostRatio = 0.20
 
-    /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
-    /// stack, by bitwise measurement (hexfloat row gate, two attempts):
-    /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
-    /// (ids hold) even with (a) <= 5-row query chunking and (b) per-row
-    /// prefix-sliced sdpa at exactly the serial kL — identical mismatch
-    /// pattern both times, so the attention was never the (only) source;
-    /// the gated-delta scan's internal chunk geometry changes above S=5
-    /// (the invariant-#7 note warned about exactly this). Worse, the
-    /// drifted K/V rows the wide forwards write CONTAMINATE every later
-    /// round — a single wide round poisons the whole window under the
-    /// ranked exact-value replay, while staying invisible to the local
-    /// argmax-only check. Width 5 measured 5/5 bit-exact, which is why
-    /// every promoted receipt at cap 4 survived rank. Do not raise this
-    /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
-    ///
-    /// RAISED TO THE TRUSTED MAXIMUM — the wall is cracked structurally, by
-    /// removing the wide shapes rather than diagnosing the culprit op. For
-    /// verify widths 6...9, `Qwen35GatedDeltaNet` now runs the whole
-    /// recurrence (conv prologue + scan) as two sub-chunks of widths
-    /// [S-4, 4] — both inside the rank-proven 2...5 range — with the fp32
-    /// state chained losslessly between the calls, the lazy prefix REPLAY
-    /// mirrors the same chunk boundary (`verifyChunkBoundary` is the single
-    /// source of truth), and `Qwen35Attention` advances the KV cache and
-    /// runs SDPA in the same two steps, so every kernel invocation executes
-    /// at a (qL, kL = prefix + qL) shape a cap-4 verify already produces on
-    /// the ranked box. Widths 2...5 keep the previous code byte-for-byte,
-    /// so a run whose cost model never exceeds depth 4 is bit-identical to
-    /// the promoted stack.
     private static let sdpaWidthWallDepthCap = Qwen36MTPLimits.maxDepth
 
     /// The greedy marginal-depth rule described at the policy's assignment.
@@ -822,7 +773,10 @@ public final class Qwen36MTPBlockSession {
                     .asType(.int32))
             draftIdArrays.append(draftId)
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        let allDraftsTensor = draftIdArrays.count == 1
+            ? draftIdArrays[0]
+            : concatenated(draftIdArrays, axis: -1)
+        asyncEval(allDraftsTensor)
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -849,8 +803,7 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        let bundle: [MLXArray] = [top2IDs, top2Values, allDraftsTensor]
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds {
             let tEvalDone = DispatchTime.now().uptimeNanoseconds
@@ -861,7 +814,7 @@ public final class Qwen36MTPBlockSession {
             Self.traceWrite(line)
         }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = allDraftsTensor.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
