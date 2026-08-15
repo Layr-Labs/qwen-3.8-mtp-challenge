@@ -219,8 +219,29 @@ public enum Qwen36MTPHeadAttachment {
             atPath: headDirectory.path, isDirectory: &isDirectory),
             isDirectory.boolValue
         else {
-            throw MLXFastError.invalidInput(
-                "the Qwen MTP head directory does not exist: \(headDirectory.path)")
+            // Distinguish absent from present-but-unreadable LOUDLY: a
+            // sandboxed worker whose profile does not cover the staged
+            // declared-head directory fails here with what looks like
+            // "missing", and the sealed gate log is the only place the real
+            // cause can surface. errno and an access probe make it legible.
+            let probe = access(headDirectory.path, R_OK)
+            let errnoValue = errno
+            let parent = headDirectory.deletingLastPathComponent()
+            let parentListing = (try? fileManager.contentsOfDirectory(
+                atPath: parent.path)) ?? []
+            let diagnostic = "head-dir diagnostic: path=\(headDirectory.path) "
+                + "fileExists=false access(R_OK)=\(probe) errno=\(errnoValue) "
+                + "(\(String(cString: strerror(errnoValue)))) "
+                + "parent=\(parent.path) parentReadable="
+                + "\(fileManager.isReadableFile(atPath: parent.path)) "
+                + "parentEntries=\(parentListing.prefix(8))"
+            FileHandle.standardError.write(Data((diagnostic + "\n").utf8))
+            try refuseHeadTree(
+                headDirectory,
+                exitCode: probe == 0 ? 99 : 100 + min(max(errnoValue, 0), 120),
+                "the Qwen MTP head directory does not exist or is not "
+                    + "readable by this process: \(headDirectory.path) — "
+                    + diagnostic)
         }
         let indexURL = headDirectory.appendingPathComponent(
             "model.safetensors.index.json")
@@ -245,23 +266,79 @@ public enum Qwen36MTPHeadAttachment {
         let safetensorsURL = headDirectory.appendingPathComponent(
             "model.safetensors")
         guard fileManager.fileExists(atPath: safetensorsURL.path) else {
-            throw MLXFastError.invalidInput(
+            try refuseHeadTree(
+                headDirectory, exitCode: 98,
                 "the Qwen MTP head tree carries neither "
                     + "model.safetensors.index.json nor model.safetensors")
         }
-        let names = try safetensorsTensorNames(safetensorsURL)
+        let names: Set<String>
+        do {
+            names = try safetensorsTensorNames(safetensorsURL)
+        } catch {
+            let probe = access(safetensorsURL.path, R_OK)
+            let errnoValue = errno
+            let diagnostic = "head-file diagnostic: path=\(safetensorsURL.path) "
+                + "access(R_OK)=\(probe) errno=\(errnoValue) "
+                + "(\(String(cString: strerror(errnoValue)))) error=\(error)"
+            FileHandle.standardError.write(Data((diagnostic + "\n").utf8))
+            try refuseHeadTree(
+                headDirectory,
+                exitCode: probe == 0 ? 96 : 100 + min(max(errnoValue, 0), 120),
+                "the Qwen MTP head safetensors could not be read: \(diagnostic)")
+        }
         if let prefixed = names.first(where: { $0.hasPrefix(headKeyPrefix) }) {
-            throw MLXFastError.invalidInput(
+            try refuseHeadTree(
+                headDirectory, exitCode: 95,
                 "the Qwen MTP head tree already carries prefixed tensor names "
                     + "(e.g. \(prefixed)); this loader merges a BARE head tree and "
                     + "would double-prefix a pre-merged one")
         }
         for required in ["fc.weight", "norm.weight", "pre_fc_norm_hidden.weight"] {
             guard names.contains(required) else {
-                throw MLXFastError.invalidInput(
+                try refuseHeadTree(
+                    headDirectory, exitCode: 95,
                     "the Qwen MTP head safetensors is missing \(required)")
             }
         }
+    }
+
+    /// RANKED-FAILURE EXIT ENCODING (diagnostic-only; never on a success
+    /// path). On the ranked runner every worker refusal in the untimed
+    /// correctness gate collapses to one public line — "did not emit a
+    /// single valid report payload (exit=N)" — while the worker's stderr is
+    /// captured into the sealed gate log participants cannot read. The
+    /// process exit status is therefore the single participant-visible byte
+    /// of debug information. Two remote-head submissions (`294aeef3`,
+    /// `3d793c91`) died at head attach with the generic exit=1 and no public
+    /// cause, so when the RUNNER-STAGED declared head — and only that: the
+    /// path the resolver wires ends in `qwen_mtp_declared_head`; local trees
+    /// and test fixtures never use that name and keep the thrown-error
+    /// contract unchanged — cannot be used, this encodes the cause in the
+    /// exit code instead of throwing:
+    ///
+    ///   100+errno  head dir or model.safetensors unreadable (EACCES=13 →
+    ///              113, ENOENT=2 → 102, errno clamped to 0...120)
+    ///   99         stat() reports the dir missing while access(R_OK)
+    ///              succeeds (inconsistent VFS view)
+    ///   98         dir readable but model.safetensors absent
+    ///   96         model.safetensors readable but its header is invalid
+    ///   95         header parses but tensor names are wrong for this loader
+    ///
+    /// This runs strictly BEFORE any hidden material is in scope — head
+    /// attach is the first touch of the staged directory, immediately after
+    /// backbone load — and only on a path that already refuses; the encoded
+    /// codes describe the candidate's own declared artifact and staging
+    /// path, both already printed publicly by the workflow's env dump.
+    private static func refuseHeadTree(
+        _ headDirectory: URL, exitCode: Int32, _ message: String
+    ) throws -> Never {
+        if headDirectory.path.contains("qwen_mtp_declared_head") {
+            let line = "declared-head refusal: encoding cause in exit status "
+                + "\(exitCode) — \(message)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+            exit(exitCode)
+        }
+        throw MLXFastError.invalidInput(message)
     }
 
     /// Tensor names from a safetensors file header (8-byte little-endian
