@@ -1240,13 +1240,71 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
-    /// Per-boundary checkpoints for a multi-draft verify: entry t is the
-    /// `(conv_state, ssm_state)` after verify row t, so a partial acceptance
-    /// of `a` drafts restores entry `a` and trims only the rejected attention
-    /// rows — no repair forward at any depth. Entry 0 mirrors `rollbackState`.
-    /// Written by the fused width-S gated-delta verify; transient like
-    /// `rollbackState` (consumed or cleared by the round that requested it).
-    public var rollbackCheckpoints: [(MLXArray, MLXArray)] = []
+    /// LAZY counterpart of `rollbackState`, for a verify forward that ran the
+    /// gated-delta stack as ONE fused chunk (`nConfirmed == 0`) instead of
+    /// splitting at the confirmed prefix.
+    ///
+    /// The fused chunk never materialises the post-primary recurrent state --
+    /// the gated-delta Metal kernel carries it in thread registers across its
+    /// `for t` loop and writes only the final state. This slot instead records
+    /// the *ingredients* needed to reproduce that boundary on demand, and only
+    /// on the ~1/3 of rounds that actually reject:
+    ///
+    /// - `conv` is the post-row-0 convolution state, ALREADY EXACT. It is a
+    ///   slice of the same `concat(convState, qkv)` array the fused chunk
+    ///   convolved, so no arithmetic is redone and none can drift (the
+    ///   convolution window is associative under concatenation).
+    /// - `q`/`k`/`v` are the row-0 tensors AFTER conv1d + silu + rmsNorm, and
+    ///   `a`/`b` the row-0 gate projections. Replaying them through
+    ///   `gatedDeltaUpdate` at `T == 1` from `ssmPre` re-executes the exact
+    ///   `t == 0` body of the fused kernel from the exact same fp32 state, so
+    ///   the reproduced boundary is bit-identical to the registers the fused
+    ///   call held after its first row. Nothing upstream of the recurrence is
+    ///   recomputed.
+    ///
+    /// Transient by contract, exactly like `rollbackState`: the round that
+    /// requested it consumes or clears it, and any forward that did not request
+    /// it clears it, so a stale boundary can never be restored as if current.
+    public var fusedPrimaryBoundary: FusedPrimaryBoundary? = nil
+
+    /// Ingredients recorded by a fused (unsplit) multi-row gated-delta forward
+    /// so the post-row-0 recurrent boundary can be rebuilt with a single
+    /// recurrence step. See ``ArraysCache/fusedPrimaryBoundary``.
+    /// WIDTH-GENERAL form: the tensors are stored WHOLE (all S rows of the
+    /// fused chunk, plus the full `convState ⧺ qkv` concat window), so
+    /// `recomputeFusedPrimaryBoundary(prefixRows:)` can rebuild the boundary
+    /// after ANY committed prefix -- row 0 (the primary, K=1's case) through
+    /// row S-1 -- by slicing rows `0 ..< prefixRows` at replay time. MLXArray
+    /// values are immutable, so the full-tensor references pin exactly the
+    /// values captured at stash time; a later in-place cache-slot write
+    /// replaces a reference, never the underlying buffers.
+    public struct FusedPrimaryBoundary {
+        /// `concat(convState, qkv)` for the whole chunk
+        /// `[B, nKeep + S, convDim]`; the post-prefix-`p` conv state is the
+        /// window `[p, p + nKeep)` of this array, exact by slicing.
+        public let convInput: MLXArray
+        public let q: MLXArray
+        public let k: MLXArray
+        public let v: MLXArray
+        public let a: MLXArray
+        public let b: MLXArray
+        public let ssmPre: MLXArray?
+        public let mask: MLXArray?
+
+        public init(
+            convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray,
+            a: MLXArray, b: MLXArray, ssmPre: MLXArray?, mask: MLXArray?
+        ) {
+            self.convInput = convInput
+            self.q = q
+            self.k = k
+            self.v = v
+            self.a = a
+            self.b = b
+            self.ssmPre = ssmPre
+            self.mask = mask
+        }
+    }
 
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)

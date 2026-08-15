@@ -166,106 +166,93 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
-// MARK: - GatedDelta kernel with mid-state checkpoint
-
-/// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
-/// THIRD output: the recurrent state after timestep 0. For the width-2 MTP
-/// verify this makes the post-primary rollback checkpoint a free by-product
-/// of the single recurrence launch, instead of paying a second launch plus a
-/// full fp32 state round-trip through device memory (3.15 MB/layer/launch,
-/// x48 layers). Bit-exact vs two T=1 launches: the state lives in fp32
-/// registers across the in-kernel t-loop and the eliminated round-trip was a
-/// lossless f32 store/reload. Body is textually the vendored kernel plus the
-/// `m_state` pointer and the `t == 0` store; no new template parameters and
-/// no unused constexpr (M5 gen-17 JIT builds are strict about that).
-private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
-    let source = """
-            auto n = thread_position_in_grid.z;
-            auto b_idx = n / Hv;
-            auto hv_idx = n % Hv;
-            auto hk_idx = hv_idx / (Hv / Hk);
-            constexpr int n_per_t = Dk / 32;
-
-            // q, k: [B, T, Hk, Dk]
-            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
-
-            // v, y: [B, T, Hv, Dv]
-            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-            y += b_idx * T * Hv * Dv + hv_idx * Dv;
-
-            auto dk_idx = thread_position_in_threadgroup.x;
-            auto dv_idx = thread_position_in_grid.y;
-
-            // g: [B, T, Hv]
-            auto g_ = g + b_idx * T * Hv;
-            auto beta_ = beta + b_idx * T * Hv;
-
-            // state_in, state_out: [B, Hv, Dv, Dk]; state_mid: [B, T-1, Hv, Dv, Dk]
-            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
-
-            float state[n_per_t];
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = static_cast<float>(i_state[s_idx]);
-            }
-
-            for (int t = 0; t < T; ++t) {
-              if (true) {
-                float kv_mem = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] * g_[hv_idx];
-                  kv_mem += state[i] * k_[s_idx];
-                }
-                kv_mem = simd_sum(kv_mem);
-
-                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
-
-                float out = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] + k_[s_idx] * delta;
-                  out += state[i] * q_[s_idx];
-                }
-                out = simd_sum(out);
-                if (thread_index_in_simdgroup == 0) {
-                  y[dv_idx] = static_cast<InT>(out);
-                }
-              } else {
-                y[dv_idx] = static_cast<InT>(0);
-              }
-              if (t < T - 1) {
-                auto m_state = state_mid
-                    + (((b_idx * (T - 1) + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  m_state[s_idx] = static_cast<StT>(state[i]);
-                }
-              }
-              // Increment data pointers to next time step
-              q_ += Hk * Dk;
-              k_ += Hk * Dk;
-              v_ += Hv * Dv;
-              y += Hv * Dv;
-              g_ += Hv;
-              beta_ += Hv;
-            }
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<StT>(state[i]);
-            }
-        """
-    return MLXFast.metalKernel(
-        name: "qwen35_gated_delta_step_mid",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
-        outputNames: ["y", "state_out", "state_mid"],
-        source: source
-    )
-}()
-
 // MARK: - GatedDeltaNet
+
+/// Lazily packed concat-on-N quantized projection bank: one `quantizedMM`
+/// launch in place of N. Rows (M) are independent and each output column's
+/// dot product reads only its own weight columns, so on the `qmv` kernel
+/// family the fused call is bit-exact with the separate calls — the same
+/// argument the promoted attention-QKV fusion rests on.
+///
+/// M GATE (the qmm trap): the dispatch (`mlx/backend/metal/quantized.cpp`)
+/// routes M above the small-M batch limit (10-12 for K=5120-class shapes) to
+/// the `qmm` kernel, whose N-tiling does NOT reproduce separate calls
+/// bit-for-bit (logits drift 1-2 bf16 ULP and flip drafts). Decode rounds
+/// run M <= 8; prefill (512) returns nil and keeps the stock calls.
+final class FusedQuantizedPack {
+    /// Rows at or below this use the qmv family; 8 keeps margin under the
+    /// 10-12 dispatch batch limit for K=5120-class shapes on all archs.
+    static let maxRows = 8
+
+    private var packed = false
+    private var w: MLXArray?
+    private var s: MLXArray?
+    private var z: MLXArray?
+    private var boundaries: [Int] = []
+    private var groupSize = 0
+    private var bits = 0
+    private var mode = QuantizationMode.affine
+
+    /// Returns per-projection slices of the fused output, or `nil` when the
+    /// input is too wide (prefill) or the projections are not uniformly
+    /// affine-quantized (bf16 MTP head). Never partially mutates state: the
+    /// bank is built only when every precondition holds.
+    func call(_ x: MLXArray, _ projections: [Linear]) -> [MLXArray]? {
+        guard x.ndim >= 2 else { return nil }
+        let rows = (0 ..< x.ndim - 1).reduce(1) { $0 * x.dim($1) }
+        guard rows > 0, rows <= Self.maxRows else { return nil }
+
+        if !packed {
+            guard let first = projections.first as? QuantizedLinear else {
+                return nil
+            }
+            let quantized = projections.compactMap { $0 as? QuantizedLinear }
+            guard quantized.count == projections.count,
+                quantized.dropFirst().allSatisfy({
+                    $0.groupSize == first.groupSize && $0.bits == first.bits
+                        && $0.mode == first.mode
+                }),
+                first.mode == .affine
+            else { return nil }
+
+            // Biases must be uniformly present or uniformly absent across the
+            // bank; a mixed bank cannot be expressed as one quantizedMM.
+            let hasBias = quantized.compactMap { $0.biases }
+            let biases: MLXArray?
+            if hasBias.count == quantized.count {
+                biases = concatenated(hasBias, axis: 0).contiguous()
+            } else if hasBias.isEmpty {
+                biases = nil
+            } else {
+                return nil
+            }
+
+            w = concatenated(quantized.map { $0.weight }, axis: 0).contiguous()
+            s = concatenated(quantized.map { $0.scales }, axis: 0).contiguous()
+            z = biases
+            boundaries = quantized.map { $0.shape.0 }
+            groupSize = first.groupSize
+            bits = first.bits
+            mode = first.mode
+            packed = true
+        }
+
+        guard let w, let s else { return nil }
+        let y = quantizedMM(
+            x, w, scales: s, biases: z, transpose: true,
+            groupSize: groupSize, bits: bits, mode: mode)
+
+        var start = 0
+        var slices = [MLXArray]()
+        slices.reserveCapacity(boundaries.count)
+        for n in boundaries {
+            let end = start + n
+            slices.append(start == 0 && end == y.dim(y.ndim - 1) ? y : y[.ellipsis, start ..< end])
+            start = end
+        }
+        return slices
+    }
+}
 
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
@@ -284,28 +271,14 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "in_proj_b") var inProjB: Linear
     @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+    /// Packed [in_proj_qkv; in_proj_z; in_proj_b; in_proj_a] bank (M-gated).
+    private let inProjPack = FusedQuantizedPack()
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
-
-    // Decode-width fused input projections: ONE affine-4 matmul over the
-    // concatenated [qkv | z | b | a] output rows (N = 10240+6144+48+48 =
-    // 16480) instead of four separate launches per layer per forward. The
-    // two 48-wide launches are pure overhead at M<=2. Bit-exact per output
-    // row for the same reason as the FA QKV fuse: groups run along K, every
-    // N here and the fused N keep qmv_fast eligibility (N%8==0, K%512==0),
-    // and a row's reduction order does not depend on the launch it rides in.
-    // Prefill (S > 2) keeps the four separate calls so qmm/split-k reduction
-    // orders match the pinned baseline byte-for-byte. Underscore storage so
-    // none of this is a Module parameter.
-    private var _inW: MLXArray?
-    private var _inS: MLXArray?
-    private var _inZ: MLXArray?
-    private var _inGS = 64
-    private var _inBits = 4
-    private var _inMode = QuantizationMode.affine
 
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
@@ -347,49 +320,6 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
-    }
-
-    /// Lazily build and apply the fused [qkv|z|b|a] projection. Returns nil
-    /// until every input projection is a matching affine `QuantizedLinear`
-    /// (bf16 trees fall back to the four separate calls).
-    private func fusedInProjections(
-        _ x: MLXArray
-    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
-        if let w = _inW, let s = _inS, let zp = _inZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: zp, transpose: true,
-                groupSize: _inGS, bits: _inBits, mode: _inMode)
-            let qkvEnd = keyDim * 2 + valueDim
-            let zEnd = qkvEnd + valueDim
-            let bEnd = zEnd + numVHeads
-            return (
-                y[.ellipsis, ..<qkvEnd],
-                y[.ellipsis, qkvEnd ..< zEnd],
-                y[.ellipsis, zEnd ..< bEnd],
-                y[.ellipsis, bEnd...]
-            )
-        }
-        guard let q = inProjQKV as? QuantizedLinear,
-              let z = inProjZ as? QuantizedLinear,
-              let b = inProjB as? QuantizedLinear,
-              let a = inProjA as? QuantizedLinear,
-              q.groupSize == z.groupSize, z.groupSize == b.groupSize,
-              b.groupSize == a.groupSize,
-              q.bits == z.bits, z.bits == b.bits, b.bits == a.bits,
-              q.mode == z.mode, z.mode == b.mode, b.mode == a.mode,
-              q.mode == .affine,
-              let qz = q.biases, let zz = z.biases, let bz = b.biases,
-              let az = a.biases
-        else { return nil }
-        _inW = concatenated([q.weight, z.weight, b.weight, a.weight], axis: 0)
-            .contiguous()
-        _inS = concatenated([q.scales, z.scales, b.scales, a.scales], axis: 0)
-            .contiguous()
-        _inZ = concatenated([qz, zz, bz, az], axis: 0).contiguous()
-        _inGS = q.groupSize
-        _inBits = q.bits
-        _inMode = q.mode
-        return fusedInProjections(x)
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -454,28 +384,156 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
+    // MARK: - fused-verify boundary stash (MTP accept-path helper)
+
+    /// STASHING TWIN of ``processChunk(qkv:a:b:convState:ssmState:mask:)``.
+    ///
+    /// Identical arithmetic, identical order, identical results -- it just also
+    /// hands back everything needed to rebuild the post-row-0 recurrent boundary
+    /// later, WITHOUT re-running conv1d / silu / rmsNorm:
+    ///
+    /// - the post-row-0 convolution state is `convInput[1 ..< 1 + nKeep]`,
+    ///   i.e. a different window of the very array this chunk convolved. The
+    ///   split path's chunk-C computes `concat(convState, row0)[-nKeep:]`, which
+    ///   is the same three rows. Bit-exact by slicing, not by recomputation.
+    /// - the recurrence inputs are the row-0 slices of the tensors this chunk
+    ///   has ALREADY produced (`qNormed`, `kNormed`, `v`) plus the row-0 gate
+    ///   projections and the incoming ssm state.
+    ///
+    /// Kept as a separate function rather than a flag on `processChunk` so the
+    /// shipped split path stays byte-for-byte the code that earned the current
+    /// frontier. KEEP THE TWO IN SYNC if `processChunk` ever changes.
+    private func processChunkStashingRow0(
+        qkv: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        convState: MLXArray,
+        ssmState: MLXArray?,
+        mask: MLXArray?
+    ) -> (
+        out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
+        stash: ArraysCache.FusedPrimaryBoundary
+    ) {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let nKeep = convKernelSize - 1
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (out, newSsmState) = gatedDeltaUpdate(
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            aLog: aLog,
+            dtBias: dtBias,
+            state: ssmState,
+            mask: mask
+        )
+
+        // WIDTH-GENERAL boundary ingredients: the WHOLE chunk's tensors, so a
+        // later replay can rebuild the recurrent state after any committed
+        // prefix, not just row 0. Every leaf is a value captured at stash
+        // time (MLXArray buffers are immutable; a later in-place cache-slot
+        // write replaces a reference, never the buffers), same discipline as
+        // `snapshotRecurrent`.
+        let stash = ArraysCache.FusedPrimaryBoundary(
+            convInput: convInput,
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            ssmPre: ssmState.map { $0[.ellipsis] },
+            mask: mask
+        )
+        return (out, newConvState, newSsmState, stash)
+    }
+
+    /// Rebuild the recurrent boundary after the first `prefixRows` rows of a
+    /// fused chunk (`prefixRows == 1` is the post-PRIMARY boundary the K=1
+    /// reject path used) from a stash recorded by
+    /// ``processChunkStashingRow0(qkv:a:b:convState:ssmState:mask:)`` and write
+    /// it into `cache`. Returns `false` (leaving the cache untouched) when no
+    /// stash is present, so the caller can fall back to a generic repair.
+    ///
+    /// BIT-EXACT AT EVERY PREFIX. `gatedDeltaUpdate` runs the same Metal kernel
+    /// the fused call ran; the kernel's per-`t` body is a fixed sequence of
+    /// fp32 operations on a register-resident state, so the state after
+    /// iteration `t` depends only on `ssmPre` and rows `0 ... t` -- executing
+    /// rows `0 ..< prefixRows` alone reproduces exactly the state the fused
+    /// call held after its own row `prefixRows - 1` (`StT` is fp32, so the
+    /// extra store/load round trip is lossless). This is the sequential
+    /// recurrence's own determinism: a prefix of the iteration sequence gives
+    /// that prefix's states, whatever the total `T` of the original call was.
+    /// The convolution half is not recomputed at all -- the post-prefix window
+    /// `[prefixRows, prefixRows + nKeep)` of the stashed `convInput` is the
+    /// same three rows chunk-C would have computed, exact by slicing.
+    func recomputeFusedPrimaryBoundary(cache: MambaCache, prefixRows: Int = 1) -> Bool {
+        guard let stash = cache.fusedPrimaryBoundary else { return false }
+        let p = Swift.max(1, prefixRows)
+        let (_, boundarySsm) = gatedDeltaUpdate(
+            q: stash.q[0..., 0 ..< p, 0...],
+            k: stash.k[0..., 0 ..< p, 0...],
+            v: stash.v[0..., 0 ..< p, 0...],
+            a: stash.a[0..., 0 ..< p, 0...],
+            b: stash.b[0..., 0 ..< p, 0...],
+            aLog: aLog,
+            dtBias: dtBias,
+            state: stash.ssmPre,
+            mask: stash.mask.map { $0[0..., 0 ..< p] }
+        )
+        let nKeep = convKernelSize - 1
+        cache[0] = stash.convInput[0..., p ..< (p + nKeep)]
+        cache[1] = boundarySsm
+        cache.fusedPrimaryBoundary = nil
+        cache.rollbackState = nil
+        return true
+    }
+
     // MARK: - callAsFunction
 
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        stashPrimaryBoundary: Bool = false
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
+        // One packed launch for in_proj_qkv|z|b|a at decode widths (M<=8);
+        // bit-exact on the qmv family per the FusedQuantizedPack argument.
+        // Prefill and the bf16 MTP head keep the stock per-projection calls.
         var qkv: MLXArray
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 2, let fused = fusedInProjections(inputs) {
-            qkv = fused.0
-            z = fused.1.reshaped(B, S, numVHeads, headVDim)
-            b = fused.2
-            a = fused.3
+        if let packed = inProjPack.call(inputs, [inProjQKV, inProjZ, inProjB, inProjA]) {
+            qkv = packed[0]
+            z = packed[1].reshaped(B, S, numVHeads, headVDim)
+            b = packed[2]
+            a = packed[3]
         } else {
             qkv = inProjQKV(inputs)
             z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
@@ -499,82 +557,32 @@ final class Qwen35GatedDeltaNet: Module {
         let out: MLXArray
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
+        var pendingStash: ArraysCache.FusedPrimaryBoundary?
 
-        if nConfirmed == 1 && S >= 2 && mask == nil,
-           let midKernel = qwen35GatedDeltaMidKernel
-        {
-            // Width-2 MTP verify, single-launch form. The old split path ran
-            // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
-            // sigmoid, g) and paid two recurrence launches with a full fp32
-            // state round-trip between them, solely to observe the
-            // post-primary state. Here the prework runs once over both rows —
-            // all of it position-local, so per-row bit-identical to the split
-            // form — and the cloned kernel emits the timestep-0 state as a
-            // third output, so the rollback checkpoint is free.
-            let convInput = concatenated([convState, qkv], axis: 1)
-            let nKeep = convKernelSize - 1
-            let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
-
-            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-            // Replicates gatedDeltaUpdate's prologue exactly (fp32 beta/g,
-            // fp32 state init).
-            let beta = sigmoid(b).asType(.float32)
-            let g = computeGatedDeltaG(aLog, a, dtBias)
-            var state = ssmState
-                ?? MLXArray.zeros(
-                    [B, numVHeads, headVDim, headKDim], dtype: .float32)
-            if state.dtype != .float32 { state = state.asType(.float32) }
-
-            let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
-                template: [
-                    ("InT", dtype),
-                    ("StT", DType.float32),
-                    ("Dk", headKDim),
-                    ("Dv", headVDim),
-                    ("Hk", numKHeads),
-                    ("Hv", numVHeads),
-                ],
-                grid: (32, headVDim, B * numVHeads),
-                threadGroup: (32, 4, 1),
-                outputShapes: [
-                    [B, S, numVHeads, headVDim],
-                    state.shape,
-                    [B, S - 1, numVHeads, headVDim, headKDim],
-                ],
-                outputDTypes: [dtype, .float32, .float32]
+        if stashPrimaryBoundary && nConfirmed == 0 && S > 1 {
+            // FUSED VERIFY WITH A LAZY BOUNDARY (MTP accept path).
+            //
+            // The `nConfirmed > 0` branch below buys a free reject by paying a
+            // SPLIT on every verify: two chunks means two `conv1d`, two `silu`,
+            // two 3-way splits, four `rmsNorm`s, two recurrence launches and an
+            // output `concatenated` per gated-delta layer -- on all 48 of them,
+            // including the ~2/3 of rounds that fully accept and never look at
+            // the checkpoint.
+            //
+            // This branch runs the same rows as ONE chunk (exactly the geometry
+            // every pre-checkpoint submission verified with) and instead records
+            // the ingredients for rebuilding the post-row-0 boundary with a
+            // single recurrence step, consumed only if the draft is rejected.
+            let (o, c, s, stash) = processChunkStashingRow0(
+                qkv: qkv, a: a, b: b,
+                convState: convState,
+                ssmState: ssmState,
+                mask: mask
             )
-            // Per-boundary checkpoints: after row t, the conv state is rows
-            // (t+1)..(t+nKeep) of [convState | x0 .. x_{S-1}] and the SSM
-            // state is the kernel's mid output slice t. Checkpoint 0 doubles
-            // as the legacy single-slot `rollbackState` for the K=1 path.
-            var checkpoints: [(MLXArray, MLXArray)] = []
-            checkpoints.reserveCapacity(S - 1)
-            for t in 0 ..< (S - 1) {
-                checkpoints.append((
-                    convInput[0..., (t + 1) ..< (t + 1 + nKeep)],
-                    outputs[2][0..., t]
-                ))
-            }
-            cache?.rollbackState = checkpoints.first
-            cache?.rollbackCheckpoints = checkpoints
-            out = outputs[0]
-            finalConvState = newConvState
-            finalSsmState = outputs[1]
+            out = o
+            finalConvState = c
+            finalSsmState = s
+            pendingStash = stash
         } else if nConfirmed > 0 && nConfirmed < S {
             // Split at nConfirmed boundary for the MTP 2-token verify forward.
             // Run confirmed prefix first, snapshot rollback state, then run draft.
@@ -621,91 +629,15 @@ final class Qwen35GatedDeltaNet: Module {
         if let cache {
             cache[0] = finalConvState
             cache[1] = finalSsmState
+            // Fail-closed: a forward that did not record a boundary must not
+            // leave a previous round's stash behind, or a stale boundary could
+            // be restored as though it described this frame.
+            cache.fusedPrimaryBoundary = pendingStash
         }
 
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
-}
-
-// MARK: - Fused MLP
-
-/// Decode-width fused gate/up MLP. Same math as the vendored `Qwen3NextMLP` —
-/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 2) the
-/// gate and up projections run as ONE matmul over concatenated output rows
-/// (N = 34816), halving the biggest per-layer launch count on the hot path.
-///
-/// Row-concat on N is bit-exact per output element: affine groups run along
-/// K, every N here (17408 and 34816) keeps the fast-kernel eligibility
-/// (N%8==0 at K%512==0), and a row's dot-product arithmetic in `qmv_fast`
-/// does not depend on which launch it rides in — the in-tree precedent is
-/// the promoted FA QKV fuse below. Prefill (S > 2) keeps the two separate
-/// calls so the qmm/split-k reduction order of the pinned baseline is
-/// preserved byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
-/// fuses the plain weights the same way; the head only proposes, so that
-/// side carries no exactness constraint at all.
-final class Qwen35FusedMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-    @ModuleInfo(key: "down_proj") var downProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
-
-    private var _fqW: MLXArray?
-    private var _fqS: MLXArray?
-    private var _fqZ: MLXArray?
-    private var _fqGS = 64
-    private var _fqBits = 4
-    private var _fqMode = QuantizationMode.affine
-    private var _fbfW: MLXArray?
-    private var _gateOut = 0
-
-    init(dimensions: Int, hiddenDimensions: Int) {
-        _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-        _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-    }
-
-    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
-        if let w = _fqW, let s = _fqS, let z = _fqZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: z, transpose: true,
-                groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
-        }
-        if let w = _fbfW {
-            let y = matmul(x, w.T)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
-        }
-        if let g = gateProj as? QuantizedLinear,
-           let u = upProj as? QuantizedLinear,
-           g.groupSize == u.groupSize, g.bits == u.bits,
-           g.mode == u.mode, g.mode == .affine,
-           let gz = g.biases, let uz = u.biases
-        {
-            _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
-            _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
-            _fqZ = concatenated([gz, uz], axis: 0).contiguous()
-            _fqGS = g.groupSize
-            _fqBits = g.bits
-            _fqMode = g.mode
-            _gateOut = g.shape.0
-            return fusedGateUp(x)
-        }
-        if !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear) {
-            _fbfW = concatenated([gateProj.weight, upProj.weight], axis: 0)
-                .contiguous()
-            _gateOut = gateProj.weight.dim(0)
-            return fusedGateUp(x)
-        }
-        return nil
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
-            return downProj(silu(g) * u)
-        }
-        return downProj(silu(gateProj(x)) * upProj(x))
-    }
-
 }
 
 // MARK: - Attention
@@ -835,6 +767,38 @@ final class Qwen35Attention: Module {
     }
 }
 
+// MARK: - Dense MLP (fused gate|up)
+
+/// Dense feed-forward identical to `Qwen3NextMLP` in weights and math, with
+/// `gate_proj` and `up_proj` packed on N behind an M gate at decode widths —
+/// one qmv launch instead of two per layer per forward. `down_proj` and the
+/// `silu(gate) * up` arithmetic are untouched, so the only numeric surface is
+/// the concat-on-N pack (bit-exact on the qmv family; see
+/// `FusedQuantizedPack`). Defined here rather than edited into
+/// `Qwen3Next.swift` because only this file is in the benchmark's editable
+/// paths; the `@ModuleInfo` keys match the checkpoint's, so weight loading
+/// and quantization apply unchanged.
+final class Qwen35FusedMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: Linear
+
+    private let gateUpPack = FusedQuantizedPack()
+
+    init(dimensions: Int, hiddenDimensions: Int) {
+        _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+        _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
+        _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let gu = gateUpPack.call(x, [gateProj, upProj]) {
+            return downProj(silu(gu[0]) * gu[1])
+        }
+        return downProj(silu(gateProj(x)) * upProj(x))
+    }
+}
+
 // MARK: - SparseMoeBlock
 
 final class Qwen35SparseMoeBlock: Module, UnaryLayer {
@@ -937,7 +901,8 @@ final class Qwen35DecoderLayer: Module {
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        stashPrimaryBoundary: Bool = false
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
@@ -946,7 +911,8 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                nConfirmed: nConfirmed)
+                nConfirmed: nConfirmed,
+                stashPrimaryBoundary: stashPrimaryBoundary)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -999,7 +965,8 @@ public class Qwen35TextModelInner: Module {
     func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        stashPrimaryBoundary: Bool = false
     ) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
@@ -1011,15 +978,6 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1027,19 +985,36 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
-                    asyncEval(hiddenStates)
-                default:
-                    break
-                }
-            }
+                cache: cacheArray?[i], nConfirmed: nConfirmed,
+                stashPrimaryBoundary: stashPrimaryBoundary)
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
+    }
+
+    /// Rebuild every gated-delta layer's post-row-0 recurrent boundary from the
+    /// stash a `stashPrimaryBoundary` forward left behind.
+    ///
+    /// Preflight every layer before mutating any of them -- returning `false`
+    /// leaves the whole cache untouched so the caller can fall back to the
+    /// generic snapshot-and-repair path safely. This mirrors the fail-closed
+    /// contract of the checkpoint restore it replaces.
+    func recomputeFusedPrimaryBoundary(cache: [KVCache?], prefixRows: Int = 1) -> Bool {
+        guard cache.count == layers.count else { return false }
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  mamba.fusedPrimaryBoundary != nil,
+                  layer.linearAttn != nil
+            else { return false }
+        }
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  layer.linearAttn?.recomputeFusedPrimaryBoundary(
+                      cache: mamba, prefixRows: prefixRows) == true
+            else { return false }
+        }
+        return true
     }
 }
 
@@ -1051,17 +1026,6 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
-
-    // Declared DRAFT-ONLY vocabulary projection, carried by the declared MTP
-    // head tree as `draft_lm_head.{weight,scales,biases}` (merged under the
-    // `mtp.` prefix and intercepted in `sanitize` below). A coarser affine
-    // copy of the exact lm_head used exclusively to argmax DRAFT proposals —
-    // the head side only proposes, so its numerics are competitive surface;
-    // every ledger/verify value still comes from the exact `lmHead`. Plain
-    // stored arrays, deliberately not Module parameters.
-    private var _draftHeadW: MLXArray?
-    private var _draftHeadS: MLXArray?
-    private var _draftHeadZ: MLXArray?
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -1129,17 +1093,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // omlx: `if not hasattr(self, "mtp"): weights = {k:v if "mtp." not in k}`
         if mtp == nil {
             weights = weights.filter { !$0.key.contains("mtp.") }
-        } else if let draftW = weights.removeValue(
-            forKey: "mtp.draft_lm_head.weight")
-        {
-            // Declared draft-only lm_head: side-channel the triple out of the
-            // parameter update (there is no Module parameter for it) into the
-            // draft projection storage above.
-            _draftHeadW = draftW
-            _draftHeadS = weights.removeValue(forKey: "mtp.draft_lm_head.scales")
-            _draftHeadZ = weights.removeValue(forKey: "mtp.draft_lm_head.biases")
-        }
-        if mtp != nil, !weights.keys.contains(where: { $0.contains("mtp.") }) {
+        } else if !weights.keys.contains(where: { $0.contains("mtp.") }) {
             // MTP enabled but no mtp.* keys in checkpoint → needs re-conversion.
             // omlx: raises ValueError with "weights are missing the mtp.* tensors"
             print(
@@ -1213,6 +1167,100 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// FUSED-VERIFY VARIANT of `callWithHidden` for the K=1 speculative round.
+    ///
+    /// Identical epilogue -- the final `model.norm` and the vocabulary
+    /// projection still run over EVERY row in one call, so the logits this
+    /// returns are the same tensor `callWithHidden` would return. (Deliberate:
+    /// narrowing the head to row 0 and projecting the bonus row separately
+    /// afterwards turns one ~715 MB weight stream into two on the accept path,
+    /// which is a regression, not a saving.)
+    ///
+    /// What differs is the gated-delta geometry: `nConfirmed` is 0, so the
+    /// stack runs the verify rows as one fused chunk instead of splitting at
+    /// the confirmed prefix, and each layer records a lazy post-row-0 boundary
+    /// stash for ``recomputeFusedPrimaryBoundary(cache:)`` to consume if the
+    /// draft is rejected. This is the same forward geometry every submission
+    /// before the checkpoint split used; it is the reject path, not the rows,
+    /// that this reconstructs differently.
+    ///
+    /// Additive: `callWithHidden` above is untouched and remains the path the
+    /// trusted reference and parity tests take.
+    public func callWithHiddenStashingPrimaryBoundary(
+        input: LMInput.Text, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(
+            input.tokens, cache: cacheOpt, nConfirmed: 0,
+            stashPrimaryBoundary: true)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden)
+    }
+
+    /// See ``Qwen35TextModelInner/recomputeFusedPrimaryBoundary(cache:prefixRows:)``.
+    public func recomputeFusedPrimaryBoundary(cache: [any KVCache], prefixRows: Int = 1) -> Bool {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        return model.recomputeFusedPrimaryBoundary(cache: cacheOpt, prefixRows: prefixRows)
+    }
+
+    /// SEED-PREFILL VARIANT of `callWithHidden`: identical backbone forward, but
+    /// the final norm and the vocabulary projection are applied to the LAST ROW
+    /// ONLY.
+    ///
+    /// WHY THIS EXISTS. `Qwen36MTPBlockSession.begin` bulk-forwards the whole
+    /// 512-token seed and then keeps exactly two things: the last logit row
+    /// (whose argmax is the first pending primary) and the last pre-norm hidden
+    /// row (the context the first draft is chained from). `callWithHidden`
+    /// nevertheless projects ALL 512 hidden rows through the untied 248,320-way
+    /// head, so 511 of the 512 `[1, V]` logit rows are computed and immediately
+    /// discarded. MLX will not elide that: slicing the last row of a lazily
+    /// built matmul still forces the whole matmul, because a slice does not push
+    /// down through a `quantized_matmul` node.
+    ///
+    /// WHAT IS AND IS NOT SHARED WITH `callWithHidden`. The backbone call is
+    /// byte-identical -- same token tensor, same cache array, same `nConfirmed`
+    /// -- so all 64 layers still run over every seed position and every
+    /// recurrent/attention cache ends in the same state at the same offset. Only
+    /// the epilogue narrows. `RMSNorm` reduces over the last axis and the LM head
+    /// is a per-row projection, so both are row-independent and the surviving row
+    /// is mathematically the same vector `callWithHidden` would have put at index
+    /// `S - 1`.
+    ///
+    /// THE ONE REAL RISK, STATED PLAINLY: `[1, 1, H]` and `[1, S, H]` select
+    /// different quantized-matmul geometries (GEMV vs GEMM), which can differ in
+    /// the last ulp. That cannot change the mathematics but could in principle
+    /// flip an exact near-tie in the seed argmax. `Qwen36MTPReferenceSession` is
+    /// deliberately NOT moved onto this seam, so a local exactness run compares
+    /// the narrowed candidate decision against the original full-projection
+    /// frame instead of letting both sides adopt the same change.
+    ///
+    /// Additive: `callWithHidden` above is untouched and remains the path every
+    /// other caller (verify, serial rounds, repair forwards, the reference
+    /// session, the parity tests) uses.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let last = hidden.dim(1) - 1
+        let tail = hidden[0..., last ..< (last + 1), 0...]
+        let normed = model.norm(tail)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        // Pre-norm hidden, exactly as `callWithHidden` returns -- one row.
+        return (logits, tail)
+    }
+
     /// Apply the backbone's final `model.norm` to a hidden state.
     ///
     /// `callWithHidden` returns the PRE-norm hidden by design. MTPLX -- the exactness
@@ -1273,53 +1321,6 @@ extension Qwen35TextModel: MTPCapable {
     ) -> MLXArray {
         mtpForwardWithHidden(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache).0
     }
-
-    /// MTP head module forward WITHOUT the lm_head projection.
-    ///
-    /// Appends the fused `(hidden, nextToken)` positions to `cache` and returns
-    /// the head's post-`mtp.norm` hidden rows `[1, M, H]`. This is the
-    /// committed-history maintenance primitive (MTPLX `update_mtp_cache`,
-    /// runtime.py:364): history rows only need the KV side effect, so skipping
-    /// the 248320-wide vocabulary projection on them is pure savings. The
-    /// caller applies `applyLMHead` to whichever rows it actually samples.
-    public func mtpHeadHiddenForward(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray {
-        guard let mtp else {
-            fatalError("mtpHeadHiddenForward called but MTP head is not attached. "
-                + "Set _qwen35MTPEnabled = true before loading the model.")
-        }
-        return mtp(
-            hidden: hidden,
-            nextTokenIds: nextTokenIds,
-            embedTokens: model.embedTokens,
-            cache: cache)
-    }
-
-    /// The backbone's lm_head (or tied-embedding projection) applied to hidden
-    /// rows. Companion to `mtpHeadHiddenForward` for the rows that need logits.
-    public func applyLMHead(_ x: MLXArray) -> MLXArray {
-        if let lmHead {
-            return lmHead(x)
-        }
-        return model.embedTokens.asLinear(x)
-    }
-
-    /// Draft-only vocabulary projection: the declared head's coarser lm_head
-    /// copy when it ships one (`draft_lm_head.*` in the declared head tree),
-    /// the exact lm_head otherwise. ONLY used to choose draft proposals —
-    /// never for ledger or verify values.
-    public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
-        if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
-            let k = s.dim(1) * 64
-            let bits = w.dim(1) * 32 / k
-            return quantizedMM(
-                x, w, scales: s, biases: z, transpose: true,
-                groupSize: 64, bits: bits, mode: .affine)
-        }
-        return applyLMHead(x)
-    }
-
 
     /// Allocate a fresh KV cache for the MTP head layers.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
@@ -1399,6 +1400,29 @@ extension Qwen35Model: MTPCapable {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
+    /// See `Qwen35TextModel.callWithLastTokenHidden`. Pure pass-through, exactly
+    /// like `callWithHidden` above -- no wrapper-level arithmetic.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithLastTokenHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenStashingPrimaryBoundary`. Pure
+    /// pass-through -- no wrapper-level arithmetic.
+    public func callWithHiddenStashingPrimaryBoundary(
+        input: LMInput.Text, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithHiddenStashingPrimaryBoundary(
+            input: input, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.recomputeFusedPrimaryBoundary`.
+    public func recomputeFusedPrimaryBoundary(cache: [any KVCache], prefixRows: Int = 1) -> Bool {
+        languageModel.recomputeFusedPrimaryBoundary(cache: cache, prefixRows: prefixRows)
+    }
+
     public func mtpForward(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
@@ -1412,25 +1436,6 @@ extension Qwen35Model: MTPCapable {
         languageModel.mtpForwardWithHidden(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
-
-    /// See `Qwen35TextModel.mtpHeadHiddenForward`.
-    public func mtpHeadHiddenForward(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray {
-        languageModel.mtpHeadHiddenForward(
-            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
-    }
-
-    /// See `Qwen35TextModel.applyLMHead`.
-    public func applyLMHead(_ x: MLXArray) -> MLXArray {
-        languageModel.applyLMHead(x)
-    }
-
-    /// See `Qwen35TextModel.applyDraftLMHead`.
-    public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
-        languageModel.applyDraftLMHead(x)
-    }
-
 
     /// See `Qwen35TextModel.applyFinalNorm`.
     public func applyFinalNorm(_ x: MLXArray) -> MLXArray {
