@@ -1224,6 +1224,25 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// Run the same backbone forward while returning the already-computed
+    /// post-final-norm hidden used by the target lm_head. The Qwen MTP track's
+    /// `post_norm` hidden variant consumes exactly this tensor, so exposing it
+    /// avoids launching the identical RMSNorm again in the speculative session.
+    public func callWithPostNormHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, normed)
+    }
+
     /// Apply the backbone's final `model.norm` to a hidden state.
     ///
     /// `callWithHidden` returns the PRE-norm hidden by design. MTPLX -- the exactness
@@ -1461,6 +1480,13 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func callWithPostNormHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithPostNormHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     public func mtpForward(

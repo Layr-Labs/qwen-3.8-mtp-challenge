@@ -53,6 +53,13 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Backbone forward returning `(logits, POST-final-norm hidden)`. The
+    /// logits consume this exact normalized tensor, and the ranked Qwen track's
+    /// `post_norm` MTP variant consumes it too, so callers can share the work.
+    func callWithPostNormHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray)
+
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
