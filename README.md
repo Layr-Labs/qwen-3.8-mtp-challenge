@@ -2,43 +2,35 @@
 
 A benchmark arena for compute-optimal LLM inference on Apple Silicon.
 
-> **NOT LIVE — 3.6 → 3.8 CUTOVER IN PROGRESS.** This repository is being
-> renamed `Layr-Labs/qwen-3.6-mtp-challenge-dev` →
-> `Layr-Labs/qwen-3.8-mtp-challenge-dev` and the ranked track re-pinned from
-> Qwen 3.6 27B onto **Qwen 3.8 27B**. Nothing here can score today: the
-> ranked workflow trusts the post-rename slug, its calibration interlock is
-> `"0"`, the contract fixture's two enablement flags are `false`, and every
-> hidden-artifact pin reads the literal `QWEN38-PENDING-RELEASE`.
+> **The ranked track is live and scoring.** The track is `qwen3.8-27b-mtp-v1`.
+> The contract fixture `fixtures/qwen3_8_27b_mtp_track.json` carries
+> `official_scoring_enabled=true` and
+> `reference_baseline.publication_allowed=true`. The ranked workflow ships
+> `MLXFAST_QWEN_MTP_CALIBRATION_READY: "1"`, and every hidden and public
+> artifact pin holds a real digest. This repository,
+> `Layr-Labs/qwen-3.8-mtp-challenge`, is the public production repository the
+> ranked workflow trusts.
 >
-> **Backbone identity 2026-08-14.** The reference checkpoint is **our own**
-> MLX 4-bit affine / group-64 conversion, produced under a pinned mlx 0.32.0
-> toolchain, of the official bf16 base `Qwen/Qwen3.8-27B` @
-> `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, publishing as
-> `EigenLabs/Qwen3.8-27B-4bit`. It replaces a third-party conversion adopted
-> earlier the same day and **terminated** by the operator's validation
-> kill-switch — the deterministic reconversion cross-check found 994 of 1,847
-> tensors numerically different from our own conversion. Geometry is unaffected
-> and stays **identical to 3.6** — 64 layers on the same 4-layer hybrid repeat,
-> vocab 248320, hidden 5120, 24 attention heads / 4 KV heads, head_dim 256 — so
-> the geometry hedges stay discharged.
+> **Both pinned checkpoints are public.** The backbone is
+> `EigenLabs/Qwen3.8-27B-4bit` @
+> `eda45ab47f465d08d6558f0353a2346e2eb9d5b3`, pinned by the 10 records in
+> `fixtures/reference_qwen3_8_27b_4bit.sha256`. The MTP head is
+> `EigenLabs/Qwen3.8-27B-MTP-bf16` @
+> `26a328e070875b0314d652a039b6b59902690f03` — 15 bf16 tensors — pinned by
+> the 4 records in `fixtures/qwen3_8_27b_mtp_head.sha256`. Both download
+> anonymously. You do not need a Hugging Face token.
 >
-> **Both halves are published** as of 2026-08-14: the backbone at
-> `eda45ab47f465d08d6558f0353a2346e2eb9d5b3` with a generated 10-record byte
-> manifest, and the **MTP head** — `EigenLabs/Qwen3.8-27B-MTP-bf16`, 15 bf16
-> tensors extracted from the same bf16 base — at
-> `26a328e070875b0314d652a039b6b59902690f03` with a 4-record one (the
-> republish that added the `config.json` and `model.safetensors.index.json`
-> the head loader refuses to run without). Both
-> repositories are **private**, so provisioning either needs a Hugging Face
-> token with read access. What is still unpublished is every hidden and public
-> artifact (`QWEN38-PENDING-RELEASE`), which is what keeps the track inert.
+> **Backbone provenance.** The reference checkpoint is **our own** MLX 4-bit
+> affine / group-64 conversion, produced under a pinned mlx 0.32.0 toolchain,
+> of the official bf16 base `Qwen/Qwen3.8-27B` @
+> `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. Its geometry matches 3.6: 64
+> layers on the same 4-layer hybrid repeat, vocab 248320, hidden 5120, 24
+> attention heads / 4 KV heads, head_dim 256.
 >
-> Values still carrying a **3.6 measurement** behind
-> that closed gate are marked `QWEN38-VERIFY-AT-RELEASE` and must be
-> re-derived, not re-read.
-> [`docs/qwen-mtp-go-live-runbook.md`](docs/qwen-mtp-go-live-runbook.md) is
-> the record of the **3.6** go-live and its ids and numbers are 3.6-era
-> throughout.
+> The timed pool and the on-box baseline are measured on the Qwen 3.8 tower.
+> [`docs/qwen-mtp-go-live-runbook.md`](docs/qwen-mtp-go-live-runbook.md)
+> records the 3.6 go-live procedure that the 3.8 bring-up re-ran; its ids and
+> numbers are 3.6-era.
 
 The default — and only — ranked track in **this** repository is
 `qwen3.8-27b-mtp-v1`: the Qwen 3.8 27B target drafts a block with its own
@@ -48,7 +40,10 @@ the longest correct prefix. `benchmark.json` IS the Qwen-MTP manifest
 [`.github/workflows/qwen-mtp-ranked-benchmark.yml`](.github/workflows/qwen-mtp-ranked-benchmark.yml),
 and the track contract is `fixtures/qwen3_8_27b_mtp_track.json`. See
 [`docs/qwen-mtp-go-live-runbook.md`](docs/qwen-mtp-go-live-runbook.md) for
-the go-live procedure.
+the go-live procedure. Its local entrypoints are `./setup.sh &&
+./setup-qwen-mtp.sh` and `./benchmark-qwen-mtp.sh --local-iterate`;
+[`TASK.md`](TASK.md) is the task statement. The Quickstart and the sections
+after it are inherited DFlash prose and describe a different track.
 
 > **CONTRACT CHANGE — 2026-08-14 (operator-ratified).** Two things moved
 > together and they are one change. **(1) The editable surface is now the UNION**
@@ -60,11 +55,10 @@ the go-live procedure.
 > **(2) Scoring is re-anchored at serial = 1.0**: the published score is the
 > median of the eight per-prompt *raw* serial-relative speedups, floored at 0.90
 > and ceilinged at 3.0, with no normalisation step. Serial decode is 1.0 by
-> construction, and an unmodified tree need not be: on Qwen 3.6 it measured
-> ~0.935, a real regression rather than the zero point. `QWEN38-VERIFY-AT-RELEASE`
-> — that figure, the floor and the ceiling are all 3.6-era and are re-derived
-> during the 3.8 bring-up. The definitive editable-vs-trusted
-> table is [`docs/qwen-mtp-editable-surface.md`](docs/qwen-mtp-editable-surface.md);
+> construction, and an unmodified tree need not be: on Qwen 3.8 it measures
+> ~0.994, a real regression rather than the zero point. The floor and the
+> ceiling are operator decisions and are unchanged. The definitive
+> editable-vs-trusted table is [`docs/qwen-mtp-editable-surface.md`](docs/qwen-mtp-editable-surface.md);
 > the scoring derivation is in the go-live runbook.
 
 > **REPO SPLIT — 2026-08-13.** This repository was split from
@@ -250,7 +244,7 @@ new on 2026-08-14 and is the speculative apparatus itself:
 |---|---|
 | `mtp-head.manifest.json`, `mtp-head/` | **The MTP head itself.** Declare a head (`source`, `sha256`, `bytes`) and the runner fetches and digest-verifies it before the sandbox opens; ship a small one in `mtp-head/` for direct-dispatch testing. Absent declaration = the organizer-pinned head, which is the normal case. A head only *proposes* — the pinned target still decides every emitted token — which is why this can be yours. |
 | `Sources/MLXFastModel/Qwen36MTP*.swift` | **The drafting code and the draft schedule.** `Qwen36MTPBlockSession.draftPolicy` is the shipped per-round schedule (a constant 2) and is the first thing worth changing: any count from 0 to the trusted maximum of 8 is legal, per round, adaptively. |
-| `Sources/MLXFastModel/` | Qwen 3.6 runtime: weight loading, attention, MoE MLP, KV caches, prefill/decode execution. **Primary target.** |
+| `Sources/MLXFastModel/` | Qwen 3.8 runtime: weight loading, attention, MoE MLP, KV caches, prefill/decode execution. **Primary target.** |
 | `Sources/MLXFastTransform/` | Offline reference-checkpoint transform into benchmark-ready `weights/`. |
 | `Vendor/mlx-swift-lm/Libraries/` (listed files) | The vendored Laguna model (`MLXLLM/Models/Laguna.swift`), the DFlash target adapters (`MLXLLM/DFlashTarget.swift`, `MLXLLM/DFlashVerifyLinear.swift`), the DFlash block-decode runtime this track adds (the eight `MLXSpeculative/DFlash*.swift` files listed in `benchmark.json` — draft dispatch, batched multi-row verification, greedy rounds, KV rollback of rejected rows, draft-model configuration; `DFlashBenchmark.swift` matches the glob but is not editable), and the `MLXLMCommon` plumbing they use directly (MoE/attention dispatch helpers, KV caches, RoPE utilities/application, compiled decode, evaluation). |
 | `Vendor/mlx-swift/Source/Cmlx/` (listed files) | The MLX Metal kernels Laguna dispatches — SDPA (`steel/attn`, `sdpa_vector`), NVFP4 `fp_quantized` matmul plus shared quantized dispatch (incl. `_nax`), MoE gather GEMM (`steel_gemm_gather*`), `steel/gemm`, `gemv`, `rope`, `rms_norm`, `softmax`, `sort`, `reduce`, `copy`, elementwise, `arg_reduce`, gather indexing — as AOT `.metal`/`.h` sources and their JIT `mlx-generated/*.cpp` twins. |
@@ -372,8 +366,8 @@ against the trusted serial K=1 target oracle.
 > step and no prompt lottery: a ranked run times all eight prompts and the
 > median (mean of the two central order statistics — 8 is even) is the score.
 >
-> An **unmodified tree scores ~0.935**, not 1.0. The shipped depth-2
-> configuration is a measured ~6.5% regression against true serial decode at
+> An **unmodified tree scores ~0.994**, not 1.0. The shipped depth-2
+> configuration is a measured ~0.6% regression against true serial decode at
 > the 512-token window; the leaderboard says so rather than defining it away.
 > A candidate that **stops drafting entirely** is the serial control and scores
 > exactly 1.0 — a legal, unremarkable submission.

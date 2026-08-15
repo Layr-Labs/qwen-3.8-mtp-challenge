@@ -345,21 +345,35 @@ func participantDocsExposeDefaultCLIInstallDirectory() throws {
 }
 
 @Test
-func participantDocsDescribeDefaultDFlashScoreAndFloor() throws {
+func participantDocsDescribeTheirOwnTrackScoreAndFloor() throws {
     let readme = try String(contentsOfFile: "README.md", encoding: .utf8)
     let challenge = try String(contentsOfFile: "TASK.md", encoding: .utf8)
 
+    // The two documents describe different tracks, and that is the contract.
+    // TASK.md is the task statement for the ranked track of THIS repository,
+    // qwen3.8-27b-mtp-v1: a decode-only paired speedup anchored at serial =
+    // 1.0, the median of eight per-prompt RAW ratios, floor 0.90 and ceiling
+    // 3.0, no normalisation step. README.md keeps the inherited DFlash prose
+    // -- that track's sources, scripts and docs are retained in-tree -- so its
+    // DECODE-ONLY paired speedup, per-prompt NORMALISED by each prompt's
+    // pinned no-op reference with a single 0.95 normalised floor over a
+    // 512-token window (Amendment 32), is still pinned here. The retired
+    // serial weighted formula must be gone from both; so must the raw 0.83
+    // floor as a stated ranked floor.
+    #expect(readme.contains("dflash_decode_speedup"))
+    #expect(readme.contains("0.95"))
+    #expect(readme.lowercased().contains("no-op reference"))
+    #expect(readme.lowercased().contains("normalis"))
+
+    #expect(challenge.contains("qwen3.8-27b-mtp-v1"))
+    #expect(challenge.contains("0.90"))
+    #expect(challenge.contains("3.0"))
+    #expect(challenge.lowercased().contains("serial = 1.0"))
+    #expect(challenge.lowercased().contains("median"))
+    #expect(!challenge.contains("dflash_decode_speedup"))
+
     for document in [readme, challenge] {
-        // The default (and only) ranked track is DFlash: a DECODE-ONLY paired
-        // speedup, per-prompt NORMALISED by each prompt's pinned no-op reference,
-        // with a single 0.95 normalised floor over a 512-token window (Amendment
-        // 32). The retired serial weighted formula must be gone; so must the raw
-        // 0.83 floor as the stated ranked floor.
-        #expect(document.contains("dflash_decode_speedup"))
         #expect(document.lowercased().contains("decode-only"))
-        #expect(document.contains("0.95"))
-        #expect(document.lowercased().contains("normalis"))
-        #expect(document.lowercased().contains("no-op reference"))
         #expect(document.contains("512"))
         #expect(!document.contains("dflash_decode_speedup >= 0.83"))
         #expect(!document.contains("decode_speedup^0.75 * prefill_speedup^0.25"))
