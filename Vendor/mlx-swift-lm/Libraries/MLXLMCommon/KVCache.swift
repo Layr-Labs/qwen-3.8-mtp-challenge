@@ -1248,50 +1248,6 @@ public class ArraysCache: BaseKVCache {
     /// `rollbackState` (consumed or cleared by the round that requested it).
     public var rollbackCheckpoints: [(MLXArray, MLXArray)] = []
 
-    /// Proposal-verify tape for rebuilding an arbitrary committed recurrent
-    /// prefix on demand. Unlike `rollbackCheckpoints`, this retains the compact
-    /// inputs to the recurrence rather than materialising one fp32 SSM state at
-    /// every draft boundary. The round that requested it must consume or clear
-    /// it before another forward.
-    public var prefixReplayTape: PrefixReplayTape? = nil
-
-    public struct PrefixReplayTape {
-        public let convInput: MLXArray
-        public let q: MLXArray
-        public let k: MLXArray
-        public let v: MLXArray
-        public let a: MLXArray
-        public let b: MLXArray
-        public let ssmPre: MLXArray?
-        public let mask: MLXArray?
-        public let rowCount: Int
-        public let convStateRows: Int
-
-        public init(
-            convInput: MLXArray,
-            q: MLXArray,
-            k: MLXArray,
-            v: MLXArray,
-            a: MLXArray,
-            b: MLXArray,
-            ssmPre: MLXArray?,
-            mask: MLXArray?,
-            rowCount: Int,
-            convStateRows: Int
-        ) {
-            self.convInput = convInput
-            self.q = q
-            self.k = k
-            self.v = v
-            self.a = a
-            self.b = b
-            self.ssmPre = ssmPre
-            self.mask = mask
-            self.rowCount = rowCount
-            self.convStateRows = convStateRows
-        }
-    }
-
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
