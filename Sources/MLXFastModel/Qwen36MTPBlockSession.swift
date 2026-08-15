@@ -422,7 +422,11 @@ public final class Qwen36MTPBlockSession {
     // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        // Draft deeper on top of the promoted fast-kernel base. Depth-1 leaves
+        // multi-token acceptance unused; the accept-walk still commits only the
+        // correct prefix, so a deeper offer that the head gets right advances
+        // more tokens per verify forward. Rejected tail costs one verify window.
+        Swift.min(offeredDepth, 3)
     }
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
