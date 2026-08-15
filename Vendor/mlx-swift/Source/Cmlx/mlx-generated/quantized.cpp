@@ -882,7 +882,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     uint simd_gid,
     uint simd_lid) {
   static_assert(M >= 2 && M <= 9, "multi-row QMV supports M in [2, 9]");
-  constexpr int inputs_per_group = 2;
+  constexpr int inputs_per_group = 3;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
@@ -897,12 +897,20 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   const int in_vec_size_w = in_vec_size / in_vec_bytes_per_row_divisor;
   const int in_vec_size_g = in_vec_size / 64;
 
-  const bool has_pair = first_m + 1 < M;
-  thread float2 pair_result[rows_per_simd];
-  thread float single_result[rows_per_simd];
+  // Three verify rows share one weight-tile read per K-block: a float2 pair
+  // (rows first_m, first_m+1) plus one scalar row (first_m+2). Leaner on
+  // registers than a four-wide group while still cutting weight reads on deep
+  // verifies. Every branch keys off threadgroup uniforms, so simd_sum is
+  // always taken by the full lane set. Arithmetic is the proven kernel's.
+  const bool has_1 = first_m + 1 < M;
+  const bool has_2 = first_m + 2 < M;
+  thread float2 pair0[rows_per_simd];
+  thread float single0[rows_per_simd];
+  thread float single2[rows_per_simd];
   for (int r = 0; r < rows_per_simd; r++) {
-    pair_result[r] = 0.0f;
-    single_result[r] = 0.0f;
+    pair0[r] = 0.0f;
+    single0[r] = 0.0f;
+    single2[r] = 0.0f;
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
@@ -931,28 +939,37 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
         x + first_m * in_vec_size + k + simd_lid * values_per_thread;
     const float sum0 =
         load_vector<T, float, values_per_thread, 4>(xm0, x0);
-    if (has_pair) {
+    if (has_1) {
       thread float x1[values_per_thread];
-      const device T* xm1 = xm0 + in_vec_size;
       const float sum1 =
-          load_vector<T, float, values_per_thread, 4>(xm1, x1);
+          load_vector<T, float, values_per_thread, 4>(xm0 + in_vec_size, x1);
       for (int r = 0; r < rows_per_simd; r++) {
-        pair_result[r] += qdot_affine4_loaded_pair(
+        pair0[r] += qdot_affine4_loaded_pair(
             packed[r], x0, x1, scale_local[r], bias_local[r],
             float2(sum0, sum1));
       }
     } else {
       for (int r = 0; r < rows_per_simd; r++) {
-        single_result[r] += qdot_affine4_loaded<float>(
+        single0[r] += qdot_affine4_loaded<float>(
             packed[r], x0, scale_local[r], bias_local[r], sum0);
+      }
+    }
+
+    if (has_2) {
+      thread float x2[values_per_thread];
+      const float sum2 = load_vector<T, float, values_per_thread, 4>(
+          xm0 + 2 * in_vec_size, x2);
+      for (int r = 0; r < rows_per_simd; r++) {
+        single2[r] += qdot_affine4_loaded<float>(
+            packed[r], x2, scale_local[r], bias_local[r], sum2);
       }
     }
   }
 
-  if (has_pair) {
+  if (has_1) {
     for (int r = 0; r < rows_per_simd; r++) {
-      const float reduced0 = simd_sum(pair_result[r].x);
-      const float reduced1 = simd_sum(pair_result[r].y);
+      const float reduced0 = simd_sum(pair0[r].x);
+      const float reduced1 = simd_sum(pair0[r].y);
       if (simd_lid == 0) {
         y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced0);
         y[(first_m + 1) * out_vec_size + out_row + r] =
@@ -961,9 +978,19 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     }
   } else {
     for (int r = 0; r < rows_per_simd; r++) {
-      const float reduced = simd_sum(single_result[r]);
+      const float reduced = simd_sum(single0[r]);
       if (simd_lid == 0) {
         y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+
+  if (has_2) {
+    for (int r = 0; r < rows_per_simd; r++) {
+      const float reduced2 = simd_sum(single2[r]);
+      if (simd_lid == 0) {
+        y[(first_m + 2) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced2);
       }
     }
   }
