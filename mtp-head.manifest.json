@@ -1,13 +1,16 @@
 {
   "version": 1,
-  "source": "pinned",
+  "source": "remote",
+  "source_url": "hf:p0ly31/Qwen3.8-27B-MTP-head-q4mlp@58224b03dbf24916f121e1e7d27540454fa55fc8",
   "max_bytes": 2147483648,
 
-  "repository": "EigenLabs/Qwen3.8-27B-MTP-bf16",
-  "revision": "26a328e070875b0314d652a039b6b59902690f03",
-  "tensor_count": 15,
-  "sha256": "8fceddc664f3ea96d02e304463aa1319213ff52cdf1f3401d4bce64e7075c349",
-  "bytes": 849400347,
+  "repository": "p0ly31/Qwen3.8-27B-MTP-head-q4mlp",
+  "revision": "58224b03dbf24916f121e1e7d27540454fa55fc8",
+  "tensor_count": 26,
+  "sha256": "b6983fa2a426d3aa0594b7dfe75768c8ad62e0607ae6549370507c11feee9d71",
+  "bytes": 945903182,
+
+  "declared_head_note": "HYBRID QUANTIZED DERIVATIVE of the organizer-pinned head EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e070875b0314d652a039b6b59902690f03, plus a DRAFT-ONLY coarse vocabulary projection. Contents: fc.weight and layers.0.mlp.{gate,up,down}_proj.weight requantized to affine 4-bit group-64 (weight/scales/biases triples, mlx.core.quantize); draft_lm_head.{weight,scales,biases} = an affine 3-bit group-64 copy of the exact backbone lm_head, consumed ONLY to argmax draft proposals (the verify/ledger path keeps the exact lm_head); every other tensor byte-identical bf16 (attention q/k/v/o, all norms). 26 tensors, one model.safetensors. sha256 above is the runner's tree-digest rule over the single staged file; bytes is its size. Public repository, anonymous download. The head only PROPOSES: nothing here can move an emitted token or a ledger value; the baseline leg keeps the pinned bf16 head.",
 
   "note": "THE CHECKED-IN DECLARATION, and it selects the ORGANIZER-PINNED head. This file is an editable path (benchmark.json editablePaths) and an OPTIONAL one: a submission archive that does not carry it keeps this copy, which is why the default has to be spelled here rather than left to absence. Absence and an explicit source of 'pinned' are the only two things that select the pinned head; a declaration that is PRESENT and broken -- unreadable, unparseable, or internally inconsistent -- is a REFUSAL and never a silent fall back, because 'your head declaration was broken so we quietly scored you on the pinned head' is how a leaderboard number becomes unattributable.",
 

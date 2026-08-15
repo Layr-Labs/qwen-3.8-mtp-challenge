@@ -219,8 +219,27 @@ public enum Qwen36MTPHeadAttachment {
             atPath: headDirectory.path, isDirectory: &isDirectory),
             isDirectory.boolValue
         else {
+            // Distinguish absent from present-but-unreadable LOUDLY: a
+            // sandboxed worker whose profile does not cover the staged
+            // declared-head directory fails here with what looks like
+            // "missing", and the sealed gate log is the only place the real
+            // cause can surface. errno and an access probe make it legible.
+            let probe = access(headDirectory.path, R_OK)
+            let errnoValue = errno
+            let parent = headDirectory.deletingLastPathComponent()
+            let parentListing = (try? fileManager.contentsOfDirectory(
+                atPath: parent.path)) ?? []
+            let diagnostic = "head-dir diagnostic: path=\(headDirectory.path) "
+                + "fileExists=false access(R_OK)=\(probe) errno=\(errnoValue) "
+                + "(\(String(cString: strerror(errnoValue)))) "
+                + "parent=\(parent.path) parentReadable="
+                + "\(fileManager.isReadableFile(atPath: parent.path)) "
+                + "parentEntries=\(parentListing.prefix(8))"
+            FileHandle.standardError.write(Data((diagnostic + "\n").utf8))
             throw MLXFastError.invalidInput(
-                "the Qwen MTP head directory does not exist: \(headDirectory.path)")
+                "the Qwen MTP head directory does not exist or is not "
+                    + "readable by this process: \(headDirectory.path) — "
+                    + diagnostic)
         }
         let indexURL = headDirectory.appendingPathComponent(
             "model.safetensors.index.json")
