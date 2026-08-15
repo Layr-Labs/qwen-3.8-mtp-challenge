@@ -400,6 +400,17 @@ final class Qwen35Attention: Module {
 
     let rope: RoPELayer
 
+    // Packed Q/K/V concat on N. Underscore so it is not a Module parameter.
+    // Built once from already-quantized q/k/v; never attached as a child.
+    private var _qkvW: MLXArray?
+    private var _qkvS: MLXArray?
+    private var _qkvZ: MLXArray?
+    private var _qkvGS = 64
+    private var _qkvBits = 4
+    private var _qkvMode = QuantizationMode.affine
+    private var _qOut = 0
+    private var _kOut = 0
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -430,19 +441,52 @@ final class Qwen35Attention: Module {
         super.init()
     }
 
+    /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
+    /// concatenating already-packed weights on N is bit-exact with three
+    /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
+    private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
+            let y = quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
+                groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            let qEnd = _qOut
+            let kEnd = _qOut + _kOut
+            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+        }
+        if let q = qProj as? QuantizedLinear,
+           let k = kProj as? QuantizedLinear,
+           let v = vProj as? QuantizedLinear,
+           q.groupSize == k.groupSize, k.groupSize == v.groupSize,
+           q.bits == k.bits, k.bits == v.bits,
+           q.mode == k.mode, q.mode == .affine,
+           let qz = q.biases, let kz = k.biases, let vz = v.biases
+        {
+            _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
+            _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
+            _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            _qkvGS = q.groupSize
+            _qkvBits = q.bits
+            _qkvMode = q.mode
+            _qOut = q.shape.0
+            _kOut = k.shape.0
+            return qkv(x)
+        }
+        return (qProj(x), kProj(x), vProj(x))
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        let (qProjOutput, keysIn, valuesIn) = qkv(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = keysIn
+        var values = valuesIn
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
