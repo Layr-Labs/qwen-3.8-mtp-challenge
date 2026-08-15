@@ -1240,58 +1240,6 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
-    /// Per-boundary checkpoints for a multi-draft verify: entry t is the
-    /// `(conv_state, ssm_state)` after verify row t, so a partial acceptance
-    /// of `a` drafts restores entry `a` and trims only the rejected attention
-    /// rows — no repair forward at any depth. Entry 0 mirrors `rollbackState`.
-    /// Written by the fused width-S gated-delta verify; transient like
-    /// `rollbackState` (consumed or cleared by the round that requested it).
-    public var rollbackCheckpoints: [(MLXArray, MLXArray)] = []
-
-    /// Proposal-verify tape for rebuilding an arbitrary committed recurrent
-    /// prefix on demand. Unlike `rollbackCheckpoints`, this retains the compact
-    /// inputs to the recurrence rather than materialising one fp32 SSM state at
-    /// every draft boundary. The round that requested it must consume or clear
-    /// it before another forward.
-    public var prefixReplayTape: PrefixReplayTape? = nil
-
-    public struct PrefixReplayTape {
-        public let convInput: MLXArray
-        public let q: MLXArray
-        public let k: MLXArray
-        public let v: MLXArray
-        public let a: MLXArray
-        public let b: MLXArray
-        public let ssmPre: MLXArray?
-        public let mask: MLXArray?
-        public let rowCount: Int
-        public let convStateRows: Int
-
-        public init(
-            convInput: MLXArray,
-            q: MLXArray,
-            k: MLXArray,
-            v: MLXArray,
-            a: MLXArray,
-            b: MLXArray,
-            ssmPre: MLXArray?,
-            mask: MLXArray?,
-            rowCount: Int,
-            convStateRows: Int
-        ) {
-            self.convInput = convInput
-            self.q = q
-            self.k = k
-            self.v = v
-            self.a = a
-            self.b = b
-            self.ssmPre = ssmPre
-            self.mask = mask
-            self.rowCount = rowCount
-            self.convStateRows = convStateRows
-        }
-    }
-
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }

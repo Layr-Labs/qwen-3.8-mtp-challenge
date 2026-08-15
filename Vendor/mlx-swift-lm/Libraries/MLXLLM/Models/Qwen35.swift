@@ -166,105 +166,6 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
-// MARK: - GatedDelta kernel with mid-state checkpoint
-
-/// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
-/// THIRD output: the recurrent state after timestep 0. For the width-2 MTP
-/// verify this makes the post-primary rollback checkpoint a free by-product
-/// of the single recurrence launch, instead of paying a second launch plus a
-/// full fp32 state round-trip through device memory (3.15 MB/layer/launch,
-/// x48 layers). Bit-exact vs two T=1 launches: the state lives in fp32
-/// registers across the in-kernel t-loop and the eliminated round-trip was a
-/// lossless f32 store/reload. Body is textually the vendored kernel plus the
-/// `m_state` pointer and the `t == 0` store; no new template parameters and
-/// no unused constexpr (M5 gen-17 JIT builds are strict about that).
-private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
-    let source = """
-            auto n = thread_position_in_grid.z;
-            auto b_idx = n / Hv;
-            auto hv_idx = n % Hv;
-            auto hk_idx = hv_idx / (Hv / Hk);
-            constexpr int n_per_t = Dk / 32;
-
-            // q, k: [B, T, Hk, Dk]
-            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
-            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
-
-            // v, y: [B, T, Hv, Dv]
-            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
-            y += b_idx * T * Hv * Dv + hv_idx * Dv;
-
-            auto dk_idx = thread_position_in_threadgroup.x;
-            auto dv_idx = thread_position_in_grid.y;
-
-            // g: [B, T, Hv]
-            auto g_ = g + b_idx * T * Hv;
-            auto beta_ = beta + b_idx * T * Hv;
-
-            // state_in, state_out: [B, Hv, Dv, Dk]; state_mid: [B, T-1, Hv, Dv, Dk]
-            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
-
-            float state[n_per_t];
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              state[i] = static_cast<float>(i_state[s_idx]);
-            }
-
-            for (int t = 0; t < T; ++t) {
-              if (true) {
-                float kv_mem = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] * g_[hv_idx];
-                  kv_mem += state[i] * k_[s_idx];
-                }
-                kv_mem = simd_sum(kv_mem);
-
-                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
-
-                float out = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  state[i] = state[i] + k_[s_idx] * delta;
-                  out += state[i] * q_[s_idx];
-                }
-                out = simd_sum(out);
-                if (thread_index_in_simdgroup == 0) {
-                  y[dv_idx] = static_cast<InT>(out);
-                }
-              } else {
-                y[dv_idx] = static_cast<InT>(0);
-              }
-              if (t < T - 1) {
-                auto m_state = state_mid
-                    + (((b_idx * (T - 1) + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
-                for (int i = 0; i < n_per_t; ++i) {
-                  auto s_idx = n_per_t * dk_idx + i;
-                  m_state[s_idx] = static_cast<StT>(state[i]);
-                }
-              }
-              // Increment data pointers to next time step
-              q_ += Hk * Dk;
-              k_ += Hk * Dk;
-              v_ += Hv * Dv;
-              y += Hv * Dv;
-              g_ += Hv;
-              beta_ += Hv;
-            }
-            for (int i = 0; i < n_per_t; ++i) {
-              auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<StT>(state[i]);
-            }
-        """
-    return MLXFast.metalKernel(
-        name: "qwen35_gated_delta_step_mid",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
-        outputNames: ["y", "state_out", "state_mid"],
-        source: source
-    )
-}()
-
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
@@ -289,23 +190,6 @@ final class Qwen35GatedDeltaNet: Module {
 
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
-
-    // Decode-width fused input projections: ONE affine-4 matmul over the
-    // concatenated [qkv | z | b | a] output rows (N = 10240+6144+48+48 =
-    // 16480) instead of four separate launches per layer per forward. The
-    // two 48-wide launches are pure overhead at M<=2. Bit-exact per output
-    // row for the same reason as the FA QKV fuse: groups run along K, every
-    // N here and the fused N keep qmv_fast eligibility (N%8==0, K%512==0),
-    // and a row's reduction order does not depend on the launch it rides in.
-    // Prefill (S > 2) keeps the four separate calls so qmm/split-k reduction
-    // orders match the pinned baseline byte-for-byte. Underscore storage so
-    // none of this is a Module parameter.
-    private var _inW: MLXArray?
-    private var _inS: MLXArray?
-    private var _inZ: MLXArray?
-    private var _inGS = 64
-    private var _inBits = 4
-    private var _inMode = QuantizationMode.affine
 
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
@@ -347,49 +231,6 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
-    }
-
-    /// Lazily build and apply the fused [qkv|z|b|a] projection. Returns nil
-    /// until every input projection is a matching affine `QuantizedLinear`
-    /// (bf16 trees fall back to the four separate calls).
-    private func fusedInProjections(
-        _ x: MLXArray
-    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
-        if let w = _inW, let s = _inS, let zp = _inZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: zp, transpose: true,
-                groupSize: _inGS, bits: _inBits, mode: _inMode)
-            let qkvEnd = keyDim * 2 + valueDim
-            let zEnd = qkvEnd + valueDim
-            let bEnd = zEnd + numVHeads
-            return (
-                y[.ellipsis, ..<qkvEnd],
-                y[.ellipsis, qkvEnd ..< zEnd],
-                y[.ellipsis, zEnd ..< bEnd],
-                y[.ellipsis, bEnd...]
-            )
-        }
-        guard let q = inProjQKV as? QuantizedLinear,
-              let z = inProjZ as? QuantizedLinear,
-              let b = inProjB as? QuantizedLinear,
-              let a = inProjA as? QuantizedLinear,
-              q.groupSize == z.groupSize, z.groupSize == b.groupSize,
-              b.groupSize == a.groupSize,
-              q.bits == z.bits, z.bits == b.bits, b.bits == a.bits,
-              q.mode == z.mode, z.mode == b.mode, b.mode == a.mode,
-              q.mode == .affine,
-              let qz = q.biases, let zz = z.biases, let bz = b.biases,
-              let az = a.biases
-        else { return nil }
-        _inW = concatenated([q.weight, z.weight, b.weight, a.weight], axis: 0)
-            .contiguous()
-        _inS = concatenated([q.scales, z.scales, b.scales, a.scales], axis: 0)
-            .contiguous()
-        _inZ = concatenated([qz, zz, bz, az], axis: 0).contiguous()
-        _inGS = q.groupSize
-        _inBits = q.bits
-        _inMode = q.mode
-        return fusedInProjections(x)
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -454,192 +295,6 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
-    /// Single-chunk verify twin that retains only the ingredients needed to
-    /// reconstruct a committed recurrent prefix after the target acceptance
-    /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
-    /// midpoint state tensor is produced on the hot path.
-    /// WIDTH-WALL CHUNK BOUNDARY. Verify widths 6...9 drift from the serial
-    /// trajectory in top-2 values at rank (the `sdpaWidthWallDepthCap`
-    /// receipts: drift starts at the 6th row, widths 2...5 are bit-exact),
-    /// through wide-shape kernel selection in the recurrence prologue (the
-    /// conv runs over 3+S positions and is the shape-dependent op in this
-    /// path; the recurrence's own t-loop is order-independent of T). The fix
-    /// removes the wide shapes: split S in 6...9 into [S-4, 4] — both
-    /// sub-widths inside the rank-proven 2...5 range — chaining the fp32
-    /// recurrent state losslessly between the two calls. Replay MUST mirror
-    /// the same boundary (see `replayPrefix`), which is why this is the one
-    /// shared source of truth for it. Returns nil at widths that stay on the
-    /// proven single-chunk form.
-    fileprivate static func verifyChunkBoundary(_ rows: Int) -> Int? {
-        guard rows >= 6, rows <= 9 else { return nil }
-        return rows - 4
-    }
-
-    private func processChunkStashingPrefix(
-        qkv: MLXArray,
-        a: MLXArray,
-        b: MLXArray,
-        convState: MLXArray,
-        ssmState: MLXArray?,
-        mask: MLXArray?
-    ) -> (
-        out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
-        tape: ArraysCache.PrefixReplayTape
-    ) {
-        let B = qkv.dim(0)
-        let S = qkv.dim(1)
-        let convInput = concatenated([convState, qkv], axis: 1)
-        let nKeep = convKernelSize - 1
-        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-
-        // The conv prologue and the recurrence for one row range. `lo ..< hi`
-        // rows of the verify block; the conv window for those rows is the
-        // matching slice of the SAME concatenated conv input the single-chunk
-        // form builds, so per-position conv windows are identical and the
-        // chunked conv length (3 + rows) stays in the rank-proven regime.
-        func prologueAndScan(
-            _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
-        ) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
-            let rows = hi - lo
-            let convOut = silu(
-                conv1d(convInput[0..., lo ..< (hi + nKeep), 0...]))
-            let convSplit = MLX.split(
-                convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, rows, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, rows, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, rows, numVHeads, headVDim)
-
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-            let (out, newState) = gatedDeltaUpdate(
-                q: qNormed,
-                k: kNormed,
-                v: v,
-                a: a[0..., lo ..< hi, 0...],
-                b: b[0..., lo ..< hi, 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: stateIn,
-                mask: mask.map { $0[0..., lo ..< hi] }
-            )
-            return (out, newState, qNormed, kNormed, v)
-        }
-
-        let out: MLXArray
-        let newSsmState: MLXArray
-        let tapeQ: MLXArray
-        let tapeK: MLXArray
-        let tapeV: MLXArray
-        if let c1 = Self.verifyChunkBoundary(S) {
-            let (out1, seamState, q1, k1, v1) = prologueAndScan(0, c1, ssmState)
-            let (out2, finalState, q2, k2, v2) = prologueAndScan(c1, S, seamState)
-            out = concatenated([out1, out2], axis: 1)
-            newSsmState = finalState
-            tapeQ = concatenated([q1, q2], axis: 1)
-            tapeK = concatenated([k1, k2], axis: 1)
-            tapeV = concatenated([v1, v2], axis: 1)
-        } else {
-            let (o, s, q, k, v) = prologueAndScan(0, S, ssmState)
-            out = o
-            newSsmState = s
-            tapeQ = q
-            tapeK = k
-            tapeV = v
-        }
-
-        let tape = ArraysCache.PrefixReplayTape(
-            convInput: convInput,
-            q: tapeQ,
-            k: tapeK,
-            v: tapeV,
-            a: a,
-            b: b,
-            ssmPre: ssmState.map { $0[.ellipsis] },
-            mask: mask.map { $0[.ellipsis] },
-            rowCount: S,
-            convStateRows: nKeep)
-        return (out, newConvState, newSsmState, tape)
-    }
-
-    fileprivate func canReplayPrefix(
-        cache: MambaCache, committedRows: Int
-    ) -> Bool {
-        guard let tape = cache.prefixReplayTape,
-              committedRows > 0,
-              committedRows < tape.rowCount,
-              tape.convStateRows == convKernelSize - 1,
-              tape.convInput.dim(1)
-                  >= committedRows + tape.convStateRows,
-              tape.q.dim(1) == tape.rowCount,
-              tape.k.dim(1) == tape.rowCount,
-              tape.v.dim(1) == tape.rowCount,
-              tape.a.dim(1) == tape.rowCount,
-              tape.b.dim(1) == tape.rowCount
-        else { return false }
-        return true
-    }
-
-    /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
-    /// from the exact pre-verify state and transformed recurrence inputs.
-    /// Call only after every GDN layer has passed `canReplayPrefix`.
-    fileprivate func replayPrefix(
-        cache: MambaCache, committedRows: Int
-    ) -> Bool {
-        guard canReplayPrefix(cache: cache, committedRows: committedRows),
-              let tape = cache.prefixReplayTape
-        else { return false }
-        // Replay MUST mirror the forward's chunk boundary (width-wall fix):
-        // a wide tape's forward ran as [c1, rowCount-c1], so the state after
-        // row t is the chained two-call state. Replaying rows 0 ..< r as one
-        // call would re-introduce a wide recurrence shape AND diverge from
-        // the forward's own chaining. r <= c1 is a prefix of the forward's
-        // first call; r > c1 replays the first call in full (bitwise the
-        // same call the forward made) and a prefix of the second from the
-        // reproduced seam state.
-        func replayRange(
-            _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
-        ) -> MLXArray {
-            let rows = lo ..< hi
-            let (_, state) = gatedDeltaUpdate(
-                q: tape.q[0..., rows, 0...],
-                k: tape.k[0..., rows, 0...],
-                v: tape.v[0..., rows, 0...],
-                a: tape.a[0..., rows, 0...],
-                b: tape.b[0..., rows, 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: stateIn,
-                mask: tape.mask.map { $0[0..., rows] }
-            )
-            return state
-        }
-        let boundarySsm: MLXArray
-        if let c1 = Self.verifyChunkBoundary(tape.rowCount),
-           committedRows > c1
-        {
-            let seamState = replayRange(0, c1, tape.ssmPre)
-            boundarySsm = replayRange(c1, committedRows, seamState)
-        } else {
-            boundarySsm = replayRange(0, committedRows, tape.ssmPre)
-        }
-        cache[0] = tape.convInput[
-            0...,
-            committedRows ..< (committedRows + tape.convStateRows),
-            0...]
-        cache[1] = boundarySsm
-        cache.prefixReplayTape = nil
-        cache.rollbackState = nil
-        cache.rollbackCheckpoints = []
-        return true
-    }
-
     // MARK: - callAsFunction
 
     func callAsFunction(
@@ -653,21 +308,10 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        var qkv: MLXArray
-        let z: MLXArray
-        let b: MLXArray
-        let a: MLXArray
-        if S <= 9, let fused = fusedInProjections(inputs) {
-            qkv = fused.0
-            z = fused.1.reshaped(B, S, numVHeads, headVDim)
-            b = fused.2
-            a = fused.3
-        } else {
-            qkv = inProjQKV(inputs)
-            z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-            b = inProjB(inputs)
-            a = inProjA(inputs)
-        }
+        var qkv = inProjQKV(inputs)
+        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(inputs)
+        let a = inProjA(inputs)
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -685,96 +329,8 @@ final class Qwen35GatedDeltaNet: Module {
         let out: MLXArray
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
-        var pendingPrefixTape: ArraysCache.PrefixReplayTape?
 
-        if nConfirmed == 1 && S >= 3 && mask == nil {
-            // K>=2 verify: keep the ordinary single-chunk recurrence and a
-            // compact replay tape. This avoids writing one 3 MiB fp32 state per
-            // boundary per GDN layer on every round. K=1 deliberately remains
-            // on the already-promoted eager-checkpoint kernel below.
-            let (o, c, s, tape) = processChunkStashingPrefix(
-                qkv: qkv, a: a, b: b,
-                convState: convState, ssmState: ssmState, mask: mask)
-            out = o
-            finalConvState = c
-            finalSsmState = s
-            pendingPrefixTape = tape
-        } else if nConfirmed == 1 && S == 2 && mask == nil,
-           let midKernel = qwen35GatedDeltaMidKernel
-        {
-            // Width-2 MTP verify, single-launch form. The old split path ran
-            // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
-            // sigmoid, g) and paid two recurrence launches with a full fp32
-            // state round-trip between them, solely to observe the
-            // post-primary state. Here the prework runs once over both rows —
-            // all of it position-local, so per-row bit-identical to the split
-            // form — and the cloned kernel emits the timestep-0 state as a
-            // third output, so the rollback checkpoint is free.
-            let convInput = concatenated([convState, qkv], axis: 1)
-            let nKeep = convKernelSize - 1
-            let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
-
-            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-            // Replicates gatedDeltaUpdate's prologue exactly (fp32 beta/g,
-            // fp32 state init).
-            let beta = sigmoid(b).asType(.float32)
-            let g = computeGatedDeltaG(aLog, a, dtBias)
-            var state = ssmState
-                ?? MLXArray.zeros(
-                    [B, numVHeads, headVDim, headKDim], dtype: .float32)
-            if state.dtype != .float32 { state = state.asType(.float32) }
-
-            let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
-                template: [
-                    ("InT", dtype),
-                    ("StT", DType.float32),
-                    ("Dk", headKDim),
-                    ("Dv", headVDim),
-                    ("Hk", numKHeads),
-                    ("Hv", numVHeads),
-                ],
-                grid: (32, headVDim, B * numVHeads),
-                threadGroup: (32, 4, 1),
-                outputShapes: [
-                    [B, S, numVHeads, headVDim],
-                    state.shape,
-                    [B, S - 1, numVHeads, headVDim, headKDim],
-                ],
-                outputDTypes: [dtype, .float32, .float32]
-            )
-            // Per-boundary checkpoints: after row t, the conv state is rows
-            // (t+1)..(t+nKeep) of [convState | x0 .. x_{S-1}] and the SSM
-            // state is the kernel's mid output slice t. Checkpoint 0 doubles
-            // as the legacy single-slot `rollbackState` for the K=1 path.
-            var checkpoints: [(MLXArray, MLXArray)] = []
-            checkpoints.reserveCapacity(S - 1)
-            for t in 0 ..< (S - 1) {
-                checkpoints.append((
-                    convInput[0..., (t + 1) ..< (t + 1 + nKeep)],
-                    outputs[2][0..., t]
-                ))
-            }
-            cache?.rollbackState = checkpoints.first
-            cache?.rollbackCheckpoints = checkpoints
-            out = outputs[0]
-            finalConvState = newConvState
-            finalSsmState = outputs[1]
-        } else if nConfirmed > 0 && nConfirmed < S {
+        if nConfirmed > 0 && nConfirmed < S {
             // Split at nConfirmed boundary for the MTP 2-token verify forward.
             // Run confirmed prefix first, snapshot rollback state, then run draft.
             // omlx: GatedDeltaNet.__call__ nConfirmed > 0 branch
@@ -820,98 +376,11 @@ final class Qwen35GatedDeltaNet: Module {
         if let cache {
             cache[0] = finalConvState
             cache[1] = finalSsmState
-            // A forward that did not request replay must erase any prior tape;
-            // otherwise a later partial miss could restore a stale frame.
-            cache.prefixReplayTape = pendingPrefixTape
-            if pendingPrefixTape != nil {
-                cache.rollbackState = nil
-                cache.rollbackCheckpoints = []
-            }
         }
 
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
-}
-
-// MARK: - Fused MLP
-
-/// Decode-width fused gate/up MLP. Same math as the vendored `Qwen3NextMLP` —
-/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 2) the
-/// gate and up projections run as ONE matmul over concatenated output rows
-/// (N = 34816), halving the biggest per-layer launch count on the hot path.
-///
-/// Row-concat on N is bit-exact per output element: affine groups run along
-/// K, every N here (17408 and 34816) keeps the fast-kernel eligibility
-/// (N%8==0 at K%512==0), and a row's dot-product arithmetic in `qmv_fast`
-/// does not depend on which launch it rides in — the in-tree precedent is
-/// the promoted FA QKV fuse below. Prefill (S > 2) keeps the two separate
-/// calls so the qmm/split-k reduction order of the pinned baseline is
-/// preserved byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
-/// fuses the plain weights the same way; the head only proposes, so that
-/// side carries no exactness constraint at all.
-final class Qwen35FusedMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-    @ModuleInfo(key: "down_proj") var downProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
-
-    private var _fqW: MLXArray?
-    private var _fqS: MLXArray?
-    private var _fqZ: MLXArray?
-    private var _fqGS = 64
-    private var _fqBits = 4
-    private var _fqMode = QuantizationMode.affine
-    private var _fbfW: MLXArray?
-    private var _gateOut = 0
-
-    init(dimensions: Int, hiddenDimensions: Int) {
-        _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-        _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-    }
-
-    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
-        if let w = _fqW, let s = _fqS, let z = _fqZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: z, transpose: true,
-                groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
-        }
-        if let w = _fbfW {
-            let y = matmul(x, w.T)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
-        }
-        if let g = gateProj as? QuantizedLinear,
-           let u = upProj as? QuantizedLinear,
-           g.groupSize == u.groupSize, g.bits == u.bits,
-           g.mode == u.mode, g.mode == .affine,
-           let gz = g.biases, let uz = u.biases
-        {
-            _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
-            _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
-            _fqZ = concatenated([gz, uz], axis: 0).contiguous()
-            _fqGS = g.groupSize
-            _fqBits = g.bits
-            _fqMode = g.mode
-            _gateOut = g.shape.0
-            return fusedGateUp(x)
-        }
-        if !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear) {
-            _fbfW = concatenated([gateProj.weight, upProj.weight], axis: 0)
-                .contiguous()
-            _gateOut = gateProj.weight.dim(0)
-            return fusedGateUp(x)
-        }
-        return nil
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
-            return downProj(silu(g) * u)
-        }
-        return downProj(silu(gateProj(x)) * upProj(x))
-    }
-
 }
 
 // MARK: - Attention
@@ -1026,51 +495,16 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let attended: MLXArray
-        if L >= 6, L <= 9, case .causal = mask, cache is KVCacheSimple {
-            // WIDTH-WALL FIX, attention half (verify widths 6...9): split
-            // the query rows into [L-4, 4] — both sub-widths in the 2...5
-            // range the ranked replay has proven bit-exact — and advance
-            // the KV cache in the same two steps, so each SDPA call sees
-            // exactly the (qL, kL = prefix + qL) shape a cap-4 verify
-            // produces. `.causal` alignment is exact on both calls: chunk
-            // one's row i attends keys <= prefix + i, chunk two's row i
-            // attends keys <= prefix + (L-4) + i, which is the serial
-            // trajectory's key set for those positions. RoPE above is
-            // per-position and already applied to all L rows; per-row
-            // attention accumulation over the key axis is order-identical
-            // to the single call, so this is a shape change only.
-            let c1 = L - 4
-            let out1 = attentionWithCacheUpdate(
-                queries: queries[0..., 0..., ..<c1, 0...],
-                keys: keys[0..., 0..., ..<c1, 0...],
-                values: values[0..., 0..., ..<c1, 0...],
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            let out2 = attentionWithCacheUpdate(
-                queries: queries[0..., 0..., c1..., 0...],
-                keys: keys[0..., 0..., c1..., 0...],
-                values: values[0..., 0..., c1..., 0...],
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            attended = concatenated([out1, out2], axis: 2)
-        } else {
-            attended = attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-        }
-        let output = attended
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -1155,7 +589,7 @@ final class Qwen35DecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen35FusedMLP(
+            _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
@@ -1252,15 +686,6 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1269,45 +694,10 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
-                    asyncEval(hiddenStates)
-                default:
-                    break
-                }
-            }
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
-    }
-
-    /// Atomically rebuild every linear-attention layer at the same committed
-    /// verify prefix. The first pass is read-only; a failure leaves the entire
-    /// mixed recurrent/attention cache available to the session's generic
-    /// snapshot-and-repair fallback.
-    func replayRecurrentPrefix(
-        cache: [KVCache?], committedRows: Int
-    ) -> Bool {
-        guard cache.count == layers.count, committedRows > 0 else {
-            return false
-        }
-        for (i, layer) in layers.enumerated() where layer.isLinear {
-            guard let mamba = cache[i] as? MambaCache,
-                  let linear = layer.linearAttn,
-                  linear.canReplayPrefix(
-                    cache: mamba, committedRows: committedRows)
-            else { return false }
-        }
-        for (i, layer) in layers.enumerated() where layer.isLinear {
-            guard let mamba = cache[i] as? MambaCache,
-                  let linear = layer.linearAttn,
-                  linear.replayPrefix(
-                    cache: mamba, committedRows: committedRows)
-            else { return false }
-        }
-        return true
     }
 }
 
@@ -1319,28 +709,6 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
-
-    // Declared DRAFT-ONLY vocabulary projection, carried by the declared MTP
-    // head tree as `draft_lm_head.{weight,scales,biases}` (merged under the
-    // `mtp.` prefix and intercepted in `sanitize` below). A coarser affine
-    // copy of the exact lm_head used exclusively to argmax DRAFT proposals —
-    // the head side only proposes, so its numerics are competitive surface;
-    // every ledger/verify value still comes from the exact `lmHead`. Plain
-    // stored arrays, deliberately not Module parameters.
-    private var _draftHeadW: MLXArray?
-    private var _draftHeadS: MLXArray?
-    private var _draftHeadZ: MLXArray?
-
-    // Input-independent compact copy of the loaded exact lm_head, used only
-    // for draft proposals when no declared draft_lm_head is present. It is not
-    // ModuleInfo because it is derived during warmup, not checkpoint state.
-    private var _compactDraftHead: Linear?
-    private static let compactDraftPrefixCount = 98_304
-    private static let compactDraftControlStart = 248_044
-    private static let compactDraftControlEnd = 248_070
-    private static let compactDraftRealCount =
-        compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
-    private static let compactDraftPaddedCount = 98_336
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -1408,17 +776,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // omlx: `if not hasattr(self, "mtp"): weights = {k:v if "mtp." not in k}`
         if mtp == nil {
             weights = weights.filter { !$0.key.contains("mtp.") }
-        } else if let draftW = weights.removeValue(
-            forKey: "mtp.draft_lm_head.weight")
-        {
-            // Declared draft-only lm_head: side-channel the triple out of the
-            // parameter update (there is no Module parameter for it) into the
-            // draft projection storage above.
-            _draftHeadW = draftW
-            _draftHeadS = weights.removeValue(forKey: "mtp.draft_lm_head.scales")
-            _draftHeadZ = weights.removeValue(forKey: "mtp.draft_lm_head.biases")
-        }
-        if mtp != nil, !weights.keys.contains(where: { $0.contains("mtp.") }) {
+        } else if !weights.keys.contains(where: { $0.contains("mtp.") }) {
             // MTP enabled but no mtp.* keys in checkpoint → needs re-conversion.
             // omlx: raises ValueError with "weights are missing the mtp.* tensors"
             print(
@@ -1492,15 +850,6 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
-    /// Rebuild the target's recurrent cache after an accepted verify prefix.
-    public func replayRecurrentPrefix(
-        cache: [any KVCache], committedRows: Int
-    ) -> Bool {
-        model.replayRecurrentPrefix(
-            cache: cache.map { Optional($0) },
-            committedRows: committedRows)
-    }
-
     /// Apply the backbone's final `model.norm` to a hidden state.
     ///
     /// `callWithHidden` returns the PRE-norm hidden by design. MTPLX -- the exactness
@@ -1561,106 +910,6 @@ extension Qwen35TextModel: MTPCapable {
     ) -> MLXArray {
         mtpForwardWithHidden(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache).0
     }
-
-    /// MTP head module forward WITHOUT the lm_head projection.
-    ///
-    /// Appends the fused `(hidden, nextToken)` positions to `cache` and returns
-    /// the head's post-`mtp.norm` hidden rows `[1, M, H]`. This is the
-    /// committed-history maintenance primitive (MTPLX `update_mtp_cache`,
-    /// runtime.py:364): history rows only need the KV side effect, so skipping
-    /// the 248320-wide vocabulary projection on them is pure savings. The
-    /// caller applies `applyLMHead` to whichever rows it actually samples.
-    public func mtpHeadHiddenForward(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray {
-        guard let mtp else {
-            fatalError("mtpHeadHiddenForward called but MTP head is not attached. "
-                + "Set _qwen35MTPEnabled = true before loading the model.")
-        }
-        return mtp(
-            hidden: hidden,
-            nextTokenIds: nextTokenIds,
-            embedTokens: model.embedTokens,
-            cache: cache)
-    }
-
-    /// The backbone's lm_head (or tied-embedding projection) applied to hidden
-    /// rows. Companion to `mtpHeadHiddenForward` for the rows that need logits.
-    public func applyLMHead(_ x: MLXArray) -> MLXArray {
-        if let lmHead {
-            return lmHead(x)
-        }
-        return model.embedTokens.asLinear(x)
-    }
-
-    /// Draft-only vocabulary projection: the declared head's coarser lm_head
-    /// copy when it ships one (`draft_lm_head.*` in the declared head tree),
-    /// the exact lm_head otherwise. ONLY used to choose draft proposals —
-    /// never for ledger or verify values.
-    public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
-        if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
-            let k = s.dim(1) * 64
-            let bits = w.dim(1) * 32 / k
-            return quantizedMM(
-                x, w, scales: s, biases: z, transpose: true,
-                groupSize: 64, bits: bits, mode: .affine)
-        }
-        guard usesCompactDraftVocabulary else { return applyLMHead(x) }
-        if _compactDraftHead == nil {
-            _compactDraftHead = makeCompactDraftHead()
-        }
-        let padded = _compactDraftHead!(x)
-        // Padding exists only to retain qmv_fast's N % 8 shape. Removing it
-        // before argmax makes the duplicate rows semantically unreachable.
-        return padded[0..., 0..., 0 ..< Self.compactDraftRealCount]
-    }
-
-    /// Map compact draft IDs back to the tokenizer's full ID space without a
-    /// host readback. The low 98,304 rows retain their IDs; the appended rows
-    /// are Qwen's official text/control tokens 248,044 ... 248,069.
-    public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        guard usesCompactDraftVocabulary else { return ids }
-        return which(
-            ids .< Self.compactDraftPrefixCount,
-            ids,
-            ids + (Self.compactDraftControlStart - Self.compactDraftPrefixCount))
-    }
-
-    private var usesCompactDraftVocabulary: Bool {
-        configuration.vocabularySize == 248_320
-            && lmHead != nil && _draftHeadW == nil
-    }
-
-    private func makeCompactDraftHead() -> Linear {
-        guard let full = lmHead else {
-            fatalError("compact draft vocabulary requires an untied lm_head")
-        }
-
-        func compactRows(_ array: MLXArray) -> MLXArray {
-            let prefix = array[0 ..< Self.compactDraftPrefixCount]
-            let controls = array[
-                Self.compactDraftControlStart ..< Self.compactDraftControlEnd]
-            let paddingCount =
-                Self.compactDraftPaddedCount - Self.compactDraftRealCount
-            let padding = array[0 ..< paddingCount]
-            return concatenated([prefix, controls, padding], axis: 0)
-        }
-
-        if let quantized = full as? QuantizedLinear {
-            return QuantizedLinear(
-                weight: compactRows(quantized.weight),
-                bias: quantized.bias.map(compactRows),
-                scales: compactRows(quantized.scales),
-                biases: quantized.biases.map(compactRows),
-                groupSize: quantized.groupSize,
-                bits: quantized.bits,
-                mode: quantized.mode)
-        }
-        return Linear(
-            weight: compactRows(full.weight),
-            bias: full.bias.map(compactRows))
-    }
-
 
     /// Allocate a fresh KV cache for the MTP head layers.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
@@ -1740,14 +989,6 @@ extension Qwen35Model: MTPCapable {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
-    /// See `Qwen35TextModel.replayRecurrentPrefix`.
-    public func replayRecurrentPrefix(
-        cache: [any KVCache], committedRows: Int
-    ) -> Bool {
-        languageModel.replayRecurrentPrefix(
-            cache: cache, committedRows: committedRows)
-    }
-
     public func mtpForward(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
@@ -1761,30 +1002,6 @@ extension Qwen35Model: MTPCapable {
         languageModel.mtpForwardWithHidden(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
-
-    /// See `Qwen35TextModel.mtpHeadHiddenForward`.
-    public func mtpHeadHiddenForward(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray {
-        languageModel.mtpHeadHiddenForward(
-            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
-    }
-
-    /// See `Qwen35TextModel.applyLMHead`.
-    public func applyLMHead(_ x: MLXArray) -> MLXArray {
-        languageModel.applyLMHead(x)
-    }
-
-    /// See `Qwen35TextModel.applyDraftLMHead`.
-    public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
-        languageModel.applyDraftLMHead(x)
-    }
-
-    /// See `Qwen35TextModel.mapDraftTokenIds`.
-    public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        languageModel.mapDraftTokenIds(ids)
-    }
-
 
     /// See `Qwen35TextModel.applyFinalNorm`.
     public func applyFinalNorm(_ x: MLXArray) -> MLXArray {
