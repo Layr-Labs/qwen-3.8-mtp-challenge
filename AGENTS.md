@@ -847,7 +847,7 @@ fixture is a header-only stub (`QWEN38-PENDING-RELEASE`), and the MTP head —
 base — whose revision and byte manifest read (`QWEN38-PENDING-HEAD-UPLOAD`).
 
 Anything still carrying a 3.6 measurement is marked
-`QWEN38-VERIFY-AT-RELEASE`. `docs/CUTOVER.md` is the operator procedure;
+`QWEN38-VERIFY-AT-RELEASE`.
 `docs/qwen-mtp-go-live-runbook.md` records the **3.6** go-live and is history. The
 `laguna-xs-2.1-dflash-v1` pipeline described above is **not** ranked here; it
 stays ranked in `Layr-Labs/mlxfast-challenge-dev`. The former staging branch

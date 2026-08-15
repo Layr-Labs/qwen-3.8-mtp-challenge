@@ -19,10 +19,12 @@ set -euo pipefail
 # hash-verified against real records. Both were blocked together and both
 # resolve together: while the revision was a pending marker the URL could not
 # resolve, and while the manifest was a header-only stub it verified nothing.
-# The repository is PRIVATE, so a fetch needs credentials --
-# MLXFAST_REFERENCE_AUTH_HEADER carries them. Both variables stay
-# env-overridable so a locally staged copy can still be used without editing
-# this file.
+# The repository is PUBLIC, so the default fetch is ANONYMOUS: no Hugging Face
+# token, no login, nothing to configure. MLXFAST_REFERENCE_AUTH_HEADER remains
+# as an OPTIONAL fallback for the two cases that still need one -- a private
+# mirror staged by an operator, or an anonymous fetch being rate-limited -- and
+# is empty by default. Every variable here stays env-overridable so a locally
+# staged copy can still be used without editing this file.
 REFERENCE_MODEL_REPO="${MLXFAST_REFERENCE_MODEL_REPO:-EigenLabs/Qwen3.8-27B-4bit}"
 REFERENCE_REVISION="${MLXFAST_REFERENCE_REVISION:-eda45ab47f465d08d6558f0353a2346e2eb9d5b3}"
 REFERENCE_CACHE_REPO_DIR="models--${REFERENCE_MODEL_REPO//\//--}"
@@ -65,6 +67,15 @@ MACMON_RELEASE_URL="https://github.com/vladkens/macmon/releases/download/v${MACM
 MACMON_RELEASE_SHA256="c79fdc7ab02b456b897dcc3ea041678420d7a1d5bd669aaac36fda3885572ad6"
 MACMON_INSTALL_DIR="${HOME}/bin"
 SETUP_PARALLEL_METALLIB="${MLXFAST_SETUP_PARALLEL_METALLIB:-${MLXFAST_SETUP_PARALLEL_BUILD:-1}}"
+# WHICH ARTIFACT this run provisioned, which decides what the closing summary
+# tells the reader to do next. "target" (default) is a normal ./setup.sh run:
+# the reference checkpoint it fetched is the transform's input. "mtp-head" is
+# the delegated run setup-qwen-mtp.sh drives, where REFERENCE_DIR is the
+# speculative head -- and telling that reader to transform it into weights/
+# would be actively wrong, because it would overwrite the target weights with a
+# 15-tensor head. The knob only changes prose; it changes nothing about what is
+# downloaded or verified.
+SETUP_SUMMARY_ROLE="${MLXFAST_SETUP_SUMMARY_ROLE:-target}"
 SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
 # The participant runtime worker builds under its own SwiftPM scratch root
 # (.build-worker) so a participant-code build never writes into the trusted
@@ -117,24 +128,19 @@ REFERENCE_VERIFIED_CONTENT_IDENTITY=""
 REFERENCE_VERIFIED_EXPECTED_HASH=""
 REFERENCE_VERIFIED_EXPECTED_SIZE=""
 REFERENCE_VERIFIED_FILE_MANIFEST_HASH=""
-REFERENCE_REQUIRED_METADATA_FILES=(
-  ".gitattributes"
-  "LICENSE.md"
-  "README.md"
-  "chat_template.jinja"
-  "config.json"
-  "model.safetensors.index.json"
-  "tokenizer.json"
-  "tokenizer_config.json"
-)
+# The metadata files to download are NOT listed here. They are derived from the
+# selected manifest by reference_manifest_metadata_files (defined below,
+# alongside the other manifest readers) so that one downloader can provision two
+# artifacts whose metadata trees legitimately differ.
 
 print_help() {
   cat <<EOF
 Usage: ./setup.sh
 
 Checks the local macOS/Apple Silicon toolchain, builds the Swift harness,
-builds mlx.metallib, and downloads the Poolside Laguna XS 2.1 NVFP4 reference
-checkpoint when it is not already present.
+builds mlx.metallib, and downloads the Qwen 3.8 27B MLX 4-bit reference
+checkpoint (${REFERENCE_MODEL_REPO}) when it is not already present.
+The download is anonymous: the pinned repository is public.
 
 Important environment variables:
   MLXFAST_REFERENCE_DIR              Reference checkpoint directory.
@@ -185,6 +191,11 @@ Important environment variables:
                                      Skip the second full-checkpoint SHA256 pass
                                      after all downloaded files were already
                                      verified by size and hash. CI-only speedup.
+  MLXFAST_SETUP_SUMMARY_ROLE         Which artifact this run provisioned, which
+                                     decides the closing "next:" advice:
+                                     'target' (default) or 'mtp-head'. Set to
+                                     'mtp-head' by setup-qwen-mtp.sh, where the
+                                     transform instruction would be wrong.
   MLXFAST_SETUP_PARALLEL_METALLIB=0  Disable overlapping the Metal library build
                                      with reference checkpoint download.
                                      MLXFAST_SETUP_PARALLEL_BUILD is accepted
@@ -194,6 +205,13 @@ Important environment variables:
   MLXFAST_RUNTIME_WORKER_EXECUTABLE  Participant worker executable.
                                      Default: ${RUNTIME_WORKER_BIN}
   MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1    Build tools only; do not download weights.
+  MLXFAST_SKIP_SWIFT_BUILD=1         Reuse the Swift products from a previous
+                                     run instead of rebuilding them. Honoured
+                                     only when both binaries already exist and
+                                     are executable; otherwise the build runs
+                                     anyway. Used by setup-qwen-mtp.sh, whose
+                                     delegated download would otherwise repeat
+                                     ./setup.sh's build for no benefit.
   MLXFAST_SKIP_MLX_METALLIB=1        Skip mlx.metallib build.
   MLXFAST_SKIP_MACMON_INSTALL=1      Do not install macmon (the GPU temperature
                                      reader benchmark.sh's local cool-down gate
@@ -254,6 +272,22 @@ print_setup_summary() {
   local elapsed="$((SECONDS - SETUP_STARTED_SECONDS))"
   local reference_line
   local metallib_line
+  local checkpoint_label
+
+  # FAIL CLOSED on an unrecognised role: a typo must not silently print the
+  # transform instruction over a head cache.
+  case "${SETUP_SUMMARY_ROLE}" in
+    target)
+      checkpoint_label="reference checkpoint"
+      ;;
+    mtp-head)
+      checkpoint_label="MTP head"
+      ;;
+    *)
+      echo "setup.sh: MLXFAST_SETUP_SUMMARY_ROLE must be 'target' or 'mtp-head'" >&2
+      return 1
+      ;;
+  esac
 
   if [[ "${reference_status}" == "skipped" ]]; then
     reference_line="skipped (${REFERENCE_DIR})"
@@ -275,7 +309,22 @@ setup.sh: summary
   trusted CLI: ${SWIFT_BIN}
   participant worker: ${RUNTIME_WORKER_BIN}
   mlx.metallib: ${metallib_line}
-  reference checkpoint: ${reference_line}
+  ${checkpoint_label}: ${reference_line}
+EOF
+
+  # The head leg does NOT get the transform instruction. REFERENCE_DIR is the
+  # speculative head here, and transforming a 15-tensor head into weights/
+  # would destroy the target tree the transform is supposed to have produced.
+  if [[ "${SETUP_SUMMARY_ROLE}" == "mtp-head" ]]; then
+    cat <<EOF
+  next:
+    head provisioning is complete; the target weights/ tree belongs to ./setup.sh and this run did not touch it
+    ./benchmark-qwen-mtp.sh --local-iterate
+EOF
+    return 0
+  fi
+
+  cat <<EOF
   next:
     MLXFAST_OFFLINE_WRITABLE_PATHS="${PWD}/weights" .github/scripts/run-offline.sh ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}" --output weights
     ${SWIFT_BIN} correctness --weights weights
@@ -917,6 +966,83 @@ reference_manifest_totals() {
 
   [[ "${file_count}" -gt 0 ]] || return 1
   printf '%s %s\n' "${file_count}" "${byte_count}"
+}
+
+# The metadata (non-shard) files a provisioning run downloads are DERIVED FROM
+# THE SELECTED MANIFEST, never hard-coded, because ONE downloader provisions TWO
+# artifacts whose metadata trees legitimately disagree. The backbone
+# (fixtures/reference_qwen3_8_27b_4bit.sha256) pins README.md,
+# chat_template.jinja, config.json, generation_config.json, the index and the
+# two tokenizer files -- and NO .gitattributes and NO LICENSE.md. The MTP head
+# (fixtures/qwen3_8_27b_mtp_head.sha256, which setup-qwen-mtp.sh points
+# MLXFAST_REFERENCE_MANIFEST_PATH at) pins .gitattributes, config.json and the
+# index, and deliberately carries no README, no tokenizer and no chat template
+# at all -- see that manifest's header for why the head tree is four files.
+#
+# A hard-coded list was wrong for both of them, in both directions: it demanded
+# LICENSE.md/.gitattributes the backbone repository does not publish (a fresh
+# ./setup.sh died on "reference manifest has no entry for .gitattributes"), it
+# demanded a README and tokenizer the head will never have, and it silently
+# skipped generation_config.json, which the backbone manifest DOES pin and which
+# the ranked workflow's verify_cache -- a strict inventory in BOTH directions --
+# then rejects the cache for missing. Deriving the list from the manifest makes
+# "what is pinned" and "what is fetched" the same list by construction.
+#
+# *.safetensors is excluded on purpose: shards are downloaded separately and in
+# parallel by download_reference_shards, driven by model.safetensors.index.json
+# via list_reference_shards, once config.json and that index are on disk.
+reference_manifest_metadata_files() {
+  local source_manifest="${1:-${REFERENCE_MANIFEST_PATH}}"
+  local line
+  local expected_hash
+  local expected_size
+  local relative_path
+  local extra
+  local emitted=0
+  local hash_status
+
+  if [[ ! -f "${source_manifest}" ]]; then
+    if reference_hash_verification_enabled; then
+      hash_status=0
+    else
+      hash_status="$?"
+    fi
+    if [[ "${hash_status}" == "1" ]]; then
+      # MLXFAST_REFERENCE_HASH_VERIFY=0 is the one mode in which a missing
+      # manifest is legitimate: reference_file_is_current short-circuits before
+      # it ever reads the file, so there are no records to derive a list from.
+      # Fall back to the minimal pair the caller hard-requires anyway --
+      # config.json, and the index it reads to discover the shards -- rather
+      # than inventing names for an artifact nothing is pinning.
+      printf '%s\n' "config.json" "model.safetensors.index.json"
+      return 0
+    fi
+    echo "setup.sh: reference manifest missing at ${source_manifest}" >&2
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    read -r expected_hash expected_size relative_path extra <<< "${line}"
+    if [[ -n "${extra:-}" || -z "${expected_hash:-}" || -z "${expected_size:-}" || -z "${relative_path:-}" ]]; then
+      echo "setup.sh: malformed record in ${source_manifest}: ${line}" >&2
+      return 1
+    fi
+    if [[ "${relative_path}" == *.safetensors ]]; then
+      continue
+    fi
+    printf '%s\n' "${relative_path}"
+    emitted=$((emitted + 1))
+  done < "${source_manifest}"
+
+  # FAIL CLOSED on an empty derivation. A manifest that is all comments, or all
+  # shards, would otherwise turn into a download of nothing followed by a
+  # confusing "missing config.json" -- and, worse, a manifest truncated to its
+  # header would provision an empty directory quietly.
+  if [[ "${emitted}" -eq 0 ]]; then
+    echo "setup.sh: reference manifest ${source_manifest} names no non-shard metadata files" >&2
+    return 1
+  fi
 }
 
 stat_value() {
@@ -2750,6 +2876,25 @@ assert_frozen_dependency_graph() {
 }
 
 build_swift_harness() {
+  # MLXFAST_SKIP_SWIFT_BUILD=1 reuses binaries a previous run already produced.
+  # setup-qwen-mtp.sh delegates its download to this script, and that delegated
+  # run would otherwise repeat the whole SwiftPM build -- ~25 seconds of
+  # no-op relinking on the normal `./setup.sh && ./setup-qwen-mtp.sh` path,
+  # after which nothing about the products has changed.
+  #
+  # FAIL OPEN, deliberately: the knob is honoured only when BOTH products are
+  # already present and executable. A standalone ./setup-qwen-mtp.sh on a fresh
+  # clone has no binaries to reuse, and refusing there would turn a wasteful
+  # rebuild into a broken script -- so a missing product builds anyway and says
+  # why. This knob therefore never decides WHETHER the harness exists, only
+  # whether it is rebuilt.
+  if [[ "${MLXFAST_SKIP_SWIFT_BUILD:-0}" == "1" ]]; then
+    if ensure_swift_harness_ready 2>/dev/null; then
+      echo "setup.sh: MLXFAST_SKIP_SWIFT_BUILD=1 and both products are present; reusing ${SWIFT_BIN} and ${RUNTIME_WORKER_BIN}"
+      return 0
+    fi
+    echo "setup.sh: MLXFAST_SKIP_SWIFT_BUILD=1 but a product is missing; building anyway"
+  fi
   echo "setup.sh: building trusted Swift harness and participant runtime worker"
   assert_frozen_dependency_graph || return 1
   # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
@@ -3072,6 +3217,8 @@ download_reference_weights_locked() {
   local post_verify_status
   local shard_list
   local shard_files=()
+  local metadata_list
+  local metadata_files=()
 
   parent_dir="$(dirname "${reference_dir}")"
   ensure_reference_space "${parent_dir}" || return 1
@@ -3083,10 +3230,32 @@ download_reference_weights_locked() {
     echo "setup.sh: fallback reference source ${REFERENCE_FALLBACK_BASE_URL}"
   fi
   echo "setup.sh: reference cache path ${reference_dir}"
-  for file in "${REFERENCE_REQUIRED_METADATA_FILES[@]}"; do
+
+  # WHAT gets downloaded is whatever the selected manifest pins, minus the
+  # shards. See reference_manifest_metadata_files: the backbone and the MTP head
+  # do not publish the same metadata tree, and a hard-coded list was wrong for
+  # both of them.
+  if ! metadata_list="$(reference_manifest_metadata_files)"; then
+    return 1
+  fi
+  while IFS= read -r file; do
+    if [[ -n "${file}" ]]; then
+      metadata_files+=("${file}")
+    fi
+  done <<< "${metadata_list}"
+  if [[ "${#metadata_files[@]}" -eq 0 ]]; then
+    echo "setup.sh: reference manifest named no metadata files to download: ${REFERENCE_MANIFEST_PATH}" >&2
+    return 1
+  fi
+
+  echo "setup.sh: manifest names ${#metadata_files[@]} metadata file(s)"
+  for file in "${metadata_files[@]}"; do
     download_reference_file "${file}" "${reference_dir}/${file}" || return 1
   done
 
+  # These two stay hard requirements regardless of what the manifest says: the
+  # transform cannot run without config.json and this function cannot find the
+  # shards without the index.
   if [[ ! -f "${reference_dir}/config.json" ]]; then
     echo "setup.sh: downloaded checkpoint is missing config.json" >&2
     return 1

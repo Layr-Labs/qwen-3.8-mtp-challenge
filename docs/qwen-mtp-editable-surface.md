@@ -9,7 +9,7 @@
 > 10-record byte manifest; the **MTP head** `EigenLabs/Qwen3.8-27B-MTP-bf16` is
 > published at `26a328e070875b0314d652a039b6b59902690f03` with a 4-record one
 > (both repositories are private); goldens and calibration remain
-> `QWEN38-PENDING-RELEASE`. See `docs/CUTOVER.md`.
+> `QWEN38-PENDING-RELEASE`.
 
 **Track:** `qwen3.8-27b-mtp-v1` · **Status:** operator-ratified 2026-08-14 ·
 **Machine-readable authority:** `editablePaths` in `benchmark.json`
