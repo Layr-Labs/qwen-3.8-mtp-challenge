@@ -491,7 +491,17 @@ public final class Qwen36MTPBlockSession {
     /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
     /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// Q4 DIAGNOSTIC ARM: the promoted compact group-64 head changes the
+    /// scheduler's draft/verify cost balance, but its steady-state marginal
+    /// draft cost has not yet been isolated on the ranked M5. Use 0.16 as a
+    /// deliberately conservative intermediate arm between the promoted 0.20
+    /// control and the more aggressive 0.12/0.10 hypotheses. This is not a
+    /// claim that 0.16 is the causal optimum: the official eight-prompt median
+    /// is the experiment, and one result must not be over-read through thermal,
+    /// prompt, or queue variance. Keep the change isolated so the receipt can
+    /// answer whether the q4 head supports one increment of deeper drafting.
+    private static let headStepCostRatio = 0.16
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
