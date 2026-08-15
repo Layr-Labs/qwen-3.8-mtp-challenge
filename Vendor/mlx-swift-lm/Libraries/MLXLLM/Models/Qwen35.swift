@@ -471,7 +471,17 @@ final class Qwen35GatedDeltaNet: Module {
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 2, let fused = fusedInProjections(inputs) {
+        // Decode-width gate (was S <= 2): the concat-on-N fusion is bit-exact
+        // on the qmv kernel family, which serves M up to the batch limit
+        // (10-12 for K=5120-class shapes across architecture generations —
+        // see the qmm/qvm boundary note). The streak-laddered verify widths
+        // (S = 2..9: drafts + primary) are all inside that limit, so every
+        // DECODE round now takes the fused 4-to-1 path. Larger S (the
+        // M=512 seed prefill and the warm-up block) routes to qmm, whose
+        // N-tiling drifts logits 1-2 bf16 ULP and must stay on the stock
+        // calls. S <= 9 covers the maximum legal verify width
+        // (qwenMTPMaxDraftDepth 8 + 1 primary).
+        if S <= 9, let fused = fusedInProjections(inputs) {
             qkv = fused.0
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
