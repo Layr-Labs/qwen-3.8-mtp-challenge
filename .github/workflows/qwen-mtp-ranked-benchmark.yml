@@ -2407,7 +2407,18 @@ jobs:
                 echo "::error::the head declaration's byte count ${want_bytes} is missing, non-positive, or above the ${cap}-byte cap (track cap 2147483648)" >&2
                 exit 1
               fi
-              staged="${MLXFAST_PRIVATE_DIR}/qwen_mtp_declared_head"
+              # Stage into the JOB WORKSPACE, not the private dir: the bench
+              # sandbox denies private-dir reads by design (the sandbox probe
+              # re-proves it every run), so a head staged under
+              # MLXFAST_PRIVATE_DIR is unreadable by the very worker that must
+              # load it -- the root cause of every declared-head gate failure
+              # to date. The staged tree carries no hidden material (it is the
+              # candidate's own declared artifact, digest-verified below,
+              # runner-side, before any sandbox opens), so workspace placement
+              # leaks nothing -- the same placement the hidden-goldens step
+              # uses for material the worker must read. The pre-timing scrub
+              # allowlists this path so the head survives into the timed phase.
+              staged="${MLXFAST_JOB_WS}/.qwen-mtp-declared-head"
               rm -rf "${staged}"
               mkdir -p "${staged}"
               if [[ "${source}" == "remote" ]]; then
@@ -2771,6 +2782,10 @@ jobs:
             case "${rel}" in
               ./weights/*|./.build/*|./.build-worker/*|./correctness_prompts/*) continue ;;
               ./private/*) continue ;;
+              # The declared candidate head staged by "Resolve the declared
+              # Qwen-MTP head": digest-verified runner-side, carries no hidden
+              # material, and the timed phase still needs to load it.
+              ./.qwen-mtp-declared-head/*) continue ;;
             esac
             if grep -zqxF -- "${rel}" "${manifest}"; then
               continue
