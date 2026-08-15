@@ -185,7 +185,8 @@ public final class Qwen36MTPBlockSession {
                 : model.callWithHidden(
                     input: tokens, cache: warmCache,
                     nConfirmed: width == 2 ? 1 : 0)
-            eval(verifyLogits)
+            let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
+            eval(verifyLogits, top2IDs, top2Values)
             if width == 2 && qwenMTPFusedAcceptVerifyEnabled {
                 _ = model.recomputeFusedPrimaryBoundary(cache: warmCache)
             }
@@ -469,14 +470,18 @@ public final class Qwen36MTPBlockSession {
             if stopTokens.contains(drafts[index]) { break }
         }
 
+        let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
+        eval(top2IDs, top2Values)
+        let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
+        let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         var perRowTop2Tokens: [[Int]] = []
         var perRowTop2Logits: [[Double]] = []
         perRowTop2Tokens.reserveCapacity(draftCount + 1)
         perRowTop2Logits.reserveCapacity(draftCount + 1)
         for index in 0 ..< draftCount {
-            let (ids, values) = Self.topTwo(of: verifyLogits[0, index])
-            perRowTop2Tokens.append(ids)
-            perRowTop2Logits.append(values)
+            let base = index * 2
+            perRowTop2Tokens.append(Array(flatTop2IDs[base ..< (base + 2)]))
+            perRowTop2Logits.append(Array(flatTop2Values[base ..< (base + 2)]))
         }
 
         if acceptedCount == drafts.count {
@@ -490,9 +495,9 @@ public final class Qwen36MTPBlockSession {
                 0..., drafts.count ..< (drafts.count + 1), 0...]
             pendingLogitsRow = bonus
             pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
-            let (ids, values) = Self.topTwo(of: verifyLogits[0, drafts.count])
-            perRowTop2Tokens.append(ids)
-            perRowTop2Logits.append(values)
+            let base = drafts.count * 2
+            perRowTop2Tokens.append(Array(flatTop2IDs[base ..< (base + 2)]))
+            perRowTop2Logits.append(Array(flatTop2Values[base ..< (base + 2)]))
         } else {
             rollbackRoundCount += 1
             committed.append(contentsOf: drafts.prefix(acceptedCount))
@@ -720,6 +725,194 @@ public final class Qwen36MTPBlockSession {
     private func trimmableOffset() -> Int { Self.trimmableOffset(cache) }
 
     // MARK: - readouts
+
+    /// Shared exact ordering for the two-stage candidate-only top-2 reduction.
+    private static let linearTopTwoHeader = """
+        struct qwen_top2_state {
+            float first_value;
+            float second_value;
+            uint first_id;
+            uint second_id;
+            uint count;
+        };
+
+        inline qwen_top2_state qwen_top2_empty() {
+            qwen_top2_state state;
+            state.first_value = 0.0f;
+            state.second_value = 0.0f;
+            state.first_id = 0;
+            state.second_id = 0;
+            state.count = 0;
+            return state;
+        }
+
+        inline bool qwen_top2_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) {
+                return !candidate_nan;
+            }
+            if (candidate_value > current_value) {
+                return true;
+            }
+            if (candidate_value < current_value) {
+                return false;
+            }
+            return candidate_id < current_id;
+        }
+
+        inline void qwen_top2_insert(
+            thread qwen_top2_state &state,
+            float value,
+            uint id
+        ) {
+            if (state.count > 0 && state.first_id == id) {
+                return;
+            }
+            if (state.count > 1 && state.second_id == id) {
+                return;
+            }
+            if (state.count == 0
+                || qwen_top2_better(
+                    value, id, state.first_value, state.first_id)) {
+                if (state.count > 0) {
+                    state.second_value = state.first_value;
+                    state.second_id = state.first_id;
+                }
+                state.first_value = value;
+                state.first_id = id;
+                state.count = min(state.count + 1, 2u);
+                return;
+            }
+            if (state.count == 1
+                || qwen_top2_better(
+                    value, id, state.second_value, state.second_id)) {
+                state.second_value = value;
+                state.second_id = id;
+                state.count = 2;
+            }
+        }
+    """
+
+    /// Stage one: 32 threadgroups per row each reduce a disjoint vocabulary
+    /// stripe. This exposes enough work to occupy the GPU instead of making two
+    /// threadgroups serially scan almost a thousand logits per lane.
+    private static let linearTopTwoPartialKernel = MLXFast.metalKernel(
+        name: "qwen_mtp_linear_top2_partial",
+        inputNames: ["logits"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: """
+            uint lane = thread_position_in_threadgroup.x;
+            uint group_index = threadgroup_position_in_grid.x;
+            uint row = group_index / 32;
+            uint group = group_index % 32;
+            uint vocab = uint(logits_shape[2]);
+            qwen_top2_state local = qwen_top2_empty();
+
+            for (uint index = group * 256 + lane;
+                 index < vocab;
+                 index += 32 * 256) {
+                ulong offset = ulong(row) * ulong(logits_strides[1])
+                    + ulong(index) * ulong(logits_strides[2]);
+                qwen_top2_insert(local, float(logits[offset]), index);
+            }
+
+            threadgroup qwen_top2_state scratch[256];
+            scratch[lane] = local;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = 128; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    qwen_top2_state merged = scratch[lane];
+                    qwen_top2_state other = scratch[lane + stride];
+                    if (other.count > 0) {
+                        qwen_top2_insert(merged, other.first_value, other.first_id);
+                    }
+                    if (other.count > 1) {
+                        qwen_top2_insert(merged, other.second_value, other.second_id);
+                    }
+                    scratch[lane] = merged;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (lane == 0) {
+                uint base = (row * 32 + group) * 2;
+                partial_ids[base] = int(scratch[0].first_id);
+                partial_ids[base + 1] = int(scratch[0].second_id);
+                partial_values[base] = scratch[0].first_value;
+                partial_values[base + 1] = scratch[0].second_value;
+            }
+        """,
+        header: linearTopTwoHeader,
+        ensureRowContiguous: false
+    )
+
+    /// Stage two: one small threadgroup per row merges the 32 partial pairs.
+    private static let linearTopTwoFinalizeKernel = MLXFast.metalKernel(
+        name: "qwen_mtp_linear_top2_finalize",
+        inputNames: ["partial_ids", "partial_values"],
+        outputNames: ["top_ids", "top_values"],
+        source: """
+            uint lane = thread_position_in_threadgroup.x;
+            uint row = threadgroup_position_in_grid.x;
+            uint base = (row * 32 + lane) * 2;
+            qwen_top2_state local = qwen_top2_empty();
+            qwen_top2_insert(local, partial_values[base], uint(partial_ids[base]));
+            qwen_top2_insert(
+                local, partial_values[base + 1], uint(partial_ids[base + 1]));
+
+            threadgroup qwen_top2_state scratch[32];
+            scratch[lane] = local;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    qwen_top2_state merged = scratch[lane];
+                    qwen_top2_state other = scratch[lane + stride];
+                    qwen_top2_insert(merged, other.first_value, other.first_id);
+                    qwen_top2_insert(merged, other.second_value, other.second_id);
+                    scratch[lane] = merged;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (lane == 0) {
+                uint output_base = row * 2;
+                top_ids[output_base] = int(scratch[0].first_id);
+                top_ids[output_base + 1] = int(scratch[0].second_id);
+                top_values[output_base] = scratch[0].first_value;
+                top_values[output_base + 1] = scratch[0].second_value;
+            }
+        """,
+        header: linearTopTwoHeader,
+        ensureRowContiguous: false
+    )
+
+    private static func linearTopTwoRows(_ logits: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(logits.ndim == 3 && logits.dim(0) == 1)
+        let rows = logits.dim(1)
+        let partials = linearTopTwoPartialKernel(
+            [logits],
+            grid: (rows * 32 * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, 32, 2], [rows, 32, 2]],
+            outputDTypes: [.int32, .float32]
+        )
+        let outputs = linearTopTwoFinalizeKernel(
+            partials,
+            grid: (rows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2]],
+            outputDTypes: [.int32, .float32]
+        )
+        return (outputs[0], outputs[1])
+    }
 
     /// Top-2 token ids and logit VALUES of a single logit row.
     ///
