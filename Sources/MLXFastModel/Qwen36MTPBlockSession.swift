@@ -264,6 +264,22 @@ public final class Qwen36MTPBlockSession {
         eval(model.applyDraftLMHead(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+
+        // Warm the backbone's full-width seed-prefill shape on throwaway
+        // cache state. The scored window charges the seed prefill by
+        // contract, but Metal kernel compilation and allocator growth for
+        // the wide-prefill shape family are input-independent one-time
+        // costs — the same class this warm already hoists for the head's
+        // 512-row prime and every verify width. Zeros keep it seed-blind.
+        let prefillWarmCache = model.newCache(parameters: nil)
+        let prefillWarmTokens = Array(repeating: 0, count: 512)
+        let (prefillWarmLogits, prefillWarmHidden) = model.callWithHidden(
+            input: LMInput.Text(
+                tokens: MLXArray(prefillWarmTokens).reshaped([1, 512])),
+            cache: prefillWarmCache, nConfirmed: 0)
+        eval(prefillWarmCache.flatMap { $0.state })
+        eval(prefillWarmLogits, prefillWarmHidden)
+
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
@@ -437,10 +453,25 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+    // MLX_QWEN_MTP_TRACE_FILE: local-profiling sink. The default worker
+    // sandbox denies file-write*, so this only works with a custom
+    // MLXFAST_RUNTIME_WORKER_SANDBOX_PROFILE that allows the one path;
+    // absent the env (rank strips nothing MLX_-prefixed but sets nothing
+    // either) the trace falls back to stderr and is inert.
+    private static let traceFileHandle: FileHandle? = {
+        guard let path = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_TRACE_FILE"], !path.isEmpty
+        else { return nil }
+        FileManager.default.createFile(atPath: path, contents: nil)
+        guard let handle = FileHandle(forWritingAtPath: path) else { return nil }
+        handle.seekToEndOfFile()
+        return handle
+    }()
     private static func traceWrite(_ line: String) {
-        // stderr: the worker sandbox denies file-write*, and the parent's
-        // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
-        // `forwardsWorkerStderr` on the local mtp-timed verb.
+        if let handle = traceFileHandle {
+            handle.write(Data(line.utf8))
+            return
+        }
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -523,24 +554,126 @@ public final class Qwen36MTPBlockSession {
     /// the promoted stack.
     private static let sdpaWidthWallDepthCap = Qwen36MTPLimits.maxDepth
 
-    /// The greedy marginal-depth rule described at the policy's assignment.
+    // MARK: measured round-cost model
+    //
+    // The fixed-h marginal rule above priced every box with one constant, and
+    // its own comment history shows h was mispriced twice because the true
+    // cost curve is piecewise (the width>=6 rounds carry an extra per-row
+    // cliff) and machine-dependent (the ranked M5 and a local M3 disagree on
+    // h by >2x). Instead of a constant, measure: every completed round
+    // records its wall time under the draft count it ran, and the schedule
+    // maximises expected committed tokens per second over the measured
+    // curve. Depths not yet visited are priced from the latest base estimate
+    // times a scale-free prior shape, so the model needs no absolute seconds
+    // baked in and self-calibrates on whatever box runs it within a few
+    // rounds. Proposal-side scheduling only: any depth is ledger-exact, so
+    // this cannot affect token fidelity, and nothing here keys on input
+    // tokens.
+
+    /// EMA of measured wall seconds for rounds that drafted exactly `d`
+    /// tokens (index d, 0 = serial/skip round). 0 = no observation yet.
+    private var roundCostEMA = [Double](
+        repeating: 0, count: Qwen36MTPLimits.maxDepth + 1)
+    private var roundCostSeen = [Bool](
+        repeating: false, count: Qwen36MTPLimits.maxDepth + 1)
+    private static let roundCostAlpha = 0.25
+    /// EMA of (measured cost / prior shape factor): the per-box base-cost
+    /// scale used to price unvisited depths.
+    private var baseCostEstimate = 0.0
+    private var baseCostSeen = false
+
+    /// Scale-free prior cost shape, from the third-fit receipts: rounds at
+    /// d=2/3/4 cost 49/59.4/70.5 ms -> slope/intercept 10.75/27.5 ms, i.e.
+    /// 1 + 0.39 d in base units for widths <= 5, and the width>=6 sdpa
+    /// cliff adds ~0.47 base units per extra row above d=4. A serial round
+    /// skips the head chain entirely: 0.9.
+    /// Measured round-cost shape, M3 Max fixed-depth sweep @128 tok with
+    /// the q8 head (ms/round: 101 / 137 / 174 / 210 / 251 / 274 / 269 /
+    /// 293 for d=1..8), normalized to a ~86 ms serial-control round. The
+    /// curve is linear at ~0.42·base per step through d=4, takes a
+    /// ONE-TIME ~0.5·base bump when verify width crosses the width wall
+    /// at 6 (two sub-chunk dispatch), then flattens — and d=7 undercuts
+    /// d=6 because width 8 splits into balanced [4,4] sub-chunks where
+    /// width 7 gets [3,4]. A per-depth table is the honest prior; the
+    /// EMA overrides each entry on first visit anyway.
+    private static let priorCostTable: [Double] = [
+        1.00, 1.18, 1.60, 2.02, 2.44, 2.92, 3.19, 3.13, 3.40,
+    ]
+
+    private static func priorCostFactor(_ d: Int) -> Double {
+        guard d >= 0 else { return 1.0 }
+        guard d < priorCostTable.count else {
+            return priorCostTable[priorCostTable.count - 1]
+                + 0.42 * Double(d - priorCostTable.count + 1)
+        }
+        return priorCostTable[d]
+    }
+
+    /// Record one completed round's wall time under its draft count. The
+    /// first round is skipped: it carries first-touch/JIT cost that would
+    /// mis-seed the base estimate.
+    private func recordRoundCost(draftCount d: Int, wallNanos: UInt64) {
+        guard roundCount > 1, d >= 0, d < roundCostEMA.count else { return }
+        let s = Double(wallNanos) * 1e-9
+        guard s > 0, s < 60 else { return }
+        if roundCostSeen[d] {
+            roundCostEMA[d] += Self.roundCostAlpha * (s - roundCostEMA[d])
+        } else {
+            roundCostEMA[d] = s
+            roundCostSeen[d] = true
+        }
+        let base = s / Self.priorCostFactor(d)
+        if baseCostSeen {
+            baseCostEstimate += Self.roundCostAlpha * (base - baseCostEstimate)
+        } else {
+            baseCostEstimate = base
+            baseCostSeen = true
+        }
+    }
+
+    private func estimatedRoundCost(_ d: Int) -> Double {
+        if roundCostSeen[d] { return roundCostEMA[d] }
+        // Before any observation lands, price on the prior shape alone
+        // (arbitrary scale — only ratios matter to the argmax).
+        let base = baseCostSeen ? baseCostEstimate : 1.0
+        return base * Self.priorCostFactor(d)
+    }
+
+    /// Throughput-argmax over the measured cost curve: pick the draft count
+    /// maximising E[committed tokens] / E[round seconds], where the token
+    /// expectation comes from the per-position acceptance EMAs (bonus row
+    /// counts as +1 at every depth, as on the serial path). A light probe
+    /// keeps the curve fresh one depth above the current optimum so a
+    /// thermal or context drift can move the choice back up.
     private func costModelDepth(offeredDepth: Int) -> Int {
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             Self.sdpaWidthWallDepthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+
         var reach = 1.0
-        var expected = 0.0
-        var depth = 0
-        while depth < cap {
-            reach *= positionAcceptEMA[depth]
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
-            guard reach > threshold else { break }
+        var expected = 1.0  // the bonus/primary row always commits
+        var best = 0
+        var bestRate = expected / estimatedRoundCost(0)
+        var reachAt = [Double](repeating: 1.0, count: cap + 1)
+        for d in 1 ... cap {
+            reach *= positionAcceptEMA[d - 1]
+            reachAt[d] = reach
             expected += reach
-            depth += 1
+            let rate = expected / estimatedRoundCost(d)
+            if rate > bestRate {
+                bestRate = rate
+                best = d
+            }
         }
-        return depth
+        // Probe one above the optimum when it is unvisited or on a slow
+        // cadence, but only where acceptance still plausibly pays.
+        if best < cap, reachAt[best] * positionAcceptEMA[best] > 0.25,
+            !roundCostSeen[best + 1] || roundCount % 16 == 0
+        {
+            return best + 1
+        }
+        return best
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -610,10 +743,10 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
-        // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
-        // split a round into head-chain graph build, verify graph build, and
-        // the single blocking eval's GPU wall. Never on in a ranked run.
-        let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
+        // Round-entry timestamp: feeds the measured cost model on every
+        // round (two clock reads per round, no GPU interaction) and the
+        // local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1) when enabled.
+        let tRound0 = DispatchTime.now().uptimeNanoseconds
         var tDraftBuilt: UInt64 = 0
         var tVerifyBuilt: UInt64 = 0
 
@@ -716,6 +849,9 @@ public final class Qwen36MTPBlockSession {
                 tailIDs.asArray(Int32.self).map { Int($0) },
                 tailValues.asArray(Float.self).map { Double($0) }
             )
+            recordRoundCost(
+                draftCount: 0,
+                wallNanos: DispatchTime.now().uptimeNanoseconds - tRound0)
             // Top-2 first ID == row argmax (same ordering); no separate argMax.
             pendingPrimary = readTail.0[0]
             pendingTop2 = readTail
@@ -852,8 +988,9 @@ public final class Qwen36MTPBlockSession {
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
         eval(cache.flatMap { $0.state } + bundle)
+        let tEvalDone = DispatchTime.now().uptimeNanoseconds
+        recordRoundCost(draftCount: draftCount, wallNanos: tEvalDone - tRound0)
         if Self.traceRounds {
-            let tEvalDone = DispatchTime.now().uptimeNanoseconds
             let line = "mtp-trace: round=\(roundCount) d=\(draftCount) "
                 + "draft_build_us=\((tDraftBuilt - tRound0) / 1000) "
                 + "verify_build_us=\((tVerifyBuilt - tDraftBuilt) / 1000) "
@@ -999,6 +1136,13 @@ public final class Qwen36MTPBlockSession {
             committed = Array(committed.prefix(stopIndex + 1))
             committedTokenCount -= dropped
             reachedStopToken = true
+        }
+
+        if Self.traceRounds {
+            let tPostDone = DispatchTime.now().uptimeNanoseconds
+            Self.traceWrite("mtp-trace: post round=\(roundCount) "
+                + "accepted=\(acceptedCount) "
+                + "post_us=\((tPostDone - tEvalDone) / 1000)\n")
         }
 
         return Qwen36MTPRoundResult(
