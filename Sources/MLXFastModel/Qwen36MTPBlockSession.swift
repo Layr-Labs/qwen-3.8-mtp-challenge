@@ -464,21 +464,17 @@ public final class Qwen36MTPBlockSession {
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
     private static let headStepCostRatio = 0.20
 
-    /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
-    /// stack, by bitwise measurement (hexfloat row gate, two attempts):
-    /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
-    /// (ids hold) even with (a) <= 5-row query chunking and (b) per-row
-    /// prefix-sliced sdpa at exactly the serial kL — identical mismatch
-    /// pattern both times, so the attention was never the (only) source;
-    /// the gated-delta scan's internal chunk geometry changes above S=5
-    /// (the invariant-#7 note warned about exactly this). Worse, the
-    /// drifted K/V rows the wide forwards write CONTAMINATE every later
-    /// round — a single wide round poisons the whole window under the
-    /// ranked exact-value replay, while staying invisible to the local
-    /// argmax-only check. Width 5 measured 5/5 bit-exact, which is why
-    /// every promoted receipt at cap 4 survived rank. Do not raise this
-    /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
-    private static let sdpaWidthWallDepthCap = 4
+    /// DEPTH CAP 5 — the cache-sequenced attention bridge in Qwen35.swift
+    /// reopens verify width 6 without relaxing the ranked exact-value gate.
+    /// A 64-row hexfloat comparison measured 0/64 top-2 token/value
+    /// mismatches, and the 301-token rejection trajectory closed all 307
+    /// declared rows with no residual divergence.  Merely chunking queries
+    /// against one already-updated cache does NOT work: each <=5-row SDPA
+    /// call must advance the live KV cache before the tail call is built.
+    /// Depths 6-8 are exact under the same bridge but locally regressed from
+    /// the extra full-attention launches, so this first promoted bridge takes
+    /// only the single newly-safe draft position.
+    private static let sdpaWidthWallDepthCap = 5
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {

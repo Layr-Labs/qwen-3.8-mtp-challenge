@@ -471,7 +471,7 @@ final class Qwen35GatedDeltaNet: Module {
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 9, let fused = fusedInProjections(inputs) {
+        if S <= 2, let fused = fusedInProjections(inputs) {
             qkv = fused.0
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
@@ -799,8 +799,11 @@ final class Qwen35Attention: Module {
         return (qProj(x), kProj(x), vProj(x))
     }
 
-    func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    private func attentionCore(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        bridgeCacheAttention: Bool = false
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -820,18 +823,59 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let attentionOutput: MLXArray
+        if bridgeCacheAttention {
+            // The fused vector SDPA is bit-exact through query width 5, but at
+            // width 6 its causal multi-query path changes target top-2 values.
+            // Chunk through attentionWithCacheUpdate itself: this is important
+            // because each exact-width call must see the cache offset produced
+            // by the preceding chunk.  Splitting queries against one already-
+            // updated cache does not reproduce serial decode.
+            let exactWidth = 5
+            var chunks = [MLXArray]()
+            chunks.reserveCapacity((L + exactWidth - 1) / exactWidth)
+            for start in stride(from: 0, to: L, by: exactWidth) {
+                let end = Swift.min(start + exactWidth, L)
+                chunks.append(
+                    attentionWithCacheUpdate(
+                        queries: queries[0..., 0..., start ..< end, 0...],
+                        keys: keys[0..., 0..., start ..< end, 0...],
+                        values: values[0..., 0..., start ..< end, 0...],
+                        cache: cache,
+                        scale: scale,
+                        mask: end - start == 1 ? .none : .causal))
+            }
+            attentionOutput = concatenated(chunks, axis: 2)
+        } else {
+            attentionOutput = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask)
+        }
+
+        let output = attentionOutput
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return sigmoidMultiply(output, gate)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        bridgeWideAttention: Bool = false
+    ) -> MLXArray {
+        guard bridgeWideAttention else {
+            return oProj(attentionCore(x, mask: mask, cache: cache))
+        }
+
+        return oProj(
+            attentionCore(
+                x, mask: mask, cache: cache, bridgeCacheAttention: true))
     }
 }
 
@@ -948,7 +992,9 @@ final class Qwen35DecoderLayer: Module {
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
                 nConfirmed: nConfirmed)
         } else {
-            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            r = selfAttn!(
+                inputLayerNorm(x), mask: attentionMask, cache: cache,
+                bridgeWideAttention: nConfirmed == 1 && x.dim(1) > 5)
         }
 
         let h = x + r
