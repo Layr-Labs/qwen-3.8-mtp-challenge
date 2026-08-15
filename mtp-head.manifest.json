@@ -1,17 +1,11 @@
 {
   "version": 1,
-  "source": "pinned",
+  "source": "remote",
   "max_bytes": 2147483648,
-
-  "repository": "EigenLabs/Qwen3.8-27B-MTP-bf16",
-  "revision": "26a328e070875b0314d652a039b6b59902690f03",
-  "tensor_count": 15,
-  "sha256": "8fceddc664f3ea96d02e304463aa1319213ff52cdf1f3401d4bce64e7075c349",
-  "bytes": 849400347,
-
-  "note": "THE CHECKED-IN DECLARATION, and it selects the ORGANIZER-PINNED head. This file is an editable path (benchmark.json editablePaths) and an OPTIONAL one: a submission archive that does not carry it keeps this copy, which is why the default has to be spelled here rather than left to absence. Absence and an explicit source of 'pinned' are the only two things that select the pinned head; a declaration that is PRESENT and broken -- unreadable, unparseable, or internally inconsistent -- is a REFUSAL and never a silent fall back, because 'your head declaration was broken so we quietly scored you on the pinned head' is how a leaderboard number becomes unattributable.",
-
+  "sha256": "e24b8d8008f657b6408803972e90112bb1f8034d95ae11d979450fdc8a6c543a",
+  "bytes": 238934137,
   "pinned_head_note": "repository, revision, tensor_count, sha256 and bytes describe the head this declaration selects: EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e070875b0314d652a039b6b59902690f03, whose model.safetensors carries 15 bf16 tensors in 849,400,347 bytes. The parser does not VERIFY these for source 'pinned' -- it verifies sha256 and bytes only for 'remote' and 'in_branch', where they bound bytes the runner fetches -- so they are recorded, not enforced, and the enforcing pins are elsewhere: fixtures/qwen3_8_27b_mtp_head.sha256 (per-file digests, 4 records, 849,406,438 whole-tree bytes) checked by the ranked workflow's verify_cache, MLXFastConstants.qwenMTPHeadTensorCount (15) asserted at load, and Qwen36MTPHeadAttachment.verifyHeadTree, which is why the published tree carries config.json and model.safetensors.index.json alongside the weights.",
-
-  "bring_your_own_head_note": "To declare your OWN head, set source to 'remote' with a source_url of the form hf:<repo>@<revision> or r2:<key>, or to 'in_branch' with a repo-relative path under mtp-head/, and give the sha256 and byte count of what you are declaring. Both are REQUIRED for those sources and both are enforced: the runner resolves the declaration pre-sandbox, fetches, digest-verifies, and refuses on mismatch or on anything above max_bytes (2 GiB, the track cap; a declaration may LOWER it and may not raise it). A head only PROPOSES tokens -- the organizer-pinned target decides every emitted token and the trusted parent re-checks the whole stream against a hidden serial trajectory after the clock stops -- so a substituted head moves the accept rate, which is the game, and cannot move the output. The BASELINE leg of the pair always runs the pinned head regardless of what this file says."
+  "bring_your_own_head_note": "To declare your OWN head, set source to 'remote' with a source_url of the form hf:<repo>@<revision> or r2:<key>, or to 'in_branch' with a repo-relative path under mtp-head/, and give the sha256 and byte count of what you are declaring. Both are REQUIRED for those sources and both are enforced: the runner resolves the declaration pre-sandbox, fetches, digest-verifies, and refuses on mismatch or on anything above max_bytes (2 GiB, the track cap; a declaration may LOWER it and may not raise it). A head only PROPOSES tokens -- the organizer-pinned target decides every emitted token and the trusted parent re-checks the whole stream against a hidden serial trajectory after the clock stops -- so a substituted head moves the accept rate, which is the game, and cannot move the output. The BASELINE leg of the pair always runs the pinned head regardless of what this file says.",
+  "submitted_note": "4-bit affine group-64 quantization of the organizer-pinned EigenLabs/Qwen3.8-27B-MTP-bf16 head, produced by round-trip min/max affine quantization of every 2D weight (norms kept bf16). 239 MB tree vs the 849 MB bf16 original: the head only PROPOSES tokens and the trusted target re-verifies every emitted token, so the swap moves accept rate only. Local acceptance on the public 512-token prompt: bf16 pinned 0.9855 vs 4-bit 0.9761 at depth 8, all tokens matched, best measured seconds/token.",
+  "source_url": "hf:dusterbloom/Qwen3.8-27B-MTP-4bit-g64@b7902f232ffbc1ab0545cdfd28b098b0b67cbb45"
 }
