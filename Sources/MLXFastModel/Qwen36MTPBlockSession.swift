@@ -4,6 +4,8 @@ import MLXFastCore
 import MLXLLM
 import MLXLMCommon
 
+// OCTONARY CONTROL: executable-equivalent redraw of promoted q4/g64 frontier.
+
 // Qwen 3.6 27B native-MTP speculative decode — the worker-side hot path for the
 // `qwen3.8-27b-mtp-v1` track.
 //
