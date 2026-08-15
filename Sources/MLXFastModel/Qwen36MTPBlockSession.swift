@@ -491,7 +491,11 @@ public final class Qwen36MTPBlockSession {
     /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
     /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
-    private static let headStepCostRatio = 0.20
+    /// POST-deb63 ALL-Q4-HEAD REFIT: 0.12 below is a new control condition
+    /// after the declared head's matrices moved from bf16 to affine q4/g64,
+    /// not a reuse of the prologue-contaminated bf16-head derivation above.
+    /// It conservatively brackets 0.20 and the byte-scaled lower bound 0.056.
+    private static let headStepCostRatio = 0.12
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
