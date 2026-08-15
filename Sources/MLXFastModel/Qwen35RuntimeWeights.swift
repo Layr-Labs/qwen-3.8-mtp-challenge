@@ -3,6 +3,7 @@ import Foundation
 import MLX
 import MLXFastCore
 import MLXLLM
+import MLXLMCommon
 import MLXNN
 
 /// Eagerly loads exactly one RAM-resident Qwen35 execution backend.
@@ -176,6 +177,27 @@ public final class Qwen35RuntimeWeightCache {
             verify: [.all]
         )
         eval(model)
+
+        // Multi-row speculative verify GEMM: batched kernel sharing each
+        // packed weight fetch across the verify rows, bit-exact per row
+        // against the stock qmv_fast M=1 path. Covers every eligible
+        // QuantizedLinear leaf (GDN projections, MLP, o_proj, lm_head) plus
+        // the packed full-attention QKV through the bridge hook. Serial
+        // decode, drafting, and prefill shapes fall back untouched.
+        _ = Qwen35BatchedVerifyLinear.install(on: model)
+        Qwen35BatchedVerifyBridge.quantizedMMHook = {
+            (x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+                groupSize: Int, bits: Int) -> MLXArray? in
+            Qwen35BatchedVerifyLinear.batchedQuantizedMM(
+                x,
+                weight: weight,
+                scales: scales,
+                biases: biases,
+                groupSize: groupSize,
+                bits: bits,
+                mode: .affine
+            )
+        }
         return model
     }
 

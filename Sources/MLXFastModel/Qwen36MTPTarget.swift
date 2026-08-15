@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 
 // The model surface the native-MTP session needs, as a protocol.
 //
@@ -36,6 +37,12 @@ import MLXLMCommon
 public protocol Qwen36MTPTarget: AnyObject {
     /// True when the MTP head is attached and operational.
     var hasMTPHead: Bool { get }
+
+    /// The loaded backbone as a `Module`, for leaf-level layer replacement.
+    /// The MTP worker builds the model through `LLMModelFactory`, so this is
+    /// the only in-worker handle participant code gets for installing the
+    /// batched verify linear swap after load.
+    var underlyingModule: Module { get }
 
     /// The hybrid cache stack: `MambaCache` on the gated-delta layers,
     /// `KVCacheSimple` on the full-attention layers.
@@ -105,5 +112,9 @@ public protocol Qwen36MTPTarget: AnyObject {
 // "non-class type 'Qwen35Model' cannot conform" — a diagnostic that points at
 // the protocol rather than at the shadowing, which is why this note exists.
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
-extension Qwen35TextModel: Qwen36MTPTarget {}
-extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}
+extension Qwen35TextModel: Qwen36MTPTarget {
+    public var underlyingModule: Module { self }
+}
+extension MLXLLM.Qwen35Model: Qwen36MTPTarget {
+    public var underlyingModule: Module { self }
+}
