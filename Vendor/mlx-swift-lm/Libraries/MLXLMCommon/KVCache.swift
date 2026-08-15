@@ -1240,6 +1240,23 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
+    /// Per-row boundary tape recorded by the GDN forward when the caller asks
+    /// for it (multi-draft native-MTP verify). Entry `i` holds the
+    /// (convolution, ssm) state exactly after row `i` of the forward's input,
+    /// for `i in 0..<S-1`, so a round can roll the recurrent state back to ANY
+    /// accepted-prefix boundary without a repair forward. Transient by
+    /// contract: the recording forward's caller consumes or discards it before
+    /// the next forward; a non-recording forward clears it.
+    public var boundaryTape: [(MLXArray, MLXArray)]? = nil
+
+    /// Row-0 (post-mask) input projections stashed by a batched multi-row GDN
+    /// forward when the caller asks (`stashPrimaryInputs`): the lazy
+    /// counterpart of the boundary tape. On a rejected speculative round the
+    /// boundary state after row 0 is recomputed bit-exactly by replaying the
+    /// stashed row through `processChunk` from the pre-forward state. Cleared
+    /// by any non-stashing forward (stale-stash hazard).
+    public var primaryBoundaryInputs: (qkv: MLXArray, a: MLXArray, b: MLXArray)? = nil
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
