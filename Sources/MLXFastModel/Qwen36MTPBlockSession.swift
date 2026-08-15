@@ -491,7 +491,16 @@ public final class Qwen36MTPBlockSession {
     /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
     /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// PROMOTED-Q4 ISOLATION ARM: the declared group-64 4-bit head reduces
+    /// its artifact payload from 849 MB to 239 MB. This arm tests h = 0.10
+    /// as a deliberately isolated scheduler re-fit on that promoted head,
+    /// without mixing in kernel, verify-width, or EMA changes. At the seeded
+    /// priors it selects depth 6 (versus depth 4 at h = 0.20), while the same
+    /// marginal rule and online acceptance evidence can still back off on a
+    /// hard prompt. The official eight-prompt M5 receipt is the authority;
+    /// do not transfer this value back to the pinned-bf16 head.
+    private static let headStepCostRatio = 0.10
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
