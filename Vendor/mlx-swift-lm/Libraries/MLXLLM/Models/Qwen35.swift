@@ -1666,7 +1666,14 @@ extension Qwen35TextModel: MTPCapable {
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
     public func makeMTPCache() -> [any KVCache] {
         guard let mtp else { return [] }
-        return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
+        return mtp.layers.map { _ in
+            let cache = KVCacheSimple()
+            // The ranked 512-seed + 512-decode window fits in one allocation.
+            // Avoid the default 256-row growth copies on this candidate-only
+            // proposal cache; target/serial caches keep their existing layout.
+            cache.step = 1024
+            return cache as any KVCache
+        }
     }
 }
 
