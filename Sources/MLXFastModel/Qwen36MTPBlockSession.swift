@@ -491,7 +491,14 @@ public final class Qwen36MTPBlockSession {
     /// the UNFUSED-sdpa cliff — the very regime the depth cap excludes.
     /// 0.60 measured -1% (over-strict ramp, 16 rounds); 0.20 reaches the
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// Q4 DIAGNOSTIC ARM: 0.14 is an aggressive intermediate bracket point
+    /// for the promoted group-64 compact head. It changes the cold-start choice
+    /// from depth 4 to 5, while remaining above the historically underpriced
+    /// 0.12 fit. This is a one-variable official experiment, not a claim that
+    /// artifact-byte shrinkage makes the whole chained head step scale equally;
+    /// interpret the eight-prompt receipt against same-base neighboring arms.
+    private static let headStepCostRatio = 0.14
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
