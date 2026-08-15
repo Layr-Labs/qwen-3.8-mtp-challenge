@@ -115,6 +115,10 @@ public final class Qwen36MTPBlockSession {
     private var cache: [any KVCache] = []
     /// Logits of the row that produces the next primary. One row, `[1, 1, V]`.
     private var pendingLogitsRow: MLXArray?
+    /// Exact target top-1 ID for `pendingLogitsRow` when that row came from the
+    /// already-materialized speculative top-2 readout. Serial/adaptive K=0 keeps
+    /// using `argmaxLast` so the control path remains unchanged.
+    private var pendingPrimaryID: Int?
     /// The (post-norm) trunk hidden that seeds the next draft round.
     private var pendingHidden: MLXArray?
 
@@ -324,10 +328,6 @@ public final class Qwen36MTPBlockSession {
                 expected: expected, actual: base, round: roundCount)
         }
 
-        let primary = argmaxLast(logitsRow)
-        var committed = [primary]
-        committedTokenCount += 1
-
         // THE DRAFT SCHEDULE. `depth` is what the parent offered; `draftCount`
         // is what this round proposes, and from here down it is the only width
         // that matters -- the draft loop, the declared row count, the per-row
@@ -339,6 +339,15 @@ public final class Qwen36MTPBlockSession {
                 && draftCount <= Qwen36MTPLimits.maxDepth,
             "draftPolicy returned \(draftCount) for an offer of \(depth); a "
                 + "round may propose 0 ... min(offer, maxDepth) drafts")
+
+        // A speculative predecessor already materialized this row's exact top-1
+        // as part of the trusted top-2 ledger. Consume it only on the ranked K=1
+        // path; serial/adaptive K=0 and wider experiments retain their own argMax.
+        let reusablePrimary = draftCount == 1 ? pendingPrimaryID : nil
+        pendingPrimaryID = nil
+        let primary = reusablePrimary ?? argmaxLast(logitsRow)
+        var committed = [primary]
+        committedTokenCount += 1
 
         // A stop token as the primary ends the run BEFORE any drafting: there is
         // nothing after it to predict, and drafting past it would charge the
@@ -501,6 +510,7 @@ public final class Qwen36MTPBlockSession {
             pendingLogitsRow = bonus
             pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
+            pendingPrimaryID = flatTop2IDs[base]
             perRowTop2Tokens.append(Array(flatTop2IDs[base ..< (base + 2)]))
             perRowTop2Logits.append(Array(flatTop2Values[base ..< (base + 2)]))
         } else {
@@ -521,6 +531,7 @@ public final class Qwen36MTPBlockSession {
                 pendingLogitsRow = verifyLogits[
                     0..., acceptedCount ..< (acceptedCount + 1), 0...]
                 pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingPrimaryID = flatTop2IDs[acceptedCount * 2]
                 perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
                 perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
             } else if fastK1 && Self.restoreAfterSingleDraftReject(
@@ -529,6 +540,7 @@ public final class Qwen36MTPBlockSession {
                 pendingLogitsRow = verifyLogits[
                     0..., acceptedCount ..< (acceptedCount + 1), 0...]
                 pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingPrimaryID = flatTop2IDs[acceptedCount * 2]
                 perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
                 perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
             } else {
@@ -543,6 +555,7 @@ public final class Qwen36MTPBlockSession {
                 pendingLogitsRow = repairLogits[
                     0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
                 pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
+                pendingPrimaryID = nil
                 let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
                 perRowTop2Tokens.append(ids)
                 perRowTop2Logits.append(values)
@@ -561,6 +574,7 @@ public final class Qwen36MTPBlockSession {
             committed = Array(committed.prefix(stopIndex + 1))
             committedTokenCount -= dropped
             reachedStopToken = true
+            pendingPrimaryID = nil
         }
 
         return Qwen36MTPRoundResult(
