@@ -124,12 +124,13 @@ func setupScriptDefaultsToFastReferenceMirror() throws {
     #expect(setup.contains("stop_reference_download_heartbeat"))
     #expect(setup.contains("still downloading safetensors shard(s)"))
 
-    // The Yukon submission CLI (mlxfast) is installed by the external Yukon
+    // The Yukon CLI (`yukon`) is installed by the external Yukon
     // installer; setup only surfaces install/PATH-activation guidance and
     // must never fail because of it.
-    #expect(main.contains("wait_for_mlx_metallib_build\ncheck_mlxfast_cli\nprint_setup_summary \"ready\""))
+    #expect(main.contains("wait_for_mlx_metallib_build\ncheck_yukon_cli\nprint_setup_summary \"ready\""))
     #expect(setup.contains("is not on PATH, so"))
     #expect(setup.contains("external Yukon installer"))
+    #expect(setup.contains("use the Yukon CLI ('yukon')"))
 
     // The pinned backbone repository is PUBLIC since the 2026-08-14 publish, so
     // the documented default is an anonymous fetch and
@@ -332,7 +333,7 @@ func benchmarkFailsFastWhenSetupArtifactsAreMissing() throws {
     #expect(prerequisite.lowerBound < automaticBuild.lowerBound)
 
     let guardBody = String(benchmark[prerequisite.lowerBound..<automaticBuild.lowerBound])
-    #expect(guardBody.contains("MLXFAST_CLI_COMMAND"))
+    #expect(guardBody.contains("YUKON_CLI_COMMAND"))
     #expect(guardBody.contains("exit 1"))
 }
 
@@ -432,7 +433,7 @@ func benchmarkRejectsPartialSetupBeforeInvokingExistingBinary() throws {
         "MLXFAST_NO_SANDBOX": "1",
         "MLXFAST_SWIFT_BIN": fakeSwift.path,
         "MLXFAST_MLX_METALLIB": root.appendingPathComponent("missing.metallib").path,
-        "MLXFAST_CLI_COMMAND": "mlxfast-dev",
+        "YUKON_CLI_COMMAND": "yukon-dev",
         "MLXFAST_SCORE_PATH": root.appendingPathComponent("score.json").path,
         "MLXFAST_INTEGRITY_PATH": root.appendingPathComponent("integrity.json").path,
     ])
@@ -447,16 +448,25 @@ func benchmarkRejectsPartialSetupBeforeInvokingExistingBinary() throws {
     ) ?? ""
 
     #expect(process.terminationStatus != 0)
-    #expect(stderrText.contains("mlxfast-dev setup"))
+    #expect(stderrText.contains("yukon-dev setup"))
     #expect(!FileManager.default.fileExists(atPath: invocation.path))
 }
 
 @Test
 func participantDocsExposeDefaultCLIInstallDirectory() throws {
     let pathExport = #"export PATH="${HOME}/.local/bin:${PATH}""#
+    let retiredParticipantPrefix = ["mlx", "fast"].joined()
     for path in ["README.md", "TASK.md", "AGENTS.md", "CLAUDE.md"] {
         let document = try String(contentsOfFile: path, encoding: .utf8)
         #expect(document.contains(pathExport), "\(path) must expose the default CLI install directory")
+        #expect(document.contains("Yukon CLI (`yukon`)"), "\(path) must name the Yukon CLI explicitly")
+        for verb in ["login", "clone", "submit", "submissions", "run", "sync"] {
+            let retiredCommand = "\(retiredParticipantPrefix) \(verb)"
+            #expect(
+                !document.contains(retiredCommand),
+                "\(path) must direct participants to `yukon`, not `\(retiredCommand)`"
+            )
+        }
     }
 }
 
@@ -1878,7 +1888,7 @@ func submissionStaticReviewOversizeFailureExplainsStaleCloneDeletions() throws {
     #expect(oversize.output.contains("deletes 1 editable file(s) that exist on the trusted base"))
     #expect(oversize.output.contains("Vendor/mlx-swift/Kernel.metal"))
     #expect(oversize.output.contains("stale clone"))
-    #expect(oversize.output.contains("mlxfast sync"))
+    #expect(oversize.output.contains("yukon sync"))
     #expect(oversize.output.contains("resubmit"))
 }
 
@@ -3574,7 +3584,7 @@ func benchmarkLocalIterateModeUsesPublicFixtureAndNonOfficialScore() throws {
     #expect(!runtime.contains("teacherForcedCorrectnessStep(previousToken: testCase.expectedTokens[decodedStep])"))
     #expect(!runtime.contains("topLogits(from:"))
     // Local modes publish the estimated (non-official) score so the Yukon CLI
-    // (`mlxfast run`), which requires a finite numeric score at scorePath, can
+    // (`yukon run`), which requires a finite numeric score at scorePath, can
     // consume valid local runs; invalid timing produces an explicit failed payload.
     #expect(runtime.contains("let estimatedScore = BenchmarkScore.score("))
     #expect(runtime.contains("error: \"local estimated score is invalid:"))

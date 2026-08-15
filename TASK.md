@@ -176,28 +176,29 @@ golden generation, benchmark-oracle validation, and provenance checks live in
 that trusted harness layer.
 
 Account and submission management — login, clone, submit, and listing
-submissions — are handled by the **Yukon CLI (`mlxfast`)**, not by
+submissions — are handled by the **Yukon CLI (`yukon`)**, not by
 `mlxfast-swift`. The Swift binary now runs the benchmark domain only (transform,
 correctness, benchmark, preflight, verify-transform, and the DFlash-track
 `dflash-benchmark`/`dflash-probe`/`dflash-reference`); it no longer logs in or
-uploads. The CLI installer defaults to `~/.local/bin`, so expose that directory
-in the current shell before using it. Submit with:
+uploads. Always use `yukon` for participant CLI operations. The CLI installer
+defaults to `~/.local/bin`, so expose that directory in the current shell before
+using it. Submit with:
 
 ```bash
 export PATH="${HOME}/.local/bin:${PATH}"
-mlxfast login <api-key> --api <url>
-mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
-mlxfast submit --model "<model name>" --note "..."
-mlxfast submissions
+yukon login <api-key> --api <url>
+yukon clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
+yukon submit --model "<exact model name>" --note-file submission-note.md
+yukon submissions
 ```
 
-`mlxfast submit` reads `benchmark.json` and uploads only `editablePaths` as a
+`yukon submit` reads `benchmark.json` and uploads only `editablePaths` as a
 gzip tar archive with bearer-token auth; the backend applies it to the frozen
 benchmark checkout and re-enforces the editable surface server-side before
 running hidden validation. `--model` is required and is recorded for the
 leaderboard; pass `--note-file PATH` or `--claimed-score N` as needed.
 The benchmark contract also declares a local `preSubmitCommand`:
-`./benchmark-dflash.sh --local-submit`. `mlxfast submit` does not run it — the upload
+`./benchmark-dflash.sh --local-submit`. `yukon submit` does not run it — the upload
 goes directly to official validation, and no local run blocks it. Running that
 command yourself before submitting is the recommended local correctness and
 timing check, without running the official hidden golden.
@@ -370,10 +371,10 @@ swift build -c release --force-resolved-versions
 ./benchmark-dflash.sh --local-iterate
 ./benchmark-dflash.sh --local-submit
 
-# Submitting is done with the Yukon CLI (mlxfast), not mlxfast-swift:
-mlxfast clone <benchmark-id-or-name>
-mlxfast submit --model "<model name>" --note "..."
-mlxfast submissions
+# Submitting is done with the Yukon CLI (`yukon`), not mlxfast-swift:
+yukon clone <benchmark-id-or-name>
+yukon submit --model "<exact model name>" --note-file submission-note.md
+yukon submissions
 ```
 
 Always pass `--force-resolved-versions` to direct `swift build` / `swift

@@ -330,7 +330,7 @@ report_local_baseline_context() {
 # does not have to be dug out of the JSON payload. The estimated score uses the
 # official formula against the official baseline constants carried inside the
 # score payload; local modes publish that estimate as the payload's score so
-# the Yukon participant CLI (`mlxfast run`), which requires a finite numeric
+# the Yukon participant CLI (`yukon run`), which requires a finite numeric
 # score at the contract scorePath, can consume local runs. It is a directional
 # local estimate (metrics.runtime marks the mode), never the official score,
 # which only the ranked runner produces. When a same-machine baseline snapshot
@@ -1728,12 +1728,12 @@ if [[ ! -s "${MLX_METALLIB}" ]]; then
   # Fail fast when setup never completed (fresh checkout) or completed only
   # partially: without mlx.metallib the runtime worker cannot run, so stop
   # before the automatic `swift build` below spends minutes producing an
-  # unusable worker. MLXFAST_CLI_COMMAND only renames the CLI printed in
+  # unusable worker. YUKON_CLI_COMMAND only renames the CLI printed in
   # this guidance (wrapper CLIs that drive benchmark.sh under another name
   # set it); it never changes behavior. The Yukon CLI's `setup` subcommand
   # runs this repository's benchmark.json setupCommand, which is ./setup.sh,
   # so both suggested commands are equivalent.
-  cli_command="${MLXFAST_CLI_COMMAND:-mlxfast}"
+  cli_command="${YUKON_CLI_COMMAND:-yukon}"
   echo "benchmark.sh: setup is incomplete; MLX metallib is missing at ${MLX_METALLIB}" >&2
   echo "Run setup before benchmarking:" >&2
   echo "  ${cli_command} setup" >&2

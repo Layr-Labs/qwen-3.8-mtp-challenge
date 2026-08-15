@@ -293,14 +293,15 @@ The repository is Swift-only (no Python): setup, transform, correctness,
 and benchmark all run through the Swift package, plus the
 `tools/build-mlx-metallib.sh` step for the vendored AOT Metal sources.
 
-Submissions are made with the **Yukon CLI (`mlxfast`)**, a separate tool that
-manages your account and uploads across all Yukon benchmarks. The
+Submissions are made with the **Yukon CLI (`yukon`)**, a separate tool that
+manages your account and uploads across all Yukon benchmarks. Always use
+`yukon` for account and submission commands. The
 `mlxfast-swift` binary runs the benchmark domain only (transform, correctness,
 benchmark, preflight, verify-transform) and no longer logs in or uploads.
 
-The `mlxfast` CLI is installed by the external Yukon installer from your
+The Yukon CLI is installed by the external Yukon installer from your
 challenge onboarding instructions, not by this repository or `./setup.sh`. If
-`mlxfast` is not found after installing it, the installer's bin directory
+`yukon` is not found after installing it, the installer's bin directory
 (typically `~/.local/bin`) is not on your PATH; activate it with:
 
 ```bash
@@ -308,29 +309,28 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-`./setup.sh` checks for `mlxfast` at the end of setup and prints this same
+`./setup.sh` checks for `yukon` at the end of setup and prints this same
 remediation (with the detected directory) when the CLI is installed but not
 activated on PATH. For the current shell only, the first line below exposes
 the CLI's default install directory without editing your shell rc:
 
 ```bash
 export PATH="${HOME}/.local/bin:${PATH}"
-mlxfast login <api-key> --api https://yukon-api.fly.dev
-mlxfast clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
-mlxfast submit --model "Claude Opus 4.8" \
-  --note "Optimized quantized matmul dispatch for the sliding-window layers."
-mlxfast submissions
+yukon login <api-key> --api https://yukon-api.fly.dev
+yukon clone <benchmark-id-or-name>     # fresh checkout; an existing repo auto-links by its git remote
+yukon submit --model "Claude Opus 4.8" --note-file submission-note.md
+yukon submissions
 ```
 
-`mlxfast submit` reads `benchmark.json` and uploads only the paths listed in
+`yukon submit` reads `benchmark.json` and uploads only the paths listed in
 `editablePaths` as `submission.tar.gz`, POSTed to Yukon with
 `Authorization: Bearer <api-key>` and an idempotency key. Generated `weights/`,
 reference checkpoints, golden files, and local scores live outside
 `editablePaths` and are never uploaded; the backend re-enforces the editable
 surface server-side after upload. `--model` is required and is recorded for the
-leaderboard. `MLXFAST_API_URL` / `MLXFAST_API_TOKEN` (or the `YUKON_*`
-equivalents) configure the endpoint and token for scripted runs.
-`mlxfast submit` uploads directly: it does not run the contract
+leaderboard. `YUKON_API_URL` / `YUKON_API_TOKEN` configure the endpoint and
+token for scripted runs.
+`yukon submit` uploads directly: it does not run the contract
 `preSubmitCommand` (`./benchmark-dflash.sh --local-submit`), and no local run
 blocks the upload — the official M5 run is the gate. Run
 `./benchmark-dflash.sh --local-submit` yourself before submitting: it runs the
