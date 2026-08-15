@@ -457,7 +457,16 @@ public final class Qwen36MTPBlockSession {
                 input: verifyTokens, cache: cache)
             : model.callWithHidden(
                 input: verifyTokens, cache: cache, nConfirmed: fastK1 ? 1 : 0)
-        let verifyArgmax = argmaxAll(verifyLogits)
+        let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
+        eval(top2IDs, top2Values)
+        let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
+        let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
+        // The reducer's first ID uses the target argmax ordering: larger logit,
+        // then lower token ID on an exact tie. Reuse it for acceptance instead of
+        // launching a second vocabulary-wide argMax over the same rows.
+        let verifyArgmax = stride(from: 0, to: flatTop2IDs.count, by: 2).map {
+            flatTop2IDs[$0]
+        }
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -470,10 +479,6 @@ public final class Qwen36MTPBlockSession {
             if stopTokens.contains(drafts[index]) { break }
         }
 
-        let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        eval(top2IDs, top2Values)
-        let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
-        let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         var perRowTop2Tokens: [[Int]] = []
         var perRowTop2Logits: [[Double]] = []
         perRowTop2Tokens.reserveCapacity(draftCount + 1)
@@ -952,9 +957,6 @@ public final class Qwen36MTPBlockSession {
         return argMax(row, axis: -1).item(Int.self)
     }
 
-    private func argmaxAll(_ logits: MLXArray) -> [Int] {
-        argMax(logits, axis: -1)[0].asArray(Int.self)
-    }
 }
 
 /// Compiled bounds for the native-MTP track. Deliberately not env-overridable.
