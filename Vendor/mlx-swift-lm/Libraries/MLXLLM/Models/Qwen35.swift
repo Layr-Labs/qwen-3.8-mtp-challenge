@@ -168,17 +168,18 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDelta verify helpers
 
-/// Fuse the ordinary elementwise primitives that form the recurrence's
-/// fp32 `g` and `beta` inputs. `compile` preserves every typed bf16 temporary
-/// in these expressions while removing their dispatch and materialization
-/// overhead. Shapeless compilation shares one trace across verify widths.
+/// Fuse the ordinary elementwise primitives that form the recurrence's fp32
+/// `g` and `beta` inputs. The third input is the per-layer memoized
+/// `-exp(A_log)`, so the promoted compiled prologue and the input-independent
+/// gate memo stack instead of replacing one another. Shapeless compilation
+/// shares one trace across verify widths.
 private let qwen35CompiledGatedDeltaGBeta:
     @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
 {
     let body: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (
         MLXArray, MLXArray
-    ) = { a, b, aLog, dtBias in
-        let g = computeGatedDeltaG(aLog, a, dtBias)
+    ) = { a, b, negExpALog, dtBias in
+        let g = exp(negExpALog * softplus(a + dtBias))
         let beta = sigmoid(b).asType(.float32)
         return (g, beta)
     }
@@ -372,6 +373,62 @@ final class Qwen35GatedDeltaNet: Module {
     private var _inBits = 4
     private var _inMode = QuantizationMode.affine
 
+    // Input-independent per-layer memo of `-exp(A_log)` in fp32 — the only
+    // input-independent factor of the decay gate `g = exp(-exp(A_log) *
+    // softplus(a + dt_bias))`. `computeGatedDeltaG` rebuilt it (astype, exp,
+    // negate — three launches per layer per recurrence call) every round;
+    // the multiply and outer exp that consume it are unchanged, and
+    // `-exp(x) * s` was already `negative(exp(x)) * s`, so g is
+    // arithmetically identical. Pure weight-derived cache, the allowed
+    // input-independent kind.
+    private var _negExpALog: MLXArray?
+    private var negExpALog: MLXArray {
+        if let cached = _negExpALog { return cached }
+        let value = -exp(aLog.asType(.float32))
+        _negExpALog = value
+        return value
+    }
+
+    /// `gatedDeltaUpdate` with the g-gate's input-independent factor served
+    /// from `negExpALog`. The prologue replicates the vendored function's
+    /// arithmetic exactly (fp32 beta and g, fp32 state coercion) and the
+    /// dispatch reuses the same internal kernel/ops pair. Guarded on the
+    /// same kernel-availability condition class as the S == 2 mid-kernel:
+    /// when custom kernels are unavailable we fall back to the untouched
+    /// vendored `gatedDeltaUpdate`, never to a mismatched dispatch.
+    ///
+    /// Apply the weight-derived memo uniformly at every sequence width,
+    /// including the depth-0 serial-control path. The optimization is
+    /// input-independent and arithmetically identical for both benchmark
+    /// legs; the kernel-availability guard below is the only dispatch gate.
+    private func gatedDeltaUpdateMemoG(
+        q: MLXArray,
+        k: MLXArray,
+        v: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        state: MLXArray?,
+        mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        guard qwen35GatedDeltaMidKernel != nil else {
+            return gatedDeltaUpdate(
+                q: q, k: k, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+        }
+        let beta = sigmoid(b).asType(.float32)
+        let g = exp(negExpALog * softplus(a + dtBias))
+        let B = q.dim(0)
+        let Dk = q.dim(3)
+        let Hv = v.dim(2)
+        let Dv = v.dim(3)
+        var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+        if state.dtype != .float32 {
+            state = state.asType(.float32)
+        }
+        return gatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -505,14 +562,12 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
+        let (out, newSsmState) = gatedDeltaUpdateMemoG(
             q: qNormed,
             k: kNormed,
             v: v,
             a: a,
             b: b,
-            aLog: aLog,
-            dtBias: dtBias,
             state: ssmState,
             mask: mask
         )
@@ -523,23 +578,6 @@ final class Qwen35GatedDeltaNet: Module {
     /// reconstruct a committed recurrent prefix after the target acceptance
     /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
     /// midpoint state tensor is produced on the hot path.
-    /// WIDTH-WALL CHUNK BOUNDARY. Verify widths 6...9 drift from the serial
-    /// trajectory in top-2 values at rank (the `sdpaWidthWallDepthCap`
-    /// receipts: drift starts at the 6th row, widths 2...5 are bit-exact),
-    /// through wide-shape kernel selection in the recurrence prologue (the
-    /// conv runs over 3+S positions and is the shape-dependent op in this
-    /// path; the recurrence's own t-loop is order-independent of T). The fix
-    /// removes the wide shapes: split S in 6...9 into [S-4, 4] — both
-    /// sub-widths inside the rank-proven 2...5 range — chaining the fp32
-    /// recurrent state losslessly between the two calls. Replay MUST mirror
-    /// the same boundary (see `replayPrefix`), which is why this is the one
-    /// shared source of truth for it. Returns nil at widths that stay on the
-    /// proven single-chunk form.
-    fileprivate static func verifyChunkBoundary(_ rows: Int) -> Int? {
-        guard rows >= 6, rows <= 9 else { return nil }
-        return rows - 4
-    }
-
     private func processChunkStashingPrefix(
         qkv: MLXArray,
         a: MLXArray,
@@ -556,103 +594,49 @@ final class Qwen35GatedDeltaNet: Module {
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
 
-        // The conv prologue and the recurrence for one row range. `lo ..< hi`
-        // rows of the verify block; the conv window for those rows is the
-        // matching slice of the SAME concatenated conv input the single-chunk
-        // form builds, so per-position conv windows are identical and the
-        // chunked conv length (3 + rows) stays in the rank-proven regime.
-        func prologueAndScan(
-            _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
-        ) -> (
-            MLXArray, MLXArray, MLXArray, MLXArray, MLXArray,
-            MLXArray, MLXArray
-        ) {
-            let rows = hi - lo
-            let convOut = silu(
-                conv1d(convInput[0..., lo ..< (hi + nKeep), 0...]))
-            let convSplit = MLX.split(
-                convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, rows, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, rows, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, rows, numVHeads, headVDim)
+        let convSplit = MLX.split(
+            convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            let aChunk = a[0..., lo ..< hi, 0...]
-            let bChunk = b[0..., lo ..< hi, 0...]
-            let chunkMask = mask.map { $0[0..., lo ..< hi] }
-            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
-                aChunk, bChunk, aLog, dtBias)
-            let recurrence: (MLXArray, MLXArray)
-            if MLXHardwareInfo.isCompiledDecodeSupported {
-                recurrence = qwen35GatedDeltaPrepared(
-                    q: qNormed, k: kNormed, v: v,
-                    g: g, beta: beta, state: stateIn, mask: chunkMask)
-            } else {
-                recurrence = gatedDeltaUpdate(
-                    q: qNormed,
-                    k: kNormed,
-                    v: v,
-                    a: aChunk,
-                    b: bChunk,
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: stateIn,
-                    mask: chunkMask
-                )
-            }
-            return (
-                recurrence.0, recurrence.1, qNormed, kNormed, v, g, beta)
-        }
-
-        let out: MLXArray
-        let newSsmState: MLXArray
-        let tapeQ: MLXArray
-        let tapeK: MLXArray
-        let tapeV: MLXArray
-        let tapeG: MLXArray
-        let tapeBeta: MLXArray
-        if let c1 = Self.verifyChunkBoundary(S) {
-            let (out1, seamState, q1, k1, v1, g1, beta1) =
-                prologueAndScan(0, c1, ssmState)
-            let (out2, finalState, q2, k2, v2, g2, beta2) =
-                prologueAndScan(c1, S, seamState)
-            out = concatenated([out1, out2], axis: 1)
-            newSsmState = finalState
-            tapeQ = concatenated([q1, q2], axis: 1)
-            tapeK = concatenated([k1, k2], axis: 1)
-            tapeV = concatenated([v1, v2], axis: 1)
-            tapeG = concatenated([g1, g2], axis: 1)
-            tapeBeta = concatenated([beta1, beta2], axis: 1)
+        // Keep the recurrence and conv prologue wide. The promoted compiled
+        // g/beta launch reduction feeds the same single recurrence, while the
+        // SDPA helper alone bridges the width-sensitive kernel boundary.
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+            a, b, negExpALog, dtBias)
+        let recurrence: (MLXArray, MLXArray)
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            recurrence = qwen35GatedDeltaPrepared(
+                q: qNormed, k: kNormed, v: v,
+                g: g, beta: beta, state: ssmState, mask: mask)
         } else {
-            let (o, s, q, k, v, g, beta) =
-                prologueAndScan(0, S, ssmState)
-            out = o
-            newSsmState = s
-            tapeQ = q
-            tapeK = k
-            tapeV = v
-            tapeG = g
-            tapeBeta = beta
+            recurrence = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: ssmState, mask: mask)
         }
-
+        let out = recurrence.0
+        let newSsmState = recurrence.1
         let tape = ArraysCache.PrefixReplayTape(
             convInput: convInput,
-            q: tapeQ,
-            k: tapeK,
-            v: tapeV,
+            q: qNormed,
+            k: kNormed,
+            v: v,
             a: a,
             b: b,
-            g: tapeG,
-            beta: tapeBeta,
+            g: g,
+            beta: beta,
             ssmPre: ssmState.map { $0[.ellipsis] },
             mask: mask.map { $0[.ellipsis] },
             rowCount: S,
@@ -689,51 +673,30 @@ final class Qwen35GatedDeltaNet: Module {
         guard canReplayPrefix(cache: cache, committedRows: committedRows),
               let tape = cache.prefixReplayTape
         else { return false }
-        // Replay MUST mirror the forward's chunk boundary (width-wall fix):
-        // a wide tape's forward ran as [c1, rowCount-c1], so the state after
-        // row t is the chained two-call state. Replaying rows 0 ..< r as one
-        // call would re-introduce a wide recurrence shape AND diverge from
-        // the forward's own chaining. r <= c1 is a prefix of the forward's
-        // first call; r > c1 replays the first call in full (bitwise the
-        // same call the forward made) and a prefix of the second from the
-        // reproduced seam state.
-        func replayRange(
-            _ lo: Int, _ hi: Int, _ stateIn: MLXArray?
-        ) -> MLXArray {
-            let rows = lo ..< hi
-            let recurrence: (MLXArray, MLXArray)
-            if MLXHardwareInfo.isCompiledDecodeSupported {
-                recurrence = qwen35GatedDeltaPrepared(
-                    q: tape.q[0..., rows, 0...],
-                    k: tape.k[0..., rows, 0...],
-                    v: tape.v[0..., rows, 0...],
-                    g: tape.g[0..., rows],
-                    beta: tape.beta[0..., rows],
-                    state: stateIn,
-                    mask: tape.mask.map { $0[0..., rows] })
-            } else {
-                recurrence = gatedDeltaUpdate(
-                    q: tape.q[0..., rows, 0...],
-                    k: tape.k[0..., rows, 0...],
-                    v: tape.v[0..., rows, 0...],
-                    a: tape.a[0..., rows, 0...],
-                    b: tape.b[0..., rows, 0...],
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: stateIn,
-                    mask: tape.mask.map { $0[0..., rows] })
-            }
-            return recurrence.1
-        }
-        let boundarySsm: MLXArray
-        if let c1 = Self.verifyChunkBoundary(tape.rowCount),
-           committedRows > c1
-        {
-            let seamState = replayRange(0, c1, tape.ssmPre)
-            boundarySsm = replayRange(c1, committedRows, seamState)
+        let rows = 0 ..< committedRows
+        let recurrence: (MLXArray, MLXArray)
+        if MLXHardwareInfo.isCompiledDecodeSupported {
+            recurrence = qwen35GatedDeltaPrepared(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                g: tape.g[0..., rows],
+                beta: tape.beta[0..., rows],
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] })
         } else {
-            boundarySsm = replayRange(0, committedRows, tape.ssmPre)
+            recurrence = gatedDeltaUpdate(
+                q: tape.q[0..., rows, 0...],
+                k: tape.k[0..., rows, 0...],
+                v: tape.v[0..., rows, 0...],
+                a: tape.a[0..., rows, 0...],
+                b: tape.b[0..., rows, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: tape.ssmPre,
+                mask: tape.mask.map { $0[0..., rows] })
         }
+        let boundarySsm = recurrence.1
         cache[0] = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -834,10 +797,10 @@ final class Qwen35GatedDeltaNet: Module {
                 MLXArray(invScale).asType(dtype)
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            // Replicates gatedDeltaUpdate's prologue exactly (fp32 beta/g,
-            // fp32 state init).
+            // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
+            // serving the gate's input-independent factor from the layer memo.
             let (g, beta) = qwen35CompiledGatedDeltaGBeta(
-                a, b, aLog, dtBias)
+                a, b, negExpALog, dtBias)
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
@@ -948,7 +911,7 @@ final class Qwen35GatedDeltaNet: Module {
 // MARK: - Fused MLP
 
 /// Decode-width fused gate/up MLP. Same math as the vendored `Qwen3NextMLP` —
-/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 2) the
+/// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 9) the
 /// gate and up projections run as ONE matmul over concatenated output rows
 /// (N = 34816), halving the biggest per-layer launch count on the hot path.
 ///
@@ -956,9 +919,13 @@ final class Qwen35GatedDeltaNet: Module {
 /// K, every N here (17408 and 34816) keeps the fast-kernel eligibility
 /// (N%8==0 at K%512==0), and a row's dot-product arithmetic in `qmv_fast`
 /// does not depend on which launch it rides in — the in-tree precedent is
-/// the promoted FA QKV fuse below. Prefill (S > 2) keeps the two separate
-/// calls so the qmm/split-k reduction order of the pinned baseline is
-/// preserved byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
+/// the promoted FA QKV fuse below. The guard covers exactly the widths the
+/// host still serves through the per-row-exact QMV dispatch (crossrow for
+/// M <= 5, per-row qmv_fast above it; the qmv batch limit is 10+ for these
+/// shapes on this generation — the same coverage the S <= 9 GDN in-proj
+/// fuse gate relies on); prefill (S > 9) keeps the two separate calls so
+/// the qmm/split-k reduction order of the pinned baseline is preserved
+/// byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
 /// side carries no exactness constraint at all.
 final class Qwen35FusedMLP: Module, UnaryLayer {
@@ -1017,7 +984,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
+        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -1052,6 +1019,12 @@ final class Qwen35Attention: Module {
     private var _qkvMode = QuantizationMode.affine
     private var _qOut = 0
     private var _kOut = 0
+    // Dense (bf16) Q/K/V pack for the MTP head layers, same concat-on-N
+    // argument as the quantized pack above: rows are independent, so one
+    // GEMM over concatenated weights is bit-exact with three separate
+    // launches — and this is the proposal side regardless. Cuts two
+    // launches and two host ops from every head chain step.
+    private var _qkvDenseW: MLXArray?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1095,6 +1068,12 @@ final class Qwen35Attention: Module {
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
         }
+        if let w = _qkvDenseW {
+            let y = matmul(x, w.transposed(1, 0))
+            let qEnd = _qOut
+            let kEnd = _qOut + _kOut
+            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+        }
         if let q = qProj as? QuantizedLinear,
            let k = kProj as? QuantizedLinear,
            let v = vProj as? QuantizedLinear,
@@ -1111,6 +1090,17 @@ final class Qwen35Attention: Module {
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
+            return qkv(x)
+        }
+        if !(qProj is QuantizedLinear), !(kProj is QuantizedLinear),
+           !(vProj is QuantizedLinear),
+           qProj.bias == nil, kProj.bias == nil, vProj.bias == nil
+        {
+            _qkvDenseW = concatenated(
+                [qProj.weight, kProj.weight, vProj.weight], axis: 0
+            ).contiguous()
+            _qOut = qProj.weight.dim(0)
+            _kOut = kProj.weight.dim(0)
             return qkv(x)
         }
         return (qProj(x), kProj(x), vProj(x))
@@ -1137,51 +1127,16 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let attended: MLXArray
-        if L >= 6, L <= 9, case .causal = mask, cache is KVCacheSimple {
-            // WIDTH-WALL FIX, attention half (verify widths 6...9): split
-            // the query rows into [L-4, 4] — both sub-widths in the 2...5
-            // range the ranked replay has proven bit-exact — and advance
-            // the KV cache in the same two steps, so each SDPA call sees
-            // exactly the (qL, kL = prefix + qL) shape a cap-4 verify
-            // produces. `.causal` alignment is exact on both calls: chunk
-            // one's row i attends keys <= prefix + i, chunk two's row i
-            // attends keys <= prefix + (L-4) + i, which is the serial
-            // trajectory's key set for those positions. RoPE above is
-            // per-position and already applied to all L rows; per-row
-            // attention accumulation over the key axis is order-identical
-            // to the single call, so this is a shape change only.
-            let c1 = L - 4
-            let out1 = attentionWithCacheUpdate(
-                queries: queries[0..., 0..., ..<c1, 0...],
-                keys: keys[0..., 0..., ..<c1, 0...],
-                values: values[0..., 0..., ..<c1, 0...],
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            let out2 = attentionWithCacheUpdate(
-                queries: queries[0..., 0..., c1..., 0...],
-                keys: keys[0..., 0..., c1..., 0...],
-                values: values[0..., 0..., c1..., 0...],
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            attended = concatenated([out1, out2], axis: 2)
-        } else {
-            attended = attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-        }
-        let output = attended
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -1446,6 +1401,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     // for draft proposals when no declared draft_lm_head is present. It is not
     // ModuleInfo because it is derived during warmup, not checkpoint state.
     private var _compactDraftHead: Linear?
+    // Prefix 98_304, the promoted trim. A 49_152 halving was measured on the
+    // public longcopy gate and REGRESSED: three of its committed argmax ids
+    // live in [49_152, 248_044), the head could no longer propose them, and
+    // the forced rejects cost more round-bases than the halved compact-head
+    // read saved (accept 1.00 -> 0.877, 21.1 -> 22.8 ms/token). The read is
+    // ~315 MB of affine-4 rows per draft step (~0.6 ms), so the ceiling of
+    // any further trim is small and the acceptance downside is not.
     private static let compactDraftPrefixCount = 98_304
     private static let compactDraftControlStart = 248_044
     private static let compactDraftControlEnd = 248_070
@@ -1727,8 +1689,9 @@ extension Qwen35TextModel: MTPCapable {
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
-    /// host readback. The low 98,304 rows retain their IDs; the appended rows
-    /// are Qwen's official text/control tokens 248,044 ... 248,069.
+    /// host readback. The low `compactDraftPrefixCount` rows retain their
+    /// IDs; the appended rows are Qwen's official text/control tokens
+    /// 248,044 ... 248,069.
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
         guard usesCompactDraftVocabulary else { return ids }
         return which(
