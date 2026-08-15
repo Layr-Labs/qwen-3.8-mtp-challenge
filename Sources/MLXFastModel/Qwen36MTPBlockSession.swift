@@ -342,13 +342,15 @@ public final class Qwen36MTPBlockSession {
 
     /// Consecutive fully-accepted DRAFTING rounds. The streak-gated schedule
     /// widens by one draft per full acceptance (1 -> 2 -> 3, capped), and
-    /// collapses back to 1 after any miss, so a prompt the head reads poorly
-    /// degrades to plain K=1 instead of paying wasted head steps per round.
+    /// collapses toward the last accepted prefix after any miss, so a prompt
+    /// the head reads poorly does not jump straight back to K=1.
     private var fullAcceptStreak = 0
-    /// Cap on the streak ladder. The verify row is nearly free (weight-bound
-    /// forward), so the cap prices the marginal HEAD step against its
-    /// acceptance odds; 3 keeps the wasted-work tail short on mixed prose.
-    private static let streakDepthCap = 4
+    /// Cap on the streak ladder. Official 1.9546 receipts on this tip show
+    /// the two median prompts already drafting 2.78 and 3.33 against a cap
+    /// of 4, and the easy prompts saturating at 3.67 — the cap is binding.
+    /// Per-row GDN checkpoints make a wider reject cheap; the trusted offer
+    /// is 8. Soft-reset (below) still collapses a total miss to K=1.
+    private static let streakDepthCap = 8
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -714,8 +716,13 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
+        // Soft reset: a partial accept keeps credit for the prefix that
+        // matched, so the next round drafts ~accepted+1 instead of collapsing
+        // to 1. A total miss (acceptedCount == 0) still returns to K=1.
         fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+            acceptedCount == drafts.count
+            ? fullAcceptStreak + 1
+            : acceptedCount
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
