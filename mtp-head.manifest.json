@@ -1,17 +1,10 @@
 {
   "version": 1,
-  "source": "pinned",
+  "source": "remote",
+  "source_url": "hf:Lie24/Qwen3.8-27B-MTP-head-q4mlp@0f25d04e5634c5410ade8cb63e2d7809c79c9233",
+  "sha256": "b6983fa2a426d3aa0594b7dfe75768c8ad62e0607ae6549370507c11feee9d71",
+  "bytes": 945903182,
   "max_bytes": 2147483648,
 
-  "repository": "EigenLabs/Qwen3.8-27B-MTP-bf16",
-  "revision": "26a328e070875b0314d652a039b6b59902690f03",
-  "tensor_count": 15,
-  "sha256": "8fceddc664f3ea96d02e304463aa1319213ff52cdf1f3401d4bce64e7075c349",
-  "bytes": 849400347,
-
-  "note": "THE CHECKED-IN DECLARATION, and it selects the ORGANIZER-PINNED head. This file is an editable path (benchmark.json editablePaths) and an OPTIONAL one: a submission archive that does not carry it keeps this copy, which is why the default has to be spelled here rather than left to absence. Absence and an explicit source of 'pinned' are the only two things that select the pinned head; a declaration that is PRESENT and broken -- unreadable, unparseable, or internally inconsistent -- is a REFUSAL and never a silent fall back, because 'your head declaration was broken so we quietly scored you on the pinned head' is how a leaderboard number becomes unattributable.",
-
-  "pinned_head_note": "repository, revision, tensor_count, sha256 and bytes describe the head this declaration selects: EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e070875b0314d652a039b6b59902690f03, whose model.safetensors carries 15 bf16 tensors in 849,400,347 bytes. The parser does not VERIFY these for source 'pinned' -- it verifies sha256 and bytes only for 'remote' and 'in_branch', where they bound bytes the runner fetches -- so they are recorded, not enforced, and the enforcing pins are elsewhere: fixtures/qwen3_8_27b_mtp_head.sha256 (per-file digests, 4 records, 849,406,438 whole-tree bytes) checked by the ranked workflow's verify_cache, MLXFastConstants.qwenMTPHeadTensorCount (15) asserted at load, and Qwen36MTPHeadAttachment.verifyHeadTree, which is why the published tree carries config.json and model.safetensors.index.json alongside the weights.",
-
-  "bring_your_own_head_note": "To declare your OWN head, set source to 'remote' with a source_url of the form hf:<repo>@<revision> or r2:<key>, or to 'in_branch' with a repo-relative path under mtp-head/, and give the sha256 and byte count of what you are declaring. Both are REQUIRED for those sources and both are enforced: the runner resolves the declaration pre-sandbox, fetches, digest-verifies, and refuses on mismatch or on anything above max_bytes (2 GiB, the track cap; a declaration may LOWER it and may not raise it). A head only PROPOSES tokens -- the organizer-pinned target decides every emitted token and the trusted parent re-checks the whole stream against a hidden serial trajectory after the clock stops -- so a substituted head moves the accept rate, which is the game, and cannot move the output. The BASELINE leg of the pair always runs the pinned head regardless of what this file says."
+  "note": "Declares a byte-identical PUBLIC mirror (Lie24/Qwen3.8-27B-MTP-head-q4mlp, mirrored for fetch-time availability) of the quantized draft head published by polymorf (credit: polymorf's 45c257f1/3d793c9 notes; original artifact p0ly31/Qwen3.8-27B-MTP-head-q4mlp@58224b03 -- same file sha256 608073ca..., same tree digest, same bytes): the pinned bf16 head with fc + MLP requantized to affine-4 group-64, attention kept bf16, plus draft_lm_head.{weight,scales,biases} -- an affine 3-bit group-64 copy of the backbone lm_head consumed ONLY to argmax draft proposals. 26 tensors. sha256 is the runner's TREE digest over the single staged file ('<sha256(model.safetensors)>  model.safetensors' line), the exact value the ranked resolver printed and verified on run 31874236389; bytes is that file's size. The verify/ledger path keeps the exact pinned-quantization lm_head; this head only PROPOSES tokens -- the organizer-pinned target decides every emitted token and the trusted parent re-checks the stream against the hidden serial trajectory, so a substituted head moves the accept rate and cannot move the output. The loader wiring for this exact tree shape (index-less bare model.safetensors, quantized triples, draft_lm_head side-channel) ships in this archive's Sources/MLXFastModel and is the same wiring the promoted 45c257f1 already carries in fallback-inert form."
 }
