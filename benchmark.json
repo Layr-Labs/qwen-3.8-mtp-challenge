@@ -40,7 +40,7 @@
     "floor (0.90), ceiling (3.0) and the ~0.935 unmodified-tree expectation. Those",
     "came from measuring the shipped depth-2 configuration against true serial on",
     "QWEN 3.6 and are not claims about 3.8.",
-    "See docs/CUTOVER.md; docs/qwen-mtp-go-live-runbook.md is the 3.6 record.",
+    "docs/qwen-mtp-go-live-runbook.md is the 3.6 record.",
     "CONTRACT CHANGE 2026-08-14 (operator-ratified). The competitive surface is the",
     "UNION of MLX runner/kernel optimisation -- what the challenge family has always",
     "been -- AND the whole speculative apparatus: head weights (mtp-head.manifest.json",

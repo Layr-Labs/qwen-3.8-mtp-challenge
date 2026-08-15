@@ -510,7 +510,7 @@ struct QwenMTPTrackNamingTests {
     /// bring-up has completed. Each switch below is a one-character edit away from
     /// flipping, so DISARMING the track means editing this test in the same commit
     /// as the flags -- deliberate friction, in both directions
-    /// (NEW-MODEL-BRINGUP 7.5, docs/CUTOVER.md).
+    /// (NEW-MODEL-BRINGUP 7.5).
     @Test
     func theQwenMTPTrackIsArmedOnQwen38() throws {
         let workflow = try S.text(".github/workflows/qwen-mtp-ranked-benchmark.yml")
