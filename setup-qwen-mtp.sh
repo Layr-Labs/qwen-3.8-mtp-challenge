@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Provision the organizer-pinned Qwen 3.6 27B MTP HEAD for the native-MTP
+# Provision the organizer-pinned Qwen 3.8 27B MTP HEAD for the native-MTP
 # speculative-decode track (qwen3.8-27b-mtp-v1).
 #
 # This script provisions the MTP HEAD and NOTHING else. The track's TARGET is
-# the same Qwen 3.6 27B 4-bit checkpoint ./setup.sh already pins, downloads and
+# the same Qwen 3.8 27B 4-bit checkpoint ./setup.sh already pins, downloads and
 # verifies (fixtures/reference_qwen3_8_27b_4bit.sha256) -- so there is no second
 # target download here and no way for this script to switch the base challenge
 # onto a different checkpoint.
@@ -17,11 +17,16 @@
 # and delegates. One downloader, one verification path, one set of stall and
 # resume semantics.
 #
-# The delegated run also rebuilds the Swift binaries if they are stale, which is
-# idempotent and normally a no-op after ./setup.sh. The tool-installing legs
-# (Homebrew, cmake, the Metal toolchain, macmon) and the metallib build are
-# skipped: ./setup.sh owns those and this script must not mutate global state a
-# second time.
+# The delegated run does NOT rebuild the Swift binaries: it passes
+# MLXFAST_SKIP_SWIFT_BUILD=1, so an existing pair of products is reused. That
+# rebuild was never a no-op -- SwiftPM still relinks both products, ~25 seconds
+# on the ordinary `./setup.sh && ./setup-qwen-mtp.sh` path -- and nothing about
+# them can have changed between the two commands. The knob fails open: on a
+# fresh clone where ./setup.sh has not run, setup.sh builds anyway rather than
+# leaving this script without a harness. The tool-installing legs (Homebrew,
+# cmake, the Metal toolchain, macmon) and the metallib build are skipped for the
+# same reason in the other direction: ./setup.sh owns those and this script must
+# not mutate global state a second time.
 set -euo pipefail
 umask 022
 
@@ -51,10 +56,13 @@ TRACK_ID="qwen3.8-27b-mtp-v1"
 # and both halves of the checkpoint are published now, so ./setup.sh and this
 # script resolve against the same 3.8 pair.
 #
-# THE HEAD REPOSITORY IS PRIVATE. An unauthenticated fetch 401s; export a
-# Hugging Face token with read access to EigenLabs/Qwen3.8-27B-MTP-bf16, or
-# stage the four files into MLXFAST_QWEN_MTP_HEAD_DIR and run --verify-only.
-# Both variables stay env-overridable either way.
+# THE HEAD REPOSITORY IS PUBLIC. An unauthenticated fetch of
+# EigenLabs/Qwen3.8-27B-MTP-bf16 resolves, so no Hugging Face token and no
+# login are needed for the normal path. Credentials remain OPTIONAL, through
+# setup.sh's MLXFAST_REFERENCE_AUTH_HEADER, for a private mirror or a
+# rate-limited anonymous fetch; alternatively stage the four files into
+# MLXFAST_QWEN_MTP_HEAD_DIR and run --verify-only. Both variables stay
+# env-overridable either way.
 MTP_HEAD_MODEL_ID="${MLXFAST_QWEN_MTP_HEAD_REPO:-EigenLabs/Qwen3.8-27B-MTP-bf16}"
 MTP_HEAD_REVISION="${MLXFAST_QWEN_MTP_HEAD_REVISION:-26a328e070875b0314d652a039b6b59902690f03}"
 MTP_HEAD_MANIFEST="${MLXFAST_QWEN_MTP_HEAD_MANIFEST_PATH:-${ROOT_DIR}/fixtures/qwen3_8_27b_mtp_head.sha256}"
@@ -85,11 +93,12 @@ usage() {
   cat <<EOF
 Usage: ./setup-qwen-mtp.sh [--verify-only] [--print-paths]
 
-Provision the organizer-pinned Qwen 3.6 27B MTP head. Downloads are resumable
-and every byte is checked against the checked-in SHA256/size manifest, because
-the download itself is ./setup.sh's downloader driven at this artifact.
+Provision the organizer-pinned Qwen 3.8 27B MTP head. The download is anonymous
+(the pinned head repository is public), resumable, and every byte is checked
+against the checked-in SHA256/size manifest, because the download itself is
+./setup.sh's downloader driven at this artifact.
 
-The TARGET is not provisioned here: it is the Qwen 3.6 27B reference checkpoint
+The TARGET is not provisioned here: it is the Qwen 3.8 27B reference checkpoint
 ./setup.sh downloads and verifies against
 fixtures/reference_qwen3_8_27b_4bit.sha256. Run ./setup.sh first (without
 MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1), then this script.
@@ -195,6 +204,15 @@ delegated_env=(
   # The head is ~247 MB, not ~16 GB: the backbone's free-space floor would
   # refuse on machines that can comfortably hold it.
   MLXFAST_REFERENCE_MIN_FREE_GIB="${MLXFAST_QWEN_MTP_HEAD_MIN_FREE_GIB:-2}"
+  # The closing summary must not tell this reader to transform REFERENCE_DIR
+  # into weights/: REFERENCE_DIR is the MTP head for the delegated run, and
+  # transforming a 15-tensor head over the target weights is exactly the wrong
+  # next step. Prose only -- nothing about the download or verification changes.
+  MLXFAST_SETUP_SUMMARY_ROLE=mtp-head
+  # Reuse the Swift products ./setup.sh already built instead of relinking both
+  # of them for a download. Fails open in setup.sh: if a product is missing (a
+  # standalone run on a fresh clone) the build happens anyway.
+  MLXFAST_SKIP_SWIFT_BUILD=1
   # ./setup.sh owns global tool state and the metallib; do not mutate either a
   # second time from here.
   MLXFAST_SKIP_HOMEBREW_INSTALL=1
