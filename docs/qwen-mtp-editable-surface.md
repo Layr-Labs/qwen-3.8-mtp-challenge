@@ -1,15 +1,14 @@
 # Qwen 3.8 native-MTP track — the definitive editable-vs-trusted table
 
-> **NOT LIVE — 3.6 → 3.8 cutover in progress.** The editable/trusted LINE below
-> is a design decision and survives the model change unchanged; the ARTIFACTS on
-> the trusted side are re-provisioned during the 3.8 bring-up. As of 2026-08-14
-> the **target checkpoint** is our own mlx-0.32.0 conversion of the official
-> bf16 base, `EigenLabs/Qwen3.8-27B-4bit` (geometry verified identical to 3.6),
-> published at `eda45ab47f465d08d6558f0353a2346e2eb9d5b3` with a generated
-> 10-record byte manifest; the **MTP head** `EigenLabs/Qwen3.8-27B-MTP-bf16` is
-> published at `26a328e070875b0314d652a039b6b59902690f03` with a 4-record one
-> (both repositories are private); goldens and calibration remain
-> `QWEN38-PENDING-RELEASE`.
+> **The track is live and scoring.** The editable/trusted line below is a
+> design decision and survives the model change unchanged. The **target
+> checkpoint** is our own mlx-0.32.0 conversion of the official bf16 base,
+> `EigenLabs/Qwen3.8-27B-4bit` (geometry verified identical to 3.6), published
+> at `eda45ab47f465d08d6558f0353a2346e2eb9d5b3` with a generated 10-record byte
+> manifest. The **MTP head** `EigenLabs/Qwen3.8-27B-MTP-bf16` is published at
+> `26a328e070875b0314d652a039b6b59902690f03` with a 4-record one. Both
+> repositories are public and download anonymously. The goldens are regenerated
+> against the 3.8 tower and the calibration is measured on it.
 
 **Track:** `qwen3.8-27b-mtp-v1` · **Status:** operator-ratified 2026-08-14 ·
 **Machine-readable authority:** `editablePaths` in `benchmark.json`

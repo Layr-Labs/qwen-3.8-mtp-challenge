@@ -17,9 +17,9 @@ changing the observable model behavior required by the correctness gates.
 > non-drafting rounds legal), and the MTP head weights themselves via
 > `mtp-head.manifest.json`. **(2) Scoring is anchored at serial = 1.0** — the
 > median of eight per-prompt RAW serial-relative speedups, floor 0.90, ceiling
-> 3.0, no normalisation. An unmodified tree scores ~0.935 and holds the board. Read
+> 3.0, no normalisation. An unmodified tree scores ~0.994 and holds the board. Read
 > `docs/qwen-mtp-editable-surface.md` for the definitive editable-vs-trusted
-> table and the "Qwen 3.6 MTP track" section below for the working contract.
+> table and the "Qwen 3.8 MTP track" section below for the working contract.
 > **Every scoring and surface statement in the inherited DFlash prose below is
 > about a different track and does not apply here.**
 
@@ -821,33 +821,34 @@ its own names and must not be revived.
 
 ## Qwen 3.8 MTP track (ranked track of this repository)
 
-**Status: NOT LIVE — 3.6 → 3.8 cutover in progress.** `main` of this
-repository IS the `qwen3.8-27b-mtp-v1` track — `benchmark.json` is its
-manifest, `fixtures/qwen3_8_27b_mtp_track.json` its contract, and
-`.github/workflows/qwen-mtp-ranked-benchmark.yml` its ranked pipeline — but
-the track is INERT AND FAIL-CLOSED pending the Qwen 3.8 bring-up: the
-calibration interlock is `"0"`, both contract enablement flags are `false`,
-and every hidden-artifact pin reads `QWEN38-PENDING-RELEASE`.
+**Status: live and scoring.** `main` of this repository IS the
+`qwen3.8-27b-mtp-v1` track — `benchmark.json` is its manifest,
+`fixtures/qwen3_8_27b_mtp_track.json` its contract, and
+`.github/workflows/qwen-mtp-ranked-benchmark.yml` its ranked pipeline. The
+calibration interlock is `"1"`, both contract enablement flags are `true`, and
+every hidden and public artifact pin holds a real digest. The track serves from
+the public production repository `Layr-Labs/qwen-3.8-mtp-challenge`.
 
 **Backbone identity 2026-08-14.** The reference checkpoint is **our own** MLX
 4-bit affine / group-64 conversion, produced under a pinned mlx 0.32.0
 toolchain, of the official bf16 base `Qwen/Qwen3.8-27B` @
 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` (1,847 tensors, all
-`language_model.`, no `mtp.`), publishing as `EigenLabs/Qwen3.8-27B-4bit`. It
+`language_model.`, no `mtp.`), published as `EigenLabs/Qwen3.8-27B-4bit`. It
 replaces a third-party personal-account conversion adopted earlier the same day
 and **terminated** by the operator's validation kill-switch: the deterministic
 reconversion cross-check that adoption had reserved was performed and found 994
 of 1,847 tensors numerically different from our own conversion. The geometry
 reading is unaffected — it is a property of the bf16 base and the terminating
 cross-check was numerical, not structural — so the geometry hedges stay
-discharged. Nothing is published yet, under three markers: the backbone's
-revision (`QWEN38-PENDING-BACKBONE-PUBLISH`), its per-file byte manifest, whose
-fixture is a header-only stub (`QWEN38-PENDING-RELEASE`), and the MTP head —
-`EigenLabs/Qwen3.8-27B-MTP-bf16`, 15 bf16 tensors extracted from the same bf16
-base — whose revision and byte manifest read (`QWEN38-PENDING-HEAD-UPLOAD`).
+discharged. Both halves are published and pinned by sha: the backbone at
+`eda45ab47f465d08d6558f0353a2346e2eb9d5b3` with a 10-record byte manifest, and
+the MTP head — `EigenLabs/Qwen3.8-27B-MTP-bf16`, 15 bf16 tensors extracted from
+the same bf16 base — at `26a328e070875b0314d652a039b6b59902690f03` with a
+4-record one. Both repositories are public and download anonymously; no Hugging
+Face token is required.
 
-Anything still carrying a 3.6 measurement is marked
-`QWEN38-VERIFY-AT-RELEASE`.
+The timed pool, the on-box baseline and the calibration expectation are
+measured on the Qwen 3.8 tower; the 3.6 measurements they replaced are gone.
 `docs/qwen-mtp-go-live-runbook.md` records the **3.6** go-live and is history. The
 `laguna-xs-2.1-dflash-v1` pipeline described above is **not** ranked here; it
 stays ranked in `Layr-Labs/mlxfast-challenge-dev`. The former staging branch
@@ -859,7 +860,7 @@ this repo) for the phase plan.
 
 **What you may change.** The union of two surfaces, and the second half is new:
 
-- *The MLX runner and kernel path* — the Qwen 3.6 text tower under
+- *The MLX runner and kernel path* — the Qwen 3.8 text tower under
   `Sources/MLXFastModel/`, the offline transform, and the vendored MLX/Metal
   kernel families the forward pass dispatches. This is the primary axis and it
   is unchanged.
@@ -901,19 +902,19 @@ is a regression bound, not a quality bar: publishing below 1.0 is allowed and
 the board will show it. The median rule is the mean of the two central order
 statistics — 8 is even, so it matters.
 
-**An unmodified tree scores ~0.935, not 1.0.** The shipped depth-2
-configuration is a measured ~6.5% regression against true serial decode at the
+**An unmodified tree scores ~0.994, not 1.0.** The shipped depth-2
+configuration is a measured ~0.6% regression against true serial decode at the
 512-token window; the score says so instead of defining it away. Two direct
 consequences for how you should think about the work:
 
-- *You are not starting at parity.* Roughly 6.5% of the gap to 1.0 is the cost
-  of the shipped speculative machinery itself — verify-row cost, rollback, the
+- *You are not starting at parity.* That ~0.6% gap to 1.0 is the cost of the
+  shipped speculative machinery itself — verify-row cost, rollback, the
   head forward — and closing it is legitimate, on-target work.
 - *Turning drafting off is legal and scores exactly 1.0.* A candidate whose
   policy returns 0 every round IS the serial control. That is an honest
   submission and a real (if unambitious) baseline; it is also why non-drafting
   rounds could be legalised without opening an exploit. Note the ordering this
-  creates: 1.0 (draft nothing) beats 0.935 (the stock schedule), so the very
+  creates: 1.0 (draft nothing) beats 0.994 (the stock schedule), so the very
   first thing worth checking is whether your change is actually paying for the
   speculation it does.
 
@@ -934,24 +935,26 @@ and by the checked-in manifest `fixtures/reference_qwen3_8_27b_4bit.sha256`:
 
 ```text
 repository  EigenLabs/Qwen3.8-27B-4bit
-revision    QWEN38-PENDING-BACKBONE-PUBLISH
-manifest    fixtures/reference_qwen3_8_27b_4bit.sha256   (header-only stub)
+revision    eda45ab47f465d08d6558f0353a2346e2eb9d5b3
+manifest    fixtures/reference_qwen3_8_27b_4bit.sha256   (10 records)
 upstream    Qwen/Qwen3.8-27B @ 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 ```
 
-Pinned 2026-08-14, our own conversion. The manifest fixture pins only its
-repository header line; its revision header reads the marker and its per-file
-body is generated from the published snapshot in a follow-up commit, alongside
-the workflow's `MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS` / `_BYTES`
-(`QWEN38-PENDING-RELEASE`).
+Pinned 2026-08-14, our own conversion, published and public. The manifest
+fixture's body is generated from that published snapshot, and the workflow's
+`MLXFAST_QWEN_MTP_TARGET_MANIFEST_RECORDS` / `_BYTES` are summed from it
+(10 / 15153237117).
 
 The MTP head is a separately pinned artifact and is NOT part of the backbone
 port: the transform never selects `mtp.*` tensors, and the backbone contains
 none (1,847 tensors, all `language_model.`). Its 3.8 repository is
 `EigenLabs/Qwen3.8-27B-MTP-bf16` — 15 bf16 tensors, 849,398,784 tensor bytes in
 a single 849,400,347-byte `model.safetensors`, extracted from the bf16 base
-above — but it is not uploaded, so its revision and byte manifest read
-`QWEN38-PENDING-HEAD-UPLOAD`. (The head's tensor count was `31` until
+above — published and public at revision
+`26a328e070875b0314d652a039b6b59902690f03` and pinned by the 4 records in
+`fixtures/qwen3_8_27b_mtp_head.sha256`. The published tree also carries
+`config.json` and `model.safetensors.index.json`, because the head loader
+refuses to run without them. (The head's tensor count was `31` until
 2026-08-14: that was the 3.6 head's 4-bit weight/scales/biases triples, not a
 different architecture.) The last *pinned* head was
 `mlx-community/Qwen3.6-27B-MTP-4bit` @ `83795d546e9d328160e593fb0bf10b2bf2fe637e`;
