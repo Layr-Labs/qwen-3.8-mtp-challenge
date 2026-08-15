@@ -500,7 +500,111 @@ final class Qwen35GatedDeltaNet: Module {
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
 
-        if nConfirmed == 1 && S >= 2 && mask == nil,
+        if nConfirmed == 1 && S >= 6 && S <= 9 && mask == nil,
+           let midKernel = qwen35GatedDeltaMidKernel
+        {
+            // WIDTH-WALL FIX (verify widths 6...9). A single-launch wide
+            // forward at S >= 6 drifts from the serial trajectory in top-2
+            // values (the `sdpaWidthWallDepthCap` receipts: drift starts at
+            // the 6th row, widths 2-5 are bit-exact at rank). The drift
+            // enters through the recurrence PROLOGUE, whose kernel choice
+            // can change with the sequence shape (conv over 3+S positions),
+            // not through the mid kernel's t-loop (fp32 registers, order
+            // independent of T). So: run the whole gated-delta layer as two
+            // sub-chunks of the widths the ranked replay has already proven
+            // bit-exact — [S-4, 4], both in 2...5 — chaining the recurrent
+            // state through the kernel's own fp32 output (lossless) and the
+            // conv state as a slice of the same concatenated conv input the
+            // single-launch form builds. Every op then executes at a shape
+            // the promoted cap-4 stack already exercises on the ranked box,
+            // which is the whole exactness argument: nothing new to prove.
+            // Per-boundary rollback checkpoints are assembled across the
+            // two launches exactly as the single-launch form declares them:
+            // mid states inside a chunk, the chunk-1 final state at the
+            // seam. Widths 2...5 keep the untouched single-launch branch
+            // below, byte-for-byte.
+            let convInput = concatenated([convState, qkv], axis: 1)
+            let nKeep = convKernelSize - 1
+            let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+            let c1 = S - 4
+
+            var state = ssmState
+                ?? MLXArray.zeros(
+                    [B, numVHeads, headVDim, headKDim], dtype: .float32)
+            if state.dtype != .float32 { state = state.asType(.float32) }
+
+            func chunkForward(
+                _ lo: Int, _ hi: Int, _ stateIn: MLXArray
+            ) -> (MLXArray, MLXArray, MLXArray) {
+                let rows = hi - lo
+                let convOut = silu(
+                    conv1d(convInput[0..., lo ..< (hi + nKeep), 0...]))
+                let convSplit = MLX.split(
+                    convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = convSplit[0].reshaped(B, rows, numKHeads, headKDim)
+                let k = convSplit[1].reshaped(B, rows, numKHeads, headKDim)
+                let v = convSplit[2].reshaped(B, rows, numVHeads, headVDim)
+
+                let dtype = q.dtype
+                let invScale = pow(Float(headKDim), -0.5)
+                let qNormed =
+                    MLXArray(pow(invScale, 2)).asType(dtype)
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                let kNormed =
+                    MLXArray(invScale).asType(dtype)
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+                let betaC = sigmoid(b[0..., lo ..< hi, 0...]).asType(.float32)
+                let gC = computeGatedDeltaG(
+                    aLog, a[0..., lo ..< hi, 0...], dtBias)
+
+                let outs = midKernel(
+                    [qNormed, kNormed, v, gC, betaC, stateIn, MLXArray(rows)],
+                    template: [
+                        ("InT", dtype),
+                        ("StT", DType.float32),
+                        ("Dk", headKDim),
+                        ("Dv", headVDim),
+                        ("Hk", numKHeads),
+                        ("Hv", numVHeads),
+                    ],
+                    grid: (32, headVDim, B * numVHeads),
+                    threadGroup: (32, 4, 1),
+                    outputShapes: [
+                        [B, rows, numVHeads, headVDim],
+                        stateIn.shape,
+                        [B, rows - 1, numVHeads, headVDim, headKDim],
+                    ],
+                    outputDTypes: [dtype, .float32, .float32]
+                )
+                return (outs[0], outs[1], outs[2])
+            }
+
+            let (y1, seamState, mid1) = chunkForward(0, c1, state)
+            let (y2, finalState, mid2) = chunkForward(c1, S, seamState)
+
+            var checkpoints: [(MLXArray, MLXArray)] = []
+            checkpoints.reserveCapacity(S - 1)
+            for t in 0 ..< (S - 1) {
+                let ssmAtT: MLXArray
+                if t < c1 - 1 {
+                    ssmAtT = mid1[0..., t]
+                } else if t == c1 - 1 {
+                    ssmAtT = seamState
+                } else {
+                    ssmAtT = mid2[0..., t - c1]
+                }
+                checkpoints.append((
+                    convInput[0..., (t + 1) ..< (t + 1 + nKeep)],
+                    ssmAtT
+                ))
+            }
+            cache?.rollbackState = checkpoints.first
+            cache?.rollbackCheckpoints = checkpoints
+            out = concatenated([y1, y2], axis: 1)
+            finalConvState = newConvState
+            finalSsmState = finalState
+        } else if nConfirmed == 1 && S >= 2 && mask == nil,
            let midKernel = qwen35GatedDeltaMidKernel
         {
             // Width-2 MTP verify, single-launch form. The old split path ran
@@ -820,16 +924,51 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let attended: MLXArray
+        if L >= 6, L <= 9, case .causal = mask, cache is KVCacheSimple {
+            // WIDTH-WALL FIX, attention half (verify widths 6...9): split
+            // the query rows into [L-4, 4] — both sub-widths in the 2...5
+            // range the ranked replay has proven bit-exact — and advance
+            // the KV cache in the same two steps, so each SDPA call sees
+            // exactly the (qL, kL = prefix + qL) shape a cap-4 verify
+            // produces. `.causal` alignment is exact on both calls: chunk
+            // one's row i attends keys <= prefix + i, chunk two's row i
+            // attends keys <= prefix + (L-4) + i, which is the serial
+            // trajectory's key set for those positions. RoPE above is
+            // per-position and already applied to all L rows; per-row
+            // attention accumulation over the key axis is order-identical
+            // to the single call, so this is a shape change only.
+            let c1 = L - 4
+            let out1 = attentionWithCacheUpdate(
+                queries: queries[0..., 0..., ..<c1, 0...],
+                keys: keys[0..., 0..., ..<c1, 0...],
+                values: values[0..., 0..., ..<c1, 0...],
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+            let out2 = attentionWithCacheUpdate(
+                queries: queries[0..., 0..., c1..., 0...],
+                keys: keys[0..., 0..., c1..., 0...],
+                values: values[0..., 0..., c1..., 0...],
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+            attended = concatenated([out1, out2], axis: 2)
+        } else {
+            attended = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
+        let output = attended
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }

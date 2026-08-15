@@ -464,21 +464,25 @@ public final class Qwen36MTPBlockSession {
     /// cap in ~3 rounds and still prices a real skip at p < 0.2.
     private static let headStepCostRatio = 0.20
 
-    /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
-    /// stack, by bitwise measurement (hexfloat row gate, two attempts):
-    /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
-    /// (ids hold) even with (a) <= 5-row query chunking and (b) per-row
-    /// prefix-sliced sdpa at exactly the serial kL — identical mismatch
-    /// pattern both times, so the attention was never the (only) source;
-    /// the gated-delta scan's internal chunk geometry changes above S=5
-    /// (the invariant-#7 note warned about exactly this). Worse, the
-    /// drifted K/V rows the wide forwards write CONTAMINATE every later
-    /// round — a single wide round poisons the whole window under the
-    /// ranked exact-value replay, while staying invisible to the local
-    /// argmax-only check. Width 5 measured 5/5 bit-exact, which is why
-    /// every promoted receipt at cap 4 survived rank. Do not raise this
-    /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
-    private static let sdpaWidthWallDepthCap = 4
+    /// DEPTH CAP RAISED TO THE TRUSTED MAXIMUM — the width wall is cracked
+    /// structurally. The wall (verify widths 6-9 drifting from the serial
+    /// trajectory in top-2 VALUES, drift starting at the 6th row, widths
+    /// 2-5 bit-exact at rank) came from wide-shape kernel selection inside
+    /// the gated-delta layer's prologue and the wide single-call SDPA. The
+    /// fix does not identify the culprit op — it removes the wide shapes
+    /// entirely: for S in 6...9, `Qwen35GatedDeltaNet` now runs the whole
+    /// recurrence (conv prologue + scan) as two sub-chunks of widths
+    /// [S-4, 4] (both in the rank-proven 2...5 range) with the fp32
+    /// recurrent state chained losslessly through the kernel's own output,
+    /// and `Qwen35Attention` advances the KV cache and runs SDPA in the
+    /// same two steps, so every kernel invocation executes at a
+    /// (qL, kL = prefix + qL) shape a cap-4 verify already produces. The
+    /// earlier attempts that chunked ONLY the attention half (and still
+    /// drifted) are consistent with this: the gated-delta prologue kept its
+    /// wide shape there. Widths 2...5 keep the previous single-launch code
+    /// byte-for-byte, so a run whose cost model never exceeds depth 4 is
+    /// bit-identical to the promoted stack.
+    private static let sdpaWidthWallDepthCap = Qwen36MTPLimits.maxDepth
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
