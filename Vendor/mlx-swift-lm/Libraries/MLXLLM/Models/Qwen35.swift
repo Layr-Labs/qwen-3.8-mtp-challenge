@@ -670,6 +670,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPModule?
+    private var mtpHeadQuantizationPrepared = false
 
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
@@ -845,6 +846,7 @@ extension Qwen35TextModel: MTPCapable {
             fatalError("mtpForwardWithHidden called but MTP head is not attached. "
                 + "Set _qwen35MTPEnabled = true before loading the model.")
         }
+        prepareMTPHeadQuantization(mtp)
         let mtpOut = mtp(
             hidden: hidden,
             nextTokenIds: nextTokenIds,
@@ -857,6 +859,26 @@ extension Qwen35TextModel: MTPCapable {
             logits = lmHead!(mtpOut)
         }
         return (logits, mtpOut)
+    }
+
+    /// Quantize the separately loaded BF16 proposal tower before its first
+    /// input-independent warm call. The target tower and shared LM head are not
+    /// children of `mtp` and remain byte-for-byte on their existing paths.
+    private func prepareMTPHeadQuantization(_ mtp: Qwen35MTPModule) {
+        guard !mtpHeadQuantizationPrepared else { return }
+        mtpHeadQuantizationPrepared = true
+
+        quantize(
+            model: mtp,
+            groupSize: 64,
+            bits: 4,
+            mode: .affine,
+            filter: { path, module in
+                guard module is Linear else { return false }
+                return path == "fc"
+                    || path.contains(".mlp.")
+            })
+        eval(mtp.parameters().flattened().map(\.1))
     }
 
     /// Run the MTP head forward.
