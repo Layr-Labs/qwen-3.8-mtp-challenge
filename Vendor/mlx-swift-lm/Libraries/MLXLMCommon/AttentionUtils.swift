@@ -101,6 +101,43 @@ public func attentionWithCacheUpdate(
         )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        // WIDE-DECODE EXACTNESS CHUNK (B == 1, causal, 6 <= qL <= 9): the
+        // fused sdpa vector path serves qL * gqa <= 32; above it the dispatch
+        // changes kernel family and the accumulation order of every score —
+        // the measured source of the MTP width wall's top-2 VALUE drift.
+        // Splitting the queries at row 5 keeps both halves on the fused
+        // vector path with windows that are BYTE-IDENTICAL to two
+        // consecutive <= 5-row rounds at the same offsets: with bottom-right
+        // causal alignment, chunk A (rows 0..<5) over keys[..<kL-(qL-5)]
+        // gives row i the window a width-5 round would, and chunk B
+        // (rows 5..) over the full keys gives row 5+j the window a follow-up
+        // width-(qL-5) round would. Keys/values are re-sliced, not
+        // recomputed — the only extra cost is one more pass over the KV
+        // rows (a few MB), never over weights. Serial (qL == 1), the <= 5
+        // verify widths, and prefill (qL > 9) are untouched.
+        let qL = queries.dim(2)
+        let kL = cachedKeys.dim(2)
+        if queries.dim(0) == 1, qL >= 6, qL <= 9, kL >= qL,
+           case .causal = mask
+        {
+            let split = 5
+            let kSplit = kL - (qL - split)
+            let outA = MLXFast.scaledDotProductAttention(
+                queries: queries[0..., 0..., 0 ..< split, 0...],
+                keys: cachedKeys[0..., 0..., 0 ..< kSplit, 0...],
+                values: cachedValues[0..., 0..., 0 ..< kSplit, 0...],
+                scale: scale,
+                mask: .causal
+            )
+            let outB = MLXFast.scaledDotProductAttention(
+                queries: queries[0..., 0..., split..., 0...],
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: .causal
+            )
+            return concatenated([outA, outB], axis: 2)
+        }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: cachedKeys,
