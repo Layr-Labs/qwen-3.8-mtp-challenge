@@ -516,7 +516,12 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// PR135/Q4 DIAGNOSTIC ARM: 0.30 is the conservative high-cost point on
+    /// the promoted single-forward SDPA bridge. It reduces cold depth 4 to 3,
+    /// testing whether avoiding weak marginal drafts helps difficult prompts
+    /// enough to lift the eight-prompt median. It is a control, not a verdict.
+    private static let headStepCostRatio = 0.30
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
