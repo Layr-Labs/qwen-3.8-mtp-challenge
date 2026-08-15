@@ -34,7 +34,10 @@ final class Qwen35MTPDecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            // Same fused gate/up MLP as the backbone layers; here the linears
+            // stay bf16 and the fuse takes the plain-weight path. Head side —
+            // proposal-only, no exactness constraint.
+            _mlp.wrappedValue = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
@@ -120,5 +123,26 @@ final class Qwen35MTPModule: Module {
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
+    }
+
+    /// Requantize the head's fc and MLP linears to affine-4 group-64. The
+    /// attention q/k/v/o projections STAY bf16 — the 5205c88 receipt showed
+    /// the all-linear form dropped acceptance (0.641 -> 0.600) while the
+    /// fc+MLP-only form kept it byte-identical and cut most of the head's
+    /// per-draft weight read (~640 of ~810 MB to a quarter). Draft side only:
+    /// a lossier head can lower the accept rate, never an emitted token.
+    /// Goes through `quantize(model:filter:)` — Module properties must not be
+    /// mutated directly.
+    func quantizeForDrafting() {
+        MLXNN.quantize(
+            model: self, groupSize: 64, bits: 4,
+            filter: { path, module in
+                guard module is Linear, !(module is QuantizedLinear)
+                else { return false }
+                return path == "fc" || path.contains("mlp.")
+            })
+        for layer in layers {
+            (layer.mlp as? Qwen35FusedMLP)?.resetFusedBanks()
+        }
     }
 }
