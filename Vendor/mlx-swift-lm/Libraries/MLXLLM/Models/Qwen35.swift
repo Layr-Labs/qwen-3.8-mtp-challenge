@@ -529,15 +529,17 @@ final class Qwen35GatedDeltaNet: Module {
     /// through wide-shape kernel selection in the recurrence prologue (the
     /// conv runs over 3+S positions and is the shape-dependent op in this
     /// path; the recurrence's own t-loop is order-independent of T). The fix
-    /// removes the wide shapes: split S in 6...9 into [S-4, 4] — both
-    /// sub-widths inside the rank-proven 2...5 range — chaining the fp32
-    /// recurrent state losslessly between the two calls. Replay MUST mirror
+    /// removes the wide shapes: split S in 6...9 into [ceil(S/2), floor(S/2)]
+    /// — both sub-widths inside the rank-proven 2...5 range — chaining the
+    /// fp32 recurrent state losslessly between the two calls. Balanced halves
+    /// (vs the earlier [S-4, 4]) change only widths 6 and 7, to [3,3] and
+    /// [4,3]; widths 8 and 9 already split balanced. Replay MUST mirror
     /// the same boundary (see `replayPrefix`), which is why this is the one
     /// shared source of truth for it. Returns nil at widths that stay on the
     /// proven single-chunk form.
     fileprivate static func verifyChunkBoundary(_ rows: Int) -> Int? {
         guard rows >= 6, rows <= 9 else { return nil }
-        return rows - 4
+        return (rows + 1) / 2
     }
 
     private func processChunkStashingPrefix(
@@ -1017,7 +1019,15 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 2, let (g, u) = fusedGateUp(x) {
+        // Width guard raised 2 -> 5: rows 3-5 still dispatch the per-row
+        // qmv kernel (get_qmv_batch_limit >= 12 at these D/O on every
+        // supported arch), and row-concat on N changes which launch a row
+        // rides in, not its dot-product order — so the fuse stays exact
+        // through the full single-chunk verify range while saving one
+        // quantized projection launch per dense MLP. Widths >= 6 (the
+        // wide-verify projections, which run unchunked) keep the separate
+        // gate/up calls and the pinned baseline's reduction order.
+        if x.dim(-2) <= 5, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
