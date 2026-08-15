@@ -53,6 +53,30 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Tape-capable variant used by the multi-draft speculative verify: with
+    /// `recordTape` the GDN layers split per row and record every
+    /// accepted-prefix boundary state into `ArraysCache.boundaryTape`.
+    /// `logitsLimit` restricts the LM-head projection to the first `limit`
+    /// rows (all-row hidden is still returned) for the lazy bonus-row path.
+    /// `stashPrimaryInputs` runs the GDN batched and stashes row-0 projections
+    /// for reject-time boundary reconstruction.
+    func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        recordTape: Bool, logitsLimit: Int?, stashPrimaryInputs: Bool
+    ) -> (MLXArray, MLXArray)
+
+    /// LM-head logits for one row of a pre-norm hidden `[1, S, H]` — the lazy
+    /// counterpart of a logits-limited verify. Bit-exact with the batched
+    /// projection (RMSNorm is row-wise; matmul rows are independent).
+    func logitsForRow(_ hidden: MLXArray, row: Int) -> MLXArray
+
+    /// Reconstruct every GDN layer's post-primary boundary state from the
+    /// stashed row-0 projections and the pre-verify snapshot. Fail-closed
+    /// preflight; `false` leaves the cache untouched.
+    func recomputePrimaryBoundary(
+        cache: [any KVCache], snapshot: [Int: [MLXArray?]]
+    ) -> Bool
+
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
@@ -83,3 +107,34 @@ public protocol Qwen36MTPTarget: AnyObject {
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
 extension Qwen35TextModel: Qwen36MTPTarget {}
 extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}
+
+/// The tape-capable forward is a requirement of this track's multi-draft
+/// verify loop (see `Qwen36MTPBlockSession`); both vendored conformers
+/// implement it directly. A conformer that has not adopted the tape yet still
+/// satisfies the protocol through this fallback, which simply never records.
+extension Qwen36MTPTarget {
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        recordTape: Bool, logitsLimit: Int?, stashPrimaryInputs: Bool
+    ) -> (MLXArray, MLXArray) {
+        _ = logitsLimit
+        _ = recordTape
+        _ = stashPrimaryInputs
+        return callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func logitsForRow(_ hidden: MLXArray, row: Int) -> MLXArray {
+        _ = hidden
+        _ = row
+        preconditionFailure(
+            "logitsForRow requires a conformer with the lazy-row head")
+    }
+
+    public func recomputePrimaryBoundary(
+        cache: [any KVCache], snapshot: [Int: [MLXArray?]]
+    ) -> Bool {
+        _ = cache
+        _ = snapshot
+        return false
+    }
+}

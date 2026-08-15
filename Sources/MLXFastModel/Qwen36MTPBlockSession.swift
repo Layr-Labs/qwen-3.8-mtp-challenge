@@ -173,9 +173,19 @@ public final class Qwen36MTPBlockSession {
         }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width == 2 ? 1 : 0)
+            // Width 2 warms the EXACT scored k=1 verify shape: batched GDN
+            // with stashed row-0 projections and a row-0-limited head, so the
+            // split/limit dispatches materialize outside every scored window.
+            let (verifyLogits, _) = width == 2
+                ? model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0, recordTape: false,
+                    logitsLimit: 1, stashPrimaryInputs: true)
+                : model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0)
             eval(verifyLogits)
             eval(warmCache.flatMap { $0.state })
         }
@@ -397,13 +407,32 @@ public final class Qwen36MTPBlockSession {
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
+        //    Multi-draft rounds verify with a per-row boundary tape instead,
+        //    which makes ANY acceptance count roll back free (same argument:
+        //    the GDN scan is sequential fp32 per row; chunk splits never change
+        //    the op sequence per row).
         let fastK1 = draftCount == 1
         let snapshot = Self.snapshotRecurrent(cache)
         let verifyInput = committed + drafts
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
-            cache: cache, nConfirmed: fastK1 ? 1 : 0)
+        // BATCHED + STASH + LAZY BONUS (k=1): the GDN runs as ONE width-2
+        // chunk per layer (half the launches of the nConfirmed split), each
+        // layer stashes its row-0 projections, and only row 0's logits are
+        // projected. On reject (~36% of rounds) the post-primary boundary is
+        // reconstructed by replaying the stashed row through the same
+        // recurrence from the pre-verify snapshot — bit-exact (sequential
+        // fp32 per-row arithmetic; conv windows associative). On accept the
+        // bonus row's logits materialize lazily from the saved hidden.
+        let (verifyLogits, verifyHidden) = fastK1
+            ? model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
+                cache: cache, nConfirmed: 0, recordTape: false,
+                logitsLimit: 1, stashPrimaryInputs: true)
+            : model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
+                cache: cache, nConfirmed: 0, recordTape: true,
+                logitsLimit: nil, stashPrimaryInputs: false)
         let verifyArgmax = argmaxAll(verifyLogits)
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
@@ -430,15 +459,19 @@ public final class Qwen36MTPBlockSession {
         if acceptedCount == drafts.count {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
             // rollback, no repair forward; the bonus row carries the next primary
-            // and the last hidden row seeds the next draft.
+            // and the last hidden row seeds the next draft. The bonus row's
+            // logits are materialized HERE (lazily) from the already-computed
+            // hidden — bit-exact with the batched projection.
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            let bonus = verifyLogits[
-                0..., drafts.count ..< (drafts.count + 1), 0...]
-            pendingLogitsRow = bonus
+            let bonusLogits = fastK1
+                ? model.logitsForRow(verifyHidden, row: drafts.count)
+                : verifyLogits[
+                    0..., drafts.count ..< (drafts.count + 1), 0...]
+            pendingLogitsRow = bonusLogits
             pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
-            let (ids, values) = Self.topTwo(of: verifyLogits[0, drafts.count])
+            let (ids, values) = Self.topTwo(of: bonusLogits[0, 0])
             perRowTop2Tokens.append(ids)
             perRowTop2Logits.append(values)
         } else {
@@ -453,9 +486,30 @@ public final class Qwen36MTPBlockSession {
             // the same post-primary distribution, so reuse its already-recorded
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
-            if fastK1 && Self.restoreAfterSingleDraftReject(
+            if fastK1 && Self.restoreAfterSingleDraftRejectStashed(
+                model, cache, snapshot, to: committedOffset)
+            {
+                pendingLogitsRow = verifyLogits[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
+                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
+                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
+            } else if fastK1 && Self.restoreAfterSingleDraftReject(
                 cache, to: committedOffset)
             {
+                pendingLogitsRow = verifyLogits[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
+                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
+                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
+            } else if !fastK1 && Self.restoreAfterMultiDraftReject(
+                cache, acceptedCount: acceptedCount, to: committedOffset,
+                verifiedTokens: verifyInput.count)
+            {
+                // Multi-draft tape rollback: the boundary state after the
+                // accepted prefix is tape[acceptedCount]; the correction
+                // token's row (verify row acceptedCount) is already computed.
+                // The trusted tail row is that same row's distribution.
                 pendingLogitsRow = verifyLogits[
                     0..., acceptedCount ..< (acceptedCount + 1), 0...]
                 pendingHidden = hiddenRow(verifyHidden, acceptedCount)
@@ -600,10 +654,94 @@ public final class Qwen36MTPBlockSession {
         return true
     }
 
+    /// Stash-based variant: GDN layers reconstruct their post-primary boundary
+    /// by replaying the stashed row-0 projections from the pre-verify snapshot;
+    /// attention caches trim the single rejected draft position. Fail-closed
+    /// preflight on the attention side (the model's recompute preflights the
+    /// GDN side itself; `false` from it leaves those layers untouched too).
+    private static func restoreAfterSingleDraftRejectStashed(
+        _ model: any Qwen36MTPTarget,
+        _ cache: [any KVCache],
+        _ snapshot: [Int: [MLXArray?]],
+        to committedOffset: Int
+    ) -> Bool {
+        // Attention preflight first: every trimmable cache exactly one
+        // rejected position ahead of the committed offset, no unknown kinds.
+        for entry in cache {
+            if entry is ArraysCache { continue }
+            if entry.isTrimmable {
+                guard entry.offset == committedOffset + 1 else { return false }
+            } else {
+                return false
+            }
+        }
+        // GDN reconstruction (preflights internally, fails before mutation).
+        guard model.recomputePrimaryBoundary(cache: cache, snapshot: snapshot)
+        else { return false }
+        for entry in cache {
+            if entry is ArraysCache { continue }
+            if entry.isTrimmable, entry.offset > committedOffset {
+                _ = entry.trim(entry.offset - committedOffset)
+            }
+        }
+        return true
+    }
+
     private static func clearRecurrentRollback(_ cache: [any KVCache]) {
         for entry in cache {
-            (entry as? ArraysCache)?.rollbackState = nil
+            if let arrays = entry as? ArraysCache {
+                arrays.rollbackState = nil
+                arrays.primaryBoundaryInputs = nil
+            }
         }
+    }
+
+    /// Restore the per-row boundary tape after a multi-draft verify that ran
+    /// with `recordTape == true`. Entry `acceptedCount` of the tape is the
+    /// recurrent state immediately after the accepted prefix; each attention
+    /// cache is `verifiedTokens - (1 + acceptedCount)` rejected positions ahead
+    /// of the same committed offset.
+    ///
+    /// Preflight every layer before mutating any of them, mirroring the K=1
+    /// restore: returning `false` leaves the cache untouched so the caller can
+    /// fall back to the generic snapshot and repair path safely.
+    private static func restoreAfterMultiDraftReject(
+        _ cache: [any KVCache],
+        acceptedCount: Int,
+        to committedOffset: Int,
+        verifiedTokens: Int
+    ) -> Bool {
+        for entry in cache {
+            if let arrays = entry as? ArraysCache {
+                guard let tape = arrays.boundaryTape,
+                      acceptedCount >= 0, acceptedCount < tape.count
+                else { return false }
+            } else if entry.isTrimmable {
+                guard entry.offset == committedOffset
+                    + (verifiedTokens - (1 + acceptedCount))
+                else { return false }
+            } else {
+                return false
+            }
+        }
+
+        for entry in cache {
+            if let arrays = entry as? ArraysCache,
+               let tape = arrays.boundaryTape,
+               acceptedCount < tape.count
+            {
+                arrays[0] = tape[acceptedCount].0
+                arrays[1] = tape[acceptedCount].1
+                arrays.rollbackState = nil
+                arrays.boundaryTape = nil
+            } else if entry.isTrimmable {
+                _ = entry.trim(
+                    Swift.min(
+                        verifiedTokens - (1 + acceptedCount),
+                        entry.offset - committedOffset))
+            }
+        }
+        return true
     }
 
     /// Offset of the first trimmable (global-attention) cache — the sequence

@@ -251,6 +251,37 @@ final class Qwen35GatedDeltaNet: Module {
     ///   - ssmState: Initial SSM state (nil on first token)
     ///   - mask: SSM mask for `gatedDeltaUpdate` (optional)
     /// - Returns: `(out, newConvState, newSsmState)`
+    /// Replay the stashed row-0 projections through the same recurrence to
+    /// reconstruct the post-primary (conv, ssm) boundary state — the lazy
+    /// rollback counterpart of a batched multi-row verify that stashed its
+    /// inputs instead of splitting.
+    ///
+    /// BIT-EXACT: the batched kernel processes rows sequentially in fp32 from
+    /// the same pre-forward state, so replaying row 0 alone from that state
+    /// reproduces its arithmetic exactly; the conv window for row 0 is
+    /// `[convState .. row0]` in both the batched and the replay call
+    /// (associativity of concatenation). Assumes no padded rows (decode-time
+    /// verify carries no padding).
+    func recomputePrimaryBoundary(
+        cache: MambaCache, snapshot: [MLXArray?]
+    ) -> Bool {
+        guard let stash = cache.primaryBoundaryInputs,
+              let convPre = snapshot[0], let ssmPre = snapshot[1]
+        else { return false }
+        let (_, boundaryConv, boundarySsm) = processChunk(
+            qkv: stash.qkv,
+            a: stash.a,
+            b: stash.b,
+            convState: convPre,
+            ssmState: ssmPre,
+            mask: nil
+        )
+        cache[0] = boundaryConv
+        cache[1] = boundarySsm
+        cache.primaryBoundaryInputs = nil
+        return true
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -301,7 +332,9 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        recordBoundaryTape: Bool = false,
+        stashPrimaryInputs: Bool = false
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
@@ -330,7 +363,50 @@ final class Qwen35GatedDeltaNet: Module {
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
 
-        if nConfirmed > 0 && nConfirmed < S {
+        if recordBoundaryTape && S > 1 {
+            // PER-ROW BOUNDARY TAPE (multi-draft native-MTP verify). Process
+            // each row as its own chunk and record the (conv, ssm) state after
+            // every row into `cache.boundaryTape`, so a round can roll the
+            // recurrent state back to ANY accepted-prefix boundary with no
+            // repair forward.
+            //
+            // BIT-EXACTNESS: the conv window for row t is
+            // [convState .. row t] regardless of chunk boundaries (concat is
+            // associative — the same argument the nConfirmed split rests on),
+            // and the SSM scan is a sequential fp32 per-row recurrence whether
+            // the rows arrive in one kernel call or several. Only the chunk
+            // partition changes; the op sequence per row does not.
+            var tape: [(MLXArray, MLXArray)] = []
+            tape.reserveCapacity(S - 1)
+            var outs: [MLXArray] = []
+            outs.reserveCapacity(S)
+            var chunkConvState = convState
+            var chunkSsmState = ssmState
+            for t in 0 ..< S {
+                let (o, c, s) = processChunk(
+                    qkv: qkv[0..., t ..< (t + 1), 0...],
+                    a: a[0..., t ..< (t + 1), 0...],
+                    b: b[0..., t ..< (t + 1), 0...],
+                    convState: chunkConvState,
+                    ssmState: chunkSsmState,
+                    mask: mask.map { $0[0..., t ..< (t + 1)] }
+                )
+                outs.append(o)
+                chunkConvState = c
+                chunkSsmState = s
+                if t < S - 1 {
+                    tape.append((c, s))
+                }
+            }
+            out = concatenated(outs, axis: 1)
+            finalConvState = chunkConvState
+            // The loop ran at least once (S > 1 here), so the chunk state is
+            // non-nil: processChunk always returns a materialized ssm state.
+            finalSsmState = chunkSsmState
+                ?? MLXArray.zeros(
+                    [B, numVHeads, headVDim, headKDim], dtype: .float32)
+            cache?.boundaryTape = tape
+        } else if nConfirmed > 0 && nConfirmed < S {
             // Split at nConfirmed boundary for the MTP 2-token verify forward.
             // Run confirmed prefix first, snapshot rollback state, then run draft.
             // omlx: GatedDeltaNet.__call__ nConfirmed > 0 branch
@@ -376,6 +452,21 @@ final class Qwen35GatedDeltaNet: Module {
         if let cache {
             cache[0] = finalConvState
             cache[1] = finalSsmState
+            // A forward that did not record a tape must not leave a previous
+            // round's tape in place — a stale boundary would be restored as
+            // though it were current. Same for a stashed projection set.
+            if !recordBoundaryTape {
+                cache.boundaryTape = nil
+            }
+            if stashPrimaryInputs && S > 1 {
+                cache.primaryBoundaryInputs = (
+                    qkv: qkv[0..., 0 ..< 1, 0...],
+                    a: a[0..., 0 ..< 1, 0...],
+                    b: b[0..., 0 ..< 1, 0...]
+                )
+            } else {
+                cache.primaryBoundaryInputs = nil
+            }
         }
 
         let normedOut = norm(out, gate: z)
@@ -568,7 +659,9 @@ final class Qwen35DecoderLayer: Module {
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        recordBoundaryTape: Bool = false,
+        stashPrimaryInputs: Bool = false
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
@@ -577,7 +670,9 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                nConfirmed: nConfirmed)
+                nConfirmed: nConfirmed,
+                recordBoundaryTape: recordBoundaryTape,
+                stashPrimaryInputs: stashPrimaryInputs)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -630,7 +725,9 @@ public class Qwen35TextModelInner: Module {
     func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        recordBoundaryTape: Bool = false,
+        stashPrimaryInputs: Bool = false
     ) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
@@ -649,11 +746,37 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
+                cache: cacheArray?[i], nConfirmed: nConfirmed,
+                recordBoundaryTape: recordBoundaryTape,
+                stashPrimaryInputs: stashPrimaryInputs)
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
+    }
+
+    /// Walk every gated-delta layer and reconstruct its post-primary boundary
+    /// state from the stashed row-0 projections and the PRE-VERIFY snapshot.
+    /// Preflight every layer before mutating any of them; `false` leaves the
+    /// cache untouched so the caller can fall back to snapshot + repair.
+    func recomputePrimaryBoundary(
+        cache: [KVCache?], snapshot: [Int: [MLXArray?]]
+    ) -> Bool {
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  mamba.primaryBoundaryInputs != nil,
+                  let saved = snapshot[i],
+                  saved[0] != nil, saved[1] != nil
+            else { return false }
+        }
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  let saved = snapshot[i],
+                  layer.linearAttn?.recomputePrimaryBoundary(
+                    cache: mamba, snapshot: saved) == true
+            else { return false }
+        }
+        return true
     }
 }
 
@@ -789,12 +912,41 @@ extension Qwen35TextModel: MTPCapable {
     ///
     /// PR #990: `return out, hidden  # pre-norm hidden for MTP head`
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
+    /// Exact `MTPCapable` witness — see the protocol requirement. Delegates to
+    /// the extended overload with no recording and no logits limit.
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
+        callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed,
+            recordTape: false, logitsLimit: nil)
+    }
+
+    /// Tape-capable forward: `recordTape` makes the GDN layers split per row
+    /// and record every accepted-prefix boundary state into
+    /// `ArraysCache.boundaryTape` (multi-draft native-MTP verify rollback).
+    /// `logitsLimit` restricts the LM-head projection to the first `limit`
+    /// rows (the hidden for ALL rows is still returned): a speculative verify
+    /// needs only row 0's logits to decide acceptance, materializing the
+    /// bonus row lazily via ``logitsForRow(_:row:)`` once it is known to be
+    /// committed. `stashPrimaryInputs` runs the GDN batched (no split) and
+    /// stashes each layer's row-0 projections for reject-time boundary
+    /// reconstruction via ``recomputePrimaryBoundary(cache:snapshot:)``.
+    /// Bit-exact per row in every mode: RMSNorm is row-wise, matmul rows are
+    /// independent, and the GDN recurrence is sequential fp32 per row.
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        recordTape: Bool, logitsLimit: Int? = nil,
+        stashPrimaryInputs: Bool = false
+    ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let hidden = model(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed,
+            recordBoundaryTape: recordTape,
+            stashPrimaryInputs: stashPrimaryInputs)
+        let limited = logitsLimit.map { Swift.min(Swift.max(1, $0), hidden.dim(1)) }
+        let normed = limited.map { model.norm(hidden[0..., 0 ..< $0, 0...]) }
+            ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(normed)
@@ -804,6 +956,26 @@ extension Qwen35TextModel: MTPCapable {
         // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
         // is the normalization step — it expects the raw backbone output as input.
         return (logits, hidden)
+    }
+
+    /// LM-head logits for one row of a pre-norm hidden `[1, S, H]` — the lazy
+    /// counterpart of `logitsLimit`, bit-exact with the batched projection
+    /// (RMSNorm is row-wise; matmul rows are independent).
+    public func logitsForRow(_ hidden: MLXArray, row: Int) -> MLXArray {
+        let rowHidden = hidden[0..., row ..< (row + 1), 0...]
+        let normed = model.norm(rowHidden)
+        if let lmHead {
+            return lmHead(normed)
+        }
+        return model.embedTokens.asLinear(normed)
+    }
+
+    /// See ``Qwen35TextModelInner/recomputePrimaryBoundary(cache:snapshot:)``.
+    public func recomputePrimaryBoundary(
+        cache: [any KVCache], snapshot: [Int: [MLXArray?]]
+    ) -> Bool {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        return model.recomputePrimaryBoundary(cache: cacheOpt, snapshot: snapshot)
     }
 
     /// Apply the backbone's final `model.norm` to a hidden state.
@@ -943,6 +1115,44 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        recordTape: Bool
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed,
+            recordTape: recordTape, logitsLimit: nil)
+    }
+
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        recordTape: Bool, logitsLimit: Int?
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed,
+            recordTape: recordTape, logitsLimit: logitsLimit)
+    }
+
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int,
+        recordTape: Bool, logitsLimit: Int?, stashPrimaryInputs: Bool
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed,
+            recordTape: recordTape, logitsLimit: logitsLimit,
+            stashPrimaryInputs: stashPrimaryInputs)
+    }
+
+    public func logitsForRow(_ hidden: MLXArray, row: Int) -> MLXArray {
+        languageModel.logitsForRow(hidden, row: row)
+    }
+
+    public func recomputePrimaryBoundary(
+        cache: [any KVCache], snapshot: [Int: [MLXArray?]]
+    ) -> Bool {
+        languageModel.recomputePrimaryBoundary(cache: cache, snapshot: snapshot)
     }
 
     public func mtpForward(
