@@ -516,7 +516,12 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    /// PROMOTED-Q4 b6ce-NATIVE REFILL: h = 0.16 preserves the long-prefix
+    /// warmup, 0.95 evidence cap, streak-gated depth-8 path, and SDPA-only
+    /// chunking. Cold rounds remain capped at depth 4. After three full
+    /// accepts, seeded evidence selects depth 6; rejections still reset the
+    /// gate and update the same conditional EMAs. Official M5 evidence wins.
+    private static let headStepCostRatio = 0.16
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
