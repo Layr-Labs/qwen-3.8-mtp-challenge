@@ -127,6 +127,30 @@ public final class Qwen36MTPBlockSession {
     public private(set) var began = false
     public private(set) var reachedStopToken = false
 
+    // MARK: - adaptive draft schedule state
+
+    /// Most recent drafting round's width and acceptance, feeding
+    /// `adaptiveDraftCount`. Only rounds that actually drafted update these:
+    /// serial rounds (offer 0) and adaptive skips (policy returns 0) are not
+    /// drafting rounds and leave the history untouched.
+    private var lastRoundDrafted = 0
+    private var lastRoundAccepted = 0
+
+    /// Rolling (drafted, accepted) pairs for the most recent drafting rounds,
+    /// capped at `acceptanceWindow`. The policy reads the windowed acceptance
+    /// rate to decide whether speculation is paying at all. Only drafting
+    /// rounds (draftCount > 0) enter the window.
+    private var acceptanceHistory: [(drafted: Int, accepted: Int)] = []
+    /// Adaptive skips in a row. While shut down, the policy probes the head
+    /// again every `probeInterval` skip rounds so a head that recovered is
+    /// not missed for the rest of the decode.
+    private var consecutiveSkips = 0
+    private static let acceptanceWindow = 8
+    /// Below this windowed acceptance rate a verify row does not pay for
+    /// itself, so the schedule falls back to serial (adaptive skip = 0).
+    private static let acceptanceFloor = 0.45
+    private static let probeInterval = 8
+
     public init(
         model: any Qwen36MTPTarget,
         stopTokens: Set<Int>,
@@ -136,6 +160,9 @@ public final class Qwen36MTPBlockSession {
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
+        self.draftPolicy = { [weak self] offeredDepth, round in
+            self?.adaptiveDraftCount(offeredDepth: offeredDepth, round: round) ?? 0
+        }
     }
 
     // MARK: - warm
@@ -175,7 +202,7 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width == 2 ? 1 : 0)
+                cache: warmCache, nConfirmed: 0)
             eval(verifyLogits)
             eval(warmCache.flatMap { $0.state })
         }
@@ -210,10 +237,22 @@ public final class Qwen36MTPBlockSession {
 
     /// How many tokens to draft this round, given the parent's offer.
     ///
-    /// THE SHIPPED DEFAULT IS A CONSTANT 2, and it is a starting line rather
-    /// than a recommendation: 2 is the depth this track was pinned at while
-    /// depth was an operator parameter, so an unmodified tree reproduces the
-    /// measured reference behaviour exactly. A submission owns this function.
+    /// THE POLICY BELOW IS THE FIRST THING A SUBMISSION SHOULD CHANGE. The
+    /// shipped reference schedule (`draftPolicy`) was a constant 2, the depth
+    /// this track was pinned at while depth was an operator parameter; an
+    /// unmodified tree reproduces the measured reference behaviour exactly.
+    ///
+    /// THIS SUBMISSION SHIPS AN ADAPTIVE SCHEDULE. The operator's sealed
+    /// measurement matrix is the ground truth this is built on: a constant
+    /// depth of 1 was the best measured width (+5.4% predicted raw median),
+    /// a constant 2 is a measured ~0.6% regression against serial on the 3.8
+    /// tower (the 0.994 calibration), and a constant 3 was far worse
+    /// (−22.3%). So this schedule drafts ONE token per round normally,
+    /// attempts a second only on a full-acceptance streak, and falls back to
+    /// drafting nothing while the rolling acceptance rate is too low for a
+    /// verify row to pay for itself. That fallback is what protects the 0.90
+    /// floor: against a head the pool does not reward, the schedule degrades
+    /// to serial (~1.0) instead of paying for rejected verify rows.
     ///
     /// Contract, enforced by a precondition at the call site and re-enforced by
     /// the TRUSTED parent against `qwenMTPMaxDraftDepth`: return a value in
@@ -224,21 +263,55 @@ public final class Qwen36MTPBlockSession {
     /// the scored window, which the worker is never told. Acceptance history is
     /// available through `acceptedDraftTotal` / `rejectedDraftTotal` /
     /// `rollbackRoundCount`.
-    // OPERATOR K-TEST VARIANT, k = 1. Draft ONE token per round at whatever
-    // width the parent offers. This is the only thing that changes: the verify
-    // block is still `[primary] + drafts`, acceptance is still the longest
-    // common prefix over the target's own argmaxes, and the snapshot / rollback
-    // / re-forward repair is untouched. The emitted stream is therefore the
-    // same greedy target chain at any offer, which is what keeps every width
-    // bit-exact.
-    //
-    // Legal by the 2026-08-14 contract for the reason the doc comment above
-    // states: the return value need only land in
-    // `0 ... min(offeredDepth, Qwen36MTPLimits.maxDepth)`, and the trusted
-    // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
-        offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        offeredDepth, round in
+        Swift.min(offeredDepth, 0)
+    }
+
+    /// The adaptive schedule this submission ships. See `draftPolicy`.
+    ///
+    /// Returns 0 ... min(offer, maxDepth); the call-site precondition bounds
+    /// the actual return, so the math here is only as careful as the
+    /// threshold and the caps.
+    private func adaptiveDraftCount(offeredDepth: Int, round: Int) -> Int {
+        let maxAllowed = Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth)
+        guard maxAllowed >= 1 else { return 0 }
+
+        // First round (or a fresh probe after a shutdown): no history to
+        // trust. Draft one token.
+        guard !acceptanceHistory.isEmpty else { return Swift.min(maxAllowed, 1) }
+
+        // Shutdown probe: while shut down the window never refreshes, so
+        // every `probeInterval` skip rounds the head gets one more chance;
+        // a recovered head is never missed for the rest of the decode.
+        if consecutiveSkips >= Self.probeInterval {
+            acceptanceHistory.removeAll()
+            lastRoundDrafted = 0
+            lastRoundAccepted = 0
+            consecutiveSkips = 0
+            return Swift.min(maxAllowed, 1)
+        }
+
+        // While the windowed acceptance rate is below the floor, drafting does
+        // not pay: every verify row costs more than the expected accepted
+        // token. Draft nothing -- an adaptive skip costs exactly serial.
+        if acceptanceHistory.count >= Self.acceptanceWindow {
+            let drafted = acceptanceHistory.reduce(0) { $0 + $1.drafted }
+            let accepted = acceptanceHistory.reduce(0) { $0 + $1.accepted }
+            if drafted > 0,
+               Double(accepted) / Double(drafted) < Self.acceptanceFloor
+            {
+                return 0
+            }
+        }
+
+        // Full acceptance last round is a streak: one extra draft is the most
+        // the calibration ever rewarded (constant 2 measured ~0.994 raw).
+        if lastRoundDrafted >= 1, lastRoundAccepted == lastRoundDrafted {
+            return Swift.min(maxAllowed, 2)
+        }
+
+        return Swift.min(maxAllowed, 1)
     }
 
     /// The shipped schedule's width. See `draftPolicy`.
@@ -343,12 +416,19 @@ public final class Qwen36MTPBlockSession {
         // path reads it. That is the difference between "MTP off" and "MTP depth
         // 1", and it is the whole reason this branch exists.
         //
+        // The adaptive schedule records a skip only when the policy chose it
+        // (an offered 0 is the control leg and leaves the schedule history
+        // alone); `adaptiveDraftCount`'s probe counter keys off it.
+        //
         // The single row this forward produces IS the round's target tail row:
         // its argmax becomes the next primary, exactly as the bonus row does on
         // the speculative path. So the ledger closes with declaredRows = 1,
         // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
         // box wrapper agrees without any special case there.
         if depth == Qwen36MTPLimits.serialControlDepth || draftCount == 0 {
+            if depth != Qwen36MTPLimits.serialControlDepth {
+                consecutiveSkips += 1
+            }
             let (serialLogits, serialHidden) = model.callWithHidden(
                 input: LMInput.Text(
                     tokens: MLXArray([primary]).reshaped([1, 1])),
@@ -393,17 +473,16 @@ public final class Qwen36MTPBlockSession {
             nextToken = proposal
         }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let fastK1 = draftCount == 1
+        // 2. Snapshot the recurrent (non-trimmable) state, then verify in ONE
+        //    batched forward. `nConfirmed` stays 0 deliberately: a non-zero value
+        //    installs the vendored depth-1-only rollback AND changes the GDN
+        //    chunk geometry, both of which fight the snapshot/rollback below.
         let snapshot = Self.snapshotRecurrent(cache)
         let verifyInput = committed + drafts
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(
                 tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
-            cache: cache, nConfirmed: fastK1 ? 1 : 0)
+            cache: cache, nConfirmed: 0)
         let verifyArgmax = argmaxAll(verifyLogits)
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
@@ -431,7 +510,6 @@ public final class Qwen36MTPBlockSession {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
             // rollback, no repair forward; the bonus row carries the next primary
             // and the last hidden row seeds the next draft.
-            Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             let bonus = verifyLogits[
@@ -442,45 +520,39 @@ public final class Qwen36MTPBlockSession {
             perRowTop2Tokens.append(ids)
             perRowTop2Logits.append(values)
         } else {
+            // PARTIAL: undo the WHOLE verify window — restore the recurrent
+            // snapshot and trim all `1 + draftCount` positions from the trimmable
+            // caches — then re-forward only the committed block. The correction
+            // token (the target's own row-`acceptedCount` argmax) is NEVER
+            // emitted here; it arrives as the next round's primary, out of the
+            // repair forward, which is what keeps the emitted stream identical to
+            // the serial trajectory.
             rollbackRoundCount += 1
             committed.append(contentsOf: drafts.prefix(acceptedCount))
             committedTokenCount += acceptedCount
-
-            // K=1 rejection: the target already computed the primary's exact
-            // logits and hidden row. Restore the recurrent checkpoint written
-            // immediately after that primary, trim just the rejected draft from
-            // attention caches, and carry row 0 forward. The trusted tail row is
-            // the same post-primary distribution, so reuse its already-recorded
-            // top-2 evidence rather than running the target again.
-            let committedOffset = base + committed.count
-            if fastK1 && Self.restoreAfterSingleDraftReject(
-                cache, to: committedOffset)
-            {
-                pendingLogitsRow = verifyLogits[
-                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
-                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
-                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
-            } else {
-                // Generic K>1 / defensive fallback: undo the whole verify window
-                // and re-forward the committed block.
-                Self.rollbackAfterVerify(
-                    cache, snapshot, verifiedTokens: verifyInput.count, to: base)
-                let (repairLogits, repairHidden) = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(committed).reshaped([1, committed.count])),
-                    cache: cache, nConfirmed: 0)
-                pendingLogitsRow = repairLogits[
-                    0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
-                pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
-                let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
-                perRowTop2Tokens.append(ids)
-                perRowTop2Logits.append(values)
-            }
+            Self.rollbackAfterVerify(
+                cache, snapshot, verifiedTokens: verifyInput.count, to: base)
+            let (repairLogits, repairHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(committed).reshaped([1, committed.count])),
+                cache: cache, nConfirmed: 0)
+            pendingLogitsRow = repairLogits[
+                0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
+            pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
+            let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
+            perRowTop2Tokens.append(ids)
+            perRowTop2Logits.append(values)
         }
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
+        lastRoundDrafted = draftCount
+        lastRoundAccepted = acceptedCount
+        consecutiveSkips = 0
+        acceptanceHistory.append((drafted: draftCount, accepted: acceptedCount))
+        if acceptanceHistory.count > Self.acceptanceWindow {
+            acceptanceHistory.removeFirst()
+        }
         eval(cache.flatMap { $0.state })
         if let row = pendingLogitsRow, let h = pendingHidden { eval(row, h) }
 
@@ -561,48 +633,6 @@ public final class Qwen36MTPBlockSession {
             if entry.isTrimmable, entry.offset > base {
                 _ = entry.trim(Swift.min(verifiedTokens, entry.offset - base))
             }
-        }
-    }
-
-    /// Restore the checkpoint produced by a two-token verify with
-    /// `nConfirmed == 1`. The checkpoint is the recurrent state immediately
-    /// after the primary; each attention cache is exactly one rejected draft
-    /// token ahead of that same committed offset.
-    ///
-    /// Preflight every layer before mutating any of them. Returning `false`
-    /// leaves the cache untouched so the caller can use the generic snapshot and
-    /// repair path safely.
-    private static func restoreAfterSingleDraftReject(
-        _ cache: [any KVCache],
-        to committedOffset: Int
-    ) -> Bool {
-        for entry in cache {
-            if let arrays = entry as? ArraysCache {
-                guard arrays.rollbackState != nil else { return false }
-            } else if entry.isTrimmable {
-                guard entry.offset == committedOffset + 1 else { return false }
-            } else {
-                return false
-            }
-        }
-
-        for entry in cache {
-            if let arrays = entry as? ArraysCache,
-               let saved = arrays.rollbackState
-            {
-                arrays[0] = saved.0
-                arrays[1] = saved.1
-                arrays.rollbackState = nil
-            } else if entry.isTrimmable {
-                _ = entry.trim(entry.offset - committedOffset)
-            }
-        }
-        return true
-    }
-
-    private static func clearRecurrentRollback(_ cache: [any KVCache]) {
-        for entry in cache {
-            (entry as? ArraysCache)?.rollbackState = nil
         }
     }
 
