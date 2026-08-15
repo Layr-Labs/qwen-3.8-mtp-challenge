@@ -175,7 +175,8 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: 0)
+                cache: warmCache,
+                nConfirmed: width > 1 ? -1 : 0)
             eval(verifyLogits)
             eval(warmCache.flatMap { $0.state })
         }
@@ -238,7 +239,7 @@ public final class Qwen36MTPBlockSession {
     // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 0)
+        Swift.min(offeredDepth, 2)
     }
 
     /// The shipped schedule's width. See `draftPolicy`.
@@ -402,7 +403,8 @@ public final class Qwen36MTPBlockSession {
         let (verifyLogits, verifyHidden) = model.callWithHidden(
             input: LMInput.Text(
                 tokens: MLXArray(verifyInput).reshaped([1, verifyInput.count])),
-            cache: cache, nConfirmed: 0)
+            cache: cache,
+            nConfirmed: -1)
         let verifyArgmax = argmaxAll(verifyLogits)
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
@@ -436,6 +438,7 @@ public final class Qwen36MTPBlockSession {
                 0..., drafts.count ..< (drafts.count + 1), 0...]
             pendingLogitsRow = bonus
             pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            Self.clearSpeculativePrefixStates(cache)
             let (ids, values) = Self.topTwo(of: verifyLogits[0, drafts.count])
             perRowTop2Tokens.append(ids)
             perRowTop2Logits.append(values)
@@ -450,18 +453,32 @@ public final class Qwen36MTPBlockSession {
             rollbackRoundCount += 1
             committed.append(contentsOf: drafts.prefix(acceptedCount))
             committedTokenCount += acceptedCount
-            Self.rollbackAfterVerify(
-                cache, snapshot, verifiedTokens: verifyInput.count, to: base)
-            let (repairLogits, repairHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray(committed).reshaped([1, committed.count])),
-                cache: cache, nConfirmed: 0)
-            pendingLogitsRow = repairLogits[
-                0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
-            pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
-            let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
-            perRowTop2Tokens.append(ids)
-            perRowTop2Logits.append(values)
+            let retainedVerifyPrefix = Self.retainAcceptedVerifyPrefix(
+                cache,
+                acceptedCount: acceptedCount,
+                draftCount: draftCount,
+                base: base)
+            if retainedVerifyPrefix {
+                pendingLogitsRow = verifyLogits[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
+                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                let (ids, values) = Self.topTwo(of: verifyLogits[0, acceptedCount])
+                perRowTop2Tokens.append(ids)
+                perRowTop2Logits.append(values)
+            } else {
+                Self.rollbackAfterVerify(
+                    cache, snapshot, verifiedTokens: verifyInput.count, to: base)
+                let (repairLogits, repairHidden) = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(committed).reshaped([1, committed.count])),
+                    cache: cache, nConfirmed: 0)
+                pendingLogitsRow = repairLogits[
+                    0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1), 0...]
+                pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
+                let (ids, values) = Self.topTwo(of: lastRow(repairLogits))
+                perRowTop2Tokens.append(ids)
+                perRowTop2Logits.append(values)
+            }
         }
 
         acceptedDraftTotal += acceptedCount
@@ -541,11 +558,60 @@ public final class Qwen36MTPBlockSession {
                 // The vendored depth-1 rollback snapshot, if the GDN forward ever
                 // wrote one, describes a frame this rollback just discarded.
                 arrays.rollbackState = nil
+                arrays.speculativePrefixStates.removeAll(keepingCapacity: true)
                 continue
             }
             if entry.isTrimmable, entry.offset > base {
                 _ = entry.trim(Swift.min(verifiedTokens, entry.offset - base))
             }
+        }
+    }
+
+    /// Keep exactly `[primary] + acceptedDrafts` from an already-evaluated
+    /// verify block. Returns false without mutation unless every layer exposes
+    /// the expected cache shape, allowing the existing repair path to remain a
+    /// defensive fallback.
+    private static func retainAcceptedVerifyPrefix(
+        _ cache: [any KVCache],
+        acceptedCount: Int,
+        draftCount: Int,
+        base: Int
+    ) -> Bool {
+        let retainedRows = 1 + acceptedCount
+        let rejectedRows = draftCount - acceptedCount
+        let verifiedEnd = base + 1 + draftCount
+
+        for entry in cache {
+            if let arrays = entry as? ArraysCache {
+                guard arrays.speculativePrefixStates.count == draftCount + 1 else {
+                    return false
+                }
+                continue
+            }
+            guard entry.isTrimmable,
+                  entry.offset == verifiedEnd,
+                  entry.offset - rejectedRows == base + retainedRows
+            else { return false }
+        }
+
+        for entry in cache {
+            if let arrays = entry as? ArraysCache {
+                let state = arrays.speculativePrefixStates[acceptedCount]
+                arrays[0] = state.0
+                arrays[1] = state.1
+                arrays.rollbackState = nil
+                arrays.speculativePrefixStates.removeAll(keepingCapacity: true)
+            } else if rejectedRows > 0 {
+                _ = entry.trim(rejectedRows)
+            }
+        }
+        return true
+    }
+
+    private static func clearSpeculativePrefixStates(_ cache: [any KVCache]) {
+        for case let arrays as ArraysCache in cache {
+            arrays.rollbackState = nil
+            arrays.speculativePrefixStates.removeAll(keepingCapacity: true)
         }
     }
 

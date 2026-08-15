@@ -250,15 +250,21 @@ final class Qwen35GatedDeltaNet: Module {
     ///   - convState: Initial conv state [B, conv_kernel_size-1, conv_dim]
     ///   - ssmState: Initial SSM state (nil on first token)
     ///   - mask: SSM mask for `gatedDeltaUpdate` (optional)
-    /// - Returns: `(out, newConvState, newSsmState)`
+    /// - Returns: output, final states, and optionally one state pair per prefix.
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
         b: MLXArray,
         convState: MLXArray,
         ssmState: MLXArray?,
-        mask: MLXArray?
-    ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray) {
+        mask: MLXArray?,
+        capturePrefixStates: Bool = false
+    ) -> (
+        out: MLXArray,
+        newConvState: MLXArray,
+        newSsmState: MLXArray,
+        prefixStates: [(MLXArray, MLXArray)]
+    ) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
 
@@ -281,6 +287,30 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
+        if capturePrefixStates {
+            let (out, newSsmState, ssmPrefixes) = gatedDeltaUpdateWithPrefixStates(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: ssmState,
+                mask: mask
+            )
+            var prefixStates: [(MLXArray, MLXArray)] = []
+            prefixStates.reserveCapacity(S)
+            for index in 0 ..< S {
+                let start = index + 1
+                let convPrefix = convInput[
+                    0..., start ..< (start + nKeep), 0...]
+                prefixStates.append(
+                    (convPrefix[.ellipsis], ssmPrefixes[index][.ellipsis]))
+            }
+            return (out, newConvState, newSsmState, prefixStates)
+        }
+
         let (out, newSsmState) = gatedDeltaUpdate(
             q: qNormed,
             k: kNormed,
@@ -292,7 +322,7 @@ final class Qwen35GatedDeltaNet: Module {
             state: ssmState,
             mask: mask
         )
-        return (out, newConvState, newSsmState)
+        return (out, newConvState, newSsmState, [])
     }
 
     // MARK: - callAsFunction
@@ -330,14 +360,33 @@ final class Qwen35GatedDeltaNet: Module {
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
 
-        if nConfirmed > 0 && nConfirmed < S {
+        // Prefix snapshots are one-call scratch state. Clear any prior verify
+        // block before selecting this call's execution mode.
+        cache?.speculativePrefixStates.removeAll(keepingCapacity: true)
+
+        if nConfirmed == -1 && S > 1 {
+            // Preserve the original single recurrent kernel and arithmetic
+            // order. Its additional output records the state after each row.
+            let step = processChunk(
+                qkv: qkv,
+                a: a,
+                b: b,
+                convState: convState,
+                ssmState: ssmState,
+                mask: mask,
+                capturePrefixStates: true)
+            cache?.speculativePrefixStates = step.prefixStates
+            out = step.out
+            finalConvState = step.newConvState
+            finalSsmState = step.newSsmState
+        } else if nConfirmed > 0 && nConfirmed < S {
             // Split at nConfirmed boundary for the MTP 2-token verify forward.
             // Run confirmed prefix first, snapshot rollback state, then run draft.
             // omlx: GatedDeltaNet.__call__ nConfirmed > 0 branch
             let maskC = mask.map { $0[0..., 0..<nConfirmed] }
             let maskD = mask.map { $0[0..., nConfirmed...] }
 
-            let (outC, convC, ssmC) = processChunk(
+            let confirmed = processChunk(
                 qkv: qkv[0..., 0..<nConfirmed, 0...],
                 a: a[0..., 0..<nConfirmed, 0...],
                 b: b[0..., 0..<nConfirmed, 0...],
@@ -347,30 +396,31 @@ final class Qwen35GatedDeltaNet: Module {
             )
             // Snapshot (conv_state, ssm_state) after confirmed prefix for rollback.
             // omlx: cache.rollback_state = (conv_c, ssm_c)
-            cache?.rollbackState = (convC, ssmC)
+            cache?.rollbackState = (
+                confirmed.newConvState, confirmed.newSsmState)
 
-            let (outD, convF, ssmF) = processChunk(
+            let draft = processChunk(
                 qkv: qkv[0..., nConfirmed..., 0...],
                 a: a[0..., nConfirmed..., 0...],
                 b: b[0..., nConfirmed..., 0...],
-                convState: convC,
-                ssmState: ssmC,
+                convState: confirmed.newConvState,
+                ssmState: confirmed.newSsmState,
                 mask: maskD
             )
-            out = concatenated([outC, outD], axis: 1)
-            finalConvState = convF
-            finalSsmState = ssmF
+            out = concatenated([confirmed.out, draft.out], axis: 1)
+            finalConvState = draft.newConvState
+            finalSsmState = draft.newSsmState
         } else {
             // Standard single-chunk path (nConfirmed == 0 or S == 1).
-            let (o, c, s) = processChunk(
+            let step = processChunk(
                 qkv: qkv, a: a, b: b,
                 convState: convState,
                 ssmState: ssmState,
                 mask: mask
             )
-            out = o
-            finalConvState = c
-            finalSsmState = s
+            out = step.out
+            finalConvState = step.newConvState
+            finalSsmState = step.newSsmState
         }
 
         if let cache {

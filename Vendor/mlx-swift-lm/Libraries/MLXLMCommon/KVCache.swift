@@ -1240,6 +1240,11 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
+    /// Recurrent states after each input prefix of a speculative verify block.
+    /// Populated only by the Qwen MTP prefix-capture mode and consumed before
+    /// the next target call. Index `i` is the state after verify row `i`.
+    public var speculativePrefixStates: [(MLXArray, MLXArray)] = []
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
