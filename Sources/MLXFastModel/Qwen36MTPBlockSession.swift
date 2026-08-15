@@ -123,6 +123,8 @@ public final class Qwen36MTPBlockSession {
     private var pendingLogitsRow: MLXArray?
     /// The (post-norm) trunk hidden that seeds the next draft round.
     private var pendingHidden: MLXArray?
+    /// Next primary already named by the previous verify top-1.
+    private var pendingPrimaryId: Int?
 
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
@@ -355,7 +357,8 @@ public final class Qwen36MTPBlockSession {
                 expected: expected, actual: base, round: roundCount)
         }
 
-        let primary = argmaxLast(logitsRow)
+        let primary = pendingPrimaryId ?? argmaxLast(logitsRow)
+        pendingPrimaryId = nil
         var committed = [primary]
         committedTokenCount += 1
 
@@ -428,6 +431,7 @@ public final class Qwen36MTPBlockSession {
             eval(cache.flatMap { $0.state })
             if let row = pendingLogitsRow, let h = pendingHidden { eval(row, h) }
             let (tailTokens, tailLogits) = Self.topTwo(of: lastRow(serialLogits))
+            pendingPrimaryId = tailTokens.first
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -574,6 +578,7 @@ public final class Qwen36MTPBlockSession {
 
         acceptedDraftTotal += acceptedCount
         rejectedDraftTotal += drafts.count - acceptedCount
+        pendingPrimaryId = perRowTop2Tokens.last?.first
         if qwenMTPCommittedHistoryEnabled && draftCount > 1 {
             // k>1 live drafts after the primary wrote speculative head rows
             // chained from the head hidden, not the trunk. Trim them; accepted

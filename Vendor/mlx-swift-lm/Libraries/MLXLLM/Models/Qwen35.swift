@@ -831,6 +831,10 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        // Width-2 verify only: overlap host graph build with GPU work.
+        // Serial S==1 and seed S==512 stay eager so the denominator and
+        // prefill qmm path are unchanged.
+        let overlapDecode = hiddenStates.dim(1) == 2
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -840,6 +844,9 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed,
                 stashPrimaryBoundary: stashPrimaryBoundary)
+            if overlapDecode && (i == 0 || i == 8 || i == 24 || i == 40 || i == 56) {
+                asyncEval(hiddenStates)
+            }
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
