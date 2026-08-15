@@ -442,6 +442,18 @@ public final class Qwen36MTPBlockSession {
     /// telemetry counter; the cost-model schedule below reads the per-position
     /// EMAs, not this.
     private var fullAcceptStreak = 0
+    /// Prompt thermostat (tail protection): consecutive rounds whose FIRST
+    /// draft was rejected. After `promptColdCapAfter` of them the prompt is
+    /// treated as cold and the depth cap is clamped to 1 (single draft) until
+    /// a first-draft acceptance or a full accept resets the streak. The
+    /// per-position EMAs converge in ~10 rounds from optimistic priors, and
+    /// during that transient a cold prompt over-drafts depth 2-4 every round;
+    /// the median score is set by the whole 8-prompt profile, so a fast,
+    /// fast-releasing guard on the tail prompts is worth more than the few
+    /// extra tokens a slow-converging schedule keeps drafting into a cold
+    /// prompt.
+    private var firstRejectStreak = 0
+    private static let promptColdCapAfter = 2
 
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
@@ -565,9 +577,12 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+        var widthCap = fullAcceptStreak >= Self.segmentedStreakGate
             ? Self.segmentedVerifyDepthCap
             : Self.sdpaWidthWallDepthCap
+        if firstRejectStreak >= Self.promptColdCapAfter {
+            widthCap = Swift.min(widthCap, 1)
+        }
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -1029,6 +1044,8 @@ public final class Qwen36MTPBlockSession {
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+        firstRejectStreak =
+            acceptedCount == 0 && !drafts.isEmpty ? firstRejectStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
