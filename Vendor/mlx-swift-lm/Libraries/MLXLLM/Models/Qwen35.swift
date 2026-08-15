@@ -1103,7 +1103,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             if layer.isLinear {
                 return MambaCache()
             }
-            return KVCacheSimple()
+            let cache = KVCacheSimple()
+            // Pre-size the K/V allocation so the 512-seed + 512-decode window
+            // never crosses a growth step: KVCacheSimple regrows by concat-
+            // copying the whole used prefix, which lands 3-4 O(history) copies
+            // per cache inside the timed window at the default step of 256.
+            // Allocation size only changes the zeros tail; every read is a
+            // sliced view bounded by `offset`, so values are untouched.
+            cache.step = 2048
+            return cache
         }
     }
 
@@ -1325,7 +1333,14 @@ extension Qwen35TextModel: MTPCapable {
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
     public func makeMTPCache() -> [any KVCache] {
         guard let mtp else { return [] }
-        return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
+        return mtp.layers.map { _ in
+            // Same pre-size rationale as `newCache`: the committed-history head
+            // cache holds seed + every committed token, so it crosses the
+            // default 256-step boundary repeatedly inside the timed window.
+            let cache = KVCacheSimple()
+            cache.step = 2048
+            return cache as any KVCache
+        }
     }
 }
 

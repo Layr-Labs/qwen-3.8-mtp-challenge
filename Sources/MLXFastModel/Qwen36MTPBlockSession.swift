@@ -235,13 +235,21 @@ public final class Qwen36MTPBlockSession {
             cache: historyWarmCache)
         eval(model.applyDraftLMHead(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]))
-        let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
-        let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
-        let folded = model.mtpHeadHiddenForward(
-            hidden: foldHidden, nextTokenIds: foldTokens,
-            cache: historyWarmCache)
-        eval(model.applyDraftLMHead(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // An accept-fold round flushes backlog + 1 rows: with the streak
+        // ladder capped at 4 that is any width in 1 ... 5, and the first
+        // occurrence of each width would otherwise compile inside the scored
+        // window. Warm them all.
+        for foldWidth in 1 ... Swift.min(Self.streakDepthCap + 1, maxDepth + 1) {
+            let foldHidden = MLXArray.zeros([1, foldWidth, hDim], dtype: row.dtype)
+            let foldTokens = MLXArray(
+                Array(repeating: Int32(0), count: foldWidth)
+            ).reshaped([1, foldWidth])
+            let folded = model.mtpHeadHiddenForward(
+                hidden: foldHidden, nextTokenIds: foldTokens,
+                cache: historyWarmCache)
+            eval(model.applyDraftLMHead(
+                folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -710,9 +718,16 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
-            headHistoryBacklogTokens.append(drafts[index])
+        if acceptedCount > 0 {
+            // One final-norm over all accepted rows instead of `acceptedCount`
+            // single-row norms: RMSNorm is row-local, so the batched rows are
+            // the per-row results bit-for-bit, and the flush concat accepts a
+            // multi-row backlog element unchanged.
+            let acceptedRows = verifyHidden[0..., 0 ..< acceptedCount, 0...]
+            headHistoryBacklogHidden.append(
+                postNorm ? model.applyFinalNorm(acceptedRows) : acceptedRows)
+            headHistoryBacklogTokens.append(
+                contentsOf: drafts.prefix(acceptedCount))
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
