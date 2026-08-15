@@ -516,7 +516,16 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// FIFTH FIT — the declared-head swap (91743270) changed the head
+    /// variant without the re-fit this comment's own rule demands. A head
+    /// step streams the head layer plus the shared lm_head readout (~0.65
+    /// GiB, unchanged target weight); the head layer fell 849 MB bf16 ->
+    /// 239 MB 4-bit/g64, so the stream drops ~1.48 -> ~0.87 GiB and the
+    /// marginal shrinks ~0.59x: 0.20 -> ~0.118, shipped as 0.12. The
+    /// ranked pair is the arbiter; 0.08 / 0.16 are the documented spread
+    /// arms. Depth stays under the proven bit-exact regime (width <= 5).
+    private static let headStepCostRatio = 0.12
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
