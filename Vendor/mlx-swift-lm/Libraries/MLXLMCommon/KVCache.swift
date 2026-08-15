@@ -1262,8 +1262,6 @@ public class ArraysCache: BaseKVCache {
         public let v: MLXArray
         public let a: MLXArray
         public let b: MLXArray
-        public let g: MLXArray
-        public let beta: MLXArray
         public let ssmPre: MLXArray?
         public let mask: MLXArray?
         public let rowCount: Int
@@ -1276,8 +1274,6 @@ public class ArraysCache: BaseKVCache {
             v: MLXArray,
             a: MLXArray,
             b: MLXArray,
-            g: MLXArray,
-            beta: MLXArray,
             ssmPre: MLXArray?,
             mask: MLXArray?,
             rowCount: Int,
@@ -1289,8 +1285,6 @@ public class ArraysCache: BaseKVCache {
             self.v = v
             self.a = a
             self.b = b
-            self.g = g
-            self.beta = beta
             self.ssmPre = ssmPre
             self.mask = mask
             self.rowCount = rowCount
