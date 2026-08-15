@@ -170,6 +170,12 @@ public final class Qwen36MTPBlockSession {
         postNorm: Bool = true
     ) throws {
         guard model.hasMTPHead else { throw Qwen36MTPSessionError.headNotAttached }
+        // Batched multi-row verify GEMM: swap eligible quantized linears for
+        // the T-row shared-weight-read kernel and register the packed-QKV
+        // bridge. Idempotent; runs before warmAllDepths so every verify width
+        // JIT-compiles outside any scored window. Shape-guarded: serial M=1,
+        // draft steps, and prefill fall back to the stock path untouched.
+        Qwen35BatchedVerifyLinear.installOnce(on: model.underlyingModule)
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
@@ -233,15 +239,8 @@ public final class Qwen36MTPBlockSession {
         let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
-        let primedDraftLogits = model.applyDraftLMHead(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
-        // Warm the complete proposal-side expression used by a live draft.
-        // The compact vocabulary changes the reduction shape and adds an
-        // on-device ID map, so warming logits alone leaves both kernels to
-        // cold-JIT inside the first scored round.
-        let primedDraftID = model.mapDraftTokenIds(
-            argMax(primedDraftLogits, axis: -1).asType(.int32))
-        eval(primedDraftID)
+        eval(model.applyDraftLMHead(
+            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]))
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadHiddenForward(
@@ -355,7 +354,18 @@ public final class Qwen36MTPBlockSession {
     /// Cap on the streak ladder. The verify row is nearly free (weight-bound
     /// forward), so the cap prices the marginal HEAD step against its
     /// acceptance odds; 3 keeps the wasted-work tail short on mixed prose.
-    private static let streakDepthCap = 4
+    /// `MLXFAST_QWEN_MTP_STREAK_DEPTH_CAP` overrides (default 4, the
+    /// promoted-frontier value). The batched verify kernel shares each packed
+    /// weight fetch across all T rows, so higher caps are cheaper than they
+    /// were on the stock per-row dispatch.
+    private static let streakDepthCap: Int = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_QWEN_MTP_STREAK_DEPTH_CAP"],
+            let parsed = Int(raw), parsed >= 1 {
+            return parsed
+        }
+        return 6
+    }()
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -573,18 +583,16 @@ public final class Qwen36MTPBlockSession {
             cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.mapDraftTokenIds(
-            argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                .asType(.int32))
+        var draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+            .asType(.int32)
         draftIdArrays.append(draftId)
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.mapDraftTokenIds(
-                argMax(model.applyDraftLMHead(draftHidden), axis: -1)
-                    .asType(.int32))
+            draftId = argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                .asType(.int32)
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])

@@ -2084,3 +2084,42 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
         .info(info)
     }
 }
+
+/// Bridge for the speculative-decode multi-row verify GEMM.
+///
+/// The Qwen MTP verify pass pushes T = draftCount + 1 rows through the
+/// packed affine-4 QKV projection (and every other quantized projection).
+/// The runtime registers a hook that runs a batched kernel sharing each
+/// packed weight fetch across all T rows with per-row arithmetic identical
+/// to the stock `qmv_fast` M=1 kernel, so verify rows stay bit-exact against
+/// the serial control leg. Callers fall back to `quantizedMM` when the hook
+/// is absent or the shape does not qualify.
+public enum Qwen35BatchedVerifyBridge {
+    public typealias Hook =
+        (_ x: MLXArray, _ weight: MLXArray, _ scales: MLXArray,
+            _ biases: MLXArray, _ groupSize: Int, _ bits: Int) -> MLXArray?
+
+    /// Runs the batched verify GEMM for `x` (row count 2...max) against the
+    /// given affine quantized operands, or returns nil to fall back.
+    public static var quantizedMMHook: Hook? {
+        get { currentHook() }
+        set { setHook(newValue) }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var hookStorage:
+        ((_ x: MLXArray, _ weight: MLXArray, _ scales: MLXArray,
+            _ biases: MLXArray, _ groupSize: Int, _ bits: Int) -> MLXArray?)? = nil
+
+    private static func currentHook() -> Hook? {
+        lock.lock()
+        defer { lock.unlock() }
+        return hookStorage
+    }
+
+    private static func setHook(_ value: Qwen35BatchedVerifyBridge.Hook?) {
+        lock.lock()
+        defer { lock.unlock() }
+        hookStorage = value
+    }
+}
