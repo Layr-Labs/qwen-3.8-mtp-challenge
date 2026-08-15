@@ -554,9 +554,12 @@ public final class Qwen36MTPBlockSession {
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
+    /// cap 4; any reject resets the streak. Two consecutive full accepts are
+    /// enough evidence to open the exact segmented-attention path; this arm
+    /// changes only that qualification latency and leaves every depth and
+    /// cost-model input unchanged.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
