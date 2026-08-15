@@ -914,14 +914,16 @@ public final class Qwen36MTPBlockSession {
             }
         }
 
-        // Head-history upkeep. Trim the speculative deeper-draft rows back to
-        // the valid prefix, then queue the ACCEPTED transitions for the next
-        // drafting round's flush: row i of the verify output is the trunk
-        // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
-        // committed pair. The rejecting round queues nothing — the next
-        // round's own (pendingHidden, primary) row covers that transition.
-        Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
+        // Head-history upkeep. A deeper draft step has already appended the
+        // MTP row for the preceding draft. Keep those rows only when that draft
+        // was accepted, and trim every rejected/uncommitted row. The final
+        // proposed draft has no following head step, so full acceptance still
+        // queues that one canonical target-hidden transition for the next
+        // round's flush.
+        let retainedAcceptedRows = min(acceptedCount, draftCount - 1)
+        Self.trimTrimmable(
+            headCache, to: validHistoryOffset + retainedAcceptedRows)
+        for index in retainedAcceptedRows ..< acceptedCount {
             headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
