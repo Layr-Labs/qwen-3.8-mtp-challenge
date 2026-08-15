@@ -191,6 +191,16 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
+    // Packed qkv+z concat on N. Underscore so it is not a Module parameter.
+    // Built once from already-quantized in_proj_qkv / in_proj_z; never a child.
+    private var _qkvzW: MLXArray?
+    private var _qkvzS: MLXArray?
+    private var _qkvzZ: MLXArray?
+    private var _qkvzGS = 64
+    private var _qkvzBits = 4
+    private var _qkvzMode = QuantizationMode.affine
+    private var _qkvN = 0
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -295,6 +305,36 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
+    /// One affine-4 GEMM for in_proj_qkv (N=10240) + in_proj_z (N=6144).
+    /// Rows are independent, so concatenating already-packed weights on N is
+    /// bit-exact with two separate qmv_fast launches. Never glue a/b (N=48).
+    /// Unquantized Linear falls back.
+    private func qkvz(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let w = _qkvzW, let s = _qkvzS, let z = _qkvzZ {
+            let y = quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
+                groupSize: _qkvzGS, bits: _qkvzBits, mode: _qkvzMode)
+            return (y[.ellipsis, ..<_qkvN], y[.ellipsis, _qkvN...])
+        }
+        if let q = inProjQKV as? QuantizedLinear,
+           let zz = inProjZ as? QuantizedLinear,
+           q.groupSize == zz.groupSize,
+           q.bits == zz.bits,
+           q.mode == zz.mode, q.mode == .affine,
+           let qz = q.biases, let zb = zz.biases
+        {
+            _qkvzW = concatenated([q.weight, zz.weight], axis: 0).contiguous()
+            _qkvzS = concatenated([q.scales, zz.scales], axis: 0).contiguous()
+            _qkvzZ = concatenated([qz, zb], axis: 0).contiguous()
+            _qkvzGS = q.groupSize
+            _qkvzBits = q.bits
+            _qkvzMode = q.mode
+            _qkvN = q.shape.0
+            return qkvz(x)
+        }
+        return (inProjQKV(x), inProjZ(x))
+    }
+
     // MARK: - callAsFunction
 
     func callAsFunction(
@@ -308,8 +348,9 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+        let (qkvIn, zFlat) = qkvz(inputs)
+        var qkv = qkvIn
+        let z = zFlat.reshaped(B, S, numVHeads, headVDim)
         let b = inProjB(inputs)
         let a = inProjA(inputs)
 
