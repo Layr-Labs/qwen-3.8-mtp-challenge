@@ -781,6 +781,30 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35TextModel: MTPCapable {
     public var hasMTPHead: Bool { mtp != nil }
 
+    /// Seed-prefill specialization for the native-MTP worker.
+    ///
+    /// The full backbone still runs over every input position so all 64 layer
+    /// caches are identical to `callWithHidden`. Only the final position is
+    /// consumed after prefill, so slice before the final norm and the untied
+    /// 248,320-way vocabulary projection instead of materializing 511 unused
+    /// logit rows.
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: 0)
+        let last = hidden[
+            0..., (hidden.dim(1) - 1) ..< hidden.dim(1), 0...]
+        let normed = model.norm(last)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, last)
+    }
+
     /// Run a backbone forward that also returns pre-norm hidden states.
     ///
     /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw backbone output
@@ -938,6 +962,12 @@ extension Qwen35Model: LoRAModel {
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
     public var hasMTPHead: Bool { languageModel.hasMTPHead }
+
+    public func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithLastTokenHidden(input: input, cache: cache)
+    }
 
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int

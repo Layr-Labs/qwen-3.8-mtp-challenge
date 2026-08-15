@@ -53,6 +53,13 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Seed-prefill seam: run the complete backbone and update every cache row,
+    /// but normalize and vocabulary-project only the final hidden position.
+    /// The MTP session consumes no earlier seed logits or hidden rows.
+    func callWithLastTokenHidden(
+        input: LMInput.Text, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray)
+
     /// MTP head forward returning `(logits, head post-`mtp.norm` hidden)`.
     func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]

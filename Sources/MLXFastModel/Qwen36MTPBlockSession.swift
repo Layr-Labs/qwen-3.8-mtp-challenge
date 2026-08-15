@@ -192,12 +192,12 @@ public final class Qwen36MTPBlockSession {
         guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         cache = model.newCache(parameters: nil)
-        let (logits, hidden) = model.callWithHidden(
+        let (logits, hidden) = model.callWithLastTokenHidden(
             input: LMInput.Text(
                 tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
-            cache: cache, nConfirmed: 0)
-        pendingLogitsRow = logits[0..., (logits.dim(1) - 1) ..< logits.dim(1), 0...]
-        pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
+            cache: cache)
+        pendingLogitsRow = logits
+        pendingHidden = hidden
         eval(cache.flatMap { $0.state })
         eval(pendingLogitsRow!, pendingHidden!)
         seedTokenCount = seedTokens.count
