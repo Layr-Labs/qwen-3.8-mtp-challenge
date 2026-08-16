@@ -343,6 +343,15 @@ final class Qwen35GatedDeltaNet: Module {
     let valueDim: Int
     let convKernelSize: Int
     let convDim: Int
+    let qNormScale: Float
+    let kNormScale: Float
+
+    // Input-independent BF16 weights for the GDN Q/K RMSNorms. RMSNorm writes
+    // `weight * T(x * invRMS)`, matching the old post-norm BF16 multiply while
+    // avoiding two separate elementwise launches in every linear-attention
+    // layer. These are runtime constants, not model parameters.
+    private let _qRMSNormWeightBF16: MLXArray
+    private let _kRMSNormWeightBF16: MLXArray
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
@@ -439,6 +448,15 @@ final class Qwen35GatedDeltaNet: Module {
         self.valueDim = headVDim * numVHeads
         self.convKernelSize = args.linearConvKernelDim
         self.convDim = keyDim * 2 + valueDim
+        let inverseScale = pow(Float(headKDim), -0.5)
+        let qNormScale = pow(inverseScale, 2)
+        let kNormScale = inverseScale
+        self.qNormScale = qNormScale
+        self.kNormScale = kNormScale
+        self._qRMSNormWeightBF16 = MLXArray.full(
+            [headKDim], values: MLXArray(qNormScale), dtype: .bfloat16)
+        self._kRMSNormWeightBF16 = MLXArray.full(
+            [headKDim], values: MLXArray(kNormScale), dtype: .bfloat16)
 
         precondition(
             numVHeads % numKHeads == 0,
@@ -469,6 +487,28 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
+    }
+
+    /// Apply the existing GDN Q/K normalization and scale. The ranked BF16
+    /// path folds each scale into RMSNorm's write; other dtypes retain the
+    /// original unweighted-RMSNorm-then-multiply expression.
+    private func normalizeQK(
+        _ q: MLXArray, _ k: MLXArray
+    ) -> (q: MLXArray, k: MLXArray) {
+        if q.dtype == .bfloat16 && k.dtype == .bfloat16 {
+            return (
+                MLXFast.rmsNorm(q, weight: _qRMSNormWeightBF16, eps: 1e-6),
+                MLXFast.rmsNorm(k, weight: _kRMSNormWeightBF16, eps: 1e-6)
+            )
+        }
+
+        let dtype = q.dtype
+        return (
+            MLXArray(qNormScale).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+            MLXArray(kNormScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        )
     }
 
     /// Lazily build and apply the fused [qkv|z|b|a] projection. Returns nil
@@ -553,14 +593,7 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizeQK(q, k)
 
         let (out, newSsmState) = gatedDeltaUpdateMemoG(
             q: qNormed,
@@ -602,14 +635,7 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizeQK(q, k)
 
         // Keep the recurrence and conv prologue wide. The promoted compiled
         // g/beta launch reduction feeds the same single recurrence, while the
@@ -789,13 +815,7 @@ final class Qwen35GatedDeltaNet: Module {
             let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let (qNormed, kNormed) = normalizeQK(q, k)
 
             // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
             // serving the gate's input-independent factor from the layer memo.
