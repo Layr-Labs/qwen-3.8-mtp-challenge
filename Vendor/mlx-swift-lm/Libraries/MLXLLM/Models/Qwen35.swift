@@ -2027,6 +2027,331 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// MARK: - exact target LM-head top-2
+//
+// The speculative target path needs only the two greatest logits per verify
+// row, but an ordinary QuantizedLinear call first writes all 248,320 BF16
+// logits and the session then reads that carrier in a separate partial
+// reduction.  These kernels keep the promoted affine4/g64 multi-row QMV
+// arithmetic, round each completed dot product to BF16 at the same boundary,
+// and immediately retain only a partial top-2 pair.  The target still performs
+// every mandatory dot product; only the unobservable full-logits carrier and
+// its consumer edge disappear.
+private let qwen35TargetLMHeadTop2PartialCount = 8192
+
+private let qwen35TargetLMHeadTop2Header = """
+    struct qwen_target_top2_state {
+        float first_value;
+        float second_value;
+        uint first_id;
+        uint second_id;
+        uint count;
+    };
+
+    inline qwen_target_top2_state qwen_target_top2_empty() {
+        qwen_target_top2_state state;
+        state.first_value = 0.0f;
+        state.second_value = 0.0f;
+        state.first_id = 0;
+        state.second_id = 0;
+        state.count = 0;
+        return state;
+    }
+
+    inline bool qwen_target_top2_better(
+        float candidate_value,
+        uint candidate_id,
+        float current_value,
+        uint current_id
+    ) {
+        bool candidate_nan = isnan(candidate_value);
+        bool current_nan = isnan(current_value);
+        if (candidate_nan != current_nan) { return !candidate_nan; }
+        if (candidate_value > current_value) { return true; }
+        if (candidate_value < current_value) { return false; }
+        return candidate_id < current_id;
+    }
+
+    inline void qwen_target_top2_insert(
+        thread qwen_target_top2_state &state,
+        float value,
+        uint id
+    ) {
+        if (state.count > 0 && state.first_id == id) { return; }
+        if (state.count > 1 && state.second_id == id) { return; }
+        if (state.count == 0
+            || qwen_target_top2_better(
+                value, id, state.first_value, state.first_id)) {
+            if (state.count > 0) {
+                state.second_value = state.first_value;
+                state.second_id = state.first_id;
+            }
+            state.first_value = value;
+            state.first_id = id;
+            state.count = min(state.count + 1, 2u);
+            return;
+        }
+        if (state.count == 1
+            || qwen_target_top2_better(
+                value, id, state.second_value, state.second_id)) {
+            state.second_value = value;
+            state.second_id = id;
+            state.count = 2;
+        }
+    }
+"""
+
+private func qwen35TargetLMHeadInputsPerWeightStream(_ rows: Int) -> Int {
+    switch rows {
+    case 1: 1
+    case 2: 2
+    case 3: 3
+    case 4: 4
+    case 5, 6: 3
+    case 7, 8: 4
+    case 9: 3
+    default:
+        preconditionFailure("target LM-head top-2 supports rows 1...9")
+    }
+}
+
+private func qwen35MakeTargetLMHeadTop2PartialKernel(
+    rows: Int
+) -> MLXFast.MLXFastKernel {
+    let inputsPerWeightStream = qwen35TargetLMHeadInputsPerWeightStream(rows)
+    return MLXFast.metalKernel(
+        name: "qwen35_target_lm_head_top2_partial_m\(rows)_v1",
+        inputNames: ["x", "w_q", "scales", "biases"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: """
+            constexpr uint qwen_rows = \(rows);
+            constexpr uint qwen_inputs_per_weight_stream =
+                \(inputsPerWeightStream);
+            constexpr uint qwen_hidden = 5120;
+            constexpr uint qwen_partial_count =
+                \(qwen35TargetLMHeadTop2PartialCount);
+
+            uint stream = threadgroup_position_in_grid.x;
+            uint partial_index = threadgroup_position_in_grid.y;
+            uint thread_id = thread_position_in_threadgroup.x;
+            uint simd_lane = thread_index_in_simdgroup;
+            uint simd_group = simdgroup_index_in_threadgroup;
+            uint first_row = stream * qwen_inputs_per_weight_stream;
+            uint valid_rows = min(
+                qwen_inputs_per_weight_stream, qwen_rows - first_row);
+            uint vocabulary = uint(w_q_shape[0]);
+
+            qwen_target_top2_state local[4];
+            for (uint m = 0; m < 4; ++m) {
+                local[m] = qwen_target_top2_empty();
+            }
+
+            // One 64-thread group retains a disjoint vocabulary stripe. Two
+            // SIMD groups compute four output rows each, exactly like
+            // qmv_fast. Adjacent verify inputs share each loaded weight tile
+            // with the same 1/2/3/4-row partition as the promoted QMV path.
+            for (uint tile = partial_index;
+                 tile < vocabulary / 8;
+                 tile += qwen_partial_count) {
+                uint output_base = tile * 8 + simd_group * 4;
+                float result[4][4];
+                for (uint r = 0; r < 4; ++r) {
+                    for (uint m = 0; m < 4; ++m) {
+                        result[r][m] = 0.0f;
+                    }
+                }
+
+                // qmv_fast's values-per-thread is 16 and its K block is 512.
+                // The four-value grouping, scale/bias placement and K
+                // accumulation order below are copied from
+                // qmv_fast_crossrow_affine4_g64_wide.
+                for (uint k = 0; k < qwen_hidden; k += 512) {
+                    ushort packed[4][4];
+                    float scale_local[4];
+                    float bias_local[4];
+                    for (uint r = 0; r < 4; ++r) {
+                        uint output_row = output_base + r;
+                        uint packed_column = (k + simd_lane * 16) / 8;
+                        ulong w_offset =
+                            ulong(output_row) * ulong(w_q_strides[0])
+                            + ulong(packed_column) * ulong(w_q_strides[1]);
+                        uint word0 = w_q[w_offset];
+                        uint word1 = w_q[w_offset + ulong(w_q_strides[1])];
+                        packed[r][0] = ushort(word0 & 0xffffu);
+                        packed[r][1] = ushort(word0 >> 16);
+                        packed[r][2] = ushort(word1 & 0xffffu);
+                        packed[r][3] = ushort(word1 >> 16);
+
+                        uint group_column = k / 64 + simd_lane / 4;
+                        ulong scale_offset =
+                            ulong(output_row) * ulong(scales_strides[0])
+                            + ulong(group_column) * ulong(scales_strides[1]);
+                        ulong bias_offset =
+                            ulong(output_row) * ulong(biases_strides[0])
+                            + ulong(group_column) * ulong(biases_strides[1]);
+                        scale_local[r] = float(scales[scale_offset]);
+                        bias_local[r] = float(biases[bias_offset]);
+                    }
+
+                    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    float partial[4][4];
+                    for (uint r = 0; r < 4; ++r) {
+                        for (uint m = 0; m < 4; ++m) {
+                            partial[r][m] = 0.0f;
+                        }
+                    }
+
+                    for (uint i = 0; i < 4; ++i) {
+                        float a0[4], a1[4], a2[4], a3[4];
+                        for (uint m = 0; m < valid_rows; ++m) {
+                            uint element = k + simd_lane * 16 + i * 4;
+                            ulong x_offset =
+                                ulong(first_row + m) * ulong(x_strides[1])
+                                + ulong(element) * ulong(x_strides[2]);
+                            float x0 = float(x[x_offset]);
+                            float x1 = float(x[
+                                x_offset + ulong(x_strides[2])]);
+                            float x2 = float(x[
+                                x_offset + 2 * ulong(x_strides[2])]);
+                            float x3 = float(x[
+                                x_offset + 3 * ulong(x_strides[2])]);
+                            sums[m] += x0 + x1 + x2 + x3;
+                            a0[m] = x0;
+                            a1[m] = x1 / 16.0f;
+                            a2[m] = x2 / 256.0f;
+                            a3[m] = x3 / 4096.0f;
+                        }
+                        for (uint r = 0; r < 4; ++r) {
+                            for (uint m = 0; m < valid_rows; ++m) {
+                                partial[r][m] +=
+                                    a0[m] * (packed[r][i] & 0x000f)
+                                    + a1[m] * (packed[r][i] & 0x00f0)
+                                    + a2[m] * (packed[r][i] & 0x0f00)
+                                    + a3[m] * (packed[r][i] & 0xf000);
+                            }
+                        }
+                    }
+                    for (uint r = 0; r < 4; ++r) {
+                        for (uint m = 0; m < valid_rows; ++m) {
+                            result[r][m] +=
+                                scale_local[r] * partial[r][m]
+                                + sums[m] * bias_local[r];
+                        }
+                    }
+                }
+
+                for (uint r = 0; r < 4; ++r) {
+                    for (uint m = 0; m < valid_rows; ++m) {
+                        float reduced = simd_sum(result[r][m]);
+                        if (simd_lane == 0) {
+                            // QuantizedLinear's output is BF16. Compare only
+                            // after the identical cast/write boundary.
+                            T rounded = T(reduced);
+                            qwen_target_top2_insert(
+                                local[m], float(rounded), output_base + r);
+                        }
+                    }
+                }
+            }
+
+            threadgroup qwen_target_top2_state scratch[2][4];
+            if (simd_lane == 0) {
+                for (uint m = 0; m < valid_rows; ++m) {
+                    scratch[simd_group][m] = local[m];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (thread_id == 0) {
+                for (uint m = 0; m < valid_rows; ++m) {
+                    qwen_target_top2_state merged = qwen_target_top2_empty();
+                    for (uint s = 0; s < 2; ++s) {
+                        qwen_target_top2_state other = scratch[s][m];
+                        if (other.count > 0) {
+                            qwen_target_top2_insert(
+                                merged, other.first_value, other.first_id);
+                        }
+                        if (other.count > 1) {
+                            qwen_target_top2_insert(
+                                merged, other.second_value, other.second_id);
+                        }
+                    }
+                    uint row = first_row + m;
+                    ulong output_offset =
+                        (ulong(row) * qwen_partial_count
+                            + ulong(partial_index)) * 2;
+                    partial_ids[output_offset] = int(merged.first_id);
+                    partial_ids[output_offset + 1] = int(merged.second_id);
+                    partial_values[output_offset] = merged.first_value;
+                    partial_values[output_offset + 1] = merged.second_value;
+                }
+            }
+        """,
+        header: qwen35TargetLMHeadTop2Header,
+        ensureRowContiguous: false
+    )
+}
+
+private let qwen35TargetLMHeadTop2PartialKernels = (1 ... 9).map {
+    qwen35MakeTargetLMHeadTop2PartialKernel(rows: $0)
+}
+
+private let qwen35TargetLMHeadTop2FinalizeKernel = MLXFast.metalKernel(
+    name: "qwen35_target_lm_head_top2_finalize_v1",
+    inputNames: ["partial_ids", "partial_values"],
+    outputNames: ["top_ids", "top_values"],
+    source: """
+        constexpr uint qwen_partial_count =
+            \(qwen35TargetLMHeadTop2PartialCount);
+        constexpr uint qwen_threads = 256;
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        qwen_target_top2_state local = qwen_target_top2_empty();
+
+        for (uint partial = lane;
+             partial < qwen_partial_count;
+             partial += qwen_threads) {
+            ulong input_offset =
+                (ulong(row) * qwen_partial_count + ulong(partial)) * 2;
+            qwen_target_top2_insert(
+                local, partial_values[input_offset],
+                uint(partial_ids[input_offset]));
+            qwen_target_top2_insert(
+                local, partial_values[input_offset + 1],
+                uint(partial_ids[input_offset + 1]));
+        }
+
+        threadgroup qwen_target_top2_state scratch[qwen_threads];
+        scratch[lane] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = qwen_threads / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                qwen_target_top2_state merged = scratch[lane];
+                qwen_target_top2_state other = scratch[lane + stride];
+                if (other.count > 0) {
+                    qwen_target_top2_insert(
+                        merged, other.first_value, other.first_id);
+                }
+                if (other.count > 1) {
+                    qwen_target_top2_insert(
+                        merged, other.second_value, other.second_id);
+                }
+                scratch[lane] = merged;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            ulong output_offset = ulong(row) * 2;
+            top_ids[output_offset] = int(scratch[0].first_id);
+            top_ids[output_offset + 1] = int(scratch[0].second_id);
+            top_values[output_offset] = scratch[0].first_value;
+            top_values[output_offset + 1] = scratch[0].second_value;
+        }
+    """,
+    header: qwen35TargetLMHeadTop2Header,
+    ensureRowContiguous: false
+)
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2064,6 +2389,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
+
+    private static let targetLMHeadTop2Enabled: Bool = {
+        switch ProcessInfo.processInfo.environment["MLXFAST_QWEN_TARGET_LMHEAD_TOP2"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }()
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2201,9 +2538,8 @@ extension Qwen35TextModel: MTPCapable {
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
-        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let (normed, hidden) = callWithHiddenForTargetTopTwo(
+            input: input, cache: cache, nConfirmed: nConfirmed)
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(normed)
@@ -2213,6 +2549,85 @@ extension Qwen35TextModel: MTPCapable {
         // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
         // is the normalization step — it expects the raw backbone output as input.
         return (logits, hidden)
+    }
+
+    /// Target backbone forward without constructing a vocabulary projection.
+    ///
+    /// The speculative verifier consumes the final-normalized rows only through
+    /// `targetLMHeadTopTwo`, so constructing a full logits node would retain the
+    /// carrier this fast path is designed to remove. Ordinary callers keep using
+    /// `callWithHidden`, whose projection is unchanged.
+    public func callWithHiddenForTargetTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        return (normed, hidden)
+    }
+
+    /// Exact target LM-head top-2 for BF16 affine4/g64 verify rows.
+    ///
+    /// Returns nil outside the frozen target geometry so the caller can execute
+    /// the existing `applyLMHead -> linearTopTwoRows` expression. Values are
+    /// float32 views of the exact BF16-rounded QuantizedLinear outputs.
+    public func targetLMHeadTopTwo(
+        _ x: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard Self.targetLMHeadTop2Enabled,
+              x.ndim == 3, x.dim(0) == 1,
+              (1 ... 9).contains(x.dim(1)),
+              x.dim(2) == 5120,
+              x.dtype == .bfloat16,
+              let quantized = lmHead as? QuantizedLinear,
+              type(of: quantized) == QuantizedLinear.self,
+              quantized.groupSize == 64,
+              quantized.bits == 4,
+              quantized.mode == .affine,
+              quantized.bias == nil,
+              quantized.weight.ndim == 2,
+              quantized.weight.dtype == .uint32,
+              quantized.weight.dim(0) == vocabularySize,
+              quantized.weight.dim(1) * 8 == 5120,
+              vocabularySize == 248_320,
+              quantized.scales.ndim == 2,
+              quantized.scales.dtype == .bfloat16,
+              quantized.scales.dim(0) == vocabularySize,
+              quantized.scales.dim(1) == 5120 / 64,
+              let biases = quantized.biases,
+              biases.ndim == 2,
+              biases.dtype == .bfloat16,
+              biases.shape == quantized.scales.shape
+        else { return nil }
+
+        let rows = x.dim(1)
+        let inputsPerWeightStream =
+            qwen35TargetLMHeadInputsPerWeightStream(rows)
+        let weightStreams =
+            (rows + inputsPerWeightStream - 1) / inputsPerWeightStream
+        let partials = qwen35TargetLMHeadTop2PartialKernels[rows - 1](
+            [x, quantized.weight, quantized.scales, biases],
+            template: [("T", x.dtype)],
+            grid: (
+                weightStreams * 64,
+                qwen35TargetLMHeadTop2PartialCount,
+                1
+            ),
+            threadGroup: (64, 1, 1),
+            outputShapes: [
+                [rows, qwen35TargetLMHeadTop2PartialCount, 2],
+                [rows, qwen35TargetLMHeadTop2PartialCount, 2],
+            ],
+            outputDTypes: [.int32, .float32]
+        )
+        let outputs = qwen35TargetLMHeadTop2FinalizeKernel(
+            partials,
+            grid: (rows * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2]],
+            outputDTypes: [.int32, .float32]
+        )
+        return (outputs[0], outputs[1])
     }
 
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
@@ -2510,6 +2925,21 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenForTargetTopTwo`.
+    public func callWithHiddenForTargetTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithHiddenForTargetTopTwo(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.targetLMHeadTopTwo`.
+    public func targetLMHeadTopTwo(
+        _ x: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        languageModel.targetLMHeadTopTwo(x)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

@@ -51,6 +51,19 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Backbone forward returning `(final-norm hidden, PRE-norm hidden)`
+    /// without constructing the target vocabulary projection. The speculative
+    /// verify feeds the first value directly into `targetLMHeadTopTwo`.
+    func callWithHiddenForTargetTopTwo(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray)
+
+    /// Exact target LM-head top-2 for eligible verify rows. Returns nil before
+    /// graph mutation outside the specialized affine4/g64 BF16 envelope.
+    func targetLMHeadTopTwo(
+        _ x: MLXArray
+    ) -> (MLXArray, MLXArray)?
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.

@@ -292,13 +292,16 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
+            let (verifyProjectionInput, _) = model.callWithHiddenForTargetTopTwo(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
                 cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
-            // Compile the two top-2 reduction kernels outside the scored window
-            // at every row count a round can dispatch.
-            let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            // Compile the exact fused target projection/top-2 kernels outside
+            // the scored window at every row count a round can dispatch. The
+            // fallback expression is warmed here too when the loaded head is
+            // outside the affine4/g64 envelope.
+            let (warmTop2IDs, warmTop2Values) =
+                targetTopTwo(verifyProjectionInput)
+            eval(warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -566,7 +569,7 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 2
+    private static let segmentedStreakGate = 3
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -912,7 +915,8 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
+        let (verifyProjectionInput, verifyHidden) =
+            model.callWithHiddenForTargetTopTwo(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
@@ -924,7 +928,7 @@ public final class Qwen36MTPBlockSession {
         // in ONE eval. The `.item()`/`.asArray` calls below then copy from
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
-        let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
+        let (top2IDs, top2Values) = targetTopTwo(verifyProjectionInput)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
         eval(cache.flatMap { $0.state } + bundle)
@@ -1464,6 +1468,19 @@ public final class Qwen36MTPBlockSession {
             outputDTypes: [.int32, .float32]
         )
         return (outputs[0], outputs[1])
+    }
+
+    /// Target verify readout. The specialized model path consumes final-norm
+    /// hidden rows directly and never creates a full vocabulary carrier. Any
+    /// geometry outside its fail-closed envelope executes the prior expression
+    /// byte-for-byte.
+    private func targetTopTwo(
+        _ normalizedHidden: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        if let fused = model.targetLMHeadTopTwo(normalizedHidden) {
+            return fused
+        }
+        return Self.linearTopTwoRows(model.applyLMHead(normalizedHidden))
     }
 
     public static func topTwo(of logitRow: MLXArray) -> ([Int], [Double]) {
