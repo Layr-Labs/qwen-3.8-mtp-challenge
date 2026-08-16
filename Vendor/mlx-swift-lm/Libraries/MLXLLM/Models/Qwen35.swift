@@ -495,6 +495,148 @@ private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
     )
 }()
 
+// Width-2 mid kernel with IN-KERNEL q/k RMS norms: replicates
+// `rms_single_row`'s exact arithmetic (per-lane 4-value sum-of-squares over
+// the 32 dk lanes -> simd_sum butterfly -> precise::rsqrt(acc/Dk + eps) ->
+// per-element T rounding), then applies the invScale multiplies with the
+// same two-rounding order as the host sequence (norm-round to T, then
+// scale-multiply rounding in float over the T-rounded value). Eliminates the
+// two separate rmsNorm launches + two scalar multiplies per GDN layer per
+// verify round (96 launches/round at width 2). The scale factors arrive as
+// the exact host-built MLXArrays so their bf16 bits are identical.
+private let qwen35GatedDeltaMidFusedNormKernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // RAW conv-split q, k: [B, T, Hk, Dk] (pre-norm, pre-scale)
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            // Host scale factors, already rounded to InT bits.
+            const float q_scale = static_cast<float>(q_scale_in);
+            const float k_scale = static_cast<float>(k_scale_in);
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              // In-kernel exact RMS norms over this row's Dk values,
+              // replicating rms_single_row: each lane owns its n_per_t
+              // contiguous values, sums squares in order, one simd_sum,
+              // precise rsqrt(acc/Dk + eps). Computed redundantly per
+              // simdgroup (each dv row's 32 dk lanes) — deterministic, so
+              // all simdgroups derive identical bits.
+              float q_acc = 0.0f;
+              float k_acc = 0.0f;
+              float q_raw[n_per_t];
+              float k_raw[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                float qf = static_cast<float>(q_[s_idx]);
+                float kf = static_cast<float>(k_[s_idx]);
+                q_raw[i] = qf;
+                k_raw[i] = kf;
+                q_acc += qf * qf;
+                k_acc += kf * kf;
+              }
+              q_acc = simd_sum(q_acc);
+              k_acc = simd_sum(k_acc);
+              const float q_inv_mean =
+                  metal::precise::rsqrt(q_acc / Dk + eps_in);
+              const float k_inv_mean =
+                  metal::precise::rsqrt(k_acc / Dk + eps_in);
+              InT q_n[n_per_t];
+              InT k_n[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                // First rounding: norm output stored as T, exactly like
+                // rms_single_row's static_cast<T>(x[i] * inv_mean).
+                q_n[i] = static_cast<InT>(q_raw[i] * q_inv_mean);
+                k_n[i] = static_cast<InT>(k_raw[i] * k_inv_mean);
+              }
+
+              if (true) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] * g_[hv_idx];
+                  kv_mem += state[i]
+                      * static_cast<float>(k_n[i]) * k_scale;
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  // Second rounding: the host's elementwise scalar multiply
+                  // computes float(T_norm) * float(T_scale) and rounds to T;
+                  // then the recurrence reads it back as float. Replicate
+                  // both roundings exactly.
+                  InT q_s = static_cast<InT>(
+                      static_cast<float>(q_n[i]) * q_scale);
+                  InT k_s = static_cast<InT>(
+                      static_cast<float>(k_n[i]) * k_scale);
+                  state[i] = state[i] + static_cast<float>(k_s) * delta;
+                  out += state[i] * static_cast<float>(q_s);
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[dv_idx] = static_cast<InT>(out);
+                }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
+              }
+              if (t < T - 1) {
+                auto m_state = state_mid
+                    + (((b_idx * (T - 1) + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  m_state[s_idx] = static_cast<StT>(state[i]);
+                }
+              }
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gated_delta_step_mid_fused_norm",
+        inputNames: [
+            "q", "k", "v", "g", "beta", "state_in", "T", "q_scale_in",
+            "k_scale_in", "eps_in",
+        ],
+        outputNames: ["y", "state_out", "state_mid"],
+        source: source
+    )
+}()
+
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
@@ -987,16 +1129,17 @@ final class Qwen35GatedDeltaNet: Module {
             finalSsmState = s
             pendingPrefixTape = tape
         } else if nConfirmed == 1 && S == 2 && mask == nil,
-           let midKernel = qwen35GatedDeltaMidKernel
+           let midKernel = qwen35GatedDeltaMidFusedNormKernel
         {
-            // Width-2 MTP verify, single-launch form. The old split path ran
-            // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
-            // sigmoid, g) and paid two recurrence launches with a full fp32
-            // state round-trip between them, solely to observe the
-            // post-primary state. Here the prework runs once over both rows —
-            // all of it position-local, so per-row bit-identical to the split
-            // form — and the cloned kernel emits the timestep-0 state as a
-            // third output, so the rollback checkpoint is free.
+            // Width-2 MTP verify, single-launch form WITH in-kernel q/k
+            // norms. The old split path ran EVERY satellite op twice and
+            // paid two recurrence launches solely to observe the post-primary
+            // state; the promoted mid kernel folded the recurrence but still
+            // launched two rmsNorms + two scalar multiplies per layer. This
+            // variant replicates rms_single_row's exact arithmetic in-kernel
+            // (per-lane 4-value partition over the 32 dk lanes, one simd_sum,
+            // precise rsqrt(acc/Dk + eps), T-round then scale-round) so the
+            // norms cost zero launches while staying bit-identical.
             let convInput = concatenated([convState, qkv], axis: 1)
             let nKeep = convKernelSize - 1
             let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
@@ -1009,15 +1152,12 @@ final class Qwen35GatedDeltaNet: Module {
 
             let dtype = q.dtype
             let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            // The exact host-built scale arrays (same MLXArray values the
+            // separated path multiplied with), passed as kernel inputs so
+            // their InT bits are identical.
+            let qScale = MLXArray(pow(invScale, 2)).asType(dtype)
+            let kScale = MLXArray(invScale).asType(dtype)
 
-            // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
-            // serving the gate's input-independent factor from the layer memo.
             let (g, beta) = qwen35CompiledGatedDeltaGBeta(
                 a, b, negExpALog, dtBias)
             var state = ssmState
@@ -1026,7 +1166,10 @@ final class Qwen35GatedDeltaNet: Module {
             if state.dtype != .float32 { state = state.asType(.float32) }
 
             let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
+                [
+                    q, k, v, g, beta, state, MLXArray(S), qScale, kScale,
+                    MLXArray(Float(1e-6)),
+                ],
                 template: [
                     ("InT", dtype),
                     ("StT", DType.float32),
