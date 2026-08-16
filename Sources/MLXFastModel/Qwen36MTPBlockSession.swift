@@ -603,15 +603,15 @@ public final class Qwen36MTPBlockSession {
         {
             positionAcceptEMA[acceptedCount] +=
                 alpha * (0.0 - positionAcceptEMA[acceptedCount])
-        } else if acceptedCount == drafts.count, !drafts.isEmpty,
+        } else if acceptedCount == drafts.count,
+                  acceptedCount >= Self.sdpaWidthWallDepthCap,
                   acceptedCount < positionAcceptEMA.count
         {
-            // Optimism transfer: a FULLY accepted round is evidence about the
-            // position just past the round's depth too — the chain was hot and
-            // only the schedule ended it. Without this the first unreached
-            // position keeps its cold prior and the product-of-EMAs reach can
-            // never clear the deep threshold inside a short window; this is
-            // the streak ladder's widening step, recast as evidence. Capped
+            // Qualified optimism transfer: a fully accepted round is evidence
+            // about the position just past the round only after the promoted
+            // pre-streak cap was actually exercised. Shallower perfect rounds
+            // keep their observed successes but do not boost an unobserved
+            // deeper position. Capped
             // at 0.95: transferred optimism is inference, not observation,
             // and deep positions never merit a certainty estimate
             // without treating that inference as a real observation.
