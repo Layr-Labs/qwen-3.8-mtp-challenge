@@ -226,7 +226,6 @@ public enum Qwen35GatedDeltaNet {
         mask: MLXArray? = nil,
         state: Qwen35GatedDeltaState? = nil
     ) throws -> MLXArray {
-        #if DEBUG
         try validate(
             input,
             weights: weights,
@@ -234,7 +233,6 @@ public enum Qwen35GatedDeltaNet {
             mask: mask,
             state: state
         )
-        #endif
 
         let batchSize = input.dim(0)
         let sequenceLength = input.dim(1)

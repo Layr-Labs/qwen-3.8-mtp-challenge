@@ -93,12 +93,10 @@ public enum Qwen35Block {
                 "Qwen35 block input or norm shapes are invalid"
             )
         }
-        #if DEBUG
         try validateContract(
             weights: weights,
             hiddenSize: input.dim(2)
         )
-        #endif
 
         let normalizedInput = Qwen35Ops.rmsNorm(
             input,
