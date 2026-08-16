@@ -566,7 +566,12 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    // Deep widths are already bit-exact through the segmented SDPA path. Let
+    // the per-position acceptance model price them every round instead of
+    // hiding them behind a binary full-accept streak: one harmless tail miss
+    // should update that position's EMA, not collapse the next three rounds to
+    // depth four and discard evidence from every earlier position.
+    private static let segmentedStreakGate = 0
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
