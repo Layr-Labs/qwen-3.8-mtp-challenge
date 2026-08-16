@@ -248,9 +248,11 @@ private let qwen35CompiledGatedDeltaPostNorm:
 // knife-edge. The remaining five outputs measured bit-exact at S=3..9 over
 // 5 seeds x 4 compile modes (12,983,040 element comparisons, zero mismatches)
 // on the vendored MLX version, with a +1-row conv-window negative control
-// failing exactly the three outputs that read the window. S=2 breaks the
-// conv-state copy (a state row would come from the OLD conv state, which the
-// copy loop does not read), hence the hard S >= 3 gate. The fused in-proj
+// failing exactly the three outputs that read the window. S=2 used to
+// break the conv-state copy (a state row would come from the OLD conv
+// state, which the qkv-only copy loop does not read). The prefix gather
+// below completes that row from `conv_state` when T < NKeep, so S=2 is
+// now inside the byte-receipt envelope. The fused in-proj
 // carrier's live row stride (16480, not 10240) is consumed via the provided
 // stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
 // would silently insert a full-carrier copy and give back the launch saving.
@@ -381,6 +383,27 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           for (uint i = 0; i < 4; ++i) {
             conv_out[state_base + i] =
                 qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
+          }
+        }
+        // Width-2: when T < NKeep the new conv state's LEADING rows come
+        // from the OLD conv state, not qkv. The copy above covers state
+        // rows [NKeep - T, NKeep); this gathers the prefix [0, NKeep - T)
+        // from conv_state so the state output is complete at every verify
+        // width >= 2. Verbatim copy — no arithmetic — so exactness is
+        // unaffected. At T=2 NKeep=3 this is one row: conv_state[2] ->
+        // conv_out[0], matching the last-3 window [old2, new0, new1].
+        if (T < NKeep && row == 0) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < NKeep - T; ++j) {
+            const uint state_base = j * C + channel_base + lane * 4;
+            const ulong src_base = ulong(T + j) * ulong(conv_state_strides[1])
+                + ulong(channel_base + lane * 4)
+                    * ulong(conv_state_strides[2]);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              conv_out[state_base + i] = conv_state[
+                  src_base + ulong(i) * ulong(conv_state_strides[2])];
+            }
           }
         }
         """
@@ -989,37 +1012,84 @@ final class Qwen35GatedDeltaNet: Module {
         } else if nConfirmed == 1 && S == 2 && mask == nil,
            let midKernel = qwen35GatedDeltaMidKernel
         {
-            // Width-2 MTP verify, single-launch form. The old split path ran
-            // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
-            // sigmoid, g) and paid two recurrence launches with a full fp32
-            // state round-trip between them, solely to observe the
-            // post-primary state. Here the prework runs once over both rows —
-            // all of it position-local, so per-row bit-identical to the split
-            // form — and the cloned kernel emits the timestep-0 state as a
-            // third output, so the rollback checkpoint is free.
+            // Width-2 MTP verify. Prefer the packed GDN-prework mixer that
+            // already covers widths 3-9: with the T < NKeep prefix gather
+            // the new conv-state output is complete at T=2, so conv1d +
+            // SiLU + split + Q/K rms + g collapse to one launch beside the
+            // existing mid-state recurrence kernel. Fail-closed onto the
+            // stock chain for any geometry outside the byte-receipt
+            // envelope. Recurrence stays the promoted mid kernel — no
+            // fused-norm mid rewrite, no compiled head-step.
             let convInput = concatenated([convState, qkv], axis: 1)
             let nKeep = convKernelSize - 1
-            let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
+            let packedHit = MLXHardwareInfo.isCompiledDecodeSupported
+                && B == 1 && S == 2 && nKeep == 3
+                && numKHeads == 16 && numVHeads == 48
+                && headKDim == 128 && headVDim == 128
+                && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+                && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+                && a.dtype == .bfloat16 && b.dtype == .bfloat16
 
-            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-            // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
-            // serving the gate's input-independent factor from the layer memo.
-            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
-                a, b, negExpALog, dtBias)
+            let dtype: DType
+            let qNormed: MLXArray
+            let kNormed: MLXArray
+            let v: MLXArray
+            let g: MLXArray
+            let beta: MLXArray
+            let newConvState: MLXArray
+            if packedHit {
+                let invScale = pow(Float(headKDim), -0.5)
+                let outs = qwen35PackedGDNPreworkKernel(
+                    [qkv, a, convState, conv1d.weight, aLog, dtBias,
+                     MLXArray(pow(invScale, 2)).asType(.bfloat16),
+                     MLXArray(invScale).asType(.bfloat16)],
+                    template: [
+                        ("Hk", numKHeads), ("Dk", headKDim),
+                        ("Hv", numVHeads), ("Dv", headVDim),
+                        ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                    ],
+                    grid: (32, S, 2 * numKHeads + numVHeads),
+                    threadGroup: (32, 1, 1),
+                    outputShapes: [
+                        [B, S, numKHeads, headKDim],
+                        [B, S, numKHeads, headKDim],
+                        [B, S, numVHeads, headVDim],
+                        [B, nKeep, qkv.dim(2)],
+                        [B, S, numVHeads],
+                    ],
+                    outputDTypes: [
+                        .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                    ]
+                )
+                qNormed = outs[0]
+                kNormed = outs[1]
+                v = outs[2]
+                newConvState = outs[3]
+                g = outs[4]
+                // beta stays a plain graph op BY DESIGN — same as widths 3-9.
+                beta = sigmoid(b).asType(.float32)
+                dtype = qNormed.dtype
+            } else {
+                newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+                let convOut = silu(conv1d(convInput))
+                let convSplit = MLX.split(
+                    convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+                let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+                v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+                dtype = q.dtype
+                let invScale = pow(Float(headKDim), -0.5)
+                qNormed =
+                    MLXArray(pow(invScale, 2)).asType(dtype)
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                kNormed =
+                    MLXArray(invScale).asType(dtype)
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                let gBeta = qwen35CompiledGatedDeltaGBeta(
+                    a, b, negExpALog, dtBias)
+                g = gBeta.0
+                beta = gBeta.1
+            }
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
