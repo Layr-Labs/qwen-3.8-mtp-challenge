@@ -1027,8 +1027,14 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
-        fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+        // Only a perfect round at the proven shallow wall qualifies evidence
+        // for opening the expensive deep segment. A full accept after the
+        // policy has already backed off to depth 1...3 is useful acceptance
+        // evidence, but it does not establish that width 5+ will amortize its
+        // extra verify work; require the schedule to recover to depth 4 first.
+        let fullAcceptAtShallowWall = acceptedCount == drafts.count
+            && drafts.count >= Self.sdpaWidthWallDepthCap
+        fullAcceptStreak = fullAcceptAtShallowWall ? fullAcceptStreak + 1 : 0
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
