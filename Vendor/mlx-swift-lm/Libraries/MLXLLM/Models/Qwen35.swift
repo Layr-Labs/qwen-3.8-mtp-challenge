@@ -1392,7 +1392,9 @@ public class Qwen35TextModelInner: Module {
         // rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
+        // schedule scaled from 40 to 64 layers, front rungs kept). The
+        // denser candidate ladder uses four-layer spacing after the first two
+        // boundaries to expose more host/GPU overlap on the 64-layer target.
         let ladderActive = inputs.dim(1) <= 2
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
@@ -1404,7 +1406,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
                 switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
+                case 0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61:
                     asyncEval(hiddenStates)
                 default:
                     break
