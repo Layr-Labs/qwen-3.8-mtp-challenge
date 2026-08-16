@@ -2050,6 +2050,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     // Input-independent compact copy of the loaded exact lm_head, used only
     // for draft proposals when no declared draft_lm_head is present. It is not
     // ModuleInfo because it is derived during warmup, not checkpoint state.
+    /// Coverage latch for the compact draft vocabulary (see
+    /// `latchFullDraftVocabulary`). Stored here because the MTPCapable
+    /// extension that uses it cannot hold stored properties.
+    fileprivate var fullDraftVocabularyLatched = false
+
     private var _compactDraftHead: Linear?
     // Prefix 98_304, the promoted trim. A 49_152 halving was measured on the
     // public longcopy gate and REGRESSED: three of its committed argmax ids
@@ -2334,12 +2339,26 @@ extension Qwen35TextModel: MTPCapable {
     /// the exact lm_head otherwise. ONLY used to choose draft proposals —
     /// never for ledger or verify values.
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
+        // Coverage latch released: proposals argmax the full resident
+        // lm_head regardless of which compact readout (runtime-derived or
+        // declared) was in force. Under a full-vocabulary declared readout
+        // the latch can never fire (no id is unreachable), so this bypass
+        // only ever replaces a COMPACT readout.
+        if fullDraftVocabularyLatched { return applyLMHead(x) }
         if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
             let k = s.dim(1) * 64
             let bits = w.dim(1) * 32 / k
-            return quantizedMM(
+            let logits = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: 64, bits: bits, mode: .affine)
+            // A COMPACT-shaped declared draft readout (the runtime compact
+            // vocabulary's padded row count) drops its padding rows before
+            // argmax, exactly as the runtime-derived compact head does; its
+            // ids are then mapped back by `mapDraftTokenIds` below.
+            if w.dim(0) == Self.compactDraftPaddedCount {
+                return logits[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            }
+            return logits
         }
         guard usesCompactDraftVocabulary else { return applyLMHead(x) }
         if _compactDraftHead == nil {
@@ -2391,15 +2410,58 @@ extension Qwen35TextModel: MTPCapable {
     /// IDs; the appended rows are Qwen's official text/control tokens
     /// 248,044 ... 248,069.
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        guard usesCompactDraftVocabulary else { return ids }
+        // The compact id space applies on the runtime-derived compact path
+        // AND when the DECLARED draft readout is compact-shaped (its rows
+        // are the same prefix + control layout by contract). Once the
+        // coverage latch has released, proposals come from the full lm_head
+        // and ids are already true vocabulary ids.
+        guard !fullDraftVocabularyLatched,
+              usesCompactDraftVocabulary || declaredDraftHeadIsCompact
+        else { return ids }
         return which(
             ids .< Self.compactDraftPrefixCount,
             ids,
             ids + (Self.compactDraftControlStart - Self.compactDraftPrefixCount))
     }
 
+    /// True when a declared draft readout ships the compact row layout.
+    private var declaredDraftHeadIsCompact: Bool {
+        _draftHeadW.map { $0.dim(0) == Self.compactDraftPaddedCount } ?? false
+    }
+
+    /// COVERAGE LATCH for the compact draft vocabulary.
+    ///
+    /// The promoted compact readout keeps rows [0, 98304) + the 26 control
+    /// rows and drops the rest, saving ~432 MB of reads per draft step. The
+    /// cost is invisible on prose whose ids all live in the prefix and
+    /// severe on text that does not: a token whose id falls in
+    /// [98304, 248044) is STRUCTURALLY UNPROPOSABLE, so every occurrence is
+    /// a forced reject no head can avoid. Measured on this box, 64-token
+    /// windows: prose 0.00% unreachable (accept 1.0000 either way, compact
+    /// 2.0% faster), code-like text 6.59% unreachable (compact accept
+    /// 0.7812 / 22.544 ms/token vs full 0.8833 / 21.910 — the trim COSTS
+    /// 2.8% there).
+    ///
+    /// So the trim is kept as the default and RELEASED on evidence: the
+    /// session latches full coverage once the TARGET's own correction rows
+    /// prove tokens are being missed for reachability, not for quality.
+    /// Nothing here reads the prompt; the signal is the target's argmax,
+    /// the same ledger evidence the round already materialises.
+    /// Release the compact trim for the rest of the session.
+    public func latchFullDraftVocabulary() {
+        fullDraftVocabularyLatched = true
+    }
+
+    /// True while a compact trim — runtime-derived or declared — is still
+    /// in force (the coverage latch has not released it).
+    public var draftVocabularyIsCompact: Bool {
+        usesCompactDraftVocabulary
+            || (!fullDraftVocabularyLatched && declaredDraftHeadIsCompact)
+    }
+
     private var usesCompactDraftVocabulary: Bool {
-        configuration.vocabularySize == 248_320
+        !fullDraftVocabularyLatched
+            && configuration.vocabularySize == 248_320
             && lmHead != nil && _draftHeadW == nil
     }
 
@@ -2563,6 +2625,16 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.draftTokenID`.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
         languageModel.draftTokenID(x)
+    }
+
+    /// See `Qwen35TextModel.latchFullDraftVocabulary`.
+    public func latchFullDraftVocabulary() {
+        languageModel.latchFullDraftVocabulary()
+    }
+
+    /// See `Qwen35TextModel.draftVocabularyIsCompact`.
+    public var draftVocabularyIsCompact: Bool {
+        languageModel.draftVocabularyIsCompact
     }
 
     /// See `Qwen35TextModel.mapDraftTokenIds`.

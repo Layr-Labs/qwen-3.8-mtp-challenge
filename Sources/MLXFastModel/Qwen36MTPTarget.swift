@@ -96,6 +96,12 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// instead of six. Proposal side only.
     func draftTokenID(_ x: MLXArray) -> MLXArray
 
+    /// Release the compact draft-vocabulary trim for the rest of the session.
+    func latchFullDraftVocabulary()
+
+    /// True while the compact draft vocabulary is still in force.
+    var draftVocabularyIsCompact: Bool { get }
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
