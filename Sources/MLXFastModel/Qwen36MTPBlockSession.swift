@@ -492,10 +492,9 @@ public final class Qwen36MTPBlockSession {
     /// lands exactly where it hurts. The EMAs converge to the prompt's
     /// truth within ~10 rounds regardless; what protects the hard prompts
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
-    /// uncapped transfer, not the prior).
+    private static let acceptEMAAlpha = 0.25
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
-    private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
@@ -566,7 +565,7 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 1
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -587,13 +586,7 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            }
-            reach *= p
+            reach *= positionAcceptEMA[depth]
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
