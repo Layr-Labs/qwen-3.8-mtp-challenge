@@ -2280,9 +2280,17 @@ extension Qwen35TextModel: MTPCapable {
         if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
             let k = s.dim(1) * 64
             let bits = w.dim(1) * 32 / k
-            return quantizedMM(
+            let logits = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: 64, bits: bits, mode: .affine)
+            // A COMPACT-shaped declared draft readout (the runtime compact
+            // vocabulary's padded row count) drops its padding rows before
+            // argmax, exactly as the runtime-derived compact head does; its
+            // ids are then mapped back by `mapDraftTokenIds` below.
+            if w.dim(0) == Self.compactDraftPaddedCount {
+                return logits[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            }
+            return logits
         }
         guard usesCompactDraftVocabulary else { return applyLMHead(x) }
         if _compactDraftHead == nil {
@@ -2334,7 +2342,13 @@ extension Qwen35TextModel: MTPCapable {
     /// IDs; the appended rows are Qwen's official text/control tokens
     /// 248,044 ... 248,069.
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        guard usesCompactDraftVocabulary else { return ids }
+        // The compact id space applies on the runtime-derived compact path
+        // AND when the DECLARED draft readout is compact-shaped (its rows
+        // are the same prefix + control layout by contract).
+        let declaredCompact =
+            _draftHeadW.map { $0.dim(0) == Self.compactDraftPaddedCount }
+            ?? false
+        guard usesCompactDraftVocabulary || declaredCompact else { return ids }
         return which(
             ids .< Self.compactDraftPrefixCount,
             ids,
