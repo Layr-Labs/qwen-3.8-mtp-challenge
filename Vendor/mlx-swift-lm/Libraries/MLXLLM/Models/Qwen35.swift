@@ -910,6 +910,20 @@ final class Qwen35GatedDeltaNet: Module {
 
 // MARK: - Fused MLP
 
+/// Fuse the elementwise SiLU gate and product after the decode-width gate/up
+/// matmul. Shapeless compilation shares one trace across verify widths while
+/// preserving the existing operation order and BF16 boundary.
+private let qwen35CompiledFusedSwiGLU:
+    @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { gate, up in
+        silu(gate) * up
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 /// Decode-width fused gate/up MLP. Same math as the vendored `Qwen3NextMLP` —
 /// `down(silu(gate(x)) * up(x))` — but at decode/verify widths (S <= 9) the
 /// gate and up projections run as ONE matmul over concatenated output rows
@@ -985,7 +999,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
-            return downProj(silu(g) * u)
+            return downProj(qwen35CompiledFusedSwiGLU(g, u))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
@@ -1388,6 +1402,7 @@ final class Qwen35Attention: Module {
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
+           L <= 16,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
