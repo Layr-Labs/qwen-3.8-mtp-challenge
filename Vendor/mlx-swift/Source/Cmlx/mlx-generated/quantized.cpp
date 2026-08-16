@@ -970,14 +970,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
 }
 
 // Wider row sharing for the affine4/g64 multi-row QMV. Same contract as
-// qmv_fast_crossrow_affine4_g64: the frozen host launches M x-groups for each
-// 8-output tile, so a group that claims NA adjacent input rows lets the
-// remaining host groups return without reading weights. NA up to 4 shares one
-// nibble mask and one integer-to-float conversion across NA inputs while
-// holding only four x values per input live at a time, so the register
-// footprint stays near the two-input kernel's. load_vector, the qdot
-// expression, the K accumulation order and simd_sum are unchanged for every
-// output element.
+// qmv_fast_crossrow_affine4_g64. NA up to 4 shares one nibble mask and one
+// integer-to-float conversion across NA inputs while holding only four x values
+// per input live at a time, so the register footprint stays near the two-input
+// kernel's. The host launches only the groups that can claim input rows;
+// matrix_rows still carries the original M for exact tail selection. load_vector,
+// the qdot expression, the K accumulation order and simd_sum are unchanged for
+// every output element.
 template <typename T, int NA>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     const device uint32_t* w,
@@ -1791,10 +1790,12 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* w_strides [[buffer(12)]],
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
+    const constant int& matrix_rows [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)ntg;
   if (batched) {
     int M = x_shape[x_batch_ndims];
     adjust_matrix_offsets<T>(
@@ -1819,7 +1820,7 @@ template <typename T, int group_size, int bits, bool batched>
       // Wide row sharing needs enough output tiles to keep the machine fed;
       // below 4096 outputs the reduced x-group count thins the grid, so the
       // promoted pair kernel is kept there byte-for-byte.
-      switch (ntg.x) {
+      switch (matrix_rows) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
@@ -1864,7 +1865,7 @@ template <typename T, int group_size, int bits, bool batched>
           break;
       }
     } else {
-      switch (ntg.x) {
+      switch (matrix_rows) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
