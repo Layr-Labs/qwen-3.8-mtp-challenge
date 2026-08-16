@@ -2158,6 +2158,32 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// Return logits plus the hidden representation selected by the native-MTP
+    /// block session. The post-norm variant reuses `normed` -- the exact tensor
+    /// that feeds `lmHead` -- so accepted verify rows do not repeat the final
+    /// RMSNorm after the target readout has materialized.
+    ///
+    /// Keep `callWithHidden` unchanged: the shared `MTPCapable` contract and
+    /// generation helpers outside this ranked block session require pre-norm
+    /// hidden states.
+    public func callWithReusableHidden(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int,
+        postNorm: Bool
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, postNorm ? normed : hidden)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -2453,6 +2479,20 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithReusableHidden`.
+    public func callWithReusableHidden(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int,
+        postNorm: Bool
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithReusableHidden(
+            input: input,
+            cache: cache,
+            nConfirmed: nConfirmed,
+            postNorm: postNorm)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

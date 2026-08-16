@@ -51,6 +51,22 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Backbone forward returning logits plus the hidden representation the
+    /// MTP session consumes. When `postNorm` is true, the second result is the
+    /// exact post-final-norm tensor already used to produce `logits`; callers
+    /// can retain and slice it instead of launching the same final RMSNorm
+    /// again for accepted verify rows. When false, the second result keeps the
+    /// ordinary pre-norm contract.
+    ///
+    /// This is deliberately separate from `callWithHidden`: the vendored
+    /// `MTPCapable` API and its other consumers still require pre-norm hidden.
+    func callWithReusableHidden(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int,
+        postNorm: Bool
+    ) -> (MLXArray, MLXArray)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
