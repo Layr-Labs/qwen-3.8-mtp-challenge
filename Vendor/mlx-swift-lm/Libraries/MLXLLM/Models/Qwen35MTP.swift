@@ -56,8 +56,9 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let (h, normalized) = qwen35ResidualRMSNorm(
+            x, r, norm: postAttentionLayerNorm)
+        return h + (mlp as! UnaryLayer)(normalized)
     }
 
     /// Populate this layer's K/V history without computing a dead layer

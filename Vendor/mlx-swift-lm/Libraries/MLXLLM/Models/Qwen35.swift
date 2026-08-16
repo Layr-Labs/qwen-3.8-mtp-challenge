@@ -1263,6 +1263,128 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+// MARK: - Residual RMSNorm
+
+// The target model consumes both values produced at this boundary: the rounded
+// bf16 residual feeds the next skip connection while its RMS-normalized value
+// feeds the MLP.  Computing them together avoids materializing the residual for
+// a second kernel launch.  The reduction and casts intentionally mirror MLX's
+// rms_single_row/rms_looped kernels (four contiguous reads per thread, the same
+// SIMD/threadgroup reduction, precise rsqrt, and a bf16 cast before scaling).
+private let qwen35ResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_residual_rms_norm_bf16_v1",
+    inputNames: ["residual", "branch", "weight", "eps"],
+    outputNames: ["summed", "normalized"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint group_size = threads_per_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint axis_size = uint(residual_shape[residual_ndim - 1]);
+        size_t row_base = size_t(row) * size_t(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint offset = 0; offset < axis_size;
+             offset += group_size * n_reads) {
+            uint first = offset + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint element = first + i;
+                if (element < axis_size) {
+                    size_t index = row_base + size_t(element);
+                    bfloat value = bfloat(residual[index] + branch[index]);
+                    summed[index] = value;
+                    float value_f = float(value);
+                    acc += value_f * value_f;
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint offset = 0; offset < axis_size;
+             offset += group_size * n_reads) {
+            uint first = offset + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint element = first + i;
+                if (element < axis_size) {
+                    size_t index = row_base + size_t(element);
+                    normalized[index] = weight[element]
+                        * bfloat(float(summed[index]) * inv_mean);
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Returns the bf16-rounded residual and the post-attention RMSNorm output.
+/// Unsupported dtypes or layouts retain the ordinary MLX implementation.
+func qwen35ResidualRMSNorm(
+    _ residual: MLXArray,
+    _ branch: MLXArray,
+    norm: RMSNorm
+) -> (residual: MLXArray, normalized: MLXArray) {
+    guard residual.dtype == .bfloat16,
+          branch.dtype == .bfloat16,
+          norm.weight.dtype == .bfloat16,
+          residual.shape == branch.shape,
+          residual.ndim > 0,
+          norm.weight.ndim == 1,
+          let axisSize = residual.shape.last,
+          axisSize > 0,
+          norm.weight.size == axisSize,
+          residual.size % axisSize == 0
+    else {
+        let summed = residual + branch
+        return (summed, norm(summed))
+    }
+
+    let rows = residual.size / axisSize
+    let threadGroupSize: Int
+    if axisSize > 4096 {
+        // Matches MLX's rms_looped launch on Apple GPUs.
+        threadGroupSize = 1024
+    } else {
+        let threadsNeeded = (axisSize + 3) / 4
+        threadGroupSize = max(32, ((threadsNeeded + 31) / 32) * 32)
+    }
+
+    let outputs = qwen35ResidualRMSNormKernel(
+        [residual, branch, norm.weight, norm.eps],
+        grid: (rows * threadGroupSize, 1, 1),
+        threadGroup: (threadGroupSize, 1, 1),
+        outputShapes: [residual.shape, residual.shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
@@ -1325,8 +1447,9 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let (h, normalized) = qwen35ResidualRMSNorm(
+            x, r, norm: postAttentionLayerNorm)
+        return h + (mlp as! UnaryLayer)(normalized)
     }
 }
 
