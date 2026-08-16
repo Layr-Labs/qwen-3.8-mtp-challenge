@@ -550,12 +550,12 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 4
 
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
-    /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
-    /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    /// Experimental cap for streak-qualified deep rounds. The trusted
+    /// per-round maximum remains 8, but this isolated arm stops at depth 6
+    /// to price the d7-8 tail without changing h, the cold cap, or the streak
+    /// gate. rows_per_round = depth + 1 stays ledger-legal; any reject still
+    /// resets the streak.
+    private static let segmentedVerifyDepthCap = 6
     private static let segmentedStreakGate = 3
 
     /// The greedy marginal-depth rule described at the policy's assignment.
