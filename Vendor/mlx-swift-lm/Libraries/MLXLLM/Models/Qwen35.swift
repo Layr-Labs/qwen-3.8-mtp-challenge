@@ -236,16 +236,18 @@ private let qwen35CompiledGatedDeltaPostNorm:
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
 // ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
-// split + Q/K rmsNorm-and-scale + the compiled-g producer — for S in 3...9 on
-// the one-wide-call path. Five outputs: normed/scaled Q and K, activated V,
-// the next 3-row conv state, and fp32 `g`. DESIGN NOTE, load-bearing: `beta`
-// is DELIBERATELY NOT a kernel output. An exhaustive sweep of all 65,280
-// finite bf16 inputs found the in-kernel sigmoid diverges from MLX's by 1 ulp
-// on exactly one input (0xC0DB = -6.84375); silu and softplus are bit-exact
-// everywhere. beta feeds the VERIFY recurrence where fidelity is absolute, so
-// it stays a plain graph `sigmoid(b)` — one [1,S,48] elementwise launch,
-// ~0.06 ms of the ~0.7 ms saving, in exchange for removing an unquantifiable
-// knife-edge. The remaining five outputs measured bit-exact at S=3..9 over
+// split + Q/K rmsNorm-and-scale + the compiled-g/beta producer — for S in
+// 3...9 on the one-wide-call path. Six outputs: normed/scaled Q and K,
+// activated V, the next 3-row conv state, and fp32 `g` and `beta`. DESIGN
+// NOTE, load-bearing: the exhaustive bf16 sweep's lone old mismatch at 0xC0DB
+// (-6.84375) identified the compiled sigmoid's observable rounding boundary.
+// Explicit fp32 evaluation reproduces the measured result, while the BF16
+// sigmoid output still rounds that value back to InT before the graph's
+// `.asType(.float32)`. `qwen35_prework_beta` spells out both conversions;
+// doing the sigmoid in InT or omitting the intermediate BF16 cast is not
+// exact. SiLU and softplus keep their independently verified paths. The
+// original five outputs measured
+// bit-exact at S=3..9 over
 // 5 seeds x 4 compile modes (12,983,040 element comparisons, zero mismatches)
 // on the vendored MLX version, with a +1-row conv-window negative control
 // failing exactly the three outputs that read the window. S=2 breaks the
@@ -261,6 +263,13 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         inline InT qwen35_prework_sigmoid(InT x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
           return (x < 0) ? y : 1 - y;
+        }
+
+        inline float qwen35_prework_beta(InT x) {
+          const float x32 = static_cast<float>(x);
+          const float y = 1.0f / (1.0f + metal::exp(metal::abs(x32)));
+          const float sigmoid32 = (x32 < 0.0f) ? y : 1.0f - y;
+          return static_cast<float>(static_cast<InT>(sigmoid32));
         }
 
         inline InT qwen35_prework_logaddexp(InT x, InT y) {
@@ -369,6 +378,9 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
             const float product = neg_exp_a * static_cast<float>(softplus);
             const uint scalar_output = row * Hv + head;
             g_out[scalar_output] = metal::precise::exp(product);
+            const ulong b_offset = ulong(row) * ulong(b_strides[1])
+                + ulong(head) * ulong(b_strides[2]);
+            beta_out[scalar_output] = qwen35_prework_beta(b[b_offset]);
           }
         }
 
@@ -387,10 +399,12 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
     return MLXFast.metalKernel(
         name: "qwen35_packed_gdn_prework",
         inputNames: [
-            "qkv", "a", "conv_state", "conv_weight", "a_log",
+            "qkv", "a", "b", "conv_state", "conv_weight", "a_log",
             "dt_bias", "q_scale", "k_scale",
         ],
-        outputNames: ["q_out", "k_out", "v_out", "conv_out", "g_out"],
+        outputNames: [
+            "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out",
+        ],
         source: source,
         header: header,
         ensureRowContiguous: false)
@@ -777,7 +791,7 @@ final class Qwen35GatedDeltaNet: Module {
         if mixerHit {
             let invScale = pow(Float(headKDim), -0.5)
             let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, convState, conv1d.weight, aLog, dtBias,
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
                  MLXArray(pow(invScale, 2)).asType(.bfloat16),
                  MLXArray(invScale).asType(.bfloat16)],
                 template: [
@@ -793,9 +807,11 @@ final class Qwen35GatedDeltaNet: Module {
                     [B, S, numVHeads, headVDim],
                     [B, nKeep, qkv.dim(2)],
                     [B, S, numVHeads],
+                    [B, S, numVHeads],
                 ],
                 outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+                    .float32, .float32,
                 ]
             )
             qNormed = outs[0]
@@ -803,10 +819,7 @@ final class Qwen35GatedDeltaNet: Module {
             v = outs[2]
             newConvState = outs[3]
             g = outs[4]
-            // beta stays a plain graph op BY DESIGN — see the kernel's
-            // header comment. Same expression as the compiled producer's
-            // beta half, so the recurrence sees identical bytes.
-            beta = sigmoid(b).asType(.float32)
+            beta = outs[5]
         } else {
             newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
             let convOut = silu(conv1d(convInput))
