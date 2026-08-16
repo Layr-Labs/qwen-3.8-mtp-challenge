@@ -928,6 +928,30 @@ final class Qwen35GatedDeltaNet: Module {
 /// byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
 /// side carries no exactness constraint at all.
+///
+/// Fuse the SiLU gate and product after the fused gate-up GEMM into one
+/// Metal pass: `silu(y[..., :half]) * y[..., half...]` reads each output
+/// element once and writes the activation once, replacing the two-kernel
+/// slice+silu+mul path (one silu launch, one multiply launch, one
+/// intermediate materialization) with a single launch. The arithmetic is
+/// elementwise and unchanged — silu first, then multiply, same rounding —
+/// so the values are bit-identical to the two-kernel path; only the
+/// intermediate buffer disappears. Shapeless compilation shares one trace
+/// across verify widths (the fused GEMM's N is constant, so the half-split
+/// offsets are width-invariant).
+private let qwen35CompiledFusedSwiGLU:
+    @Sendable (MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray) -> MLXArray = { y in
+        let half = y.dim(-1) / 2
+        return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -948,16 +972,14 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
+    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            let y = quantizedMM(
+            return quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let w = _fbfW {
-            let y = matmul(x, w.T)
-            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
+            return matmul(x, w.T)
         }
         if let g = gateProj as? QuantizedLinear,
            let u = upProj as? QuantizedLinear,
@@ -984,8 +1006,12 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
-            return downProj(silu(g) * u)
+        // The fused path is only taken when the gate/up split is provably
+        // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
+        // to the exact two-projection expression, preserving the original
+        // slicing semantics in every case.
+        if x.dim(-2) <= 9, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+            return downProj(qwen35CompiledFusedSwiGLU(y))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
