@@ -1747,14 +1747,14 @@ func submissionStaticReviewQwenMTPArmSwapsThePolicyAndStillFailsClosed() throws 
     #expect(emptyTrack.output.contains("MLXFAST_SUBMISSION_TRACK_ID is set but empty"))
 }
 
-// The ranked Qwen-MTP pipeline has THREE consumers of an editable surface --
-// enforce-modifiable-surface.sh, run-submission-static-review.sh and
-// overlay-editable-paths.sh -- and all three default to benchmark.json when
-// CONTRACT_PATH is unset. They must never disagree: judging a submission against
-// one surface while enforcing and overlaying another is how a submitter's edits
-// get accepted by one gate and silently dropped by the next. Pin that the
-// workflow names this track's manifest at every one of them, and that the
-// manifest it names is the one the static-review arm was authored against.
+// The ranked Qwen-MTP pipeline has TWO consumers of an editable surface --
+// run-submission-static-review.sh and overlay-editable-paths.sh -- and both
+// default to benchmark.json when CONTRACT_PATH is unset. They must never
+// disagree: reviewing a submission against one surface while overlaying another
+// is how a submitter's edits get inspected by one gate and silently dropped by
+// the next. Pin that the workflow names this track's manifest at both consumers,
+// and that the manifest it names is the one the static-review arm was authored
+// against.
 @Test
 func qwenMTPWorkflowNamesTheTrackManifestAtEveryEditableSurfaceConsumer() throws {
     let workflow = try String(
@@ -1765,12 +1765,11 @@ func qwenMTPWorkflowNamesTheTrackManifestAtEveryEditableSurfaceConsumer() throws
     let overlayOccurrences = workflow.components(
         separatedBy: "CONTRACT_PATH: ${{ env.MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT }}"
     ).count - 1
-    // enforce-modifiable-surface.sh and run-submission-static-review.sh are
-    // invoked inline (shell assignment); overlay-editable-paths.sh takes it as
-    // step env.
+    // run-submission-static-review.sh is invoked inline (shell assignment);
+    // overlay-editable-paths.sh takes it as step env.
     #expect(
-        occurrences == 2,
-        "expected both inline editable-surface consumers to set CONTRACT_PATH, found \(occurrences)"
+        occurrences == 1,
+        "expected the inline static-review consumer to set CONTRACT_PATH once, found \(occurrences)"
     )
     #expect(overlayOccurrences == 1)
     #expect(workflow.contains("MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT: benchmark.qwen-mtp.json"))
@@ -1798,6 +1797,23 @@ func qwenMTPWorkflowNamesTheTrackManifestAtEveryEditableSurfaceConsumer() throws
     #expect(!workflow.contains("so this step refuses today"))
     #expect(!workflow.contains(
         "allowlist accepts only `serial` and `dflash|laguna-xs-2.1-dflash-v1`"))
+}
+
+// Concurrent submissions are intentionally allowed to remain based on an
+// earlier trusted-main commit. Requiring their parent to equal the current tip
+// caused valid queued jobs to fail whenever another submission was promoted
+// first. Keep the ancestry and single-commit checks, but never restore that
+// equality check or the redundant workflow-side surface gate.
+@Test
+func qwenMTPWorkflowAllowsConcurrentSubmissionBases() throws {
+    let workflow = try String(
+        contentsOfFile: ".github/workflows/qwen-mtp-ranked-benchmark.yml", encoding: .utf8)
+
+    #expect(workflow.contains("rev-list --parents -n 1 \"${actual_sha}\""))
+    #expect(workflow.contains("merge-base --is-ancestor \"${base_sha}\" \"${TRUSTED_MAIN_SHA}\""))
+    #expect(workflow.contains("printf 'base_sha=%s\\n' \"${base_sha}\" >> \"${GITHUB_OUTPUT}\""))
+    #expect(!workflow.contains("submission must be based on current trusted main"))
+    #expect(!workflow.contains("enforce-modifiable-surface.sh"))
 }
 
 // Behavioral pin for the stale-clone diagnostic in run-submission-static-
