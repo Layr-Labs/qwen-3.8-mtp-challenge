@@ -96,6 +96,20 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// instead of six. Proposal side only.
     func draftTokenID(_ x: MLXArray) -> MLXArray
 
+    /// One draft proposal WITH its margin evidence in a single fused readout
+    /// dispatch: `ids` is the same device-resident `[1, 1]` int32
+    /// `draftTokenID` returns; `top2` is the exact fp32 `[first, second]`
+    /// logit pair the margin gate consumes. Equivalent to
+    /// `(mapDraftTokenIds(argMax(applyDraftLMHead(x), axis: -1)),
+    ///   linearTopTwoRows(applyDraftLMHead(x)).1)`, minus the slice, the
+    /// two-stage top-2 launches, and the compare/add/which remap tail. The
+    /// winner's tie-break ordering is exactly the session's
+    /// (`linearTopTwoRows`): larger logit wins, lower id wins an exact tie,
+    /// NaN last. Proposal side only — the head only proposes, so nothing
+    /// routed through this call can reach an emitted token or a ledger
+    /// value.
+    func mtpHeadDraftSelectTop2(_ x: MLXArray) -> (ids: MLXArray, top2: MLXArray)
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
