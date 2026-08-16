@@ -927,7 +927,7 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
