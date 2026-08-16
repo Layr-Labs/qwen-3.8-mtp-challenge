@@ -1160,8 +1160,14 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fqMode = QuantizationMode.affine
     private var _fbfW: MLXArray?
     private var _gateOut = 0
+    private let fuseLongPrefillSwiGLU: Bool
 
-    init(dimensions: Int, hiddenDimensions: Int) {
+    init(
+        dimensions: Int,
+        hiddenDimensions: Int,
+        fuseLongPrefillSwiGLU: Bool = false
+    ) {
+        self.fuseLongPrefillSwiGLU = fuseLongPrefillSwiGLU
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1206,7 +1212,12 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
             return downProj(silu(g) * u)
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
+        let g = gateProj(x)
+        let u = upProj(x)
+        if fuseLongPrefillSwiGLU && x.dim(-2) >= 512 {
+            return downProj(compiledSiluProduct(g, u))
+        }
+        return downProj(silu(g) * u)
     }
 
 }
@@ -1732,7 +1743,8 @@ final class Qwen35DecoderLayer: Module {
         } else {
             _mlp.wrappedValue = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
-                hiddenDimensions: args.intermediateSize
+                hiddenDimensions: args.intermediateSize,
+                fuseLongPrefillSwiGLU: true
             )
         }
 
