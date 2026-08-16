@@ -944,6 +944,16 @@ public final class Qwen36MTPBlockSession {
         let verifyArgmax = stride(
             from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
 
+        // ONE final-norm launch for the whole verify window, sliced per row
+        // below, replacing the 1 + acceptedCount separate applyFinalNorm
+        // launches the per-row `hiddenRow` used to issue. RMSNorm is
+        // row-local, so a row slice of the batched norm is the same
+        // arithmetic as norming the row alone; these rows feed only the
+        // head (pendingHidden and the accepted-history backlog), i.e. the
+        // proposal side, which the exactness contract does not bind.
+        let verifyHiddenNormed = postNorm
+            ? model.applyFinalNorm(verifyHidden) : verifyHidden
+
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
         //    truth for draft i. Row `draftCount` is the BONUS row and is only
@@ -975,7 +985,8 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            pendingHidden = verifyHiddenNormed[
+                0..., (verifyHiddenNormed.dim(1) - 1) ..< verifyHiddenNormed.dim(1), 0...]
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1000,7 +1011,8 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingHidden = verifyHiddenNormed[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1043,7 +1055,8 @@ public final class Qwen36MTPBlockSession {
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
         for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+            headHistoryBacklogHidden.append(
+                verifyHiddenNormed[0..., index ..< (index + 1), 0...])
             headHistoryBacklogTokens.append(drafts[index])
         }
         fullAcceptStreak =
