@@ -147,6 +147,39 @@ public final class Qwen36MTPBlockSession {
     // forward as extra leading rows — the head weights are read once per
     // drafting round either way.
     private var headHistoryCache: [any KVCache]?
+    /// Compiled single-row head draft step bound to `headHistoryCache`
+    /// (steps 2..d of the draft loop). nil until the cache exists or when
+    /// the layer is not promotable / compiled decode is off. The head chain
+    /// is host-build-bound — per-step asyncEval measured neutral in both
+    /// regimes — so the win here is tracing the ~25-op graph once instead
+    /// of rebuilding it per step. Proposal-side only; acceptance is the
+    /// canary. Kill switch: MLX_QWEN_MTP_HEAD_COMPILE=0.
+    private var headCompiledStep:
+        (@Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray))?
+    /// Compiled per-width head flush steps (step 1 of the draft loop),
+    /// keyed by flush width S. Each width keeps its own traced graph — the
+    /// width-derived slice bounds must stay concrete — built lazily here
+    /// and pre-warmed for every S in 1...9 by `warmAllDepths`. The eager
+    /// K/V-only/full flush pair remains the fallback for S > 9 or a
+    /// non-promotable cache. Same kill switch as the draft step.
+    private var headCompiledFlushSteps:
+        [Int: (@Sendable (MLXArray, MLXArray) -> MLXArray)] = [:]
+    private static let headCompileEnabled =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_HEAD_COMPILE"] != "0"
+    /// SIZING TRIM for the ceiling endgame. The compiled head step is
+    /// bit-identical to the eager step, so restricting HOW MANY chain
+    /// positions ride it changes no value -- only the fraction of the
+    /// host-build saving the round captures. The full mechanism (every
+    /// step 2..d compiled) measured +7.2% on the local MTP leg; the
+    /// frontier headroom under the 3.0 plausibility ceiling is smaller
+    /// than that, so the trim picks up only the first
+    /// `headCompileStepLimit` chain positions per round. Adjust AFTER
+    /// calibrating against the frontier at fire time; 0 = flush-only.
+    private static let headCompileStepLimit = 1
+    /// Compiled multi-row FLUSH steps crash with quantized head layers (see
+    /// the call-site note); compiled single-row draft steps do not. This
+    /// switch keeps the flush eager unconditionally.
+    private static let headCompileFlushEnabled = false
     /// Committed fused rows not yet appended: (post-norm trunk hidden at t,
     /// token at t+1). Flushed as leading rows of the next draft forward.
     private var headHistoryBacklogHidden: [MLXArray] = []
@@ -327,6 +360,69 @@ public final class Qwen36MTPBlockSession {
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
+
+        // HEAD-COMPILE WARM. Pre-create the real (promoted) head history
+        // cache and exercise the compiled draft step twice so the trace and
+        // every kernel JIT it pulls in happen HERE, outside the scored
+        // window — the same discipline the compact-vocabulary warm applies
+        // (a first-call JIT inside a scored round is exactly how 7b33621's
+        // faster-in-steady-state submission still lost). The offset is
+        // reset afterwards: the first real drafting round must see an EMPTY
+        // cache so lazy seed priming fires, and rows beyond the offset are
+        // never read.
+        if headHistoryCache == nil {
+            var fresh = model.makeMTPCache()
+            if fresh.count == 1, let simple = fresh[0] as? KVCacheSimple {
+                fresh = [CompilableKVCache.promote(from: simple, maxLength: 4096)]
+            }
+            headHistoryCache = fresh
+        }
+        if Self.headCompileEnabled,
+           let step = model.compiledHeadDraftStep(cache: headHistoryCache!)
+        {
+            headCompiledStep = step
+            let warmRow = MLXArray.zeros([1, 1, hDim], dtype: row.dtype)
+            let warmTok = MLXArray(Int32(0)).reshaped([1, 1])
+            let (r1, id1) = step(warmRow, warmTok)
+            let (r2, id2) = step(r1, id1)
+            eval(r2, id2, headHistoryCache!.flatMap { $0.state })
+            for entry in headHistoryCache! where entry.isTrimmable {
+                _ = entry.trim(entry.offset)
+            }
+            eval(headHistoryCache!.flatMap { $0.state })
+
+            // FLUSH-WIDTH WARM. The round flush dispatches a per-width
+            // compiled graph for every S in 1...9 (backlog + transition
+            // row); compile each width's trace HERE and run it once so the
+            // trace and every kernel JIT it pulls in land outside the scored
+            // window — the same discipline the draft-step warm above and the
+            // compact-vocabulary warm apply. The offset is reset afterwards
+            // exactly as above: the first real drafting round must see an
+            // EMPTY cache so lazy seed priming fires, and rows beyond the
+            // offset are never read.
+            var warmFlushRows: [MLXArray] = []
+            // Skipped when `headCompileFlushEnabled` is false: tracing the
+            // multi-row flush with quantized head layers produces the empty
+            // last-row crash (see the draft-loop call site), and warming a
+            // graph the rounds never dispatch would JIT it for nothing.
+            if Self.headCompileFlushEnabled {
+                for w in 1 ... 9 {
+                    guard let flush = model.compiledHeadFlushStep(
+                        cache: headHistoryCache!, width: w)
+                    else { continue }
+                    headCompiledFlushSteps[w] = flush
+                    warmFlushRows.append(flush(
+                        MLXArray.zeros([1, w, hDim], dtype: row.dtype),
+                        MLXArray(Array(repeating: Int32(0), count: w))
+                            .reshaped([1, w])))
+                }
+            }
+            eval(warmFlushRows + headHistoryCache!.flatMap { $0.state })
+            for entry in headHistoryCache! where entry.isTrimmable {
+                _ = entry.trim(entry.offset)
+            }
+            eval(headHistoryCache!.flatMap { $0.state })
+        }
 
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
@@ -817,19 +913,31 @@ public final class Qwen36MTPBlockSession {
         if let existing = headHistoryCache {
             headCache = existing
         } else {
-            let fresh = model.makeMTPCache()
+            var fresh = model.makeMTPCache()
+            // Promote the single full-attention KV layer to the compilable
+            // form (fixed [1,H,4096,D] buffers, array offsets) so the draft
+            // loop's steps 2..d can run through the compiled head step.
+            // maxLength 4096 bounds the whole run: 512-row seed + committed
+            // tokens + speculative drafts stay well under it.
+            if fresh.count == 1, let simple = fresh[0] as? KVCacheSimple {
+                fresh = [CompilableKVCache.promote(from: simple, maxLength: 4096)]
+            }
             headHistoryCache = fresh
             headCache = fresh
-            if let seedHidden = seedHiddenForPriming,
-               seedTokensForPriming.count > 1
-            {
-                // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
-                // tokens 1..L-1 (hidden at t predicts alongside token t+1).
-                let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
-            }
+        }
+        // Lazy seed priming keys on the cache being EMPTY, not on which
+        // code path created it (the warm loop pre-creates the promoted
+        // cache so the compiled step traces outside the scored window).
+        if let seedHidden = seedHiddenForPriming,
+           seedTokensForPriming.count > 1,
+           (headCache.first?.offset ?? -1) == 0
+        {
+            // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
+            // tokens 1..L-1 (hidden at t predicts alongside token t+1).
+            let primeCount = seedTokensForPriming.count - 1
+            flushHidden.append(
+                model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+            flushTokens.append(contentsOf: seedTokensForPriming[1...])
             seedHiddenForPriming = nil
             seedTokensForPriming = []
         }
@@ -864,14 +972,49 @@ public final class Qwen36MTPBlockSession {
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
         // idea.md V6 journal. Single submission after the loop, as before.)
         var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
+        // Per-width compiled flush (step 1). The flush width S is the
+        // backlog plus this round's (pendingHidden, primary) transition
+        // row; every width in 1...9 is pre-traced by the warm outside the
+        // scored window, so scored rounds replay a compiled graph instead
+        // of rebuilding the head's host graph. The compiled closure returns
+        // the flush's LAST hidden row [1,1,H] directly; the draftHidden /
+        // draftId derivation below stays eager and identical to the
+        // fallback's.
+        let flushWidth = flushTokens.count
+        var flushStep: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+        // COMPILED-FLUSH DISABLED: the multi-row K/V-only history path
+        // traced through `compile` returns an empty last hidden row when
+        // the head's projections are QuantizedLinear (the declared 4-bit
+        // head at rank; reproduced locally — PR #254's M5 correctness-gate
+        // crash class). The single-row compiled draft step is unaffected
+        // and stays active; the flush uses the eager K/V-only path verbatim.
+        if Self.headCompileEnabled, Self.headCompileFlushEnabled,
+           (1...9).contains(flushWidth) {
+            if let cached = headCompiledFlushSteps[flushWidth] {
+                flushStep = cached
+            } else if let built = model.compiledHeadFlushStep(
+                cache: headCache, width: flushWidth)
+            {
+                headCompiledFlushSteps[flushWidth] = built
+                flushStep = built
+            }
+        }
+        var draftHidden: MLXArray
+        if let flushStep {
+            draftHidden = flushStep(draftInputHidden, draftInputTokens)
+        } else {
+            // Eager fallback — S > 9, or the builder declined (non-promotable
+            // cache / compiled decode off). Identical to the pre-compiled
+            // flush: K/V-only history rows first, ordinary forward on nil.
+            let headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache)
+            draftHidden = headHidden[
+                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        }
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -880,12 +1023,28 @@ public final class Qwen36MTPBlockSession {
         // the first step carries the history flush, which IS real GPU work
         // the device can start while the host builds steps 2..d.
         asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+        // Lazily bind the compiled step to this session's head cache. Built
+        // once, reused by every later round; the warm loop exercises it
+        // outside the scored window before the first round.
+        if headCompiledStep == nil, Self.headCompileEnabled,
+           let step = model.compiledHeadDraftStep(cache: headCache)
+        {
+            headCompiledStep = step
+        }
+        for chainIndex in 1 ..< draftCount {
+            if let step = headCompiledStep,
+               chainIndex <= Self.headCompileStepLimit
+            {
+                let (row, id) = step(draftHidden, draftId)
+                draftHidden = row
+                draftId = id
+            } else {
+                let stepHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                draftHidden = stepHidden[
+                    0..., (stepHidden.dim(1) - 1) ..< stepHidden.dim(1), 0...]
+                draftId = model.draftTokenID(draftHidden)
+            }
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
