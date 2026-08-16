@@ -396,6 +396,24 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         ensureRowContiguous: false)
 }()
 
+/// Fuse the history-only K/V normalization and layout views. RoPE and cache
+/// update stay outside because they consume the mutable cache offset.
+private let qwen35CompiledHistoryKVLayout:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) = {
+        keys, values, weight in
+        let normalizedKeys = MLXFast.rmsNorm(keys, weight: weight, eps: 1e-6)
+        return (
+            normalizedKeys.transposed(0, 2, 1, 3),
+            values.transposed(0, 2, 1, 3)
+        )
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -1578,10 +1596,22 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
         var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, kvHeads, -1)
         values = values.reshaped(B, L, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
+        let useCompiledLayout = MLXHardwareInfo.isCompiledDecodeSupported
+            && B == 1 && L >= 2
+            && keys.dtype == .bfloat16 && values.dtype == .bfloat16
+            && kNorm.weight.dtype == .bfloat16
+            && kNorm.eps == 1e-6
+            && keys.shape == [B, L, kvHeads, headDim]
+            && values.shape == [B, L, kvHeads, headDim]
+        if useCompiledLayout {
+            (keys, values) = qwen35CompiledHistoryKVLayout(
+                keys, values, kNorm.weight)
+        } else {
+            keys = kNorm(keys).transposed(0, 2, 1, 3)
+            values = values.transposed(0, 2, 1, 3)
+        }
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
     }
