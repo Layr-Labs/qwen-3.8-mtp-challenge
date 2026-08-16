@@ -453,6 +453,11 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// Width of the last fully-accepted drafting round. Used as a hold/probe
+    /// floor so a hot streak cannot shrink on a single conservative
+    /// first-position confidence dip. Cleared on any reject.
+    private var lastFullAcceptDepth = 0
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -565,8 +570,15 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
+    ///
+    /// Gate 2, not 3: the published median is the mean of the 4th and 5th
+    /// ordered prompts. The last sealed 4th-order prompt sat at mean draft
+    /// 4.27 — exactly on the cap-4 / cap-8 boundary — so a third consecutive
+    /// full accept was an extra round of leaving accepted tokens on the
+    /// table. Two consecutive full accepts is still a real hot streak
+    /// (cold prompts reset on the first reject and never see width 6–9).
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -598,6 +610,20 @@ public final class Qwen36MTPBlockSession {
             guard reach > threshold else { break }
             expected += reach
             depth += 1
+        }
+        // Hold-and-probe floor. The cost model plus the one-sided first-
+        // position confidence min() can shrink a just-perfect round (the
+        // sealed 4th-order prompt sat at mean draft 4.27 — it was already
+        // hot and still gave width back). After a full accept, keep at
+        // least that width; if this round's cap has room, probe one
+        // deeper. A reject clears `lastFullAcceptDepth`, so cold prompts
+        // never inherit a floor.
+        if lastFullAcceptDepth > 0 {
+            var floor = lastFullAcceptDepth
+            if lastFullAcceptDepth < cap {
+                floor += 1
+            }
+            depth = Swift.min(cap, Swift.max(depth, floor))
         }
         return depth
     }
@@ -1042,8 +1068,13 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
-        fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+        if acceptedCount == drafts.count {
+            fullAcceptStreak += 1
+            lastFullAcceptDepth = drafts.count
+        } else {
+            fullAcceptStreak = 0
+            lastFullAcceptDepth = 0
+        }
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only

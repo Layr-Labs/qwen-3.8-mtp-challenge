@@ -1166,7 +1166,11 @@ private let qwen35CompiledFusedSwiGLU:
         return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
+        // Match the other Qwen35 compiled helpers: one shapeless trace
+        // covers every verify width. Default shapeless=false would
+        // compile a fresh graph per S in 1...9, paying host trace
+        // lookup on the exact widths the median prompt now dispatches.
+        return compile(shapeless: true, body)
     }
     return body
 }()
