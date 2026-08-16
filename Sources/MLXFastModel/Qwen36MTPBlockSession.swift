@@ -587,7 +587,13 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            reach *= positionAcceptEMA[depth]
+            var p = positionAcceptEMA[depth]
+            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+                p = Swift.min(p, conf)
+            }
+            reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
