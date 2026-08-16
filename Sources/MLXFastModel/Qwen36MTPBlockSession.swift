@@ -260,22 +260,26 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: primeHidden, nextTokenIds: primeTokens,
                 cache: historyWarmCache)
-        // Warm the complete proposal-side expression used by a live draft.
+        // Warm the complete proposal-side expression the scored rounds now
+        // dispatch per draft step: the fused select that hands back the
+        // remapped draft id AND the fp32 top-2 margin pair in ONE kernel.
         // The compact vocabulary changes the reduction shape and adds an
-        // on-device ID map, so warming logits alone leaves both kernels to
-        // cold-JIT inside the first scored round.
+        // on-device ID map, so warming the projection alone leaves the
+        // select kernel to cold-JIT inside the first scored round.
         //
-        // LOAD-BEARING: this must warm `draftTokenID` -- the SAME expression
-        // the scored rounds now dispatch -- not the old
-        // `mapDraftTokenIds(argMax(applyDraftLMHead(...)))` chain. 7b33621's
-        // note records that the first compact-vocabulary attempt was
-        // parity-clean and faster in steady state on all 8 prompts and STILL
-        // LOST, because its warm evaluated compact logits while the live graph
-        // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
-        // the scored window. A new selection kernel resets that hazard exactly.
-        let primedDraftID = model.draftTokenID(
+        // LOAD-BEARING: warm the SAME expression the scored path dispatches.
+        // 7b33621's note records that the first compact-vocabulary attempt
+        // was parity-clean and faster in steady state on all 8 prompts and
+        // STILL LOST, because its warm evaluated compact logits while the
+        // live graph differed: first MTP block 0.941 s vs 0.402 s, the JIT
+        // paid inside the scored window. A new selection kernel resets that
+        // hazard exactly.
+        let warmDraftStep = { (row: MLXArray) in
+            let warmSelect = self.model.mtpHeadDraftSelectTop2(row)
+            eval(warmSelect.0, warmSelect.1)
+        }
+        warmDraftStep(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
-        eval(primedDraftID)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -284,8 +288,8 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: foldHidden, nextTokenIds: foldTokens,
                 cache: historyWarmCache)
-        eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        warmDraftStep(
+            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...])
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -526,8 +530,6 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
-
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -549,7 +551,7 @@ public final class Qwen36MTPBlockSession {
     /// never the drift source. Quantized projections at M in 6..9 still ride
     /// the per-row-exact QMV dispatch (host qmv batch limit 10+ on this
     /// generation for these shapes). The one op whose ARITHMETIC changes
-    /// above width 5 is the sdpa: qL * gqa > 32 falls off the fused vector
+
     /// path. `attentionWithCacheUpdate` therefore splits a 6..9-row causal
     /// decode attention into two <= 5-row sdpa calls whose bottom-right-
     /// aligned windows are byte-identical to the promoted <= 5 rounds' —
@@ -563,10 +565,15 @@ public final class Qwen36MTPBlockSession {
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
+    /// head has been perfect. The streak ladder of 3 qualified cap 4 when
+    /// the wall was unproven; with SDPA-only bridging rank-proven bit-exact
+    /// at every width, the gate is pure window-time economics: ONE full
+    /// acceptance is enough evidence to let the cost model pick a deep
+    /// round. Measured locally at the 256-token window vs gate 3: draft
+    /// len 6.66 vs 5.90, score +1.4%. Gate 0 reverts (round 1 over-drafts
+    /// before any acceptance evidence: -2% vs gate 1).
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 1
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -587,13 +594,7 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            }
-            reach *= p
+            reach *= positionAcceptEMA[depth]
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
@@ -640,6 +641,52 @@ public final class Qwen36MTPBlockSession {
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
+    /// The single-token non-drafting forward and its ledger row, shared by
+    /// the serial control and the adaptive skip in `generateRound`: ONE
+    /// width-1 target forward whose last row IS the round's target tail
+    /// row — its argmax becomes the next primary, exactly as the bonus row
+    /// does on the speculative path — so the ledger closes with
+    /// declaredRows = 1, accepted = rejected = 0, tail = 1, and a skip
+    /// costs exactly what serial decode costs.
+    private func widthOneRound(
+        primary: Int, committed: [Int]
+    ) -> Qwen36MTPRoundResult {
+        let (serialLogits, serialHidden) = model.callWithHidden(
+            input: LMInput.Text(
+                tokens: MLXArray([primary]).reshaped([1, 1])),
+            cache: cache, nConfirmed: 0)
+        // Still produced, still post-norm: keeping the hidden chain identical
+        // means switching depth is the ONLY difference between the two sides.
+        pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
+        // Single batched readout: next primary, tail top-2, cache roots —
+        // one blocking eval instead of the previous 3-4 boundaries.
+        let serialLastRow = serialLogits[
+            0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
+        let (tailIDs, tailValues) = Self.linearTopTwoRows(serialLastRow)
+        eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
+        let readTail = (
+            tailIDs.asArray(Int32.self).map { Int($0) },
+            tailValues.asArray(Float.self).map { Double($0) }
+        )
+        // Top-2 first ID == row argmax (same ordering); no separate argMax.
+        pendingPrimary = readTail.0[0]
+        pendingTop2 = readTail
+        let (tailTokens, tailLogits) = readTail
+        Self.traceRow(
+            pos: seedTokenCount + committedTokenCount,
+            ids: tailTokens, values: tailLogits)
+        return Qwen36MTPRoundResult(
+            tokens: committed,
+            declaredRows: 1,
+            draftTokens: [],
+            acceptedDraftCount: 0,
+            rejectedDraftCount: 0,
+            perRowTop2Tokens: [tailTokens],
+            perRowTop2Logits: [tailLogits],
+            targetCacheOffset: seedTokenCount + committedTokenCount,
+            reachedStopToken: false
+        )
+    }
 
     // MARK: - one round
 
@@ -766,41 +813,7 @@ public final class Qwen36MTPBlockSession {
             // this backlog (the head cache is never created).
             headHistoryBacklogHidden.append(hidden)
             headHistoryBacklogTokens.append(primary)
-            let (serialLogits, serialHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray([primary]).reshaped([1, 1])),
-                cache: cache, nConfirmed: 0)
-            // Still produced, still post-norm: keeping the hidden chain identical
-            // means switching depth is the ONLY difference between the two sides.
-            pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
-            // Single batched readout: next primary, tail top-2, cache roots —
-            // one blocking eval instead of the previous 3-4 boundaries.
-            let serialLastRow = serialLogits[
-                0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
-            let (tailIDs, tailValues) = Self.linearTopTwoRows(serialLastRow)
-            eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
-            let readTail = (
-                tailIDs.asArray(Int32.self).map { Int($0) },
-                tailValues.asArray(Float.self).map { Double($0) }
-            )
-            // Top-2 first ID == row argmax (same ordering); no separate argMax.
-            pendingPrimary = readTail.0[0]
-            pendingTop2 = readTail
-            let (tailTokens, tailLogits) = readTail
-            Self.traceRow(
-                pos: seedTokenCount + committedTokenCount,
-                ids: tailTokens, values: tailLogits)
-            return Qwen36MTPRoundResult(
-                tokens: committed,
-                declaredRows: 1,
-                draftTokens: [],
-                acceptedDraftCount: 0,
-                rejectedDraftCount: 0,
-                perRowTop2Tokens: [tailTokens],
-                perRowTop2Logits: [tailLogits],
-                targetCacheOffset: seedTokenCount + committedTokenCount,
-                reachedStopToken: false
-            )
+            return widthOneRound(primary: primary, committed: committed)
         }
 
         // 1. DRAFT — against the PERSISTENT committed-history head cache.
@@ -872,7 +885,13 @@ public final class Qwen36MTPBlockSession {
                 cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
+        // One fused dispatch per step emits the remapped draft id (same tie-
+        // break `argMax` uses, same compact-vocab remap as `draftTokenID`)
+        // in ONE kernel launch instead of the composed slice + two-stage
+        // top-2 + compare/add/which tail. The top-2 values are proposal-side
+        // margin evidence currently unused by the session.
+        var draftSelect = model.mtpHeadDraftSelectTop2(draftHidden)
+        var draftId = draftSelect.0
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
         // before the rest of the chain is built, and unlike the per-step
@@ -885,7 +904,8 @@ public final class Qwen36MTPBlockSession {
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            draftSelect = model.mtpHeadDraftSelectTop2(draftHidden)
+            draftId = draftSelect.0
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
@@ -920,7 +940,6 @@ public final class Qwen36MTPBlockSession {
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
         // for the next primary), the draft ids, the top-2 evidence of every
-        // row including the bonus row, and the cache roots — is materialised
         // in ONE eval. The `.item()`/`.asArray` calls below then copy from
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
