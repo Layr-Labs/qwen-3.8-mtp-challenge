@@ -460,6 +460,22 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
+    /// VERIFY-NORM REUSE — default ON, kill switch `MLX_QWEN_MTP_NORM_REUSE=0`.
+    ///
+    /// `MLX_` prefix on purpose: the trusted worker strips `MLXFAST_*` from the
+    /// sandboxed process environment and lets `MLX_` through, so an
+    /// `MLXFAST_`-prefixed guard would be permanently ON with no way to turn it
+    /// off from the ranked workflow. Read once, at first touch of the type.
+    ///
+    /// What it gates: every round's target forward computes
+    /// `normed = model.norm(hidden)` on its way to the lm_head. When this is on,
+    /// the draft side SLICES the rows it needs out of that existing array
+    /// instead of re-running the identical row-local RMSNorm through
+    /// `applyFinalNorm`. Off, the pre-existing `applyFinalNorm` path runs
+    /// unchanged. Both produce the same values; only the launch count differs.
+    private static let reuseVerifyNorm =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_NORM_REUSE"] != "0"
     private static func traceWrite(_ line: String) {
         // stderr: the worker sandbox denies file-write*, and the parent's
         // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
@@ -766,13 +782,18 @@ public final class Qwen36MTPBlockSession {
             // this backlog (the head cache is never created).
             headHistoryBacklogHidden.append(hidden)
             headHistoryBacklogTokens.append(primary)
-            let (serialLogits, serialHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray([primary]).reshaped([1, 1])),
-                cache: cache, nConfirmed: 0)
+            let (serialLogits, serialHidden, serialNormed) =
+                model.callWithHiddenAndNormed(
+                    input: LMInput.Text(
+                        tokens: MLXArray([primary]).reshaped([1, 1])),
+                    cache: cache, nConfirmed: 0)
             // Still produced, still post-norm: keeping the hidden chain identical
             // means switching depth is the ONLY difference between the two sides.
-            pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
+            // The row is now SLICED from the norm this very forward already ran
+            // for its lm_head instead of being renormalised — same value, one
+            // launch fewer on the serial control and on every adaptive skip.
+            pendingHidden = hiddenRow(
+                serialHidden, serialNormed, serialHidden.dim(1) - 1)
             // Single batched readout: next primary, tail top-2, cache roots —
             // one blocking eval instead of the previous 3-4 boundaries.
             let serialLastRow = serialLogits[
@@ -912,9 +933,10 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
-            input: LMInput.Text(tokens: verifyTokens),
-            cache: cache, nConfirmed: 1)
+        let (verifyLogits, verifyHidden, verifyNormed) =
+            model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: verifyTokens),
+                cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -971,7 +993,8 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            pendingHidden = hiddenRow(
+                verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -996,7 +1019,8 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingHidden = hiddenRow(
+                    verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1009,11 +1033,14 @@ public final class Qwen36MTPBlockSession {
                 // second blocking eval for its own readout.
                 Self.rollbackAfterVerify(
                     cache, snapshot, verifiedTokens: draftCount + 1, to: base)
-                let (repairLogits, repairHidden) = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(committed).reshaped([1, committed.count])),
-                    cache: cache, nConfirmed: 0)
-                pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
+                let (repairLogits, repairHidden, repairNormed) =
+                    model.callWithHiddenAndNormed(
+                        input: LMInput.Text(
+                            tokens: MLXArray(committed)
+                                .reshaped([1, committed.count])),
+                        cache: cache, nConfirmed: 0)
+                pendingHidden = hiddenRow(
+                    repairHidden, repairNormed, repairHidden.dim(1) - 1)
                 let repairLastRow = repairLogits[
                     0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1),
                     0...]
@@ -1038,9 +1065,26 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
-            headHistoryBacklogTokens.append(drafts[index])
+        if acceptedCount > 0 {
+            // ONE contiguous multi-row entry when the forward published its
+            // post-norm block, `acceptedCount` single-row entries otherwise.
+            //
+            // The backlog is a list of hidden BLOCKS paired with a flat list of
+            // tokens; the flush pairs them by TOTAL ROW COUNT, not by element
+            // count (`flushTokens.count` is the row count and
+            // `concatenated(flushHidden, axis: 1)` sums the blocks' rows). The
+            // lazy seed priming above already pushes a 511-row block against
+            // 511 tokens, so multi-row entries are the established shape here,
+            // not a new invariant. Rows 0 ..< acceptedCount of the verify block
+            // are exactly the accepted drafts' trunk positions, in order.
+            if let block = normedRows(verifyHidden, verifyNormed, 0 ..< acceptedCount) {
+                headHistoryBacklogHidden.append(block)
+            } else {
+                for index in 0 ..< acceptedCount {
+                    headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+                }
+            }
+            headHistoryBacklogTokens.append(contentsOf: drafts.prefix(acceptedCount))
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
@@ -1506,6 +1550,47 @@ public final class Qwen36MTPBlockSession {
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
         let row = hidden[0..., index ..< (index + 1), 0...]
         return postNorm ? model.applyFinalNorm(row) : row
+    }
+
+    /// `hiddenRows` / `hiddenRow` with the forward's ALREADY-COMPUTED post-norm
+    /// rows, when the target published them.
+    ///
+    /// Correctness: `normed` is `model.norm(preNorm)` over the whole block —
+    /// literally the array the lm_head consumed — and `applyFinalNorm` is that
+    /// same `model.norm`. RMSNorm reduces along the last axis only, so row `i`
+    /// of the block normalisation and the normalisation of row `i` alone are
+    /// the same numbers; this file's `begin` already banks that property for
+    /// the seed-vocabulary trim.
+    ///
+    /// Blast radius if it were ever wrong anyway: these rows feed ONLY the MTP
+    /// head (`pendingHidden` and the committed-history backlog, both consumed
+    /// exclusively by `mtpHead*Forward`). The head only PROPOSES — the target
+    /// re-derives every emitted token and every ledger value from the exact
+    /// `lmHead` — so nothing reachable from here can move an emitted token or a
+    /// declared row. A mistake could only move the ACCEPT RATE.
+    ///
+    /// Degrade, never throw: any shape surprise (missing array, row count that
+    /// does not match the forward's block) falls back to `hiddenRow`.
+    private func normedRows(
+        _ preNorm: MLXArray, _ normed: MLXArray?, _ range: Range<Int>
+    ) -> MLXArray? {
+        guard Self.reuseVerifyNorm, postNorm, let normed,
+              normed.ndim == preNorm.ndim,
+              normed.ndim == 3,
+              normed.dim(0) == preNorm.dim(0),
+              normed.dim(1) == preNorm.dim(1),
+              normed.dim(2) == preNorm.dim(2),
+              range.lowerBound >= 0, range.upperBound <= normed.dim(1),
+              !range.isEmpty
+        else { return nil }
+        return normed[0..., range, 0...]
+    }
+
+    private func hiddenRow(
+        _ preNorm: MLXArray, _ normed: MLXArray?, _ index: Int
+    ) -> MLXArray {
+        normedRows(preNorm, normed, index ..< (index + 1))
+            ?? hiddenRow(preNorm, index)
     }
 
     private func lastRow(_ logits: MLXArray) -> MLXArray {

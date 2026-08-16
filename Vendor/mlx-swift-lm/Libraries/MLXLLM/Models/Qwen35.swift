@@ -2215,6 +2215,44 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// `callWithHidden` plus the POST-`model.norm` hidden it already computed.
+    ///
+    /// WHY THIS EXISTS. `callWithHidden` computes `normed = model.norm(hidden)`
+    /// on the way to `lmHead`, then drops it on the floor and returns only the
+    /// PRE-norm hidden. Every consumer that wants MTPLX's default
+    /// `base_hidden_variant == "post_norm"` (i.e. the whole draft side) then
+    /// re-derives it row by row through `applyFinalNorm`, running the SAME
+    /// `model.norm` a second time on rows that were normalised microseconds
+    /// earlier inside this function. On a drafting round the duplicate is
+    /// exactly `draftCount + 1` extra single-row RMSNorm launches.
+    ///
+    /// Returning the existing array removes that duplication with no new op,
+    /// no new kernel shape and no change to any value: the third element is
+    /// the identical `normed` the projection consumes, so
+    /// `normed[0..., i ..< i+1, 0...]` is the same buffer contents
+    /// `applyFinalNorm(hidden[0..., i ..< i+1, 0...])` produces — RMSNorm is
+    /// row-local, the property this file's seed-vocabulary trim already relies
+    /// on ("norm(row)+lmHead == the sliced full projection bit-for-bit").
+    ///
+    /// The returned `normed` is a REFERENCE to the array the lm_head consumes,
+    /// so its buffer is materialised by the same eval that materialises the
+    /// logits; holding it alive costs `rows * hiddenSize` elements (~51 KiB at
+    /// a width-5 verify), not a recomputation.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -2510,6 +2548,15 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenAndNormed`. Pass-through, exactly as
+    /// `callWithHidden` above — no wrapper-level arithmetic and no second norm.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        languageModel.callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.
