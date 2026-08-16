@@ -194,9 +194,14 @@ public final class Qwen36MTPBlockSession {
         // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
+        //
+        // MEASURED OVERRIDE: the rule above is kept exactly as shipped and its
+        // answer is the CEILING. Where this session's own per-width round
+        // timings say a narrower round commits more tokens per second, the
+        // narrower width wins. See "measured round economics" below.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            return self.scheduledDepth(offeredDepth: offeredDepth)
         }
     }
 
@@ -528,6 +533,200 @@ public final class Qwen36MTPBlockSession {
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.20
 
+    // MARK: - measured round economics (this box, this session)
+    //
+    // WHY THIS EXISTS. `headStepCostRatio` prices a draft step as a FIXED
+    // fraction of the verify forward, which makes the round cost T(d) = V + d*H
+    // linear in width. That form cannot express a marginal cost that GROWS with
+    // width, and this stack has two documented reasons for exactly that: the
+    // sdpa width wall and the gated-delta scan's chunk geometry, both named in
+    // the caps below. Where T(d) is convex the linear rule keeps reading "one
+    // more draft still costs H" and over-drafts. The h history in this file
+    // (0.12, then 0.09, then 0.6, then 0.20) is the tell: those are successive
+    // refits of a constant that a convex curve does not have.
+    //
+    // Measured on an M1 Max (64 GiB), 256-token local window, against the
+    // previous frontier: the width the linear rule chose ran 0.0794 s/token
+    // while the measured optimum near width 3 ran 0.0676, i.e. the rule left
+    // 15% on the table. Backing the fixed window cost out of both legs puts the
+    // marginal draft cost at ~42 ms at width 2 and ~53 ms at width 7.3 against
+    // a ~56 ms one-row round, so the curve is convex and no single h fixes it.
+    //
+    // So: stop assuming the shape, measure it. The round already ends in ONE
+    // blocking eval, so per-width timing needs no added synchronisation and no
+    // extra GPU work.
+    //
+    // THE SAFETY PROPERTY, which is what makes this submittable without access
+    // to the ranked box: the measured choice is clamped to
+    // `min(measured, costModelDepth)`, so this can only ever draft the SAME
+    // WIDTH OR NARROWER than the shipped schedule, and only where this box's
+    // own timings say the narrower round commits more tokens per second. Where
+    // the shipped prior is right the argmax sits at the shipped width, no probe
+    // is scheduled, and the schedule is the one it was built on.
+    private var roundTimeEMA = [Double?](repeating: nil, count: Qwen36MTPLimits.maxDepth + 1)
+    private var roundTimeSamples = [Int](repeating: 0, count: Qwen36MTPLimits.maxDepth + 1)
+    private static let roundTimeAlpha = 0.30
+    /// Start of the round in flight and the width it chose. The sample is the
+    /// delta between consecutive round starts, so a width is charged for
+    /// everything it provokes: both graph builds, the blocking eval, the accept
+    /// walk, and any rollback and repair.
+    private var lastRoundStartNanos: UInt64 = 0
+    private var lastRoundDraftCount = -1
+    /// The first drafting round carries the one-off head-history priming flush,
+    /// which belongs to no width.
+    private var roundSamplesSkipped = 0
+    /// Widths probed because the measured curve was still falling at its own
+    /// left edge. Never scheduled at all where the measured optimum is interior.
+    private var probeCount = 0
+    private static let maxProbeRounds = 4
+    /// DEADBAND, and it is the lesson of ranked submission 472fc5a.
+    ///
+    /// An earlier revision of this policy took the measured argmax whenever it
+    /// won at all. On an M1 Max that was worth 15% because the round cost is
+    /// convex there; on the ranked M5 the same code scored 2.6587 against its
+    /// base's 2.71512, a 2% LOSS. The M5's wide verifies are cheap, so the
+    /// measured differences between neighbouring widths are small, and chasing
+    /// them costs more in probe rounds and slight under-drafting than it wins.
+    ///
+    /// So the mechanism is no longer a width micro-optimiser. It only fires
+    /// when the alternative is overwhelmingly better, which is the case this
+    /// exists for: a prompt where speculation is a NET LOSS against serial
+    /// decode. Measured on a diverse-prose fixture, the shipped schedule runs
+    /// at 0.578 of its own serial control, so the winning margin there is about
+    /// 70%, an order of magnitude outside this band. Within the band the
+    /// schedule is exactly the one it was built on.
+    private static let deviationMargin = 1.15
+    /// Probe only where the lead draft position is missing often enough that
+    /// "stop drafting" could win. At 1.0 acceptance it cannot.
+    private static let probeAcceptCeiling = 0.85
+    /// Let the acceptance EMA see real rounds before reading it.
+    private static let probeMinRounds = 6
+    /// Rounds since this session last drafted anything. While the measured
+    /// choice is width 0 the acceptance EMAs cannot move, so one drafting round
+    /// is forced every `draftRefreshInterval` rounds to re-test the decision.
+    /// A prompt that turns predictable half way through therefore recovers,
+    /// and the cost of being wrong is one round in 24.
+    private var roundsSinceDraft = 0
+    private static let draftRefreshInterval = 24
+
+    /// Charge the elapsed wall time of the round that just finished to the width
+    /// that round chose. Two clock reads per round, no synchronisation.
+    private func recordRoundTiming(nowNanos: UInt64) {
+        defer { lastRoundStartNanos = nowNanos }
+        guard lastRoundDraftCount >= 0,
+              lastRoundDraftCount < roundTimeEMA.count,
+              lastRoundStartNanos > 0,
+              nowNanos > lastRoundStartNanos
+        else { return }
+        if roundSamplesSkipped < 1 {
+            roundSamplesSkipped += 1
+            return
+        }
+        let seconds = Double(nowNanos - lastRoundStartNanos) / 1_000_000_000.0
+        let width = lastRoundDraftCount
+        if let previous = roundTimeEMA[width] {
+            roundTimeEMA[width] = previous + Self.roundTimeAlpha * (seconds - previous)
+        } else {
+            roundTimeEMA[width] = seconds
+        }
+        roundTimeSamples[width] += 1
+    }
+
+    /// Expected tokens committed by a round that drafts `depth` wide, under the
+    /// per-position acceptance EMAs. The primary always commits.
+    private func expectedCommittedTokens(depth: Int) -> Double {
+        var reach = 1.0
+        var expected = 1.0
+        for position in 0 ..< depth where position < positionAcceptEMA.count {
+            reach *= positionAcceptEMA[position]
+            expected += reach
+        }
+        return expected
+    }
+
+    /// Does this prompt pay for speculation at all?
+    ///
+    /// THE MECHANISM IS BINARY ON PURPOSE, and that is the lesson of ranked
+    /// submission 472fc5a. An earlier revision picked the measured argmax over
+    /// every width. On an M1 Max that was worth 15% because the round cost is
+    /// convex there; on the ranked M5 the identical code scored 2.6587 against
+    /// its base's 2.71512, a 2% LOSS, because the M5's wide verifies are cheap,
+    /// neighbouring widths differ by very little, and chasing that difference
+    /// costs more in probe rounds and slight under-drafting than it wins.
+    ///
+    /// So this no longer micro-optimises width. It asks one question that the
+    /// shipped cost model cannot ask, because `headStepCostRatio` is a constant
+    /// rather than a measurement: is a drafting round actually faster per
+    /// committed token than not drafting at all? Measured here on a
+    /// diverse-prose fixture (prompt-lookup hit rate 0.233 against the public
+    /// gate fixture's 0.938), acceptance falls to 0.471, the shipped schedule
+    /// still drafts 2.46 wide, and the speculative path runs at 0.578 of its
+    /// own serial control. Parking such a prompt at width 0 measured 1.64x
+    /// faster. Empty rounds are explicitly legal under the 2026-08-14 contract,
+    /// and a candidate that does not draft simply is the serial control.
+    ///
+    /// Two samples at the shipped width and two at width 0 are enough to
+    /// decide, so the probe costs at most `maxProbeRounds` rounds out of a
+    /// window that runs to several hundred. `deviationMargin` keeps the
+    /// mechanism away from the regime that lost on the M5: the winning margin
+    /// in the case this exists for is about 70%, an order of magnitude outside
+    /// the band, while neighbouring-width noise is well inside it.
+    private func scheduledDepth(offeredDepth: Int) -> Int {
+        let ceiling = costModelDepth(offeredDepth: offeredDepth)
+        guard ceiling > 0, ceiling < roundTimeEMA.count else {
+            roundsSinceDraft += 1
+            return ceiling
+        }
+
+        // Collect the width-0 samples the comparison needs, but only once the
+        // shipped width itself has been measured AND only where the answer
+        // could plausibly be "stop drafting".
+        //
+        // THE ACCEPTANCE GATE IS WHAT MAKES THIS FREE ON AN EASY PROMPT. The
+        // probe is the mechanism's only cost, and measured at the 256-token
+        // window it was the whole of a 1.4% regression on a fixture whose lead
+        // position accepts at ~1.0, where serial can never win. Gating on the
+        // lead position's own acceptance EMA means a prompt the head predicts
+        // well is never probed at all and runs the shipped schedule exactly,
+        // while the regime this exists for (measured 0.471 acceptance, the
+        // speculative path at 0.578 of serial) is always probed.
+        if positionAcceptEMA[0] < Self.probeAcceptCeiling,
+           roundCount >= Self.probeMinRounds,
+           roundTimeSamples[ceiling] >= 2, roundTimeSamples[0] < 2,
+           probeCount < Self.maxProbeRounds
+        {
+            probeCount += 1
+            roundsSinceDraft += 1
+            return 0
+        }
+
+        guard roundTimeSamples[ceiling] >= 2, roundTimeSamples[0] >= 2,
+              let draftingSeconds = roundTimeEMA[ceiling], draftingSeconds > 0,
+              let serialSeconds = roundTimeEMA[0], serialSeconds > 0
+        else {
+            roundsSinceDraft = 0
+            return ceiling
+        }
+
+        let draftingRate = expectedCommittedTokens(depth: ceiling) / draftingSeconds
+        let serialRate = 1.0 / serialSeconds
+        guard serialRate > draftingRate * Self.deviationMargin else {
+            roundsSinceDraft = 0
+            return ceiling
+        }
+
+        // Parked at serial. The acceptance EMAs are frozen while parked, so one
+        // real drafting round every `draftRefreshInterval` re-tests the
+        // decision; a prompt that turns predictable half way through recovers,
+        // and being wrong costs one round in 24.
+        if roundsSinceDraft >= Self.draftRefreshInterval {
+            roundsSinceDraft = 0
+            return ceiling
+        }
+        roundsSinceDraft += 1
+        return 0
+    }
+
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -587,13 +786,7 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            }
-            reach *= p
+            reach *= positionAcceptEMA[depth]
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
@@ -677,7 +870,11 @@ public final class Qwen36MTPBlockSession {
         // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
         // split a round into head-chain graph build, verify graph build, and
         // the single blocking eval's GPU wall. Never on in a ranked run.
-        let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
+        // Unconditional now: the measured-economics schedule reads this clock,
+        // not just the opt-in trace. It is a mach_absolute_time read, it adds no
+        // synchronisation, and it charges the round that just ENDED.
+        let tRound0 = DispatchTime.now().uptimeNanoseconds
+        recordRoundTiming(nowNanos: tRound0)
         var tDraftBuilt: UInt64 = 0
         var tVerifyBuilt: UInt64 = 0
         var tEvalDone: UInt64 = 0
@@ -710,6 +907,9 @@ public final class Qwen36MTPBlockSession {
                 && draftCount <= Qwen36MTPLimits.maxDepth,
             "draftPolicy returned \(draftCount) for an offer of \(depth); a "
                 + "round may propose 0 ... min(offer, maxDepth) drafts")
+        // The width this round runs at, so the NEXT round's clock read can
+        // charge this round's full cost to it.
+        lastRoundDraftCount = draftCount
 
         // A stop token as the primary ends the run BEFORE any drafting: there is
         // nothing after it to predict, and drafting past it would charge the
