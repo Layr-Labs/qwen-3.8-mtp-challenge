@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:lowskillcoding/qwen38-mtp-head-4bit-g64@0966ddaff972fd3ca2be08f3640603b47e9ce70a",
-  "sha256": "cc209e30d8a7def1fc4d785be22b0ec40e16ae6763f9591255a1996a34f08f0d",
+  "source_url": "hf:lowskillcoding/qwen38-mtp-head-4bit-g64@a12cc5d46b73ac21c3a22784e4a44f1e3afeaed4",
+  "sha256": "ac964b53b0ba2a895aa9e1da9f48711f05365ba71bc8d5f4216acc03d3ff0142",
   "bytes": 238934093,
   "max_bytes": 2147483648,
-  "note": "4-bit/group-64 MLX-affine requantization of the pinned bf16 head; matches the backbone quantization geometry so the stock scales-keyed walk loads it with zero code changes. rev2 post-#56 (f2be121)."
+  "note": "head v2: per-group ALS + clip-search error-minimized 4-bit/g64 requantization (same layout as v1, strictly lower relL2 on all 8 matrices). head-v2-als-r4b."
 }
