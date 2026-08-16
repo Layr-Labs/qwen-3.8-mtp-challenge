@@ -856,8 +856,12 @@ final class Qwen35GatedDeltaNet: Module {
             b: b,
             g: g,
             beta: beta,
-            ssmPre: ssmState.map { $0[.ellipsis] },
-            mask: mask.map { $0[.ellipsis] },
+            // Both values are immutable inputs to this forward. Cache slots are
+            // rebound below rather than setitem-mutated, so retaining the input
+            // graph is the exact pre-verify value and avoids a full-state slice
+            // expression in every recurrent layer of every wide round.
+            ssmPre: ssmState,
+            mask: mask,
             rowCount: S,
             convStateRows: nKeep)
         return (out, newConvState, newSsmState, tape)
@@ -1079,6 +1083,10 @@ final class Qwen35GatedDeltaNet: Module {
             // Snapshot (conv_state, ssm_state) after confirmed prefix for rollback.
             // omlx: cache.rollback_state = (conv_c, ssm_c)
             cache?.rollbackState = (convC, ssmC)
+            // Match the authoritative K=1 restore contract even on hosts where
+            // the compiled midpoint kernel is unavailable. Entry zero is the
+            // post-primary boundary consumed by restoreAfterPrefixReject.
+            cache?.rollbackCheckpoints = [(convC, ssmC)]
 
             let (outD, convF, ssmF) = processChunk(
                 qkv: qkv[0..., nConfirmed..., 0...],

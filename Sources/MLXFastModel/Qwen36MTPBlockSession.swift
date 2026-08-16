@@ -23,15 +23,16 @@ import MLXLMCommon
 //   2. draft `cycleDepth` tokens from the head (ONE fresh head cache per round,
 //      shared across the sub-steps; each sub-step chains the head's own
 //      post-`mtp.norm` hidden — MTPLX `mtp_cache_policy` default "persistent")
-//   3. snapshot the non-trimmable (GDN/recurrent) state, then verify
-//      `[primary] + drafts` in ONE batched target forward
+//   3. verify `[primary] + drafts` in ONE batched target forward while each
+//      recurrent layer retains the exact boundary ingredients requested by
+//      `nConfirmed: 1`
 //   4. accept the longest common prefix: row i of the verify output is the
 //      target's greedy continuation of verify input i, i.e. the truth for draft i
 //   5. full acceptance -> keep the verify state; the next primary is the argmax
-//      of the bonus row D. Otherwise -> roll the WHOLE verify window back (trim
-//      all 1+D positions from the trimmable caches AND restore the recurrent
-//      snapshot) and re-forward the committed block `[primary] + acceptedDrafts`;
-//      its last row is the next primary and its last hidden feeds the next draft.
+//      of the bonus row D. Otherwise -> restore the exact committed recurrent
+//      boundary (the eager primary checkpoint at K=1, prefix replay at K>=2),
+//      trim only rejected attention rows, and reuse the already-computed verify
+//      row as the next primary/hidden state.
 //
 // WHY NOT THE VENDORED DFLASH ROLLBACK. `RecurrentRollbackCache` rolls the GDN
 // state forward by replaying an innovation tape the GDN forward is supposed to
@@ -39,9 +40,10 @@ import MLXLMCommon
 // `recordTape`, so the tape is always nil and the cache silently degenerates to a
 // pre-verify snapshot restore while the KV caches are trimmed to
 // prefix+1+accepted — the 48 recurrent layers and the 16 attention layers desync
-// on every partial acceptance. MTPLX's snapshot + rollback + re-forward needs no
-// tape, which is why it is the baseline here. Grafting the tape into the Qwen35
-// GDN forward is a documented LATER perf upgrade, deliberately not attempted.
+// on every partial acceptance. This implementation instead has the Qwen35 GDN
+// retain an eager K=1 checkpoint or an exact K>=2 prefix-replay tape. Those are
+// the sole rollback authority; a missing boundary is a poisoned-session
+// invariant failure, never permission to run a second target forward.
 
 /// One round's worth of committed tokens plus the row ledger the trusted parent
 /// audits. Field names mirror the DFlash round result so the parent-side ledger
@@ -74,6 +76,8 @@ public struct Qwen36MTPRoundResult {
 public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case headNotAttached
     case cacheOffsetInvariant(expected: Int, actual: Int, round: Int)
+    case recurrentRestoreInvariant(
+        round: Int, draftCount: Int, acceptedCount: Int)
     case notBegun
     case alreadyBegun
     case invalidDepth(Int)
@@ -86,6 +90,10 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
         case .cacheOffsetInvariant(let expected, let actual, let round):
             return "MTP cache offset invariant broken at round \(round): "
                 + "trimmable offset \(actual) != seed+emitted \(expected)"
+        case .recurrentRestoreInvariant(
+            let round, let draftCount, let acceptedCount):
+            return "MTP recurrent restore invariant broken at round \(round): "
+                + "accepted \(acceptedCount) of \(draftCount) drafts"
         case .notBegun:
             return "MTP round requested before the seed prefill"
         case .alreadyBegun:
@@ -885,11 +893,11 @@ public final class Qwen36MTPBlockSession {
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        // 2. The verify forward itself retains the exact recurrent boundary:
+        //    an eager post-primary checkpoint for K=1, or immutable recurrence
+        //    inputs for on-demand prefix replay at K>=2. Do not also build the
+        //    legacy 48-layer pre-verify snapshot: every supported reject uses
+        //    the retained boundary and reuses its already-computed target row.
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
@@ -984,43 +992,24 @@ public final class Qwen36MTPBlockSession {
             // the same post-primary distribution, so reuse its already-recorded
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
-            if Self.restoreAfterPrefixReject(
+            guard Self.restoreAfterPrefixReject(
                 model, cache,
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
-            {
-                pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
-                pendingTop2 = (
-                    perRowTop2Tokens[acceptedCount],
-                    perRowTop2Logits[acceptedCount]
-                )
-                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
-                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
-            } else {
-                // Generic K>1 / defensive fallback: undo the whole verify window
-                // and re-forward the committed block. This rare path pays a
-                // second blocking eval for its own readout.
-                Self.rollbackAfterVerify(
-                    cache, snapshot, verifiedTokens: draftCount + 1, to: base)
-                let (repairLogits, repairHidden) = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(committed).reshaped([1, committed.count])),
-                    cache: cache, nConfirmed: 0)
-                pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
-                let repairLastRow = repairLogits[
-                    0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1),
-                    0...]
-                let (tailIDs, tailValues) = Self.linearTopTwoRows(repairLastRow)
-                eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
-                let ids = tailIDs.asArray(Int32.self).map { Int($0) }
-                let values = tailValues.asArray(Float.self).map { Double($0) }
-                // Top-2 first ID == row argmax; no separate argMax launch.
-                pendingPrimary = ids[0]
-                pendingTop2 = (ids, values)
-                perRowTop2Tokens.append(ids)
-                perRowTop2Logits.append(values)
+            else {
+                throw Qwen36MTPSessionError.recurrentRestoreInvariant(
+                    round: roundCount,
+                    draftCount: draftCount,
+                    acceptedCount: acceptedCount)
             }
+            pendingPrimary = verifyArgmax[acceptedCount]
+            pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+            pendingTop2 = (
+                perRowTop2Tokens[acceptedCount],
+                perRowTop2Logits[acceptedCount]
+            )
+            perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
+            perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
         }
 
         if Self.traceRounds { tCommitDone = DispatchTime.now().uptimeNanoseconds }
@@ -1163,9 +1152,10 @@ public final class Qwen36MTPBlockSession {
     /// `acceptedCount + 1` target rows from the exact pre-verify recurrent
     /// state. Both paths then trim exactly the rejected attention rows.
     ///
-    /// Preflight every layer before mutating any of them. Returning `false`
-    /// leaves the cache untouched so the caller can use the generic snapshot
-    /// and repair path safely.
+    /// Preflight every layer before mutating any of them. Returning `false` is
+    /// a broken session invariant: warmup exercises every supported replay
+    /// width, and the caller poisons the session rather than silently adding a
+    /// second target forward with different material flow.
     private static func restoreAfterPrefixReject(
         _ model: any Qwen36MTPTarget,
         _ cache: [any KVCache],
