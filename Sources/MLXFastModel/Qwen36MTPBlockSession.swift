@@ -587,7 +587,13 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            reach *= positionAcceptEMA[depth]
+            var p = positionAcceptEMA[depth]
+            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+                p = Swift.min(p, conf)
+            }
+            reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
@@ -911,17 +917,16 @@ public final class Qwen36MTPBlockSession {
             cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
-        // this round — the per-row argmaxes (accept walk AND both candidates
-        // for the next primary), the draft ids, the top-2 evidence of every
-        // row including the bonus row, and the cache roots — is materialised
-        // in ONE eval. The `.item()`/`.asArray` calls below then copy from
-        // materialised buffers without waiting on the GPU. (MTPLX production
-        // budget: 1 sync/cycle, batched_decode.py:504-525.)
+        // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host reads this
+        // round — the per-row argmaxes, draft ids, and top-2 evidence — is
+        // materialised together. The verify forward evaluates cache-producing
+        // primitives it consumes, while cache/tape objects retain any lazy
+        // state needed by rollback or repair. Rooting those ~130 state arrays
+        // here only grows the eval frontier without forcing required work.
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
