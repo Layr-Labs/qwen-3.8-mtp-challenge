@@ -885,11 +885,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   const int in_vec_size_g = in_vec_size / 64;
 
   const bool has_pair = first_m + 1 < M;
+  // Keep one accumulator shape for every active group. On an odd final row,
+  // duplicate x0 into the unused second lane and discard that lane at write
+  // time. The first lane's arithmetic is unchanged, while removing the scalar
+  // tail accumulator lowers register pressure for every ordinary pair group.
   thread float2 pair_result[rows_per_simd];
-  thread float single_result[rows_per_simd];
   for (int r = 0; r < rows_per_simd; r++) {
     pair_result[r] = 0.0f;
-    single_result[r] = 0.0f;
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
@@ -918,39 +920,25 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
         x + first_m * in_vec_size + k + simd_lid * values_per_thread;
     const float sum0 =
         load_vector<T, float, values_per_thread, 4>(xm0, x0);
-    if (has_pair) {
-      thread float x1[values_per_thread];
-      const device T* xm1 = xm0 + in_vec_size;
-      const float sum1 =
-          load_vector<T, float, values_per_thread, 4>(xm1, x1);
-      for (int r = 0; r < rows_per_simd; r++) {
-        pair_result[r] += qdot_affine4_loaded_pair(
-            packed[r], x0, x1, scale_local[r], bias_local[r],
-            float2(sum0, sum1));
-      }
-    } else {
-      for (int r = 0; r < rows_per_simd; r++) {
-        single_result[r] += qdot_affine4_loaded<float>(
-            packed[r], x0, scale_local[r], bias_local[r], sum0);
-      }
+    thread float x1[values_per_thread];
+    const device T* xm1 = has_pair ? xm0 + in_vec_size : xm0;
+    const float sum1 =
+        load_vector<T, float, values_per_thread, 4>(xm1, x1);
+    for (int r = 0; r < rows_per_simd; r++) {
+      pair_result[r] += qdot_affine4_loaded_pair(
+          packed[r], x0, x1, scale_local[r], bias_local[r],
+          float2(sum0, sum1));
     }
   }
 
-  if (has_pair) {
-    for (int r = 0; r < rows_per_simd; r++) {
-      const float reduced0 = simd_sum(pair_result[r].x);
-      const float reduced1 = simd_sum(pair_result[r].y);
-      if (simd_lid == 0) {
-        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced0);
+  for (int r = 0; r < rows_per_simd; r++) {
+    const float reduced0 = simd_sum(pair_result[r].x);
+    const float reduced1 = simd_sum(pair_result[r].y);
+    if (simd_lid == 0) {
+      y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced0);
+      if (has_pair) {
         y[(first_m + 1) * out_vec_size + out_row + r] =
             static_cast<T>(reduced1);
-      }
-    }
-  } else {
-    for (int r = 0; r < rows_per_simd; r++) {
-      const float reduced = simd_sum(single_result[r]);
-      if (simd_lid == 0) {
-        y[first_m * out_vec_size + out_row + r] = static_cast<T>(reduced);
       }
     }
   }
