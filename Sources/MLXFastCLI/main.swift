@@ -2008,6 +2008,16 @@ private enum MLXFastCLI {
             payload["parent_measured_seconds_per_token"] =
                 report.decodeSecondsPerToken
             payload["decode_seconds"] = report.decodeSeconds
+            // The seed prefill's share of that same charged window, for the
+            // board's prefill readout. Observability only — nothing above
+            // subtracts it — and omitted (never zero) when the run predates
+            // the measurement, so a downstream mean cannot be dragged to
+            // infinity tok/s by a key that means "unmeasured".
+            if report.seedPrefillSeconds > 0, report.seedTokenCount > 0 {
+                payload["seed_prefill_seconds"] = report.seedPrefillSeconds
+                payload["prefill_seconds_per_token"] =
+                    report.seedPrefillSeconds / Double(report.seedTokenCount)
+            }
             // THE STALL GUARDRAIL'S INPUT. The box wrapper's
             // check_stall_guardrail FAILS CLOSED unless a timed report carries
             // either the full per-block array or the after-first trio, and it

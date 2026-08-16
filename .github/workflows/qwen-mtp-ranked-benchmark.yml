@@ -3145,11 +3145,19 @@ jobs:
             --argjson pairs_per_prompt "${MLXFAST_QWEN_MTP_PAIRS_PER_PROMPT}" \
             --slurpfile results "${results}" \
             '
-            {
+            # Candidate seed-prefill rates, one per prompt where the wrapper
+            # sealed one. Empty for a candidate built before the CLI measured
+            # the sub-interval; the prefill keys below are then OMITTED, never
+            # zeroed, so a mean cannot be dragged by an unmeasured run.
+            # Observability only -- the scoring path above never reads these.
+            ([ $results[0].per_prompt[]
+               | .prefill_seconds_per_token? // 0
+               | select(. > 0) ]) as $prefills
+            | {
               score: $score,
               passed: true,
               track_id: $track,
-              metrics: {
+              metrics: ({
                 mode: "qwen-mtp-paired-decode-only",
                 aggregation: "median_of_per_prompt_raw_serial_relative_speedup",
                 median_rule: "even_n_mean_of_two_central_order_statistics",
@@ -3198,9 +3206,16 @@ jobs:
                       non_drafting_round_count,
                       head_provenance_sha256,
                       parity_ok }
+                    + (if (.prefill_seconds_per_token? // 0) > 0
+                       then { prefill_seconds_per_token }
+                       else {} end)
                 ],
                 qwen_mtp_weights_hash: $weights_hash
               }
+              + (if ($prefills | length) > 0
+                 then { prefill_seconds_per_token:
+                          (($prefills | add) / ($prefills | length)) }
+                 else {} end))
             }
             ' > score.json
           shasum -a 256 score.json | awk '{print $1}' > score.json.sha256

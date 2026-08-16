@@ -341,6 +341,19 @@ public struct QwenMTPReport: Equatable {
     public let maxRoundRequestSeconds: Double
     public let p50RoundRequestSeconds: Double
 
+    /// The seed prefill's own wall time, measured by the parent as the
+    /// sub-interval of the decode window that `beginMTPDecode` occupied.
+    ///
+    /// OBSERVABILITY ONLY, and deliberately NOT subtracted from
+    /// `decodeSeconds`: the paired contract charges the seed prefill to the
+    /// decode measurement on both sides of the pair (see the clock note in
+    /// QwenRuntimeMTPDriver), and this field does not move that boundary — it
+    /// only names how much of the charged window the prefill was, so the
+    /// board can state a prefill rate. Zero means "not measured" (an older
+    /// caller or a verify-verb report), never "instant"; the payload writer
+    /// omits the key at zero rather than publishing a rate no clock produced.
+    public let seedPrefillSeconds: Double
+
     /// EFFECTIVE per-round draft counts, in emission order — what the
     /// candidate actually proposed, not what the parent offered.
     ///
@@ -468,6 +481,7 @@ public struct QwenMTPReport: Equatable {
         roundRequestSeconds: [Double] = [],
         maxRoundRequestSeconds: Double,
         p50RoundRequestSeconds: Double,
+        seedPrefillSeconds: Double = 0,
         effectiveDraftLengths: [Int] = [],
         ledger: [QwenMTPLedgerRow] = []
     ) {
@@ -494,6 +508,7 @@ public struct QwenMTPReport: Equatable {
         self.roundRequestSeconds = roundRequestSeconds
         self.maxRoundRequestSeconds = maxRoundRequestSeconds
         self.p50RoundRequestSeconds = p50RoundRequestSeconds
+        self.seedPrefillSeconds = seedPrefillSeconds
         self.effectiveDraftLengths = effectiveDraftLengths
         self.ledger = ledger
     }

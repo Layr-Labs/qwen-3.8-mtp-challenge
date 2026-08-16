@@ -93,6 +93,11 @@ extension QwenRuntime {
         // request so the seed cost cannot be hidden outside the window.
         let started = Date()
         let begin = try client.beginMTPDecode(seedTokens: golden.seedTokens)
+        // The prefill's share of the charged window, read the instant the seed
+        // request returns. Observability only: `started` stays the decode
+        // clock's origin and nothing is subtracted, so the scored quantity is
+        // bit-identical to a build without this line (see the report field).
+        let seedPrefillSeconds = Date().timeIntervalSince(started)
         guard begin.ok, let seedToken = begin.seedToken else {
             throw MLXFastError.invalidInput(
                 "the MTP worker failed the seed prefill: "
@@ -281,6 +286,7 @@ extension QwenRuntime {
             roundRequestSeconds: latencies,
             maxRoundRequestSeconds: sortedLatencies.last ?? 0,
             p50RoundRequestSeconds: QwenMTPReport.lowerMedian(latencies),
+            seedPrefillSeconds: seedPrefillSeconds,
             // PARENT-DERIVED, from the parent's own journal: the number of
             // drafts each round actually proposed. Every effective-depth
             // summary in the sealed report is computed from this array, so a
