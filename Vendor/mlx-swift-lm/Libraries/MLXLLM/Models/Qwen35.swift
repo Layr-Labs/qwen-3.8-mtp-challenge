@@ -1026,18 +1026,6 @@ final class Qwen35Attention: Module {
     // launches and two host ops from every head chain step.
     private var _qkvDenseW: MLXArray?
 
-    // Packed K/V concat for committed MTP-head history rows whose layer
-    // outputs are dead. Kept separate from the full Q/K/V pack so those rows
-    // never stream or compute the unused query+gate projection.
-    private var _kvW: MLXArray?
-    private var _kvS: MLXArray?
-    private var _kvZ: MLXArray?
-    private var _kvGS = 64
-    private var _kvBits = 4
-    private var _kvMode = QuantizationMode.affine
-    private var _kvOut = 0
-    private var _kvDenseW: MLXArray?
-
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -1116,61 +1104,6 @@ final class Qwen35Attention: Module {
             return qkv(x)
         }
         return (qProj(x), kProj(x), vProj(x))
-    }
-
-    /// One projection for K and V when no query output is observable. The
-    /// pack is model-general and is built lazily from the attached linears.
-    private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        if let w = _kvW, let s = _kvS, let z = _kvZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: z, transpose: true,
-                groupSize: _kvGS, bits: _kvBits, mode: _kvMode)
-            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
-        }
-        if let w = _kvDenseW {
-            let y = matmul(x, w.transposed(1, 0))
-            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
-        }
-        if let k = kProj as? QuantizedLinear,
-           let v = vProj as? QuantizedLinear,
-           k.groupSize == v.groupSize,
-           k.bits == v.bits,
-           k.mode == v.mode, k.mode == .affine,
-           let kz = k.biases, let vz = v.biases
-        {
-            _kvW = concatenated([k.weight, v.weight], axis: 0).contiguous()
-            _kvS = concatenated([k.scales, v.scales], axis: 0).contiguous()
-            _kvZ = concatenated([kz, vz], axis: 0).contiguous()
-            _kvGS = k.groupSize
-            _kvBits = k.bits
-            _kvMode = k.mode
-            _kvOut = k.shape.0
-            return kv(x)
-        }
-        if !(kProj is QuantizedLinear), !(vProj is QuantizedLinear),
-           kProj.bias == nil, vProj.bias == nil
-        {
-            _kvDenseW = concatenated(
-                [kProj.weight, vProj.weight], axis: 0
-            ).contiguous()
-            _kvOut = kProj.weight.dim(0)
-            return kv(x)
-        }
-        return (kProj(x), vProj(x))
-    }
-
-    /// Append rows to an attention cache without producing query outputs.
-    /// The target model never uses this proposal-head maintenance primitive.
-    func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
-        let B = x.dim(0)
-        let L = x.dim(1)
-        var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
-        _ = cache.update(keys: keys, values: values)
     }
 
     func callAsFunction(
@@ -1393,7 +1326,21 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // Decode-width asyncEval ladder: at decode widths (serial step /
+        // MTP verify up to the contract's max depth 8, i.e. S <= 9) the host
+        // otherwise builds a ~64-layer graph before anything reaches the
+        // GPU. Firing asyncEval at layer boundaries lets the GPU start on
+        // the early layers while the host is still building the rest — most
+        // valuable when the head chain is cheap (the declared 4-bit proposal
+        // head), because a fast chain leaves more of the verify-build host
+        // time exposed. Pure enqueue-timing change — no op is added, no
+        // reduction order moves, so the emitted stream is bit-identical.
+        // Schedule: front rungs 0/1 unchanged (early layers are the ones
+        // the draft chain overlaps), then stride-4 rungs through 57 — the
+        // be6b63f5 receipts measured stride-10 as still leaving host build
+        // time exposed and held back exactly this densification; ~15
+        // dispatch points over 58 layers.
+        let ladderActive = inputs.dim(1) <= 9
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1404,7 +1351,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
                 switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
+                case 0, 1, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57:
                     asyncEval(hiddenStates)
                 default:
                     break
@@ -1808,19 +1755,6 @@ extension Qwen35TextModel: MTPCapable {
             cache: cache)
     }
 
-    /// Return the final proposal hidden row while populating preceding history
-    /// through a K/V-only path. Returns nil before mutation when unavailable.
-    public func mtpHeadLastHiddenWithKVOnlyHistory(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray? {
-        guard let mtp else { return nil }
-        return mtp.lastHiddenWithKVOnlyHistory(
-            hidden: hidden,
-            nextTokenIds: nextTokenIds,
-            embedTokens: model.embedTokens,
-            cache: cache)
-    }
-
     /// The backbone's lm_head (or tied-embedding projection) applied to hidden
     /// rows. Companion to `mtpHeadHiddenForward` for the rows that need logits.
     public func applyLMHead(_ x: MLXArray) -> MLXArray {
@@ -2040,14 +1974,6 @@ extension Qwen35Model: MTPCapable {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
         languageModel.mtpHeadHiddenForward(
-            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
-    }
-
-    /// See `Qwen35TextModel.mtpHeadLastHiddenWithKVOnlyHistory`.
-    public func mtpHeadLastHiddenWithKVOnlyHistory(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray? {
-        languageModel.mtpHeadLastHiddenWithKVOnlyHistory(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
 

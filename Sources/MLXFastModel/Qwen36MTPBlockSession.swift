@@ -247,19 +247,19 @@ public final class Qwen36MTPBlockSession {
             eval(draftLogits, row)
         }
 
-        // Committed-history head shapes: compile both the K/V-only leading-row
-        // path and final full row for the full seed and a 2-row accept fold.
+        // Committed-history head shapes: the first drafting round primes the
+        // whole 512-token seed through the head in one forward, and an
+        // accept-fold round runs a 2-row head forward. Compile both (plus the
+        // single-row lm_head slice they sample) on throwaway state here,
+        // outside every scored window.
         let hDim = row.dim(-1)
         let historyWarmCache = model.makeMTPCache()
         let primeHidden = MLXArray.zeros([1, 512, hDim], dtype: row.dtype)
         let primeTokens = MLXArray(
             Array(repeating: Int32(0), count: 512)).reshaped([1, 512])
-        let primed = model.mtpHeadLastHiddenWithKVOnlyHistory(
+        let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
-            ?? model.mtpHeadHiddenForward(
-                hidden: primeHidden, nextTokenIds: primeTokens,
-                cache: historyWarmCache)
         // Warm the complete proposal-side expression used by a live draft.
         // The compact vocabulary changes the reduction shape and adds an
         // on-device ID map, so warming logits alone leaves both kernels to
@@ -278,12 +278,9 @@ public final class Qwen36MTPBlockSession {
         eval(primedDraftID)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
-        let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
+        let folded = model.mtpHeadHiddenForward(
             hidden: foldHidden, nextTokenIds: foldTokens,
             cache: historyWarmCache)
-            ?? model.mtpHeadHiddenForward(
-                hidden: foldHidden, nextTokenIds: foldTokens,
-                cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
@@ -858,12 +855,9 @@ public final class Qwen36MTPBlockSession {
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
         // idea.md V6 journal. Single submission after the loop, as before.)
         var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
+        var headHidden = model.mtpHeadHiddenForward(
             hidden: draftInputHidden, nextTokenIds: draftInputTokens,
             cache: headCache)
-            ?? model.mtpHeadHiddenForward(
-                hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-                cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
         var draftId = model.draftTokenID(draftHidden)

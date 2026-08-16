@@ -71,13 +71,6 @@ public protocol Qwen36MTPTarget: AnyObject {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray
 
-    /// Return the final proposal hidden row while preceding rows only append
-    /// K/V state. Returns nil without mutation when the head architecture
-    /// requires the ordinary full-history forward.
-    func mtpHeadLastHiddenWithKVOnlyHistory(
-        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray?
-
     /// The backbone's lm_head applied to hidden rows (draft sampling side).
     func applyLMHead(_ x: MLXArray) -> MLXArray
 
