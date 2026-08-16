@@ -260,28 +260,21 @@ public final class Qwen36MTPBlockSession {
         let primed = model.mtpHeadHiddenForward(
             hidden: primeHidden, nextTokenIds: primeTokens,
             cache: historyWarmCache)
+        let primedDraftLogits = model.applyDraftLMHead(
+            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         // Warm the complete proposal-side expression used by a live draft.
         // The compact vocabulary changes the reduction shape and adds an
         // on-device ID map, so warming logits alone leaves both kernels to
         // cold-JIT inside the first scored round.
-        //
-        // LOAD-BEARING: this must warm `draftTokenID` -- the SAME expression
-        // the scored rounds now dispatch -- not the old
-        // `mapDraftTokenIds(argMax(applyDraftLMHead(...)))` chain. 7b33621's
-        // note records that the first compact-vocabulary attempt was
-        // parity-clean and faster in steady state on all 8 prompts and STILL
-        // LOST, because its warm evaluated compact logits while the live graph
-        // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
-        // the scored window. A new selection kernel resets that hazard exactly.
-        let primedDraftID = model.draftTokenID(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
+        let primedDraftID = model.mapDraftTokenIds(
+            argMax(primedDraftLogits, axis: -1).asType(.int32))
         eval(primedDraftID)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadHiddenForward(
             hidden: foldHidden, nextTokenIds: foldTokens,
             cache: historyWarmCache)
-        eval(model.draftTokenID(
+        eval(model.applyDraftLMHead(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
@@ -523,7 +516,7 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    private static let headStepCostRatio = 0.15
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -860,7 +853,9 @@ public final class Qwen36MTPBlockSession {
             cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
+        var draftId = model.mapDraftTokenIds(
+            argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                .asType(.int32))
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
         // before the rest of the chain is built, and unlike the per-step
@@ -873,7 +868,9 @@ public final class Qwen36MTPBlockSession {
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            draftId = model.mapDraftTokenIds(
+                argMax(model.applyDraftLMHead(draftHidden), axis: -1)
+                    .asType(.int32))
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])

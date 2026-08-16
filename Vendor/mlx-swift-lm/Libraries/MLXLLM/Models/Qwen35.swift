@@ -1377,90 +1377,6 @@ public class Qwen35TextModelInner: Module {
     }
 }
 
-// MARK: - fused compact-draft selection
-//
-// PROPOSAL SIDE ONLY. The draft argmax picks which token the MTP head
-// PROPOSES; the pinned target re-derives every emitted token from the exact
-// `lmHead` and the trusted parent replays the whole stream afterwards, so
-// nothing downstream of this kernel can reach an emitted token or a ledger
-// value. See `applyDraftLMHead`'s doc comment for the same argument applied
-// to the compact row set (promoted 7b33621).
-//
-// It replaces SIX MLX primitives that existed only to turn a 98,336-wide row
-// into one integer:
-//     padded[0..., 0..., 0 ..< 98_330]     // slice off the fast-shape padding
-//     argMax(axis: -1)                     // uint32
-//     .asType(.int32)
-//     ids .< 98_304                        // mapDraftTokenIds
-//     ids + 149_740
-//     which(...)
-// Ordering is identical to `argMax`: strictly-greater value wins, an exact tie
-// goes to the LOWER id, and a NaN never beats a non-NaN. Bounding at
-// `REAL_COUNT` in the kernel is exactly what the pre-argmax slice did, so the
-// six duplicated padding rows stay unreachable even on a tie.
-private let qwen35DraftSelectKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_select",
-    inputNames: ["logits"],
-    outputNames: ["token_id"],
-    source: """
-        uint lane = thread_position_in_threadgroup.x;
-        float best_value = 0.0f;
-        uint  best_id    = 0;
-        bool  have       = false;
-
-        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
-            float value = float(logits[index]);
-            bool value_nan = isnan(value);
-            bool take;
-            if (!have) {
-                take = true;
-            } else if (value_nan != isnan(best_value)) {
-                take = !value_nan;
-            } else if (value > best_value) {
-                take = true;
-            } else if (value < best_value) {
-                take = false;
-            } else {
-                take = index < best_id;
-            }
-            if (take) { best_value = value; best_id = index; have = true; }
-        }
-
-        threadgroup float scratch_value[TG_SIZE];
-        threadgroup uint  scratch_id[TG_SIZE];
-        scratch_value[lane] = have ? best_value : NAN;
-        scratch_id[lane]    = have ? best_id : 0xFFFFFFFFu;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                float a = scratch_value[lane];
-                float b = scratch_value[lane + stride];
-                uint  ai = scratch_id[lane];
-                uint  bi = scratch_id[lane + stride];
-                bool a_empty = (ai == 0xFFFFFFFFu);
-                bool b_empty = (bi == 0xFFFFFFFFu);
-                bool take_b;
-                if (b_empty)      { take_b = false; }
-                else if (a_empty) { take_b = true; }
-                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
-                else if (b > a)   { take_b = true; }
-                else if (b < a)   { take_b = false; }
-                else              { take_b = bi < ai; }
-                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (lane == 0) {
-            uint id = scratch_id[0];
-            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
-        }
-    """,
-    header: "",
-    ensureRowContiguous: false
-)
-
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -1772,41 +1688,6 @@ extension Qwen35TextModel: MTPCapable {
         return padded[0..., 0..., 0 ..< Self.compactDraftRealCount]
     }
 
-    /// One draft proposal: the compact projection's argmax, already mapped back
-    /// to the tokenizer's ID space, as a device-resident `[1, 1]` int32.
-    ///
-    /// Same value as `mapDraftTokenIds(argMax(applyDraftLMHead(x), axis: -1))`,
-    /// produced in ONE dispatch instead of six. `applyDraftLMHead` and
-    /// `mapDraftTokenIds` are unchanged and still serve the declared-head path
-    /// and the untimed warm.
-    public func draftTokenID(_ x: MLXArray) -> MLXArray {
-        // A declared `draft_lm_head` is full-vocabulary and needs no remap, so
-        // the fused path (which bakes in the compact bounds) does not apply.
-        guard _draftHeadW == nil, usesCompactDraftVocabulary else {
-            return argMax(applyDraftLMHead(x), axis: -1).asType(.int32)
-        }
-        if _compactDraftHead == nil {
-            _compactDraftHead = makeCompactDraftHead()
-        }
-        let padded = _compactDraftHead!(x)
-        let tgSize = 1024
-        let outputs = qwen35DraftSelectKernel(
-            [padded.reshaped([Self.compactDraftPaddedCount])],
-            template: [
-                ("REAL_COUNT", Self.compactDraftRealCount),
-                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                ("CONTROL_OFFSET",
-                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
-                ("TG_SIZE", tgSize),
-            ],
-            grid: (tgSize, 1, 1),
-            threadGroup: (tgSize, 1, 1),
-            outputShapes: [[1, 1]],
-            outputDTypes: [.int32]
-        )
-        return outputs[0]
-    }
-
     /// Map compact draft IDs back to the tokenizer's full ID space without a
     /// host readback. The low `compactDraftPrefixCount` rows retain their
     /// IDs; the appended rows are Qwen's official text/control tokens
@@ -1971,11 +1852,6 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.applyDraftLMHead`.
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
         languageModel.applyDraftLMHead(x)
-    }
-
-    /// See `Qwen35TextModel.draftTokenID`.
-    public func draftTokenID(_ x: MLXArray) -> MLXArray {
-        languageModel.draftTokenID(x)
     }
 
     /// See `Qwen35TextModel.mapDraftTokenIds`.
