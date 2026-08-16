@@ -232,7 +232,6 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
-
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
 // ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
@@ -395,6 +394,8 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         header: header,
         ensureRowContiguous: false)
 }()
+
+
 
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
