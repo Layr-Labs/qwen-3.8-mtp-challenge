@@ -548,7 +548,9 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 4
+    // Controlled cold-width probe: let pre-streak rounds reach the same
+    // <=5-row SDPA-safe verify width used by the promoted bridge.
+    private static let sdpaWidthWallDepthCap = 5
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
