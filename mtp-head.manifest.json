@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:lowskillcoding/qwen38-mtp-head-4bit-g64@0966ddaff972fd3ca2be08f3640603b47e9ce70a",
-  "sha256": "cc209e30d8a7def1fc4d785be22b0ec40e16ae6763f9591255a1996a34f08f0d",
-  "bytes": 238934093,
+  "source_url": "hf:EigenLabs/Qwen3.8-27B-MTP-bf16@26a328e070875b0314d652a039b6b59902690f03",
+  "sha256": "8fceddc664f3ea96d02e304463aa1319213ff52cdf1f3401d4bce64e7075c349",
+  "bytes": 849400347,
   "max_bytes": 2147483648,
-  "note": "4-bit/group-64 MLX-affine requantization of the pinned bf16 head; matches the backbone quantization geometry so the stock scales-keyed walk loads it with zero code changes. rev2 post-#56 (f2be121)."
+  "note": "Pinned bf16 reference head. The candidate requantizes the head's linear projections to 4-bit affine group-32 at load (Qwen35RuntimeWeights quantize predicate on mtp.* paths), tracking the reference proposals more closely than the stock group-64 head. The head only proposes; emitted tokens stay target-decided."
 }

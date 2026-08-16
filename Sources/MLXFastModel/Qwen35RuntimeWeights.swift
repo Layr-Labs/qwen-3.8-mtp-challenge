@@ -163,7 +163,20 @@ public final class Qwen35RuntimeWeightCache {
 
         let sanitized = model.sanitize(weights: weights)
         quantize(model: model) { path, _ in
-            sanitized["\(path).scales"] != nil
+            // The MTP head only proposes: emitted tokens are target-decided and
+            // carry no exactness constraint from the head's arithmetic. The
+            // declared head is the pinned bf16 reference; requantizing its
+            // linears at group 32 (instead of the backbone's group 64) tracks
+            // the reference proposals more closely at near-tie boundaries,
+            // lifting draft acceptance and cutting verify rounds.
+            if path.hasPrefix("mtp") {
+                return (
+                    groupSize: 32,
+                    bits: config.quantizationBits,
+                    mode: .affine
+                )
+            }
+            return sanitized["\(path).scales"] != nil
                 ? (
                     groupSize: config.quantizationGroupSize,
                     bits: config.quantizationBits,
