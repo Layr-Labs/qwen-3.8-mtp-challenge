@@ -69,6 +69,120 @@ final class Qwen35MTPDecoderLayer: Module {
 
 // MARK: - MTPModule
 
+// The native MTP head always begins by gathering the next-token embedding,
+// RMS-normalizing that row and the paired trunk hidden independently, then
+// concatenating the two normalized results. On the shipped BF16 head those
+// are four materialization boundaries before the fusion projection can even
+// start. This kernel writes the final `[embeddingNorm, hiddenNorm]` carrier
+// directly. Its two threadgroups per logical row use the same 1024-thread,
+// four-read loop and SIMD reduction tree as MLX's `rms_looped_bf16` kernel for
+// Qwen's 5120-wide rows. The embedding half reads the table row directly, so
+// the standalone gather and both normalized intermediates disappear as well
+// as the concatenation copy.
+private let qwen35MTPFusedInputKernel = MLXFast.metalKernel(
+    name: "qwen35_mtp_fused_input_bf16_v1",
+    inputNames: [
+        "token_ids", "embedding_table", "hidden",
+        "embedding_norm_weight", "hidden_norm_weight",
+        "embedding_eps", "hidden_eps",
+    ],
+    outputNames: ["fused_input"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint threads = 1024;
+
+        const uint pair_group = threadgroup_position_in_grid.x;
+        const uint row = pair_group >> 1;
+        const bool is_embedding = (pair_group & 1) == 0;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const uint sequence = uint(hidden_shape[1]);
+        const uint batch = row / sequence;
+        const uint position = row - batch * sequence;
+
+        ulong input_base;
+        ulong input_stride;
+        if (is_embedding) {
+            const ulong token_offset = ulong(batch) * ulong(token_ids_strides[0])
+                + ulong(position) * ulong(token_ids_strides[1]);
+            const int token = int(token_ids[token_offset]);
+            input_base = ulong(token) * ulong(embedding_table_strides[0]);
+            input_stride = ulong(embedding_table_strides[1]);
+        } else {
+            input_base = ulong(batch) * ulong(hidden_strides[0])
+                + ulong(position) * ulong(hidden_strides[1]);
+            input_stride = ulong(hidden_strides[2]);
+        }
+
+        const ulong weight_stride = is_embedding
+            ? ulong(embedding_norm_weight_strides[0])
+            : ulong(hidden_norm_weight_strides[0]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r = 0; r < H; r += threads * n_reads) {
+            for (uint i = 0; i < n_reads; ++i) {
+                const uint element = r + lid * n_reads + i;
+                if (element < H) {
+                    const ulong input_index =
+                        input_base + ulong(element) * input_stride;
+                    const float value = is_embedding
+                        ? float(embedding_table[input_index])
+                        : float(hidden[input_index]);
+                    acc += value * value;
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_lane]);
+            if (simd_lane == 0) {
+                const float eps = is_embedding ? embedding_eps : hidden_eps;
+                local_inv_mean[0] = metal::precise::rsqrt(acc / H + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const ulong output_base = ulong(row) * ulong(2 * H)
+            + (is_embedding ? ulong(0) : ulong(H));
+        const float inv_mean = local_inv_mean[0];
+        for (uint r = 0; r < H; r += threads * n_reads) {
+            for (uint i = 0; i < n_reads; ++i) {
+                const uint element = r + lid * n_reads + i;
+                if (element < H) {
+                    const ulong input_index =
+                        input_base + ulong(element) * input_stride;
+                    const bfloat input_value = is_embedding
+                        ? embedding_table[input_index]
+                        : hidden[input_index];
+                    const bfloat rms_value = static_cast<bfloat>(
+                        float(input_value) * inv_mean);
+                    const bfloat weight = is_embedding
+                        ? embedding_norm_weight[ulong(element) * weight_stride]
+                        : hidden_norm_weight[ulong(element) * weight_stride];
+                    fused_input[output_base + ulong(element)] =
+                        weight * rms_value;
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 /// Multi-Token Prediction head for Qwen3.5/3.6.
 ///
 /// Fuses the backbone's pre-norm hidden state at position t with the embedding of
@@ -104,6 +218,54 @@ final class Qwen35MTPModule: Module {
         super.init()
     }
 
+    /// Produce the exact carrier consumed by `fc`. The optimized route is
+    /// deliberately narrow: the ranked BF16 head, `[B, S, H]` hidden rows,
+    /// aligned int32 token IDs, and the same H for both norm weights and the
+    /// embedding table. Any future dtype or layout contract keeps the original
+    /// gather + two RMSNorms + concatenation expression.
+    private func fusionInput(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding
+    ) -> MLXArray {
+        let hiddenSize = hidden.dim(-1)
+        if hidden.ndim == 3,
+           nextTokenIds.ndim == 2,
+           nextTokenIds.dim(0) == hidden.dim(0),
+           nextTokenIds.dim(1) == hidden.dim(1),
+           nextTokenIds.dtype == .int32,
+           hidden.dtype == .bfloat16,
+           embedTokens.weight.ndim == 2,
+           embedTokens.weight.dim(1) == hiddenSize,
+           embedTokens.weight.dtype == .bfloat16,
+           preFcNormEmbedding.weight.dim(0) == hiddenSize,
+           preFcNormEmbedding.weight.dtype == .bfloat16,
+           preFcNormHidden.weight.dim(0) == hiddenSize,
+           preFcNormHidden.weight.dtype == .bfloat16
+        {
+            let rows = hidden.dim(0) * hidden.dim(1)
+            let threads = 1024
+            let outputs = qwen35MTPFusedInputKernel(
+                [
+                    nextTokenIds, embedTokens.weight, hidden,
+                    preFcNormEmbedding.weight, preFcNormHidden.weight,
+                    preFcNormEmbedding.eps, preFcNormHidden.eps,
+                ],
+                template: [("H", hiddenSize)],
+                grid: (rows * 2 * threads, 1, 1),
+                threadGroup: (threads, 1, 1),
+                outputShapes: [[hidden.dim(0), hidden.dim(1), hiddenSize * 2]],
+                outputDTypes: [.bfloat16]
+            )
+            return outputs[0]
+        }
+
+        let embeds = embedTokens(nextTokenIds)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
+        return concatenated([e, h], axis: -1)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -112,10 +274,9 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = fc(fusionInput(
+            hidden: hidden, nextTokenIds: nextTokenIds,
+            embedTokens: embedTokens))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -146,10 +307,9 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused = fc(fusionInput(
+            hidden: hidden, nextTokenIds: nextTokenIds,
+            embedTokens: embedTokens))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
