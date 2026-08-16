@@ -287,11 +287,27 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+        // TWO PASSES over the identical sequence. Pass 0 is the compile warm
+        // this loop has always been; pass 1 re-runs it and TIMES the verify,
+        // so `measuredVerifySeconds` holds steady-state dispatch cost rather
+        // than first-touch JIT. Both passes are untimed by the harness, and
+        // pass 1 dispatches no shape pass 0 did not already dispatch.
+        // Passes 1 and 2 are both timed and the per-width MINIMUM is kept.
+        // Timing noise on a shared GPU is one-sided (interference only ever
+        // adds), so the minimum of repeats is the robust estimator of the
+        // true dispatch cost. It does NOT flatten the curve's real shape: the
+        // measured cost is genuinely non-monotonic on some hardware (an M1 Max
+        // times a 4-row verify ABOVE a 5-row one, reproduced independently in
+        // live rounds), which is exactly the kind of kernel-selection fact a
+        // constant cannot represent and a measurement can.
+        measuredVerifySeconds = Array(repeating: 0, count: maxDepth + 2)
+        for calibrationPass in 0 ... 2 {
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
+            let tVerify0 = DispatchTime.now().uptimeNanoseconds
             let (verifyLogits, _) = model.callWithHidden(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
                 cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
@@ -299,6 +315,16 @@ public final class Qwen36MTPBlockSession {
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
             eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            // Timed span ends here: this is exactly the verify plus top-2
+            // readout a scored round dispatches. The cache-state eval and the
+            // replay/trim below are warm bookkeeping a round does not pay.
+            let tVerify1 = DispatchTime.now().uptimeNanoseconds
+            if calibrationPass >= 1 {
+                let sample = Double(tVerify1 - tVerify0) / 1_000_000_000.0
+                let held = measuredVerifySeconds[width]
+                measuredVerifySeconds[width] =
+                    held > 0 ? Swift.min(held, sample) : sample
+            }
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -313,6 +339,48 @@ public final class Qwen36MTPBlockSession {
             } else {
                 Self.clearRecurrentRollback(warmCache)
             }
+        }
+        }
+
+        // Steady-state cost of ONE scored draft step: the head forward that
+        // appends a row to the head cache plus the compact draft selection,
+        // the exact pair the round's inner draft loop dispatches (and NOT
+        // `mtpForwardWithHidden`, whose full 248320-wide readout the scored
+        // path never performs). Step 0 is discarded as first-touch.
+        var headStepTotal = 0.0
+        var headStepSamples = 0
+        var calibrationRow = folded[
+            0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]
+        var calibrationToken = MLXArray([Int32(0)]).reshaped([1, 1])
+        for step in 0 ... 3 {
+            let tHead0 = DispatchTime.now().uptimeNanoseconds
+            let stepHidden = model.mtpHeadHiddenForward(
+                hidden: calibrationRow, nextTokenIds: calibrationToken,
+                cache: historyWarmCache)
+            let stepRow = stepHidden[
+                0..., (stepHidden.dim(1) - 1) ..< stepHidden.dim(1), 0...]
+            let stepID = model.draftTokenID(stepRow)
+            eval(stepID)
+            let tHead1 = DispatchTime.now().uptimeNanoseconds
+            if step > 0 {
+                let sample = Double(tHead1 - tHead0) / 1_000_000_000.0
+                headStepTotal = headStepSamples == 0
+                    ? sample
+                    : Swift.min(headStepTotal, sample)
+                headStepSamples += 1
+            }
+            calibrationRow = stepRow
+            calibrationToken = stepID
+        }
+        // Minimum, for the same one-sided-noise reason as the verify curve.
+        measuredHeadStepSeconds = headStepSamples > 0 ? headStepTotal : 0.0
+        if Self.traceRounds {
+            let curve = measuredVerifySeconds.dropFirst()
+                .map { String(format: "%.4f", $0) }
+                .joined(separator: ",")
+            Self.traceWrite("mtp-calib: usable=\(calibrationUsable) "
+                + "head=\(String(format: "%.4f", measuredHeadStepSeconds)) "
+                + "verify_by_width=\(curve)\n")
         }
 
         // A K>=2 round can reject its very first draft, which replays T=1.
@@ -528,6 +596,50 @@ public final class Qwen36MTPBlockSession {
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.18
 
+    /// ON-BOX CALIBRATION, and why a constant cannot do this job.
+    ///
+    /// The marginal rule below is exact only when its constant is the TOTAL
+    /// cost of going one depth deeper. `headStepCostRatio` prices the head
+    /// step alone and implicitly treats an extra VERIFY ROW as free. That is
+    /// very nearly true on hardware where a batched verify is flat in width,
+    /// and false where a row costs real time, so one constant cannot be right
+    /// on two machines. Measured here: the same tree, same head, same fixture,
+    /// verify cost by row count is FLAT from 6 to 9 rows on an M1 Max
+    /// (432 ms to 443 ms, +2.5%, while tokens per round rise 5.93 to 8.14),
+    /// so the shipped constant is right there; a machine whose wide verifies
+    /// cost more needs a bigger one, and guessing which is which from off-box
+    /// numbers is exactly how a schedule change stops transferring.
+    ///
+    /// So the schedule stops guessing and measures. `warmAllDepths` already
+    /// dispatches a verify at every legal width and a draft step, OUTSIDE
+    /// every scored window, on throwaway cache state; it now runs that
+    /// sequence twice and times the second pass, whose kernels the first pass
+    /// compiled. `costModelDepth` then maximises expected committed tokens
+    /// per MEASURED second over the real curve instead of extrapolating a
+    /// straight line from one constant. Nothing here can move an emitted
+    /// token: the schedule only chooses how many tokens the head PROPOSES,
+    /// the pinned target decides every one of them, and the trusted parent
+    /// re-checks the whole stream afterwards.
+    ///
+    /// `measuredVerifySeconds[w]` is one w-row verify plus its top-2 readout,
+    /// the exact pair a scored round dispatches. Index 0 is unused.
+    private var measuredVerifySeconds: [Double] = []
+    private var measuredHeadStepSeconds = 0.0
+
+    /// True once the warm produced a usable curve. Any non-finite or
+    /// non-positive sample abandons the whole calibration rather than
+    /// half-trusting it, and the shipped constant rule runs unchanged.
+    private var calibrationUsable: Bool {
+        guard measuredHeadStepSeconds > 0, measuredHeadStepSeconds.isFinite,
+              measuredVerifySeconds.count >= 2
+        else { return false }
+        for width in 1 ..< measuredVerifySeconds.count {
+            let sample = measuredVerifySeconds[width]
+            guard sample > 0, sample.isFinite else { return false }
+        }
+        return true
+    }
+
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -575,28 +687,59 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+        // The streak ladder exists because the shipped constant rule cannot
+        // see what a wide round costs: it prices only head steps, so on a box
+        // where rows are NOT free it would over-draft, and the ladder held it
+        // back. A measured curve prices rows directly, so the ladder is
+        // redundant against it and only suppresses widths the measurement has
+        // already judged. When calibration is unavailable the shipped ladder
+        // runs unchanged, which keeps the fallback byte-identical to the tree
+        // this is built on.
+        let widthCap = calibrationUsable
             ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
+            : (fullAcceptStreak >= Self.segmentedStreakGate
+                ? Self.segmentedVerifyDepthCap
+                : Self.sdpaWidthWallDepthCap)
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+
+        // MEASURED-CURVE FORM. Both forms maximise the same quantity,
+        // expected committed tokens per second. The shipped constant rule is
+        // that maximisation under the assumption that round cost is
+        // 1 + depth * h, i.e. that an extra verify ROW is free and only the
+        // head step is paid; its greedy break is the exact algebraic solution
+        // of that linear model. When the warm produced a real curve there is
+        // no need to assume the model at all: evaluate the objective directly
+        // against the widths this box actually measured. On a machine whose
+        // verify is flat in width this picks deep rounds, on one whose rows
+        // cost real time it stops early, and neither outcome is hardcoded.
         var reach = 1.0
         var expected = 0.0
+        if calibrationUsable, cap + 1 < measuredVerifySeconds.count {
+            var bestDepth = 0
+            // depth 0 commits the primary alone out of a one-row verify.
+            var bestRate = 1.0 / measuredVerifySeconds[1]
+            for depth in 1 ... cap {
+                reach *= temperedAcceptance(atPosition: depth - 1)
+                expected += reach
+                let cost = measuredVerifySeconds[depth + 1]
+                    + Double(depth) * measuredHeadStepSeconds
+                guard cost > 0 else { break }
+                let rate = (1.0 + expected) / cost
+                if rate > bestRate {
+                    bestRate = rate
+                    bestDepth = depth
+                }
+            }
+            return bestDepth
+        }
+
+        let h = Self.headStepCostRatio
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
-            }
+            let p = temperedAcceptance(atPosition: depth)
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
@@ -604,6 +747,23 @@ public final class Qwen36MTPBlockSession {
             depth += 1
         }
         return depth
+    }
+
+    /// The per-position acceptance estimate the depth rule consumes: the
+    /// running EMA, tempered at the two leading positions by the pending
+    /// row's own top-2 margin. Unchanged in value from the shipped inline
+    /// form; factored out so both the measured and the constant rule read
+    /// the identical number.
+    private func temperedAcceptance(atPosition position: Int) -> Double {
+        var p = positionAcceptEMA[position]
+        guard let tail = pendingTop2, tail.1.count >= 2 else { return p }
+        let margin = tail.1[0] - tail.1[1]
+        if position == 0 {
+            p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 2.0)))
+        } else if position == 1 {
+            p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 3.0)))
+        }
+        return p
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
