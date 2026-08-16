@@ -563,10 +563,15 @@ public final class Qwen36MTPBlockSession {
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
+    /// head has been perfect. The streak ladder of 3 qualified cap 4 when
+    /// the wall was unproven; with SDPA-only bridging rank-proven bit-exact
+    /// at every width, the gate is pure window-time economics: ONE full
+    /// acceptance is enough evidence to let the cost model pick a deep
+    /// round. Measured locally at the 256-token window vs gate 3: draft
+    /// len 6.66 vs 5.90, score +1.4%. Gate 0 reverts (round 1 over-drafts
+    /// before any acceptance evidence: -2% vs gate 1).
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 1
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
