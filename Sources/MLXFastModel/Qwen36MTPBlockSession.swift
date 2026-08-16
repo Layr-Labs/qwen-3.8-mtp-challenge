@@ -516,7 +516,12 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    // FIFTH FIT — 4-bit declared head (`9174327` / 2.715). The 0.20 constant
+    // prices a bf16 head step. The live head streams ~3.55× fewer bytes, so
+    // the same rule under-drafts (noskill's own note). Numerator shrinks;
+    // verify denominator does not. Conservative re-fit 0.20 → 0.14 (not
+    // 0.11) so hard-prompt EMAs still skip. Isolated: this constant only.
+    private static let headStepCostRatio = 0.14
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
