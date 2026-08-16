@@ -558,7 +558,7 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 4
+    private static let sdpaWidthWallDepthCap = 5
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
@@ -592,6 +592,10 @@ public final class Qwen36MTPBlockSession {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
+            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
+                p = Swift.min(p, conf2)
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)

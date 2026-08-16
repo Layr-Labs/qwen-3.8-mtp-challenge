@@ -1229,7 +1229,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
-        if x.dim(-2) <= 9, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
             return downProj(qwen35CompiledFusedSwiGLU(y))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -1633,7 +1633,7 @@ final class Qwen35Attention: Module {
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
-           L <= 16,
+           L <= 32,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
@@ -1874,7 +1874,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
                 if prefillLadder {
-                    if i == 0 || i % 4 == 3 {
+                    if i == 0 || i % 3 == 2 {
                         asyncEval(hiddenStates)
                     }
                 } else {
