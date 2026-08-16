@@ -1802,10 +1802,13 @@ template <typename T, int group_size, int bits, bool batched>
         tid);
   }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
-    if (out_vec_size >= 4096) {
+    if (out_vec_size >= 2048) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
-      // below 4096 outputs the reduced x-group count thins the grid, so the
-      // promoted pair kernel is kept there byte-for-byte.
+      // the promoted note gated this at 4096 on a thinning concern. The gate
+      // is lowered to 2048 so the attention K|V pack (N = 2*1024) also takes
+      // the 3-4-row-sharing kernels: same crossrow arithmetic (bit-exact
+      // with the pair kernel and the M=1 reference); whether the thinned
+      // grid wins or loses is M5 behavior the local host cannot resolve.
       switch (ntg.x) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
