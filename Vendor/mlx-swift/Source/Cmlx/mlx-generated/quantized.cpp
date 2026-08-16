@@ -1851,7 +1851,10 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4>(
+          // 3+3+2, not 4+4: two simultaneous vec<float,4> accumulators
+          // spill on this generation (M=8 inverted vs M=9 in the same
+          // family). IPG=3 keeps NA<=4 and avoids a one-row tail.
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
