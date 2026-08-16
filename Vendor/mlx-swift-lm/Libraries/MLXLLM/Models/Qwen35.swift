@@ -1912,61 +1912,84 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     inputNames: ["logits"],
     outputNames: ["token_id"],
     source: """
-        uint lane = thread_position_in_threadgroup.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
         float best_value = 0.0f;
         uint  best_id    = 0;
         bool  have       = false;
 
-        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
+        for (uint index = thread_id; index < REAL_COUNT; index += TG_SIZE) {
             float value = float(logits[index]);
-            bool value_nan = isnan(value);
-            bool take;
-            if (!have) {
-                take = true;
-            } else if (value_nan != isnan(best_value)) {
-                take = !value_nan;
-            } else if (value > best_value) {
-                take = true;
-            } else if (value < best_value) {
-                take = false;
-            } else {
-                take = index < best_id;
-            }
+            bool take = !have || qwen_draft_better(
+                value, index, best_value, best_id);
             if (take) { best_value = value; best_id = index; have = true; }
         }
 
-        threadgroup float scratch_value[TG_SIZE];
-        threadgroup uint  scratch_id[TG_SIZE];
-        scratch_value[lane] = have ? best_value : NAN;
-        scratch_id[lane]    = have ? best_id : 0xFFFFFFFFu;
+        if (!have) {
+            best_value = NAN;
+            best_id = 0xFFFFFFFFu;
+        }
+
+        // First level: each 32-thread SIMD group reduces its private winners
+        // with shuffle operations, without touching threadgroup memory.
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_value = simd_shuffle_down(best_value, offset);
+            uint other_id = simd_shuffle_down(best_id, offset);
+            if (simd_lane < offset && qwen_draft_better(
+                    other_value, other_id, best_value, best_id)) {
+                best_value = other_value;
+                best_id = other_id;
+            }
+        }
+
+        // Second level: publish only 32 SIMD winners, synchronize once, and
+        // let the first SIMD group reduce them with the identical total order.
+        threadgroup float scratch_value[TG_SIZE / 32];
+        threadgroup uint  scratch_id[TG_SIZE / 32];
+        if (simd_lane == 0) {
+            scratch_value[simd_group] = best_value;
+            scratch_id[simd_group] = best_id;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                float a = scratch_value[lane];
-                float b = scratch_value[lane + stride];
-                uint  ai = scratch_id[lane];
-                uint  bi = scratch_id[lane + stride];
-                bool a_empty = (ai == 0xFFFFFFFFu);
-                bool b_empty = (bi == 0xFFFFFFFFu);
-                bool take_b;
-                if (b_empty)      { take_b = false; }
-                else if (a_empty) { take_b = true; }
-                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
-                else if (b > a)   { take_b = true; }
-                else if (b < a)   { take_b = false; }
-                else              { take_b = bi < ai; }
-                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
+        if (simd_group == 0) {
+            best_value = scratch_value[simd_lane];
+            best_id = scratch_id[simd_lane];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (simd_lane < offset && qwen_draft_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (lane == 0) {
-            uint id = scratch_id[0];
-            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
+            if (simd_lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
         }
     """,
-    header: "",
+    header: """
+        inline bool qwen_draft_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
     ensureRowContiguous: false
 )
 
