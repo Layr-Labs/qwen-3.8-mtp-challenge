@@ -99,6 +99,14 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
+    /// Compiled single-row head draft step bound to a promotable head cache
+    /// (steps 2..d of the draft loop). Returns nil when unavailable; the
+    /// eager `mtpHeadHiddenForward` path is the fail-closed fallback.
+    /// Proposal side only.
+    func compiledHeadDraftStep(
+        cache: [any KVCache]
+    ) -> (@Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray))?
+
     /// INVARIANT #2. The backbone's final `model.norm`, applied to a hidden row.
     /// The MTP head's `pre_fc_norm_hidden` weights were trained on POST-norm
     /// input -- the vendored `MTPCapable.mtpForward` documentation says so

@@ -383,6 +383,26 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
                 qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
           }
         }
+        // Width-2 extension: when T < NKeep the new conv state's LEADING
+        // rows come from the OLD conv state, not qkv. The copy above
+        // covers state rows [NKeep - T, NKeep); this gathers the prefix
+        // [0, NKeep - T) from conv_state so the state output is complete
+        // at every verify width >= 2. Verbatim copy — no arithmetic — so
+        // exactness is unaffected.
+        if (T < NKeep && row == 0) {
+          #pragma clang loop unroll(full)
+          for (uint j = 0; j < NKeep - T; ++j) {
+            const uint state_base = j * C + channel_base + lane * 4;
+            const ulong src_base = ulong(T + j) * ulong(conv_state_strides[1])
+                + ulong(channel_base + lane * 4)
+                    * ulong(conv_state_strides[2]);
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; ++i) {
+              conv_out[state_base + i] = conv_state[
+                  src_base + ulong(i) * ulong(conv_state_strides[2])];
+            }
+          }
+        }
         """
     return MLXFast.metalKernel(
         name: "qwen35_packed_gdn_prework",
@@ -490,6 +510,148 @@ private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
     return MLXFast.metalKernel(
         name: "qwen35_gated_delta_step_mid",
         inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out", "state_mid"],
+        source: source
+    )
+}()
+
+// Width-2 mid kernel with IN-KERNEL q/k RMS norms: replicates
+// `rms_single_row`'s exact arithmetic (per-lane 4-value sum-of-squares over
+// the 32 dk lanes -> simd_sum butterfly -> precise::rsqrt(acc/Dk + eps) ->
+// per-element T rounding), then applies the invScale multiplies with the
+// same two-rounding order as the host sequence (norm-round to T, then
+// scale-multiply rounding in float over the T-rounded value). Eliminates the
+// two separate rmsNorm launches + two scalar multiplies per GDN layer per
+// verify round (96 launches/round at width 2). The scale factors arrive as
+// the exact host-built MLXArrays so their bf16 bits are identical.
+private let qwen35GatedDeltaMidFusedNormKernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // RAW conv-split q, k: [B, T, Hk, Dk] (pre-norm, pre-scale)
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            // Host scale factors, already rounded to InT bits.
+            const float q_scale = static_cast<float>(q_scale_in);
+            const float k_scale = static_cast<float>(k_scale_in);
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              // In-kernel exact RMS norms over this row's Dk values,
+              // replicating rms_single_row: each lane owns its n_per_t
+              // contiguous values, sums squares in order, one simd_sum,
+              // precise rsqrt(acc/Dk + eps). Computed redundantly per
+              // simdgroup (each dv row's 32 dk lanes) — deterministic, so
+              // all simdgroups derive identical bits.
+              float q_acc = 0.0f;
+              float k_acc = 0.0f;
+              float q_raw[n_per_t];
+              float k_raw[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                float qf = static_cast<float>(q_[s_idx]);
+                float kf = static_cast<float>(k_[s_idx]);
+                q_raw[i] = qf;
+                k_raw[i] = kf;
+                q_acc += qf * qf;
+                k_acc += kf * kf;
+              }
+              q_acc = simd_sum(q_acc);
+              k_acc = simd_sum(k_acc);
+              const float q_inv_mean =
+                  metal::precise::rsqrt(q_acc / Dk + eps_in);
+              const float k_inv_mean =
+                  metal::precise::rsqrt(k_acc / Dk + eps_in);
+              InT q_n[n_per_t];
+              InT k_n[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                // First rounding: norm output stored as T, exactly like
+                // rms_single_row's static_cast<T>(x[i] * inv_mean).
+                q_n[i] = static_cast<InT>(q_raw[i] * q_inv_mean);
+                k_n[i] = static_cast<InT>(k_raw[i] * k_inv_mean);
+              }
+
+              if (true) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] * g_[hv_idx];
+                  kv_mem += state[i]
+                      * static_cast<float>(k_n[i]) * k_scale;
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  // Second rounding: the host's elementwise scalar multiply
+                  // computes float(T_norm) * float(T_scale) and rounds to T;
+                  // then the recurrence reads it back as float. Replicate
+                  // both roundings exactly.
+                  InT q_s = static_cast<InT>(
+                      static_cast<float>(q_n[i]) * q_scale);
+                  InT k_s = static_cast<InT>(
+                      static_cast<float>(k_n[i]) * k_scale);
+                  state[i] = state[i] + static_cast<float>(k_s) * delta;
+                  out += state[i] * static_cast<float>(q_s);
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[dv_idx] = static_cast<InT>(out);
+                }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
+              }
+              if (t < T - 1) {
+                auto m_state = state_mid
+                    + (((b_idx * (T - 1) + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  m_state[s_idx] = static_cast<StT>(state[i]);
+                }
+              }
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gated_delta_step_mid_fused_norm",
+        inputNames: [
+            "q", "k", "v", "g", "beta", "state_in", "T", "q_scale_in",
+            "k_scale_in", "eps_in",
+        ],
         outputNames: ["y", "state_out", "state_mid"],
         source: source
     )
@@ -989,44 +1151,150 @@ final class Qwen35GatedDeltaNet: Module {
         } else if nConfirmed == 1 && S == 2 && mask == nil,
            let midKernel = qwen35GatedDeltaMidKernel
         {
-            // Width-2 MTP verify, single-launch form. The old split path ran
-            // EVERY satellite op twice (conv, silu, split, reshapes, q/k norms,
-            // sigmoid, g) and paid two recurrence launches with a full fp32
-            // state round-trip between them, solely to observe the
-            // post-primary state. Here the prework runs once over both rows —
-            // all of it position-local, so per-row bit-identical to the split
-            // form — and the cloned kernel emits the timestep-0 state as a
-            // third output, so the rollback checkpoint is free.
+            // Width-2 MTP verify. Preferred form: the packed GDN-prework
+            // kernel (promoted at widths 3-9) now also covers width 2 — its
+            // new conv-state output is completed at T < NKeep by a verbatim
+            // prefix gather from the old conv state — collapsing conv1d,
+            // SiLU, split, Q/K norm-and-scale, and the g producer into ONE
+            // launch beside the single mid-state recurrence launch. The
+            // fused-norm mid kernel stays as the fail-closed fallback for
+            // any geometry the packed gate rejects (its in-kernel norms are
+            // bit-exact, see that kernel's header).
             let convInput = concatenated([convState, qkv], axis: 1)
             let nKeep = convKernelSize - 1
-            let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
+            // Same byte-receipt envelope as the width 3-9 mixer gate; only
+            // the S lower bound differs (the kernel's state-prefix gather
+            // makes T = 2 safe).
+            let packedHit = MLXHardwareInfo.isCompiledDecodeSupported
+                && B == 1 && S <= 9 && nKeep == 3
+                && numKHeads == 16 && numVHeads == 48
+                && headKDim == 128 && headVDim == 128
+                && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+                && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+                && a.dtype == .bfloat16 && b.dtype == .bfloat16
 
-            let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+            let qNormedPacked: MLXArray?
+            let kNormedPacked: MLXArray?
+            let vPacked: MLXArray?
+            let newConvStatePacked: MLXArray?
+            let gPacked: MLXArray?
+            let betaPacked: MLXArray?
+            if packedHit {
+                let invScale = pow(Float(headKDim), -0.5)
+                let outs = qwen35PackedGDNPreworkKernel(
+                    [qkv, a, convState, conv1d.weight, aLog, dtBias,
+                     MLXArray(pow(invScale, 2)).asType(.bfloat16),
+                     MLXArray(invScale).asType(.bfloat16)],
+                    template: [
+                        ("Hk", numKHeads), ("Dk", headKDim),
+                        ("Hv", numVHeads), ("Dv", headVDim),
+                        ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                    ],
+                    grid: (32, S, 2 * numKHeads + numVHeads),
+                    threadGroup: (32, 1, 1),
+                    outputShapes: [
+                        [B, S, numKHeads, headKDim],
+                        [B, S, numKHeads, headKDim],
+                        [B, S, numVHeads, headVDim],
+                        [B, nKeep, qkv.dim(2)],
+                        [B, S, numVHeads],
+                    ],
+                    outputDTypes: [
+                        .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                    ]
+                )
+                qNormedPacked = outs[0]
+                kNormedPacked = outs[1]
+                vPacked = outs[2]
+                newConvStatePacked = outs[3]
+                gPacked = outs[4]
+                // The beta half stays host-side, exactly as the promoted
+                // width 3-9 packed path computes it (the exhaustive bf16
+                // sigmoid sweep: in-kernel sigmoid diverges 1 ulp on one
+                // input, so the recurrence must see the lazy-graph bytes).
+                betaPacked = sigmoid(b).asType(.float32)
+            } else {
+                qNormedPacked = nil
+                kNormedPacked = nil
+                vPacked = nil
+                newConvStatePacked = nil
+                gPacked = nil
+                betaPacked = nil
+            }
 
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let dtype: DType
+            let g: MLXArray
+            let beta: MLXArray
+            let qIn: MLXArray
+            let kIn: MLXArray
+            let v: MLXArray
+            let newConvState: MLXArray
+            let fusedNormFallback =
+                !packedHit && qwen35GatedDeltaMidFusedNormKernel != nil
+            if let qn = qNormedPacked, let kn = kNormedPacked,
+               let vv = vPacked, let ncs = newConvStatePacked,
+               let gg = gPacked, let bb = betaPacked
+            {
+                dtype = qn.dtype
+                g = gg
+                beta = bb
+                qIn = qn
+                kIn = kn
+                v = vv
+                newConvState = ncs
+            } else {
+                let convOut = silu(conv1d(convInput))
+                let convSplit = MLX.split(
+                    convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+                let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+                v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+                dtype = q.dtype
+                if fusedNormFallback {
+                    // Raw q/k: the fallback kernel norms them in-registers
+                    // with rms_single_row's exact arithmetic.
+                    qIn = q
+                    kIn = k
+                } else {
+                    let invScale = pow(Float(headKDim), -0.5)
+                    qIn = MLXArray(pow(invScale, 2)).asType(dtype)
+                        * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                    kIn = MLXArray(invScale).asType(dtype)
+                        * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                }
+                newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+                let gBeta = qwen35CompiledGatedDeltaGBeta(
+                    a, b, negExpALog, dtBias)
+                g = gBeta.0
+                beta = gBeta.1
+            }
 
-            // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
-            // serving the gate's input-independent factor from the layer memo.
-            let (g, beta) = qwen35CompiledGatedDeltaGBeta(
-                a, b, negExpALog, dtBias)
             var state = ssmState
                 ?? MLXArray.zeros(
                     [B, numVHeads, headVDim, headKDim], dtype: .float32)
             if state.dtype != .float32 { state = state.asType(.float32) }
 
-            let outputs = midKernel(
-                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
+            // Recurrence: the plain mid kernel when q/k arrive already
+            // normed (packed prework or the host-norm stock chain), the
+            // fused-norm variant when they arrive raw (fail-closed chain).
+            let kernelInputs: [MLXArray]
+            if packedHit || !fusedNormFallback {
+                kernelInputs = [qIn, kIn, v, g, beta, state, MLXArray(S)]
+            } else {
+                let invScale = pow(Float(headKDim), -0.5)
+                kernelInputs = [
+                    qIn, kIn, v, g, beta, state, MLXArray(S),
+                    MLXArray(pow(invScale, 2)).asType(dtype),
+                    MLXArray(invScale).asType(dtype),
+                    MLXArray(Float(1e-6)),
+                ]
+            }
+            let recurrenceKernel: MLXFast.MLXFastKernel =
+                (packedHit || !fusedNormFallback)
+                ? midKernel
+                : qwen35GatedDeltaMidFusedNormKernel!
+            let outputs = recurrenceKernel(
+                kernelInputs,
                 template: [
                     ("InT", dtype),
                     ("StT", DType.float32),
@@ -1912,84 +2180,61 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     inputNames: ["logits"],
     outputNames: ["token_id"],
     source: """
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_lane = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_position_in_threadgroup.x;
         float best_value = 0.0f;
         uint  best_id    = 0;
         bool  have       = false;
 
-        for (uint index = thread_id; index < REAL_COUNT; index += TG_SIZE) {
+        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
             float value = float(logits[index]);
-            bool take = !have || qwen_draft_better(
-                value, index, best_value, best_id);
+            bool value_nan = isnan(value);
+            bool take;
+            if (!have) {
+                take = true;
+            } else if (value_nan != isnan(best_value)) {
+                take = !value_nan;
+            } else if (value > best_value) {
+                take = true;
+            } else if (value < best_value) {
+                take = false;
+            } else {
+                take = index < best_id;
+            }
             if (take) { best_value = value; best_id = index; have = true; }
         }
 
-        if (!have) {
-            best_value = NAN;
-            best_id = 0xFFFFFFFFu;
-        }
-
-        // First level: each 32-thread SIMD group reduces its private winners
-        // with shuffle operations, without touching threadgroup memory.
-        for (uint offset = 16; offset > 0; offset >>= 1) {
-            float other_value = simd_shuffle_down(best_value, offset);
-            uint other_id = simd_shuffle_down(best_id, offset);
-            if (simd_lane < offset && qwen_draft_better(
-                    other_value, other_id, best_value, best_id)) {
-                best_value = other_value;
-                best_id = other_id;
-            }
-        }
-
-        // Second level: publish only 32 SIMD winners, synchronize once, and
-        // let the first SIMD group reduce them with the identical total order.
-        threadgroup float scratch_value[TG_SIZE / 32];
-        threadgroup uint  scratch_id[TG_SIZE / 32];
-        if (simd_lane == 0) {
-            scratch_value[simd_group] = best_value;
-            scratch_id[simd_group] = best_id;
-        }
+        threadgroup float scratch_value[TG_SIZE];
+        threadgroup uint  scratch_id[TG_SIZE];
+        scratch_value[lane] = have ? best_value : NAN;
+        scratch_id[lane]    = have ? best_id : 0xFFFFFFFFu;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (simd_group == 0) {
-            best_value = scratch_value[simd_lane];
-            best_id = scratch_id[simd_lane];
-            for (uint offset = 16; offset > 0; offset >>= 1) {
-                float other_value = simd_shuffle_down(best_value, offset);
-                uint other_id = simd_shuffle_down(best_id, offset);
-                if (simd_lane < offset && qwen_draft_better(
-                        other_value, other_id, best_value, best_id)) {
-                    best_value = other_value;
-                    best_id = other_id;
-                }
+        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                float a = scratch_value[lane];
+                float b = scratch_value[lane + stride];
+                uint  ai = scratch_id[lane];
+                uint  bi = scratch_id[lane + stride];
+                bool a_empty = (ai == 0xFFFFFFFFu);
+                bool b_empty = (bi == 0xFFFFFFFFu);
+                bool take_b;
+                if (b_empty)      { take_b = false; }
+                else if (a_empty) { take_b = true; }
+                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
+                else if (b > a)   { take_b = true; }
+                else if (b < a)   { take_b = false; }
+                else              { take_b = bi < ai; }
+                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
             }
-            if (simd_lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint id = scratch_id[0];
+            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
         }
     """,
-    header: """
-        inline bool qwen_draft_better(
-            float candidate_value,
-            uint candidate_id,
-            float current_value,
-            uint current_id
-        ) {
-            if (candidate_id == 0xFFFFFFFFu) { return false; }
-            if (current_id == 0xFFFFFFFFu) { return true; }
-            bool candidate_nan = isnan(candidate_value);
-            bool current_nan = isnan(current_value);
-            if (candidate_nan != current_nan) { return !candidate_nan; }
-            if (candidate_value > current_value) { return true; }
-            if (candidate_value < current_value) { return false; }
-            return candidate_id < current_id;
-        }
-    """,
+    header: "",
     ensureRowContiguous: false
 )
 
@@ -2251,6 +2496,53 @@ extension Qwen35TextModel: MTPCapable {
         mtpForwardWithHidden(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache).0
     }
 
+    /// Compiled single-row head draft step for the committed-history head
+    /// cache. The draft loop's steps 2..d rebuild a ~25-op graph per step on
+    /// the host — measured host-build-bound (per-step asyncEval is neutral
+    /// in both the eager and packed-prework regimes: the one-layer head's
+    /// GPU work drains faster than the host can build the next step). This
+    /// closure traces that graph ONCE through MLX `compile`, with the head
+    /// cache promoted to `CompilableKVCache` so the KV update and RoPE
+    /// offsets flow as arrays under the trace.
+    ///
+    /// Proposal-side only: the verify path is untouched, the emitted chain
+    /// cannot change, and acceptance rate is the numeric canary. Returns
+    /// nil unless the cache layer is promotable and compiled decode is on.
+    public func compiledHeadDraftStep(
+        cache: [any KVCache]
+    ) -> (@Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray))? {
+        guard let mtp,
+              MLXHardwareInfo.isCompiledDecodeSupported,
+              cache.count == 1,
+              let compilable = cache[0] as? CompilableKVCache
+        else { return nil }
+        let embed = model.embedTokens
+        let layerCache: [any KVCache] = [compilable]
+        // shapeless: false, matching CompiledDecode.compileForward — the
+        // step's shapes are constant ([1,1,H] hidden, [1,1] tokens, fixed
+        // maxLength KV buffers); the cache's offsetArray carries the only
+        // dynamic quantity as a traced array. The attention body's dim()-derived
+        // reshape/split bounds need concrete shapes to trace.
+        let step = compile(
+            inputs: [compilable], outputs: [compilable]
+        ) { (args: [MLXArray]) -> [MLXArray] in
+            // args: [hidden [1,1,H], nextTokenIds [1,1]]
+            let headHidden = mtp(
+                hidden: args[0], nextTokenIds: args[1],
+                embedTokens: embed, cache: layerCache)
+            // Constant L=1 bounds: dim()-derived bounds are symbolic under
+            // shapeless tracing and Slice cannot infer its output shape.
+            // This closure only ever serves single-row draft steps.
+            let lastRow = headHidden[0..., 0 ..< 1, 0...]
+            let id = self.draftTokenID(lastRow)
+            return [lastRow, id]
+        }
+        return { hidden, tokens in
+            let out = step([hidden, tokens])
+            return (out[0], out[1])
+        }
+    }
+
     /// MTP head module forward WITHOUT the lm_head projection.
     ///
     /// Appends the fused `(hidden, nextToken)` positions to `cache` and returns
@@ -2484,6 +2776,13 @@ extension Qwen35Model: MTPCapable {
     ) -> Bool {
         languageModel.replayRecurrentPrefix(
             cache: cache, committedRows: committedRows)
+    }
+
+    /// See `Qwen35TextModel.compiledHeadDraftStep`.
+    public func compiledHeadDraftStep(
+        cache: [any KVCache]
+    ) -> (@Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray))? {
+        languageModel.compiledHeadDraftStep(cache: cache)
     }
 
     public func mtpForward(
