@@ -565,8 +565,15 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
+    ///
+    /// Gate 2, not 3: the published median is the mean of the 4th and 5th
+    /// ordered prompts. The last sealed 4th-order prompt sat at mean draft
+    /// 4.27 — exactly on the cap-4 / cap-8 boundary — so a third consecutive
+    /// full accept was an extra round of leaving accepted tokens on the
+    /// table. Two consecutive full accepts is still a real hot streak
+    /// (cold prompts reset on the first reject and never see width 6–9).
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
