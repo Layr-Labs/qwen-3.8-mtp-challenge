@@ -527,6 +527,23 @@ public final class Qwen36MTPBlockSession {
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.18
+    /// ENGINE AXIS (2026-08-16): optional hard ceiling on the adaptive depth,
+    /// env-tunable for A/B (MLX_QWEN_MTP_MAX_DRAFT). SHIPPED DEFAULT 7: the
+    /// verify width stays <= 8 (d + 1), the widest regime proven bit-exact by
+    /// the hexfloat row gate (widths 6..8) and the narrowest that keeps the
+    /// multi-stream crossrow dispatch at two weight passes. Width 9 (d = 8)
+    /// re-reads the weights a third time AND was never bit-exact-verified, so
+    /// the cap is both the speed and the safety default. The retiled
+    /// single-stream kernels made the cap moot, but they are gated OFF in the
+    /// shipped tree (local regression on the M5 verify path).
+    private static let envMaxDraft: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_MAX_DRAFT"] ?? ""
+        let parsed = Int(raw)
+        if let parsed, parsed >= 1, parsed <= Qwen36MTPLimits.maxDepth {
+            return parsed
+        }
+        return 7
+    }()
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -570,17 +587,22 @@ public final class Qwen36MTPBlockSession {
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
-        // The width wall binds the SINGLE-CALL verify; a qualifying
-        // full-accept streak opens the segmented cap (the round then feeds
-        // the target <= 5-row segments, never a wider launch). Any reject
-        // resets the streak, so a cold or struggling prompt never sees a
-        // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
+        // ENGINE AXIS (2026-08-16, v3): the streak gate is REMOVED. The
+        // sdpa exactness chunk inside `attentionWithCacheUpdate` splits
+        // 6..9-row attention into <= 5-row byte-identical calls
+        // unconditionally (hexfloat receipts: widths 6..8 bit-exact vs the
+        // serial trajectory), so the width wall no longer binds the
+        // single-call verify; the cap below is the ledger-legal ceiling
+        // (envMaxDraft, shipped 7) only. The old streak gate (cap 4 until 3
+        // consecutive full accepts) was a pre-segmentation economic
+        // throttle; the EMA cost model + first-position confidence
+        // tempering now do that job, and the throttle cost ~37% of rounds
+        // being forced to d=4 on a 0.95-accept prompt (measured 18/48
+        // rounds at d=4 with mean draft 5.56 vs ~6.4 cap-adjacent).
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
-            widthCap)
+            Self.segmentedVerifyDepthCap,
+            Self.envMaxDraft)
         guard cap > 0 else { return 0 }
         let h = Self.headStepCostRatio
         var reach = 1.0
@@ -603,7 +625,7 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
-        return depth
+        return Swift.min(depth, Self.envMaxDraft)
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
