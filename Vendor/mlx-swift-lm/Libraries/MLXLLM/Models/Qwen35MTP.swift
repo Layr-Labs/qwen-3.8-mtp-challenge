@@ -59,6 +59,12 @@ final class Qwen35MTPDecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
+
+    /// Populate this layer's K/V history without computing a dead layer
+    /// output. Only valid when no later MTP layer consumes that output.
+    func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
+        selfAttn.appendHistoryKV(inputLayerNorm(x), cache: cache)
+    }
 }
 
 // MARK: - MTPModule
@@ -123,6 +129,35 @@ final class Qwen35MTPModule: Module {
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
+    }
+
+    /// Run one proposal flush while omitting leading-row outputs that have no
+    /// consumer. Every supplied row still participates in the fusion stage and
+    /// contributes K/V state; only the final row needs a full decoder output.
+    /// Multi-layer heads fail closed before mutating cache state.
+    func lastHiddenWithKVOnlyHistory(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> MLXArray? {
+        guard layers.count == 1, cache.count == 1,
+              hidden.dim(1) > 1,
+              nextTokenIds.dim(1) == hidden.dim(1)
+        else { return nil }
+
+        let embeds = embedTokens(nextTokenIds)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
+        let fused = fc(concatenated([e, h], axis: -1))
+        let historyCount = fused.dim(1) - 1
+
+        layers[0].appendHistoryKV(
+            fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
+
+        let current = fused[0..., historyCount..., 0...]
+        let mask = createAttentionMask(h: current, cache: cache[0])
+        return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
 
 }
