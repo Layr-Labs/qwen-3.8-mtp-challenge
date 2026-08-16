@@ -560,13 +560,35 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 4
 
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
-    /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
-    /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
+    /// Depth cap for segmented deep rounds. 8 is the trusted per-round
+    /// maximum; rows_per_round = depth + 1 stays ledger-legal.
+    ///
+    /// The streak gate below is how many consecutive fully-accepted rounds a
+    /// prompt must post before the wider cap is offered at all. It is a second
+    /// limiter stacked on the marginal rule, which already prices acceptance
+    /// through `positionAcceptEMA`: after a reject that position's EMA falls,
+    /// the product-of-EMAs reach drops, and the rule shortens the round on its
+    /// own. A streak requirement on top of that charges a reject twice -- once
+    /// through the EMA it earned, and again by holding the cap at 4 for the
+    /// next several rounds while the EMAs still support going deeper.
+    ///
+    /// 2 keeps a second confirmation before the wider cap opens -- which is
+    /// what the gate is for, since the frontier position's EMA is carried by
+    /// the optimism transfer below rather than by an observation, so opening
+    /// on a single accept would let one round both widen the cap and plant
+    /// that belief a position deeper -- while still halving the streak tax on
+    /// a prompt that accepts most rounds but not consecutively. The wide-cap
+    /// residency of a stream with full-accept probability p goes as p^gate, so
+    /// at the p ~ 0.70-0.87 this pool runs, 3 -> 2 recovers a little under
+    /// half of what removing the gate entirely would, and removing it entirely
+    /// is not available: deep rounds pay only about 1.9% on the shallowest
+    /// qualifying prompt, which is the one that sets the published median.
+    ///
+    /// Widths 6...9 are reached under either setting and are bit-exact through
+    /// the split sdpa path, so this changes how often those widths run, never
+    /// which shapes are legal.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
