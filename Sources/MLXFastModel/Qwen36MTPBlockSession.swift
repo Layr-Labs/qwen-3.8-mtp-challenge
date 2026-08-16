@@ -596,6 +596,16 @@ public final class Qwen36MTPBlockSession {
                 let margin = tail.1[0] - tail.1[1]
                 let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
                 p = Swift.min(p, conf2)
+            } else if depth == 2, let tail = pendingTop2, tail.1.count >= 2 {
+                // Continuation of the confidence ladder (margin/2.0 at depth
+                // 0, /3.0 at depth 1): a wider divisor at depth 2 prices the
+                // declining marginal confidence of the third draft row the
+                // same way audreyt's depth-1 gate prices the second. The
+                // gate only suppresses; a confident top-2 margin leaves the
+                // EMA estimate untouched.
+                let margin = tail.1[0] - tail.1[1]
+                let conf3 = 1.0 / (1.0 + exp(-margin / 4.0))
+                p = Swift.min(p, conf3)
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
