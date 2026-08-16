@@ -198,6 +198,15 @@ public final class Qwen36MTPBlockSession {
             guard let self else { return Swift.min(offeredDepth, 1) }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
+        // Local measurement override: pins the schedule to a constant depth
+        // for calibration runs. Inert unless the environment sets it; the
+        // shipped schedule stays the cost model above.
+        if let forcedRaw = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_FORCED_DEPTH"],
+            let forced = Int(forcedRaw), forced >= 0
+        {
+            draftPolicy = { offeredDepth, _ in Swift.min(forced, offeredDepth) }
+        }
     }
 
     // MARK: - warm
@@ -460,11 +469,37 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
+    /// One-round GPU capture target (see `generateRound`). MLX_ prefix so the
+    /// worker-env sanitizer forwards both.
+    private static let captureRoundPath =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_CAPTURE_PATH"]
+    private static let captureRoundIndex = Int(
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_CAPTURE_ROUND"] ?? "5") ?? 5
+    /// TMPDIR tee for the trace: the local `mtp-timed` verb spawns its worker
+    /// without stderr forwarding, so stderr-only trace lines vanish. TMPDIR
+    /// stays writable inside the worker sandbox; a fixed filename keeps the
+    /// retrieval path predictable across runs.
+    private static let traceFileHandle: FileHandle? = {
+        guard traceRounds else { return nil }
+        let env = ProcessInfo.processInfo.environment
+        let path = env["MLX_QWEN_MTP_TRACE_PATH"]
+            ?? ((env["TMPDIR"] ?? "/tmp") as NSString)
+                .appendingPathComponent("mtp-trace.log")
+        FileManager.default.createFile(atPath: path, contents: nil)
+        let handle = FileHandle(forWritingAtPath: path)
+        // Self-reporting header: proves the tee opened, from which process,
+        // and where — so a missing trace is diagnosable from the file system
+        // alone (worker stderr is discarded on the local mtp-timed verb).
+        handle?.write(Data(
+            "mtp-trace: open pid=\(getpid()) path=\(path)\n".utf8))
+        return handle
+    }()
+
     private static func traceWrite(_ line: String) {
-        // stderr: the worker sandbox denies file-write*, and the parent's
-        // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
-        // `forwardsWorkerStderr` on the local mtp-timed verb.
-        FileHandle.standardError.write(Data(line.utf8))
+        let data = Data(line.utf8)
+        FileHandle.standardError.write(data)
+        traceFileHandle?.write(data)
     }
 
     /// Exact-value row dump for the LOCAL width-wall gate: hexfloat (`%a`)
@@ -528,6 +563,15 @@ public final class Qwen36MTPBlockSession {
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.20
 
+    /// Per-step marginal cost of the k-th draft (1-based k = index + 1), in
+    /// units of one verify forward; generalizes the flat `headStepCostRatio`
+    /// in the greedy rule below. Empirically fitted from timed constant-depth
+    /// runs on this stack; the flat value is kept as the fallback for any
+    /// position past the table.
+    private static let stepCostRatios: [Double] = [
+        0.09, 0.09, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20,
+    ]
+
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -582,15 +626,24 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        // Greedy marginal rule with the measured per-step cost curve
+        // (`stepCostRatios`): with T(d) = V·(1 + Σ_{i<=d} h_i) the
+        // f(k+1) > f(k) rearrangement becomes
+        //   reach_{k+1} > h_{k+1} · (1 + S_k) / (1 + Σ_{i<=k} h_i)
+        // which reduces to the shipped flat-h threshold when every h_i = h.
         var reach = 1.0
         var expected = 0.0
+        var cumulativeCost = 0.0
         var depth = 0
         while depth < cap {
             reach *= positionAcceptEMA[depth]
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            let stepCost = depth < Self.stepCostRatios.count
+                ? Self.stepCostRatios[depth]
+                : Self.headStepCostRatio
+            let threshold = stepCost * (1.0 + expected) / (1.0 + cumulativeCost)
             guard reach > threshold else { break }
             expected += reach
+            cumulativeCost += stepCost
             depth += 1
         }
         return depth
@@ -668,6 +721,20 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
+        // Local-only GPU capture of exactly one round (MLX_QWEN_MTP_CAPTURE_PATH
+        // + MTL_CAPTURE_ENABLED=1): produces an Xcode-readable .gputrace naming
+        // every kernel this round dispatches. Requires the local sandbox
+        // profile's capture-dir write allowance. Never on in a ranked run.
+        if let capturePath = Self.captureRoundPath, roundCount == Self.captureRoundIndex {
+            MLX.GPU.startCapture(url: URL(fileURLWithPath: capturePath))
+        }
+        defer {
+            if let capturePath = Self.captureRoundPath,
+               roundCount == Self.captureRoundIndex
+            {
+                MLX.GPU.stopCapture(url: URL(fileURLWithPath: capturePath))
+            }
+        }
         // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
         // split a round into head-chain graph build, verify graph build, and
         // the single blocking eval's GPU wall. Never on in a ranked run.
