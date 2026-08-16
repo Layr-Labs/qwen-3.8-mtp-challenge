@@ -232,6 +232,126 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Fuse the learned 128-wide RMSNorm with the precise fp32 Swish gate/product.
+///
+/// The reduction and normalized writeback mirror `rms_single_row` at the Qwen
+/// GDN width (`RMS_N_READS == 4`, one 32-lane SIMD group). The normalized value
+/// is rounded to bf16 before the fp32 gate product, preserving the frontier's
+/// materialized-RMS boundary exactly.
+private let qwen35FusedGatedRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_gated_rms_norm_bf16_v1",
+    inputNames: ["x", "gate", "weight", "epsilon"],
+    outputNames: ["y"],
+    source: """
+        uint row = threadgroup_position_in_grid.x;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane_id = thread_index_in_simdgroup;
+        uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        uint sequence_length = uint(x_shape[1]);
+        uint value_heads = uint(x_shape[2]);
+        uint batch = row / (sequence_length * value_heads);
+        uint sequence_head = row % (sequence_length * value_heads);
+        uint sequence = sequence_head / value_heads;
+        uint head = sequence_head % value_heads;
+        ulong x_base = ulong(batch) * ulong(x_strides[0])
+            + ulong(sequence) * ulong(x_strides[1])
+            + ulong(head) * ulong(x_strides[2]);
+        ulong gate_base = ulong(batch) * ulong(gate_strides[0])
+            + ulong(sequence) * ulong(gate_strides[1])
+            + ulong(head) * ulong(gate_strides[2]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[32];
+
+        uint first = lid * N_READS;
+        float acc = 0.0f;
+        for (int i = 0; i < N_READS; ++i) {
+            uint element = first + uint(i);
+            ulong x_index = x_base + ulong(element) * ulong(x_strides[3]);
+            float xi = float(x[x_index]);
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+
+        if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+            if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / D + epsilon);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = 0; i < N_READS; ++i) {
+            uint element = first + uint(i);
+            ulong x_index = x_base + ulong(element) * ulong(x_strides[3]);
+            ulong gate_index = gate_base
+                + ulong(element) * ulong(gate_strides[3]);
+            ulong weight_index = ulong(element) * ulong(weight_strides[0]);
+            InT rms = weight[weight_index]
+                * static_cast<InT>(float(x[x_index]) * local_inv_mean[0]);
+            float g = float(gate[gate_index]);
+            float sigmoid_magnitude = 1 / (1 + metal::exp(metal::abs(g)));
+            float sigmoid_value = g < 0 ? sigmoid_magnitude : 1 - sigmoid_magnitude;
+            float activated = g * sigmoid_value;
+            y[ulong(row) * ulong(D) + ulong(element)] =
+                static_cast<InT>(activated * float(rms));
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Fail closed unless all inputs match the complete Qwen GDN bf16 domain.
+private func qwen35FusedGatedRMSNorm(
+    _ x: MLXArray,
+    gate: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> MLXArray? {
+    let dimension = 128
+    let readsPerLane = 4
+    guard
+        x.dtype == .bfloat16,
+        gate.dtype == .bfloat16,
+        weight.dtype == .bfloat16,
+        x.shape == gate.shape,
+        x.ndim == 4,
+        x.dim(-1) == dimension,
+        x.dim(2) > 0,
+        x.dim(0) > 0,
+        x.dim(1) > 0,
+        weight.ndim == 1,
+        weight.dim(0) == dimension,
+        x.size % dimension == 0
+    else {
+        return nil
+    }
+
+    let rows = x.size / dimension
+    return qwen35FusedGatedRMSNormKernel(
+        [x, gate, weight, eps],
+        template: [
+            ("InT", DType.bfloat16),
+            ("D", dimension),
+            ("N_READS", readsPerLane),
+        ],
+        grid: (rows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -898,7 +1018,11 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if nConfirmed == 1 && S >= 2 {
+        if let fused = qwen35FusedGatedRMSNorm(
+            out, gate: z, weight: norm.weight, eps: norm.eps)
+        {
+            normedOut = fused
+        } else if nConfirmed == 1 && S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
