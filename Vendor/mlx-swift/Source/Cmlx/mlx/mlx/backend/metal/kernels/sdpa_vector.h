@@ -57,6 +57,121 @@ template <typename T, int D, int V = D>
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
+  // KV-native grouped schedule for the multi-query verify shape. The stock
+  // schedule below runs one threadgroup per (query head, query row), so at
+  // GQA 6 the same K/V rows are streamed six times per query row. This
+  // branch instead activates two threadgroups per KV head, each serving
+  // three query heads against a single shared K/V stream; every query
+  // head's arithmetic is unchanged — same key visit order (simd_gid stride
+  // BN), same per-lane dot accumulation and simd_sum tree, same online
+  // max/exp update sequence, same output transpose/reduction through the
+  // same threadgroup planes, same final division and store — the only
+  // semantic difference is fewer repeated device loads of identical K/V
+  // bytes. The host grid is untouched: threadgroups beyond the first
+  // third return before touching any memory. Eligibility is confined to
+  // the rank-relevant shape (D == V == 256, GQA exactly 6, no tensor
+  // mask, no sinks, multi-row query) and everything else falls through
+  // to the stock path unchanged.
+  if (D == 256 && V == 256 && !has_mask && !has_sinks && gqa_factor == 6 &&
+      tpg.y >= 2 && (int(tpg.x) % 6) == 0) {
+    constexpr int GH = 3;
+    const int group_idx = int(tid.x);
+    if (group_idx * GH >= int(tpg.x)) {
+      return;
+    }
+    const int kv_batch_head_idx = group_idx / 2;
+    const int first_q_head = kv_batch_head_idx * 6 + (group_idx % 2) * GH;
+    const int q_seq = int(tid.y);
+
+    thread U qg[GH][qk_per_thread];
+    thread U og[GH][v_per_thread];
+    thread U kk[qk_per_thread];
+    thread U vv[v_per_thread];
+    U group_max[GH];
+    U group_sum[GH];
+
+    const device T* kp = keys + kv_batch_head_idx * k_head_stride +
+        simd_gid * k_seq_stride + simd_lid * qk_per_thread;
+    const device T* vp = values + kv_batch_head_idx * v_head_stride +
+        simd_gid * v_seq_stride + simd_lid * v_per_thread;
+
+    for (int h = 0; h < GH; h++) {
+      const int q_bh = first_q_head + h;
+      const int o_off = q_bh * int(tpg.y) + q_seq;
+      const int q_off = query_transposed ? int(tpg.x) * q_seq + q_bh : o_off;
+      const device T* qp = queries + q_off * D + simd_lid * qk_per_thread;
+      for (int i = 0; i < qk_per_thread; i++) {
+        qg[h][i] = static_cast<U>(scale) * qp[i];
+      }
+      for (int i = 0; i < v_per_thread; i++) {
+        og[h][i] = 0;
+      }
+      group_max[h] = Limits<U>::finite_min;
+      group_sum[h] = 0;
+    }
+
+    for (int i = simd_gid; i < N; i += BN) {
+      bool use_key = true;
+      if (do_causal) {
+        use_key = i <= (N - int(tpg.y) + q_seq);
+      }
+      if (use_key) {
+        for (int j = 0; j < qk_per_thread; j++) {
+          kk[j] = kp[j];
+        }
+        for (int j = 0; j < v_per_thread; j++) {
+          vv[j] = vp[j];
+        }
+        for (int h = 0; h < GH; h++) {
+          U score = 0;
+          for (int j = 0; j < qk_per_thread; j++) {
+            score += qg[h][j] * kk[j];
+          }
+          score = simd_sum(score);
+          U new_max = max(group_max[h], score);
+          U factor = fast::exp(group_max[h] - new_max);
+          U exp_score = fast::exp(score - new_max);
+          group_max[h] = new_max;
+          group_sum[h] = group_sum[h] * factor + exp_score;
+          for (int j = 0; j < v_per_thread; j++) {
+            og[h][j] = og[h][j] * factor + exp_score * vv[j];
+          }
+        }
+      }
+      kp += inner_k_stride;
+      vp += inner_v_stride;
+    }
+
+    for (int h = 0; h < GH; h++) {
+      if (simd_lid == 0) {
+        max_scores[simd_gid] = group_max[h];
+        sum_exp_scores[simd_gid] = group_sum[h];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      U ms = max_scores[simd_lid];
+      U head_max = simd_max(ms);
+      U factor = fast::exp(ms - head_max);
+      U se = simd_sum(sum_exp_scores[simd_lid] * factor);
+      const int q_bh = first_q_head + h;
+      const int o_off = q_bh * int(tpg.y) + q_seq;
+      device T* op = out + o_off * V + simd_gid * v_per_thread;
+      for (int i = 0; i < v_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = og[h][i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        og[h][i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+        og[h][i] = se == 0 ? og[h][i] : (og[h][i] / se);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      if (simd_lid == 0) {
+        for (int i = 0; i < v_per_thread; i++) {
+          op[i] = static_cast<T>(og[h][i]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return;
+  }
+
   // Adjust positions
   const int q_batch_head_idx = tid.x;
   const int q_seq_idx = tid.y;
