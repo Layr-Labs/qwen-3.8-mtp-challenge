@@ -1117,7 +1117,15 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if nConfirmed == 1 && S >= 2 {
+        if S >= 2 {
+            // The compiled gate product is the promoted verify-width path and
+            // is bit-exact against the eager module chain (elementwise math,
+            // width-agnostic — the ranked exact-value replay passes it mixed
+            // with the eager serial path). Extending it to prefill and every
+            // other width replaces the eager six-op chain (rms + fp32 cast +
+            // silu + fp32 cast + mul + bf16 cast, each a launch and a
+            // materialized intermediate) with rms + one fused dispatch on the
+            // 48 gated-delta layers.
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
