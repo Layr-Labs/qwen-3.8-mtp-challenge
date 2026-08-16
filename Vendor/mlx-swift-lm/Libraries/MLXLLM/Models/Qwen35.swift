@@ -1117,7 +1117,19 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if nConfirmed == 1 && S >= 2 {
+        // S >= 2 at EVERY width, prefill included — the `nConfirmed == 1`
+        // conjunct is gone. The compiled body is not new code: it is the
+        // already-promoted verify-width path, and the ranked exact-value replay
+        // has been passing it MIXED with the eager chain inside single
+        // trajectories (serial anchor eager, verify rounds compiled) since it
+        // landed. Its math is elementwise and the closure is `shapeless`, so
+        // applying it at S = 512 changes which rows it processes, not how any
+        // element is computed. At the scored 512-token seed that removes four
+        // launches and three materialised fp32/bf16 intermediates per GDN
+        // layer, across 48 gated-delta layers.
+        // S == 1 (the serial step) deliberately keeps the eager chain.
+        // Receipt: submission 28194351, 2.91377 / ecae5f0e, 2.91017.
+        if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {

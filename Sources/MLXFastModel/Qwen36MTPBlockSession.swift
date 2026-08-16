@@ -566,7 +566,15 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    /// 2, not 3. Gate 3 -> 2 has its own ranked receipt (submission f03469a9,
+    /// 2.91995 against the 2.90421 frontier) and was PROMOTED; it was then
+    /// reverted by the accept commit of the 6-way composite that followed,
+    /// whose archive carried gate 3. The gate is evidence-conditioned — any
+    /// reject resets `fullAcceptStreak` to 0 — so it can only fire on stretches
+    /// where the head has already proved perfect, which is why the tail-prompt
+    /// risk that killed the `h` axis is structurally out of scope here.
+    /// Gate 1 is measured DEAD (-7.1%); gate 0 only tied (2.9200).
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -931,7 +939,18 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        // Cache roots are deliberately NOT eval roots on the speculative path.
+        // The verify forward already evaluates the primitives that produce
+        // them, so listing ~130 recurrent/KV state arrays here only makes the
+        // host walk every GDN conv/ssm slot and every attention cache before it
+        // can `.item()` the drafts — always-on host work, never extra GPU math.
+        // The cache and tape objects keep their lazy state for rollback and
+        // repair, and the next round's first consumer forces anything still
+        // outstanding. The SERIAL control (the scoring denominator) and the
+        // rare repair path keep `cache.state` in their eval roots on purpose:
+        // the denominator must not be given a matching gift.
+        // Receipt: submission 3a7f09f4, 2.91177 / 3880df57, 2.90630.
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }

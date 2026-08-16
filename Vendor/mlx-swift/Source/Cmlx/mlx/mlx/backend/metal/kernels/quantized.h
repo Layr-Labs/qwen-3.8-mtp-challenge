@@ -1838,7 +1838,16 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4>(
+          // 3+3+2, not 4+4. M = 8 is the only hot width whose even split needs
+          // two simultaneous vec<float,4> accumulators in every active worker;
+          // the neighbouring M = 9 uses three-lane vectors and profiles CHEAPER
+          // despite doing more work (319 / 437 / 216 ms for M = 7 / 8 / 9 in the
+          // public cross-row study), which is a register cliff, not work scaling.
+          // Exact: the lanes of these vectors carry INDEPENDENT input rows and
+          // are never reduced across, so moving a row from lane 3 of a four-wide
+          // vector to lane 0 of a two-wide one cannot reorder its scalar chain.
+          // Receipt: submission 85d5bca3, 2.91143.
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
