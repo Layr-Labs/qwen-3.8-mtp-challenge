@@ -232,168 +232,30 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Fuse SiLU activation and elementwise product in SwiGLU: `silu(g) * u`.
+private let qwen35CompiledSwiGLU:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { g, u in
+        silu(g) * u
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
 
-// MARK: - packed GDN prework mixer (verify widths 3...9)
-//
-// ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
-// split + Q/K rmsNorm-and-scale + the compiled-g producer — for S in 3...9 on
-// the one-wide-call path. Five outputs: normed/scaled Q and K, activated V,
-// the next 3-row conv state, and fp32 `g`. DESIGN NOTE, load-bearing: `beta`
-// is DELIBERATELY NOT a kernel output. An exhaustive sweep of all 65,280
-// finite bf16 inputs found the in-kernel sigmoid diverges from MLX's by 1 ulp
-// on exactly one input (0xC0DB = -6.84375); silu and softplus are bit-exact
-// everywhere. beta feeds the VERIFY recurrence where fidelity is absolute, so
-// it stays a plain graph `sigmoid(b)` — one [1,S,48] elementwise launch,
-// ~0.06 ms of the ~0.7 ms saving, in exchange for removing an unquantifiable
-// knife-edge. The remaining five outputs measured bit-exact at S=3..9 over
-// 5 seeds x 4 compile modes (12,983,040 element comparisons, zero mismatches)
-// on the vendored MLX version, with a +1-row conv-window negative control
-// failing exactly the three outputs that read the window. S=2 breaks the
-// conv-state copy (a state row would come from the OLD conv state, which the
-// copy loop does not read), hence the hard S >= 3 gate. The fused in-proj
-// carrier's live row stride (16480, not 10240) is consumed via the provided
-// stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
-// would silently insert a full-carrier copy and give back the launch saving.
-private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
-    let header = """
-        typedef bfloat16_t InT;
-
-        inline InT qwen35_prework_sigmoid(InT x) {
-          auto y = 1 / (1 + metal::exp(metal::abs(x)));
-          return (x < 0) ? y : 1 - y;
-        }
-
-        inline InT qwen35_prework_logaddexp(InT x, InT y) {
-          if (metal::isnan(x) || metal::isnan(y)) {
-            return metal::numeric_limits<InT>::quiet_NaN();
-          }
-          constexpr InT inf = metal::numeric_limits<InT>::infinity();
-          InT maxval = metal::max(x, y);
-          InT minval = metal::min(x, y);
-          return (minval == -inf || maxval == inf)
-              ? maxval
-              : (maxval + log1p(metal::exp(minval - maxval)));
-        }
-        """
-    let source = """
-        const uint lane = thread_position_in_threadgroup.x;
-        const uint row = threadgroup_position_in_grid.y;
-        const uint logical_head = threadgroup_position_in_grid.z;
-
-        constexpr uint q_heads = Hk;
-        constexpr uint k_head_base = Hk;
-        constexpr uint v_head_base = 2 * Hk;
-        const bool is_q = logical_head < q_heads;
-        const bool is_k = logical_head >= k_head_base
-                       && logical_head < v_head_base;
-        const uint head = is_q ? logical_head
-                         : (is_k ? logical_head - k_head_base
-                                 : logical_head - v_head_base);
-        const uint channel_base = is_q ? head * Dk
-                                  : (is_k ? Hk * Dk + head * Dk
-                                          : 2 * Hk * Dk + head * Dv);
-
-        InT activated[4];
-        float sumsq = 0.0f;
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < 4; ++i) {
-          const uint channel = channel_base + lane * 4 + i;
-          float acc = 0.0f;
-          #pragma clang loop unroll(full)
-          for (uint tap = 0; tap < 4; ++tap) {
-            const uint input_row = row + tap;
-            const ulong input_offset = input_row < NKeep
-                ? ulong(input_row) * ulong(conv_state_strides[1])
-                    + ulong(channel) * ulong(conv_state_strides[2])
-                : ulong(input_row - NKeep) * ulong(qkv_strides[1])
-                    + ulong(channel) * ulong(qkv_strides[2]);
-            const InT xv = input_row < NKeep
-                ? conv_state[input_offset]
-                : qkv[input_offset];
-            const ulong weight_offset =
-                ulong(channel) * ulong(conv_weight_strides[0])
-                + ulong(tap) * ulong(conv_weight_strides[1]);
-            acc += static_cast<float>(xv) * conv_weight[weight_offset];
-          }
-          const InT conv = static_cast<InT>(acc);
-          const InT act = conv * qwen35_prework_sigmoid(conv);
-          activated[i] = act;
-          const float value = static_cast<float>(act);
-          sumsq += value * value;
-        }
-
-        if (is_q || is_k) {
-          threadgroup float local_inv_mean[1];
-          threadgroup float local_sums[32];
-          sumsq = simd_sum(sumsq);
-          local_sums[lane] = 0.0f;
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (lane == 0) {
-            local_sums[0] = sumsq;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          sumsq = simd_sum(local_sums[lane]);
-          if (lane == 0) {
-            local_inv_mean[0] = metal::precise::rsqrt(sumsq / Dk + 1e-6f);
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-
-          const InT scale = is_q ? q_scale : k_scale;
-          const uint output_base = (row * Hk + head) * Dk + lane * 4;
-          #pragma clang loop unroll(full)
-          for (uint i = 0; i < 4; ++i) {
-            const InT rms = InT(1) * static_cast<InT>(
-                static_cast<float>(activated[i]) * local_inv_mean[0]);
-            const InT value = scale * rms;
-            if (is_q) {
-              q_out[output_base + i] = value;
-            } else {
-              k_out[output_base + i] = value;
-            }
-          }
-        } else {
-          const uint output_base = (row * Hv + head) * Dv + lane * 4;
-          #pragma clang loop unroll(full)
-          for (uint i = 0; i < 4; ++i) {
-            v_out[output_base + i] = activated[i];
-          }
-
-          if (lane == 0) {
-            const ulong a_offset = ulong(row) * ulong(a_strides[1])
-                + ulong(head) * ulong(a_strides[2]);
-            const InT shifted = a[a_offset] + dt_bias[head];
-            const InT softplus = qwen35_prework_logaddexp(shifted, InT(0));
-            const float exp_a = metal::precise::exp(
-                static_cast<float>(a_log[head]));
-            const float neg_exp_a = -exp_a;
-            const float product = neg_exp_a * static_cast<float>(softplus);
-            const uint scalar_output = row * Hv + head;
-            g_out[scalar_output] = metal::precise::exp(product);
-          }
-        }
-
-        if (row + NKeep >= uint(T)) {
-          const uint state_row = row + NKeep - T;
-          const ulong raw_base = ulong(row) * ulong(qkv_strides[1])
-              + ulong(channel_base + lane * 4) * ulong(qkv_strides[2]);
-          const uint state_base = state_row * C + channel_base + lane * 4;
-          #pragma clang loop unroll(full)
-          for (uint i = 0; i < 4; ++i) {
-            conv_out[state_base + i] =
-                qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
-          }
-        }
-        """
-    return MLXFast.metalKernel(
-        name: "qwen35_packed_gdn_prework",
-        inputNames: [
-            "qkv", "a", "conv_state", "conv_weight", "a_log",
-            "dt_bias", "q_scale", "k_scale",
-        ],
-        outputNames: ["q_out", "k_out", "v_out", "conv_out", "g_out"],
-        source: source,
-        header: header,
-        ensureRowContiguous: false)
+/// Fuse Sigmoid gate and product in Attention output: `x * sigmoid(gate)`.
+private let qwen35CompiledSigmoidMultiply:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
+        x * sigmoid(gate)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
 }()
 
 // MARK: - GatedDelta kernel with mid-state checkpoint
@@ -757,84 +619,29 @@ final class Qwen35GatedDeltaNet: Module {
         let S = qkv.dim(1)
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
-        // Packed-prework mixer gate: fail closed onto the stock chain for any
-        // shape, geometry, or dtype outside the byte-receipt envelope. The
-        // S >= 3 lower bound is hard (the kernel's conv-state copy reads only
-        // qkv rows, which is wrong at S < nKeep); above 9 no verify exists.
-        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
-            && B == 1 && S >= 3 && S <= 9 && nKeep == 3
-            && numKHeads == 16 && numVHeads == 48
-            && headKDim == 128 && headVDim == 128
-            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
-            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
-            && a.dtype == .bfloat16 && b.dtype == .bfloat16
-        let qNormed: MLXArray
-        let kNormed: MLXArray
-        let v: MLXArray
-        let g: MLXArray
-        let beta: MLXArray
-        let newConvState: MLXArray
-        if mixerHit {
-            let invScale = pow(Float(headKDim), -0.5)
-            let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, convState, conv1d.weight, aLog, dtBias,
-                 MLXArray(pow(invScale, 2)).asType(.bfloat16),
-                 MLXArray(invScale).asType(.bfloat16)],
-                template: [
-                    ("Hk", numKHeads), ("Dk", headKDim),
-                    ("Hv", numVHeads), ("Dv", headVDim),
-                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
-                ],
-                grid: (32, S, 2 * numKHeads + numVHeads),
-                threadGroup: (32, 1, 1),
-                outputShapes: [
-                    [B, S, numKHeads, headKDim],
-                    [B, S, numKHeads, headKDim],
-                    [B, S, numVHeads, headVDim],
-                    [B, nKeep, qkv.dim(2)],
-                    [B, S, numVHeads],
-                ],
-                outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
-                ]
-            )
-            qNormed = outs[0]
-            kNormed = outs[1]
-            v = outs[2]
-            newConvState = outs[3]
-            g = outs[4]
-            // beta stays a plain graph op BY DESIGN — see the kernel's
-            // header comment. Same expression as the compiled producer's
-            // beta half, so the recurrence sees identical bytes.
-            beta = sigmoid(b).asType(.float32)
-        } else {
-            newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-            let convOut = silu(conv1d(convInput))
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
 
-            let convSplit = MLX.split(
-                convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-            v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+        let convSplit = MLX.split(
+            convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            // Keep the recurrence and conv prologue wide. The promoted
-            // compiled g/beta launch reduction feeds the same single
-            // recurrence, while the SDPA helper alone bridges the
-            // width-sensitive kernel boundary.
-            let gBeta = qwen35CompiledGatedDeltaGBeta(
-                a, b, negExpALog, dtBias)
-            g = gBeta.0
-            beta = gBeta.1
-        }
+        // Keep the recurrence and conv prologue wide. The promoted compiled
+        // g/beta launch reduction feeds the same single recurrence, while the
+        // SDPA helper alone bridges the width-sensitive kernel boundary.
+        let (g, beta) = qwen35CompiledGatedDeltaGBeta(
+            a, b, negExpALog, dtBias)
         let recurrence: (MLXArray, MLXArray)
         if MLXHardwareInfo.isCompiledDecodeSupported {
             recurrence = qwen35GatedDeltaPrepared(
@@ -1147,30 +954,6 @@ final class Qwen35GatedDeltaNet: Module {
 /// byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
 /// side carries no exactness constraint at all.
-///
-/// Fuse the SiLU gate and product after the fused gate-up GEMM into one
-/// Metal pass: `silu(y[..., :half]) * y[..., half...]` reads each output
-/// element once and writes the activation once, replacing the two-kernel
-/// slice+silu+mul path (one silu launch, one multiply launch, one
-/// intermediate materialization) with a single launch. The arithmetic is
-/// elementwise and unchanged — silu first, then multiply, same rounding —
-/// so the values are bit-identical to the two-kernel path; only the
-/// intermediate buffer disappears. Shapeless compilation shares one trace
-/// across verify widths (the fused GEMM's N is constant, so the half-split
-/// offsets are width-invariant).
-private let qwen35CompiledFusedSwiGLU:
-    @Sendable (MLXArray) -> MLXArray =
-{
-    let body: @Sendable (MLXArray) -> MLXArray = { y in
-        let half = y.dim(-1) / 2
-        return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
-    }
-    if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
-    }
-    return body
-}()
-
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1191,14 +974,16 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
+    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            return quantizedMM(
+            let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let w = _fbfW {
-            return matmul(x, w.T)
+            let y = matmul(x, w.T)
+            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let g = gateProj as? QuantizedLinear,
            let u = upProj as? QuantizedLinear,
@@ -1225,188 +1010,12 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // The fused path is only taken when the gate/up split is provably
-        // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
-        // to the exact two-projection expression, preserving the original
-        // slicing semantics in every case.
-        if x.dim(-2) <= 9, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
+            return downProj(qwen35CompiledSwiGLU(g, u))
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
+        return downProj(qwen35CompiledSwiGLU(gateProj(x), upProj(x)))
     }
 
-}
-
-// MARK: - Full-attention Q/K preparation
-
-/// Prepare BF16 Q and K rows with the same RMSNorm and partial-RoPE arithmetic
-/// as the stock primitives, but read the projection views directly and write
-/// their final head-major layout in one dispatch.  Sequence and batch extents
-/// are entirely input-derived; the caller gates only on the frozen Qwen model
-/// semantics that determine the numerical contract.
-private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
-    name: "qwen35_attention_qk_rms_rope_bf16_v1",
-    inputNames: ["q", "k", "q_weight", "k_weight", "eps", "offset", "log2_base"],
-    outputNames: ["q_out", "k_out"],
-    source: """
-        constexpr uint n_reads = 4;
-        constexpr uint simd_size = 32;
-        constexpr uint rotary_dimensions = 64;
-        constexpr uint rotary_pairs = rotary_dimensions / 2;
-
-        uint row = threadgroup_position_in_grid.x;
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_thread = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-
-        uint batch_size = uint(q_shape[0]);
-        uint sequence_length = uint(q_shape[1]);
-        uint query_heads = uint(q_shape[2]);
-        uint key_heads = uint(k_shape[2]);
-        uint axis_size = uint(q_shape[3]);
-        uint query_rows = batch_size * query_heads * sequence_length;
-        bool is_query = row < query_rows;
-        uint local_row = is_query ? row : row - query_rows;
-        uint head_count = is_query ? query_heads : key_heads;
-        uint batch = local_row / (head_count * sequence_length);
-        uint head_sequence = local_row % (head_count * sequence_length);
-        uint head = head_sequence / sequence_length;
-        uint sequence = head_sequence % sequence_length;
-
-        ulong input_base;
-        ulong input_axis_stride;
-        ulong weight_stride;
-        ulong output_base = ulong(local_row) * ulong(axis_size);
-        if (is_query) {
-            input_base = ulong(batch) * ulong(q_strides[0])
-                + ulong(sequence) * ulong(q_strides[1])
-                + ulong(head) * ulong(q_strides[2]);
-            input_axis_stride = ulong(q_strides[3]);
-            weight_stride = ulong(q_weight_strides[0]);
-        } else {
-            input_base = ulong(batch) * ulong(k_strides[0])
-                + ulong(sequence) * ulong(k_strides[1])
-                + ulong(head) * ulong(k_strides[2]);
-            input_axis_stride = ulong(k_strides[3]);
-            weight_stride = ulong(k_weight_strides[0]);
-        }
-
-        threadgroup float local_inv_mean[1];
-        threadgroup float local_sums[simd_size];
-        threadgroup bfloat normalized[256];
-
-        float acc = 0.0f;
-        uint first = thread_id * n_reads;
-        for (uint i = 0; i < n_reads; ++i) {
-            uint element = first + i;
-            if (element < axis_size) {
-                ulong index = input_base + ulong(element) * input_axis_stride;
-                float value = is_query ? float(q[index]) : float(k[index]);
-                acc += value * value;
-            }
-        }
-
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_thread == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_thread]);
-            if (simd_thread == 0) {
-                local_inv_mean[0] = metal::precise::rsqrt(
-                    acc / axis_size + eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_mean = local_inv_mean[0];
-        for (uint i = 0; i < n_reads; ++i) {
-            uint element = first + i;
-            if (element < axis_size) {
-                ulong index = input_base + ulong(element) * input_axis_stride;
-                bfloat input_value = is_query ? q[index] : k[index];
-                bfloat rms_value = bfloat(float(input_value) * inv_mean);
-                bfloat weight = is_query
-                    ? q_weight[ulong(element) * weight_stride]
-                    : k_weight[ulong(element) * weight_stride];
-                normalized[element] = weight * rms_value;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // The stock RoPE primitive copies dimensions 64...255 unchanged before
-        // rotating nontraditional pairs (i, i + 32).  Here the final output is
-        // new storage, so only the pass-through tail needs an explicit copy.
-        for (uint i = 0; i < n_reads; ++i) {
-            uint element = first + i;
-            if (element >= rotary_dimensions && element < axis_size) {
-                if (is_query) {
-                    q_out[output_base + ulong(element)] = normalized[element];
-                } else {
-                    k_out[output_base + ulong(element)] = normalized[element];
-                }
-            }
-        }
-
-        if (thread_id < rotary_pairs / n_reads) {
-            for (uint i = 0; i < n_reads; ++i) {
-                uint pair = first + i;
-                float d = float(pair) / float(rotary_pairs);
-                float inv_freq = metal::exp2(-d * float(log2_base));
-                float position = float(int(sequence) + int(offset));
-                float theta = position * inv_freq;
-                float costheta = metal::fast::cos(theta);
-                float sintheta = metal::fast::sin(theta);
-                float x1 = float(normalized[pair]);
-                float x2 = float(normalized[pair + rotary_pairs]);
-                bfloat rx1 = bfloat(x1 * costheta - x2 * sintheta);
-                bfloat rx2 = bfloat(x1 * sintheta + x2 * costheta);
-                if (is_query) {
-                    q_out[output_base + ulong(pair)] = rx1;
-                    q_out[output_base + ulong(pair + rotary_pairs)] = rx2;
-                } else {
-                    k_out[output_base + ulong(pair)] = rx1;
-                    k_out[output_base + ulong(pair + rotary_pairs)] = rx2;
-                }
-            }
-        }
-    """,
-    ensureRowContiguous: false
-)
-
-/// Internal for exact Metal parity tests. Inputs are `[B,L,H,D]`; outputs are
-/// row-contiguous `[B,H,L,D]` tensors ready for the unchanged attention/cache
-/// path.
-func qwen35AttentionQKRMSRoPE(
-    queries: MLXArray,
-    keys: MLXArray,
-    qWeight: MLXArray,
-    kWeight: MLXArray,
-    eps: Float,
-    offset: Int,
-    log2Base: Float
-) -> (queries: MLXArray, keys: MLXArray) {
-    let B = queries.dim(0)
-    let L = queries.dim(1)
-    let queryHeads = queries.dim(2)
-    let keyHeads = keys.dim(2)
-    let D = queries.dim(3)
-    let totalRows = B * L * (queryHeads + keyHeads)
-    let outputs = qwen35AttentionQKRMSRoPEKernel(
-        [queries, keys, qWeight, kWeight, eps, offset, log2Base],
-        grid: (totalRows * 64, 1, 1),
-        threadGroup: (64, 1, 1),
-        outputShapes: [[B, queryHeads, L, D], [B, keyHeads, L, D]],
-        outputDTypes: [.bfloat16, .bfloat16]
-    )
-    return (outputs[0], outputs[1])
 }
 
 // MARK: - Attention
@@ -1415,9 +1024,6 @@ final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
     let scale: Float
-    let headDim: Int
-    let usesFusedQKPreparation: Bool
-    let ropeLog2Base: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -1463,26 +1069,6 @@ final class Qwen35Attention: Module {
         self.attentionHeads = args.attentionHeads
         self.kvHeads = args.kvHeads
         self.scale = pow(Float(headDim), -0.5)
-        self.headDim = headDim
-
-        let ropeType: String = {
-            if let config = args.ropeScaling,
-               let typeValue = config["type"] ?? config["rope_type"],
-               case .string(let value) = typeValue
-            {
-                return value
-            }
-            return "default"
-        }()
-        let ropeDims = Int(Float(headDim) * args.partialRotaryFactor)
-        self.usesFusedQKPreparation =
-            args.attentionHeads == 24
-            && args.kvHeads == 4
-            && headDim == 256
-            && ropeDims == 64
-            && args.ropeTheta == 10_000_000
-            && ropeType == "default"
-        self.ropeLog2Base = Foundation.log2(args.ropeTheta)
 
         _qProj.wrappedValue = Linear(
             args.hiddenSize, args.attentionHeads * headDim * 2, bias: args.attentionBias)
@@ -1496,6 +1082,7 @@ final class Qwen35Attention: Module {
         _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
+        let ropeDims = Int(Float(headDim) * args.partialRotaryFactor)
         self.rope = initializeRope(
             dims: max(1, ropeDims),
             base: args.ropeTheta,
@@ -1626,42 +1213,12 @@ final class Qwen35Attention: Module {
         var keys = keysIn
         var values = valuesIn
 
-        keys = keys.reshaped(B, L, kvHeads, -1)
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        let hasArrayOffset = cache is CompilableRotatingKVCache
-            || cache is CompilableKVCache
-            || cache is BatchPositionedKVCache
-        if usesFusedQKPreparation,
-           L <= 16,
-           !hasArrayOffset,
-           queries.dtype == .bfloat16,
-           keys.dtype == .bfloat16,
-           qNorm.weight.dtype == .bfloat16,
-           kNorm.weight.dtype == .bfloat16,
-           queries.shape == [B, L, attentionHeads, headDim],
-           keys.shape == [B, L, kvHeads, headDim],
-           qNorm.weight.shape == [headDim],
-           kNorm.weight.shape == [headDim],
-           qNorm.eps == kNorm.eps
-        {
-            let prepared = qwen35AttentionQKRMSRoPE(
-                queries: queries,
-                keys: keys,
-                qWeight: qNorm.weight,
-                kWeight: kNorm.weight,
-                eps: qNorm.eps,
-                offset: cache?.offset ?? 0,
-                log2Base: ropeLog2Base
-            )
-            queries = prepared.queries
-            keys = prepared.keys
-        } else {
-            queries = qNorm(queries).transposed(0, 2, 1, 3)
-            keys = kNorm(keys).transposed(0, 2, 1, 3)
-            queries = applyRotaryPosition(rope, to: queries, cache: cache)
-            keys = applyRotaryPosition(rope, to: keys, cache: cache)
-        }
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -1674,7 +1231,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
     }
 }
 
@@ -1862,8 +1419,7 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = inputs.dim(1) <= 9
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1873,17 +1429,11 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
-                if prefillLadder {
-                    if i == 0 || i % 4 == 3 {
-                        asyncEval(hiddenStates)
-                    }
-                } else {
-                    switch i {
-                    case 0, 1, 9, 19, 29, 39, 49, 57:
-                        asyncEval(hiddenStates)
-                    default:
-                        break
-                    }
+                switch i {
+                case 0, 1, 9, 19, 29, 39, 49, 57:
+                    asyncEval(hiddenStates)
+                default:
+                    break
                 }
             }
         }
@@ -1946,84 +1496,61 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     inputNames: ["logits"],
     outputNames: ["token_id"],
     source: """
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_lane = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_position_in_threadgroup.x;
         float best_value = 0.0f;
         uint  best_id    = 0;
         bool  have       = false;
 
-        for (uint index = thread_id; index < REAL_COUNT; index += TG_SIZE) {
+        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
             float value = float(logits[index]);
-            bool take = !have || qwen_draft_better(
-                value, index, best_value, best_id);
+            bool value_nan = isnan(value);
+            bool take;
+            if (!have) {
+                take = true;
+            } else if (value_nan != isnan(best_value)) {
+                take = !value_nan;
+            } else if (value > best_value) {
+                take = true;
+            } else if (value < best_value) {
+                take = false;
+            } else {
+                take = index < best_id;
+            }
             if (take) { best_value = value; best_id = index; have = true; }
         }
 
-        if (!have) {
-            best_value = NAN;
-            best_id = 0xFFFFFFFFu;
-        }
-
-        // First level: each 32-thread SIMD group reduces its private winners
-        // with shuffle operations, without touching threadgroup memory.
-        for (uint offset = 16; offset > 0; offset >>= 1) {
-            float other_value = simd_shuffle_down(best_value, offset);
-            uint other_id = simd_shuffle_down(best_id, offset);
-            if (simd_lane < offset && qwen_draft_better(
-                    other_value, other_id, best_value, best_id)) {
-                best_value = other_value;
-                best_id = other_id;
-            }
-        }
-
-        // Second level: publish only 32 SIMD winners, synchronize once, and
-        // let the first SIMD group reduce them with the identical total order.
-        threadgroup float scratch_value[TG_SIZE / 32];
-        threadgroup uint  scratch_id[TG_SIZE / 32];
-        if (simd_lane == 0) {
-            scratch_value[simd_group] = best_value;
-            scratch_id[simd_group] = best_id;
-        }
+        threadgroup float scratch_value[TG_SIZE];
+        threadgroup uint  scratch_id[TG_SIZE];
+        scratch_value[lane] = have ? best_value : NAN;
+        scratch_id[lane]    = have ? best_id : 0xFFFFFFFFu;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (simd_group == 0) {
-            best_value = scratch_value[simd_lane];
-            best_id = scratch_id[simd_lane];
-            for (uint offset = 16; offset > 0; offset >>= 1) {
-                float other_value = simd_shuffle_down(best_value, offset);
-                uint other_id = simd_shuffle_down(best_id, offset);
-                if (simd_lane < offset && qwen_draft_better(
-                        other_value, other_id, best_value, best_id)) {
-                    best_value = other_value;
-                    best_id = other_id;
-                }
+        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                float a = scratch_value[lane];
+                float b = scratch_value[lane + stride];
+                uint  ai = scratch_id[lane];
+                uint  bi = scratch_id[lane + stride];
+                bool a_empty = (ai == 0xFFFFFFFFu);
+                bool b_empty = (bi == 0xFFFFFFFFu);
+                bool take_b;
+                if (b_empty)      { take_b = false; }
+                else if (a_empty) { take_b = true; }
+                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
+                else if (b > a)   { take_b = true; }
+                else if (b < a)   { take_b = false; }
+                else              { take_b = bi < ai; }
+                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
             }
-            if (simd_lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint id = scratch_id[0];
+            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
         }
     """,
-    header: """
-        inline bool qwen_draft_better(
-            float candidate_value,
-            uint candidate_id,
-            float current_value,
-            uint current_id
-        ) {
-            if (candidate_id == 0xFFFFFFFFu) { return false; }
-            if (current_id == 0xFFFFFFFFu) { return true; }
-            bool candidate_nan = isnan(candidate_value);
-            bool current_nan = isnan(current_value);
-            if (candidate_nan != current_nan) { return !candidate_nan; }
-            if (candidate_value > current_value) { return true; }
-            if (candidate_value < current_value) { return false; }
-            return candidate_id < current_id;
-        }
-    """,
+    header: "",
     ensureRowContiguous: false
 )
 
