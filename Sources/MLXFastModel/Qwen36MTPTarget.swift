@@ -96,6 +96,9 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// instead of six. Proposal side only.
     func draftTokenID(_ x: MLXArray) -> MLXArray
 
+    /// `draftTokenID` plus the proposal's top1-top2 margin in one dispatch.
+    func draftTokenIDWithMargin(_ x: MLXArray) -> (MLXArray, MLXArray)
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 

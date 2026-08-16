@@ -273,9 +273,13 @@ public final class Qwen36MTPBlockSession {
         // LOST, because its warm evaluated compact logits while the live graph
         // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
         // the scored window. A new selection kernel resets that hazard exactly.
-        let primedDraftID = model.draftTokenID(
+        // Warm the EXACT expression the scored rounds dispatch — the
+        // margin-emitting selector — not the plain `draftTokenID`. The
+        // 7b33621 lesson bit this stack once at rank: a selection kernel
+        // left cold-JITs inside the first scored round of every prompt.
+        let (primedDraftID, primedDraftMargin) = model.draftTokenIDWithMargin(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
-        eval(primedDraftID)
+        eval(primedDraftID, primedDraftMargin)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -284,8 +288,9 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: foldHidden, nextTokenIds: foldTokens,
                 cache: historyWarmCache)
-        eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        let (foldedDraftID, foldedDraftMargin) = model.draftTokenIDWithMargin(
+            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...])
+        eval(foldedDraftID, foldedDraftMargin)
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -601,7 +606,9 @@ public final class Qwen36MTPBlockSession {
     /// AT the accepted count observed a failure only if the walk actually
     /// rejected there (not when it ended early on a committed stop token);
     /// deeper positions were never reached and observe nothing.
-    private func recordAcceptOutcome(acceptedCount: Int, drafts: [Int]) {
+    private func recordAcceptOutcome(
+        acceptedCount: Int, drafts: [Int], margins: [Double] = []
+    ) {
         let alpha = Self.acceptEMAAlpha
         for index in 0 ..< acceptedCount where index < positionAcceptEMA.count {
             positionAcceptEMA[index] += alpha * (1.0 - positionAcceptEMA[index])
@@ -611,8 +618,24 @@ public final class Qwen36MTPBlockSession {
         if acceptedCount < drafts.count, !stoppedEarly,
            acceptedCount < positionAcceptEMA.count
         {
+            // MARGIN-AWARE REJECT WEIGHT: the head's own confidence at the
+            // rejected proposal (top1 - top2 of the draft readout, free in
+            // the round's single eval) grades the evidence. A HIGH-margin
+            // miss — the head was sure and wrong — is strong evidence the
+            // prompt disagrees with the head at this depth: learn faster. A
+            // LOW-margin miss is a near-coin-toss the schedule should not
+            // over-fear: learn slower. Accepts keep the stock alpha.
+            var rejectAlpha = alpha
+            if acceptedCount < margins.count {
+                let m = margins[acceptedCount]
+                if m > Self.marginConfidentReject {
+                    rejectAlpha = alpha * 1.5
+                } else if m < Self.marginNoisyReject {
+                    rejectAlpha = alpha * 0.5
+                }
+            }
             positionAcceptEMA[acceptedCount] +=
-                alpha * (0.0 - positionAcceptEMA[acceptedCount])
+                rejectAlpha * (0.0 - positionAcceptEMA[acceptedCount])
         } else if acceptedCount == drafts.count, !drafts.isEmpty,
                   acceptedCount < positionAcceptEMA.count
         {
@@ -631,6 +654,12 @@ public final class Qwen36MTPBlockSession {
             }
         }
     }
+
+    /// Margin thresholds for the margin-aware reject weighting above, in
+    /// logit units of the head's own top1 - top2 draft readout. Calibrate
+    /// against the local `mtp-margin:` trace lines.
+    private static let marginConfidentReject = 3.0
+    private static let marginNoisyReject = 1.0
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -857,7 +886,16 @@ public final class Qwen36MTPBlockSession {
         // (Per-step asyncEval was tried here and measured NEUTRAL — the
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
         // idea.md V6 journal. Single submission after the loop, as before.)
+        // Draft ids come from the SAME hierarchical top-2 reducer the verify
+        // readout uses: its first id per row IS the row argmax under the
+        // ordering `argMax` uses (the promoted b71bb35 argument), so the
+        // proposals are bit-identical to the argMax form — and the second
+        // value is free CONFIDENCE evidence. The margin (top1 - top2) of
+        // each proposal rides the round's single eval and feeds the depth
+        // schedule's margin-aware EMA updates; no extra sync, no proposal
+        // change.
         var draftIdArrays: [MLXArray] = []
+        var draftMarginArrays: [MLXArray] = []
         var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
             hidden: draftInputHidden, nextTokenIds: draftInputTokens,
             cache: headCache)
@@ -866,8 +904,10 @@ public final class Qwen36MTPBlockSession {
                 cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
+        var (draftId, draftMargin) =
+            model.draftTokenIDWithMargin(draftHidden)
         draftIdArrays.append(draftId)
+        draftMarginArrays.append(draftMargin)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
         // before the rest of the chain is built, and unlike the per-step
         // variant (measured neutral — nothing but build time between steps)
@@ -879,8 +919,10 @@ public final class Qwen36MTPBlockSession {
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            (draftId, draftMargin) =
+                model.draftTokenIDWithMargin(draftHidden)
             draftIdArrays.append(draftId)
+            draftMarginArrays.append(draftMargin)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
@@ -921,10 +963,16 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
+        bundle.append(contentsOf: draftMarginArrays)
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        // Proposal confidence per draft: top1 - top2 of the head's own
+        // readout, materialised by the round's single eval above.
+        let draftMargins: [Double] = draftMarginArrays.map { a in
+            Double(a.item(Float.self))
+        }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
@@ -1038,7 +1086,17 @@ public final class Qwen36MTPBlockSession {
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
-        recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
+        recordAcceptOutcome(
+            acceptedCount: acceptedCount, drafts: drafts,
+            margins: draftMargins)
+        if Self.traceRounds {
+            for (i, m) in draftMargins.enumerated() {
+                Self.traceWrite(
+                    "mtp-margin: round=\(roundCount) pos=\(i) "
+                    + "margin=\(String(format: "%.3f", m)) "
+                    + "accepted=\(i < acceptedCount)\n")
+            }
+        }
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.

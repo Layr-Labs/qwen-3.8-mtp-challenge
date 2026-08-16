@@ -1,9 +1,13 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:lowskillcoding/qwen38-mtp-head-4bit-g64@0966ddaff972fd3ca2be08f3640603b47e9ce70a",
-  "sha256": "cc209e30d8a7def1fc4d785be22b0ec40e16ae6763f9591255a1996a34f08f0d",
-  "bytes": 238934093,
+  "source_url": "hf:p0ly31/qx-aux-a3@c8bf0731a7a6a67736dccacbec4a7f1f5c736d56",
+  "sha256": "7a6402b269201c9d4f41d92c1dfd37482a0a25f1a5adb3673ada0d85d777ad95",
+  "bytes": 396272017,
   "max_bytes": 2147483648,
-  "note": "4-bit/group-64 MLX-affine requantization of the pinned bf16 head; matches the backbone quantization geometry so the stock scales-keyed walk loads it with zero code changes. rev2 post-#56 (f2be121)."
+  "note": "4-bit/group-64 MLX-affine requantization of the pinned bf16 head; matches the backbone quantization geometry so the stock scales-keyed walk loads it with zero code changes. rev2 post-#56 (f2be121).",
+  "repository": "p0ly31/qx-aux-a3",
+  "revision": "c8bf0731a7a6a67736dccacbec4a7f1f5c736d56",
+  "tensor_count": 34,
+  "declared_head_note": "The current crown's head plus a cheaper DRAFT-ONLY readout. Contents: (1) the uniform affine-4 group-64 quantization of the organizer-pinned bf16 head (fc, MLP gate/up/down, attention q/k/v/o as weight/scales/biases triples, norms byte-identical bf16) \u2014 tensor-identical to the promoted 9174327 head, same deterministic mx.quantize recipe; plus (2) draft_lm_head.{weight,scales,biases}: an affine 2-BIT group-64 copy of the COMPACT draft vocabulary rows of the exact backbone lm_head (prefix 98304 + control rows 248044..248069 + 6 pad rows, padded shape 98336 for N%8), consumed ONLY to argmax draft proposals. Chained-accept probes on both easy (longcopy: 50/53 identical to exact) and hard (code-seed: 274/308 vs 277/311 exact) material show the 2-bit coarse readout flips essentially nothing. The head only PROPOSES: the exact lm_head still produces every verify/ledger value; the baseline leg keeps the pinned bf16 head."
 }
