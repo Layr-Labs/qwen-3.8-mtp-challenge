@@ -826,6 +826,103 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// Double-buffer/prefetch M=1 fast path (bits=4, g64): two stock 16-wide
+// chunks per k-iteration (32 x-values in flight per thread), with both
+// chunks' weights fetched before the per-row qdots. Per-block arithmetic
+// (load_vector, qdot, K accumulation order, simd_sum) is byte-identical to
+// qmv_fast_impl for every output element; a 512-wide tail iteration keeps
+// in_vec_size values not divisible by 1024 exact.
+template <typename T>
+METAL_FUNC void qmv_fast_impl_dbp(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = 8; /* bits == 4 */
+  constexpr int bytes_per_pack = 2;
+  constexpr int values_per_chunk = 16;
+  constexpr int chunk_size = values_per_chunk * SIMD_SIZE;
+  constexpr int block_size = chunk_size * 2;
+  constexpr int scale_step_per_thread = 64 / values_per_chunk;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[2][values_per_chunk];
+  thread U result[results_per_simdgroup] = {0};
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * 2 * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_chunk;
+  y += tid.x * out_vec_size + out_row;
+
+  int k = 0;
+  for (; k + block_size <= in_vec_size; k += block_size) {
+    U sum0 = load_vector<T, U, values_per_chunk, 4>(x, x_thread[0]);
+    U sum1 =
+        load_vector<T, U, values_per_chunk, 4>(x + chunk_size, x_thread[1]);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl0 = (const device uint8_t*)(ws + row * in_vec_size_w);
+      auto wl1 = (const device uint8_t*)(ws + row * in_vec_size_w +
+          chunk_size * bytes_per_pack / pack_factor);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_chunk, 4>(wl0, x_thread[0], s, b, sum0);
+      result[row] += qdot<U, values_per_chunk, 4>(wl1, x_thread[1], s, b, sum1);
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x += block_size;
+  }
+  for (; k < in_vec_size; k += chunk_size) {
+    U sum = load_vector<T, U, values_per_chunk, 4>(x, x_thread[0]);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_chunk, 4>(wl, x_thread[0], s, b, sum);
+    }
+
+    ws += chunk_size * bytes_per_pack / pack_factor;
+    scales += chunk_size / 64;
+    biases += chunk_size / 64;
+    x += chunk_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
 // Exact-order affine4/g64 multi-row QMV. The frozen host launches M x-groups
 // for each 8-output tile. Pair adjacent input rows in one group while keeping
 // the stock two-simdgroup by four-output-row layout. Each active group caches a
@@ -1820,8 +1917,13 @@ template <typename T, int group_size, int bits, bool batched>
       // below 4096 outputs the reduced x-group count thins the grid, so the
       // promoted pair kernel is kept there byte-for-byte.
       switch (ntg.x) {
+        case 1:
+          qmv_fast_impl_dbp<T>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
         case 2:
-          qmv_fast_crossrow_affine4_g64<T, 2>(
+          qmv_fast_impl_dbp<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1865,8 +1967,13 @@ template <typename T, int group_size, int bits, bool batched>
       }
     } else {
       switch (ntg.x) {
+        case 1:
+          qmv_fast_impl_dbp<T>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
         case 2:
-          qmv_fast_crossrow_affine4_g64<T, 2>(
+          qmv_fast_impl_dbp<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -2329,6 +2436,12 @@ template <typename T, int group_size, int bits>
       s_strides,
       b_strides,
       tid);
+  if (group_size == 64 && bits == 4 && M == 1 && out_vec_size >= 1024) {
+    qmv_fast_impl_dbp<T>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        tid, simd_gid, simd_lid);
+    return;
+  }
   qmv_fast_impl<T, group_size, bits>(
       w,
       scales,
