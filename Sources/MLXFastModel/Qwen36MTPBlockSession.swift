@@ -196,7 +196,7 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            return self.evDepth(offeredDepth: offeredDepth)
         }
     }
 
@@ -604,6 +604,58 @@ public final class Qwen36MTPBlockSession {
             depth += 1
         }
         return depth
+    }
+
+    // MARK: - EV depth plan (port of mlx-serve mtpEvPlanFor, single-chunk)
+    //
+    // Picks m maximizing E(m)/T(m) over a PIECEWISE per-position marginal
+    // cost table instead of the flat-h greedy threshold walk. T(m) = 1 +
+    // sum of marginals; E(m) = 1 + acceptance chain sum. Climb is damped to
+    // +1/round (hysteresis); demotion is never damped. m = 0 (adaptive
+    // skip) competes at E=1, T=1. The mid-round tau extension and its sync
+    // do not exist here: the round has exactly one blocking eval.
+    //
+    // Cost table: marginal round cost of draft position k (1-based), in
+    // units of the d=0 round. Fit from saturated forced-depth arms on this
+    // machine (MLX_QWEN_MTP_FORCE_DEPTH), longcopy, 512 tokens.
+    private static let evCosts: [Double] = [
+        0.12, 0.10, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30,
+    ]
+    private var evMLoPrev = 1
+
+    private func evDepth(offeredDepth: Int) -> Int {
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
+        let cap = Swift.min(
+            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth), widthCap)
+        guard cap > 0 else { return 0 }
+        let loCap = Swift.min(cap, evMLoPrev + 1)
+        var chain = 1.0
+        var expected = 1.0
+        var cost = 1.0
+        var bestR = 1.0 // m = 0: one token per unit round
+        var mLo = 0
+        for m in 1 ... loCap {
+            var p = positionAcceptEMA[m - 1]
+            if m == 1, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 2.0)))
+            } else if m == 2, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 3.0)))
+            }
+            chain *= p
+            expected += chain
+            cost += Self.evCosts[m - 1]
+            let r = expected / cost
+            if r > bestR {
+                bestR = r
+                mLo = m
+            }
+        }
+        evMLoPrev = Swift.max(mLo, 1)
+        return mLo
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
