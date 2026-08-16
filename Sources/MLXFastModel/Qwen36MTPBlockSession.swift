@@ -641,176 +641,55 @@ public final class Qwen36MTPBlockSession {
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
 
-    // MARK: - one round
+    // MARK: - round-boundary draft pipelining (proposal side)
+    //
+    // Between generateRound returning and the parent's next request, the GPU
+    // is idle for the whole IPC + parent-bookkeeping gap (the in-round trace
+    // already names the post-eval host tail as "the budget for any further
+    // pipelining work"; the CROSS-round gap is the part no in-round segment
+    // can see). Everything the next round's draft chain needs is known
+    // before this round returns: the next primary (this round's committed
+    // readout), the next flush rows (upkeep just queued them), and the next
+    // draft count (the cost model is deterministic in state that is already
+    // final). So a drafting round ENQUEUES the next round's head chain
+    // before returning; the next round consumes it if — and only if — its
+    // (primary, count) match the assumption, and discards it otherwise.
+    //
+    // Legality: this is the sanctioned draft-and-verify apparatus proposing
+    // the SAME tokens it would propose one IPC later, inside one generation
+    // request, against the head's own within-request committed-history
+    // cache. The ledger still closes over the drafts each round actually
+    // declares; a discarded speculation trims back to the committed prefix
+    // exactly like a rejected deeper draft always has. The serial control
+    // (depth 0) never drafts, so it never reaches any of this — the
+    // denominator's shape is untouched.
 
-    /// Draft up to `depth` tokens, verify `[primary] + drafts` in one batched
-    /// target forward, accept the longest common prefix, and repair the caches.
-    ///
-    /// `depth` IS AN OFFER, NOT AN ORDER (contract change 2026-08-14). The
-    /// trusted parent offers a per-round ceiling and this session decides how
-    /// many tokens it actually drafts -- 0 through `Qwen36MTPLimits.maxDepth`,
-    /// per round, adaptively if it likes. The parent bounds the ACTUAL count
-    /// against the trusted maximum and derives every ledger quantity from it,
-    /// so a narrower round, a wider round and a round that drafts nothing are
-    /// all legal and all correctly accounted.
-    ///
-    /// The worker is still deliberately never told how much of the decode
-    /// window remains, so it cannot special-case the tail; the parent clamps
-    /// the scored prefix itself.
-    ///
-    /// THE POLICY BELOW IS THE FIRST THING A SUBMISSION SHOULD CHANGE. It is
-    /// the shipped reference schedule (`draftPolicy`), and it is deliberately
-    /// dumb -- a constant 2, the depth this track measured before depth became
-    /// competitive. Every acceptance-aware idea starts here: draft deeper where
-    /// the head has been right, draft nothing where it has been wrong, size the
-    /// round from the last round's accept run.
-    public func generateRound(depth: Int) throws -> Qwen36MTPRoundResult {
-        guard began, let primaryPending = pendingPrimary,
-              let tailPending = pendingTop2, let hidden = pendingHidden
-        else { throw Qwen36MTPSessionError.notBegun }
-        guard depth >= Qwen36MTPLimits.serialControlDepth,
-              depth <= Qwen36MTPLimits.maxDepth
-        else {
-            throw Qwen36MTPSessionError.invalidDepth(depth)
+    /// Speculative next-round chain: draft id arrays already submitted via
+    /// `asyncEval`, the history offset the round-end trim must restore to,
+    /// and the (primary, count) assumption that gates consumption.
+    private var pendingSpeculativeDrafts:
+        (arrays: [MLXArray], validHistoryOffset: Int,
+         forPrimary: Int, count: Int)?
+
+    /// Drop a speculated chain that will not be consumed: trim the head
+    /// cache back BELOW the speculated flush's final (hidden, primary) row
+    /// so the ordinary draft path re-flushes it from its own arguments.
+    /// The committed-history rows before it are real history and stay.
+    private func discardSpeculativeDrafts() {
+        guard let spec = pendingSpeculativeDrafts else { return }
+        pendingSpeculativeDrafts = nil
+        if let headCache = headHistoryCache {
+            Self.trimTrimmable(headCache, to: spec.validHistoryOffset - 1)
         }
-        roundCount += 1
-        // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
-        // split a round into head-chain graph build, verify graph build, and
-        // the single blocking eval's GPU wall. Never on in a ranked run.
-        let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
-        var tDraftBuilt: UInt64 = 0
-        var tVerifyBuilt: UInt64 = 0
-        var tEvalDone: UInt64 = 0
-        var tReadDone: UInt64 = 0
-        var tCommitDone: UInt64 = 0
+    }
 
-        // Round-top invariant, kept as a THROW rather than a comment: every
-        // emitted token is in the trimmable caches and the pending primary is
-        // not. A rollback that trimmed the wrong amount shows up here, one round
-        // after the mistake, instead of as a silent late divergence.
-        let base = trimmableOffset()
-        let expected = seedTokenCount + committedTokenCount
-        guard base == expected else {
-            throw Qwen36MTPSessionError.cacheOffsetInvariant(
-                expected: expected, actual: base, round: roundCount)
-        }
-
-        let primary = primaryPending
-        var committed = [primary]
-        committedTokenCount += 1
-
-        // THE DRAFT SCHEDULE. `depth` is what the parent offered; `draftCount`
-        // is what this round proposes, and from here down it is the only width
-        // that matters -- the draft loop, the declared row count, the per-row
-        // readouts and the rollback all key off it, so a policy change needs no
-        // other edit to stay ledger-correct.
-        let draftCount = draftPolicy(depth, roundCount)
-        precondition(
-            draftCount >= 0 && draftCount <= depth
-                && draftCount <= Qwen36MTPLimits.maxDepth,
-            "draftPolicy returned \(draftCount) for an offer of \(depth); a "
-                + "round may propose 0 ... min(offer, maxDepth) drafts")
-
-        // A stop token as the primary ends the run BEFORE any drafting: there is
-        // nothing after it to predict, and drafting past it would charge the
-        // measurement for work no decoder performs. The round still declares its
-        // single target tail row (the row that produced this primary's successor
-        // candidate is the one already spent), so the ledger stays closed.
-        if stopTokens.contains(primary) {
-            reachedStopToken = true
-            // The tail row to declare is the row that produced this primary —
-            // its top-2 was read out of the previous round's batched eval.
-            let (tailTokens, tailLogits) = tailPending
-            pendingPrimary = nil
-            pendingTop2 = nil
-            pendingHidden = nil
-            return Qwen36MTPRoundResult(
-                tokens: committed,
-                declaredRows: 1,
-                draftTokens: [],
-                acceptedDraftCount: 0,
-                rejectedDraftCount: 0,
-                perRowTop2Tokens: [tailTokens],
-                perRowTop2Logits: [tailLogits],
-                targetCacheOffset: seedTokenCount + committedTokenCount,
-                reachedStopToken: true
-            )
-        }
-
-        // NO DRAFTS THIS ROUND. Two ways to get here and they are not the same
-        // thing. Depth 0 is THE TRUE SERIAL CONTROL -- the parent offered
-        // nothing, the denominator this track divides by. A zero from
-        // `draftPolicy` is an ADAPTIVE SKIP: the parent offered a width and this
-        // round declined it. Both execute the identical one-token forward and
-        // both declare the identical single tail row, which is the point --
-        // an adaptive skip costs exactly what serial decode costs.
-        //
-        // One token per target forward: no
-        // draft, no head cache, no head forward, no verify window and therefore
-        // no rollback. The head stays ATTACHED and resident -- the paired
-        // contract charges its residency to both sides, so the denominator must
-        // carry the same memory and the same load shape -- but nothing on this
-        // path reads it. That is the difference between "MTP off" and "MTP depth
-        // 1", and it is the whole reason this branch exists.
-        //
-        // The single row this forward produces IS the round's target tail row:
-        // its argmax becomes the next primary, exactly as the bonus row does on
-        // the speculative path. So the ledger closes with declaredRows = 1,
-        // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
-        // box wrapper agrees without any special case there.
-        if depth == Qwen36MTPLimits.serialControlDepth || draftCount == 0 {
-            // Keep the committed-history ledger complete across non-drafting
-            // rounds: this round's transition is (old pending hidden, primary).
-            // Pure array retention — no GPU work, so the serial control's
-            // compute stream is untouched. A pure-serial session never flushes
-            // this backlog (the head cache is never created).
-            headHistoryBacklogHidden.append(hidden)
-            headHistoryBacklogTokens.append(primary)
-            let (serialLogits, serialHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray([primary]).reshaped([1, 1])),
-                cache: cache, nConfirmed: 0)
-            // Still produced, still post-norm: keeping the hidden chain identical
-            // means switching depth is the ONLY difference between the two sides.
-            pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
-            // Single batched readout: next primary, tail top-2, cache roots —
-            // one blocking eval instead of the previous 3-4 boundaries.
-            let serialLastRow = serialLogits[
-                0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
-            let (tailIDs, tailValues) = Self.linearTopTwoRows(serialLastRow)
-            eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
-            let readTail = (
-                tailIDs.asArray(Int32.self).map { Int($0) },
-                tailValues.asArray(Float.self).map { Double($0) }
-            )
-            // Top-2 first ID == row argmax (same ordering); no separate argMax.
-            pendingPrimary = readTail.0[0]
-            pendingTop2 = readTail
-            let (tailTokens, tailLogits) = readTail
-            Self.traceRow(
-                pos: seedTokenCount + committedTokenCount,
-                ids: tailTokens, values: tailLogits)
-            return Qwen36MTPRoundResult(
-                tokens: committed,
-                declaredRows: 1,
-                draftTokens: [],
-                acceptedDraftCount: 0,
-                rejectedDraftCount: 0,
-                perRowTop2Tokens: [tailTokens],
-                perRowTop2Logits: [tailLogits],
-                targetCacheOffset: seedTokenCount + committedTokenCount,
-                reachedStopToken: false
-            )
-        }
-
-        // 1. DRAFT — against the PERSISTENT committed-history head cache.
-        //    First flush the history the head has not seen yet (lazy seed
-        //    priming on the first drafting round, then any committed rows
-        //    queued since the last draft), with the current round's
-        //    (pendingHidden, primary) transition as the final row, in ONE head
-        //    forward. Only the last row's logits are projected through the
-        //    lm_head. Deeper sub-steps chain the head's OWN post-`mtp.norm`
-        //    hidden exactly as before.
+    /// The draft phase, verbatim: flush pending history (lazy seed priming
+    /// on the first drafting round) plus the (hidden, primary) row, then
+    /// chain `draftCount` head steps with on-device ids, submitting the
+    /// chain with the promoted early/late `asyncEval` pattern.
+    private func prepareDraftChain(
+        hidden: MLXArray, primary: Int, draftCount: Int
+    ) -> (arrays: [MLXArray], validHistoryOffset: Int) {
         let headCache: [any KVCache]
         var flushHidden: [MLXArray] = []
         var flushTokens: [Int] = []
@@ -889,6 +768,220 @@ public final class Qwen36MTPBlockSession {
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        return (draftIdArrays, validHistoryOffset)
+    }
+
+    /// Enqueue the NEXT round's draft chain into the round-boundary gap.
+    /// Called at the end of a drafting round, after the accept walk, the
+    /// history upkeep and the policy-state update — everything the next
+    /// round's policy reads is final, so the assumed count is exact unless
+    /// the parent changes its offer between rounds (consumption re-checks).
+    private func speculateNextDraftChain(offer: Int) {
+        guard pendingSpeculativeDrafts == nil,
+              !reachedStopToken,
+              let nextPrimary = pendingPrimary,
+              !stopTokens.contains(nextPrimary),
+              let nextHidden = pendingHidden
+        else { return }
+        let nextCount = draftPolicy(offer, roundCount + 1)
+        guard nextCount > 0, nextCount <= offer,
+              nextCount <= Qwen36MTPLimits.maxDepth
+        else { return }
+        let built = prepareDraftChain(
+            hidden: nextHidden, primary: nextPrimary, draftCount: nextCount)
+        pendingSpeculativeDrafts = (
+            built.arrays, built.validHistoryOffset, nextPrimary, nextCount)
+    }
+
+    // MARK: - one round
+
+    /// Draft up to `depth` tokens, verify `[primary] + drafts` in one batched
+    /// target forward, accept the longest common prefix, and repair the caches.
+    ///
+    /// `depth` IS AN OFFER, NOT AN ORDER (contract change 2026-08-14). The
+    /// trusted parent offers a per-round ceiling and this session decides how
+    /// many tokens it actually drafts -- 0 through `Qwen36MTPLimits.maxDepth`,
+    /// per round, adaptively if it likes. The parent bounds the ACTUAL count
+    /// against the trusted maximum and derives every ledger quantity from it,
+    /// so a narrower round, a wider round and a round that drafts nothing are
+    /// all legal and all correctly accounted.
+    ///
+    /// The worker is still deliberately never told how much of the decode
+    /// window remains, so it cannot special-case the tail; the parent clamps
+    /// the scored prefix itself.
+    ///
+    /// THE POLICY BELOW IS THE FIRST THING A SUBMISSION SHOULD CHANGE. It is
+    /// the shipped reference schedule (`draftPolicy`), and it is deliberately
+    /// dumb -- a constant 2, the depth this track measured before depth became
+    /// competitive. Every acceptance-aware idea starts here: draft deeper where
+    /// the head has been right, draft nothing where it has been wrong, size the
+    /// round from the last round's accept run.
+    public func generateRound(depth: Int) throws -> Qwen36MTPRoundResult {
+        guard began, let primaryPending = pendingPrimary,
+              let tailPending = pendingTop2, let hidden = pendingHidden
+        else { throw Qwen36MTPSessionError.notBegun }
+        guard depth >= Qwen36MTPLimits.serialControlDepth,
+              depth <= Qwen36MTPLimits.maxDepth
+        else {
+            throw Qwen36MTPSessionError.invalidDepth(depth)
+        }
+        roundCount += 1
+        // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
+        // split a round into head-chain graph build, verify graph build, and
+        // the single blocking eval's GPU wall. Never on in a ranked run.
+        let tRound0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
+        var tDraftBuilt: UInt64 = 0
+        var tVerifyBuilt: UInt64 = 0
+        var tEvalDone: UInt64 = 0
+        var tReadDone: UInt64 = 0
+        var tCommitDone: UInt64 = 0
+
+        // Round-top invariant, kept as a THROW rather than a comment: every
+        // emitted token is in the trimmable caches and the pending primary is
+        // not. A rollback that trimmed the wrong amount shows up here, one round
+        // after the mistake, instead of as a silent late divergence.
+        let base = trimmableOffset()
+        let expected = seedTokenCount + committedTokenCount
+        guard base == expected else {
+            throw Qwen36MTPSessionError.cacheOffsetInvariant(
+                expected: expected, actual: base, round: roundCount)
+        }
+
+        let primary = primaryPending
+        var committed = [primary]
+        committedTokenCount += 1
+
+        // THE DRAFT SCHEDULE. `depth` is what the parent offered; `draftCount`
+        // is what this round proposes, and from here down it is the only width
+        // that matters -- the draft loop, the declared row count, the per-row
+        // readouts and the rollback all key off it, so a policy change needs no
+        // other edit to stay ledger-correct.
+        let draftCount = draftPolicy(depth, roundCount)
+        precondition(
+            draftCount >= 0 && draftCount <= depth
+                && draftCount <= Qwen36MTPLimits.maxDepth,
+            "draftPolicy returned \(draftCount) for an offer of \(depth); a "
+                + "round may propose 0 ... min(offer, maxDepth) drafts")
+
+        // A stop token as the primary ends the run BEFORE any drafting: there is
+        // nothing after it to predict, and drafting past it would charge the
+        // measurement for work no decoder performs. The round still declares its
+        // single target tail row (the row that produced this primary's successor
+        // candidate is the one already spent), so the ledger stays closed.
+        if stopTokens.contains(primary) {
+            discardSpeculativeDrafts()
+            reachedStopToken = true
+            // The tail row to declare is the row that produced this primary —
+            // its top-2 was read out of the previous round's batched eval.
+            let (tailTokens, tailLogits) = tailPending
+            pendingPrimary = nil
+            pendingTop2 = nil
+            pendingHidden = nil
+            return Qwen36MTPRoundResult(
+                tokens: committed,
+                declaredRows: 1,
+                draftTokens: [],
+                acceptedDraftCount: 0,
+                rejectedDraftCount: 0,
+                perRowTop2Tokens: [tailTokens],
+                perRowTop2Logits: [tailLogits],
+                targetCacheOffset: seedTokenCount + committedTokenCount,
+                reachedStopToken: true
+            )
+        }
+
+        // NO DRAFTS THIS ROUND. Two ways to get here and they are not the same
+        // thing. Depth 0 is THE TRUE SERIAL CONTROL -- the parent offered
+        // nothing, the denominator this track divides by. A zero from
+        // `draftPolicy` is an ADAPTIVE SKIP: the parent offered a width and this
+        // round declined it. Both execute the identical one-token forward and
+        // both declare the identical single tail row, which is the point --
+        // an adaptive skip costs exactly what serial decode costs.
+        //
+        // One token per target forward: no
+        // draft, no head cache, no head forward, no verify window and therefore
+        // no rollback. The head stays ATTACHED and resident -- the paired
+        // contract charges its residency to both sides, so the denominator must
+        // carry the same memory and the same load shape -- but nothing on this
+        // path reads it. That is the difference between "MTP off" and "MTP depth
+        // 1", and it is the whole reason this branch exists.
+        //
+        // The single row this forward produces IS the round's target tail row:
+        // its argmax becomes the next primary, exactly as the bonus row does on
+        // the speculative path. So the ledger closes with declaredRows = 1,
+        // accepted = rejected = 0, tail = 1 -- and `rows_per_round(0) = 1` in the
+        // box wrapper agrees without any special case there.
+        if depth == Qwen36MTPLimits.serialControlDepth || draftCount == 0 {
+            discardSpeculativeDrafts()
+            // Keep the committed-history ledger complete across non-drafting
+            // rounds: this round's transition is (old pending hidden, primary).
+            // Pure array retention — no GPU work, so the serial control's
+            // compute stream is untouched. A pure-serial session never flushes
+            // this backlog (the head cache is never created).
+            headHistoryBacklogHidden.append(hidden)
+            headHistoryBacklogTokens.append(primary)
+            let (serialLogits, serialHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray([primary]).reshaped([1, 1])),
+                cache: cache, nConfirmed: 0)
+            // Still produced, still post-norm: keeping the hidden chain identical
+            // means switching depth is the ONLY difference between the two sides.
+            pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
+            // Single batched readout: next primary, tail top-2, cache roots —
+            // one blocking eval instead of the previous 3-4 boundaries.
+            let serialLastRow = serialLogits[
+                0..., (serialLogits.dim(1) - 1) ..< serialLogits.dim(1), 0...]
+            let (tailIDs, tailValues) = Self.linearTopTwoRows(serialLastRow)
+            eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
+            let readTail = (
+                tailIDs.asArray(Int32.self).map { Int($0) },
+                tailValues.asArray(Float.self).map { Double($0) }
+            )
+            // Top-2 first ID == row argmax (same ordering); no separate argMax.
+            pendingPrimary = readTail.0[0]
+            pendingTop2 = readTail
+            let (tailTokens, tailLogits) = readTail
+            Self.traceRow(
+                pos: seedTokenCount + committedTokenCount,
+                ids: tailTokens, values: tailLogits)
+            return Qwen36MTPRoundResult(
+                tokens: committed,
+                declaredRows: 1,
+                draftTokens: [],
+                acceptedDraftCount: 0,
+                rejectedDraftCount: 0,
+                perRowTop2Tokens: [tailTokens],
+                perRowTop2Logits: [tailLogits],
+                targetCacheOffset: seedTokenCount + committedTokenCount,
+                reachedStopToken: false
+            )
+        }
+
+        // 1. DRAFT — against the PERSISTENT committed-history head cache.
+        //    Either CONSUME the speculative chain the PREVIOUS round enqueued
+        //    into the round-boundary gap (see `speculateNextDraftChain`), or
+        //    build one now via `prepareDraftChain`. Consumption is guarded on
+        //    the exact (primary, count) the speculation assumed; any mismatch
+        //    discards the speculated rows and rebuilds — same tokens either
+        //    way, only the enqueue time moves.
+        let draftIdArrays: [MLXArray]
+        let validHistoryOffset: Int
+        if let spec = pendingSpeculativeDrafts,
+           spec.forPrimary == primary, spec.count == draftCount
+        {
+            pendingSpeculativeDrafts = nil
+            draftIdArrays = spec.arrays
+            validHistoryOffset = spec.validHistoryOffset
+        } else {
+            discardSpeculativeDrafts()
+            let built = prepareDraftChain(
+                hidden: hidden, primary: primary, draftCount: draftCount)
+            draftIdArrays = built.arrays
+            validHistoryOffset = built.validHistoryOffset
+        }
+        guard let headCache = headHistoryCache else {
+            throw Qwen36MTPSessionError.notBegun
+        }
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1090,6 +1183,10 @@ public final class Qwen36MTPBlockSession {
             committedTokenCount -= dropped
             reachedStopToken = true
         }
+
+        // Round-boundary pipelining: enqueue the next round's draft chain so
+        // the GPU works through the IPC/parent gap instead of idling.
+        speculateNextDraftChain(offer: depth)
 
         return Qwen36MTPRoundResult(
             tokens: committed,
