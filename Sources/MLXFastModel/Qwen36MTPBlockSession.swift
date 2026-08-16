@@ -286,6 +286,20 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // Chain ONE exact live draft step off the flushed history: the
+        // scored loop's `mtpHeadHiddenForward` -> last-row slice ->
+        // `draftTokenID` expression, fed a device-resident int32 id like
+        // round steps 2..d. This is where the head layer's fused draft tail
+        // -- or its stock chain when that gate declines -- compiles, for
+        // both L == 1 families a round issues (the flush final row above
+        // and this chained single-token step). Same 7b33621 rule as the
+        // draftTokenID warm: warm the expression the round dispatches.
+        let stepHidden = model.mtpHeadHiddenForward(
+            hidden: folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...],
+            nextTokenIds: primedDraftID,
+            cache: historyWarmCache)
+        eval(model.draftTokenID(
+            stepHidden[0..., (stepHidden.dim(1) - 1) ..< stepHidden.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)

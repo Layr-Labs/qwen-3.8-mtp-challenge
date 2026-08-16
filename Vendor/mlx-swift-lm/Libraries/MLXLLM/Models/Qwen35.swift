@@ -1200,19 +1200,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         if let w = _fbfW {
             return matmul(x, w.T)
         }
-        if let g = gateProj as? QuantizedLinear,
-           let u = upProj as? QuantizedLinear,
-           g.groupSize == u.groupSize, g.bits == u.bits,
-           g.mode == u.mode, g.mode == .affine,
-           let gz = g.biases, let uz = u.biases
-        {
-            _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
-            _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
-            _fqZ = concatenated([gz, uz], axis: 0).contiguous()
-            _fqGS = g.groupSize
-            _fqBits = g.bits
-            _fqMode = g.mode
-            _gateOut = g.shape.0
+        if buildQuantizedGateUpPack() {
             return fusedGateUp(x)
         }
         if !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear) {
@@ -1222,6 +1210,38 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
             return fusedGateUp(x)
         }
         return nil
+    }
+
+    private func buildQuantizedGateUpPack() -> Bool {
+        if _fqW != nil { return true }
+        guard let g = gateProj as? QuantizedLinear,
+              let u = upProj as? QuantizedLinear,
+              g.groupSize == u.groupSize, g.bits == u.bits,
+              g.mode == u.mode, g.mode == .affine,
+              let gz = g.biases, let uz = u.biases
+        else { return false }
+        _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
+        _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
+        _fqZ = concatenated([gz, uz], axis: 0).contiguous()
+        _fqGS = g.groupSize
+        _fqBits = g.bits
+        _fqMode = g.mode
+        _gateOut = g.shape.0
+        return true
+    }
+
+    /// The affine gate+up pack for the MTP head's fused draft tail -- the
+    /// SAME lazily-built arrays the fused forward projects with, so no
+    /// second copy of the weights ever exists. nil for the dense bf16 head
+    /// or any non-affine mix; callers fail closed to the stock chain.
+    func quantizedGateUpPack()
+        -> (w: MLXArray, s: MLXArray, z: MLXArray, gateOut: Int,
+            groupSize: Int, bits: Int)?
+    {
+        guard buildQuantizedGateUpPack(),
+              let w = _fqW, let s = _fqS, let z = _fqZ
+        else { return nil }
+        return (w, s, z, _gateOut, _fqGS, _fqBits)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -1612,7 +1632,11 @@ final class Qwen35Attention: Module {
         _ = cache.update(keys: keys, values: values)
     }
 
-    func callAsFunction(
+    /// Attention through the sigmoid output gate WITHOUT the trailing
+    /// o_proj -- split from `callAsFunction` (expression-identical
+    /// composition) so the MTP head's fused draft tail can fold o_proj into
+    /// its residual kernel. Every other caller keeps the stock chain below.
+    func gatedAttentionOutput(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let B = x.dim(0)
@@ -1674,7 +1698,13 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return sigmoidMultiply(output, gate)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        oProj(gatedAttentionOutput(x, mask: mask, cache: cache))
     }
 }
 
