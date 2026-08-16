@@ -1409,6 +1409,71 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Full-attention output gate (candidate verify widths 3...9)
+
+/// Collapse the full-attention layout conversion, gate sigmoid, and product
+/// into one producer pass.  `attention` is the raw `[B,H,S,D]` SDPA result;
+/// `q_proj` is the packed projection's strided `[B,S,H*2D]` query+gate view.
+/// The helper deliberately mirrors the stock unary `Sigmoid` functor and
+/// returns BF16 before the BF16 multiply, preserving both materialization
+/// boundaries of `output * sigmoid(gate)`.
+private let qwen35AttentionGatedOutputKernel = MLXFast.metalKernel(
+    name: "qwen35_attention_gated_output_bf16_v1",
+    inputNames: ["attention", "q_proj"],
+    outputNames: ["gated"],
+    source: """
+        uint index = thread_position_in_grid.x;
+        uint sequence_length = uint(attention_shape[2]);
+        uint head_count = uint(attention_shape[1]);
+        uint head_dimension = uint(attention_shape[3]);
+
+        uint feature = index % (head_count * head_dimension);
+        uint sequence = (index / (head_count * head_dimension))
+            % sequence_length;
+        uint batch = index / (sequence_length * head_count * head_dimension);
+        uint head = feature / head_dimension;
+        uint dimension = feature % head_dimension;
+
+        ulong attention_offset = ulong(batch) * ulong(attention_strides[0])
+            + ulong(head) * ulong(attention_strides[1])
+            + ulong(sequence) * ulong(attention_strides[2])
+            + ulong(dimension) * ulong(attention_strides[3]);
+        uint gate_feature = head * (2 * head_dimension)
+            + head_dimension + dimension;
+        ulong gate_offset = ulong(batch) * ulong(q_proj_strides[0])
+            + ulong(sequence) * ulong(q_proj_strides[1])
+            + ulong(gate_feature) * ulong(q_proj_strides[2]);
+
+        const bfloat16_t sigmoid_gate = qwen35_attention_sigmoid(
+            q_proj[gate_offset]);
+        const bfloat16_t product = attention[attention_offset] * sigmoid_gate;
+        gated[index] = product;
+    """,
+    header: """
+        inline bfloat16_t qwen35_attention_sigmoid(bfloat16_t x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+private func qwen35AttentionGatedOutput(
+    attention: MLXArray, qProjOutput: MLXArray
+) -> MLXArray {
+    let B = attention.dim(0)
+    let H = attention.dim(1)
+    let S = attention.dim(2)
+    let D = attention.dim(3)
+    return qwen35AttentionGatedOutputKernel(
+        [attention, qProjOutput],
+        grid: (B * S * H * D, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[B, S, H * D]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -1613,7 +1678,10 @@ final class Qwen35Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        nConfirmed: Int = 0
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -1663,7 +1731,7 @@ final class Qwen35Attention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let output = attentionWithCacheUpdate(
+        let attentionOutput = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
@@ -1671,8 +1739,31 @@ final class Qwen35Attention: Module {
             scale: scale,
             mask: mask
         )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+
+        if nConfirmed == 1,
+           B == 1,
+           (3 ... 9).contains(L),
+           attentionHeads == 24,
+           headDim == 256,
+           attentionOutput.dtype == .bfloat16,
+           attentionOutput.shape == [B, attentionHeads, L, headDim],
+           qProjOutput.dtype == .bfloat16,
+           qProjOutput.shape == [B, L, attentionHeads * headDim * 2],
+           let quantizedOProj = oProj as? QuantizedLinear,
+           quantizedOProj.groupSize == 64,
+           quantizedOProj.bits == 4,
+           quantizedOProj.mode == .affine,
+           quantizedOProj.shape.0 == 5120,
+           quantizedOProj.shape.1 == attentionHeads * headDim,
+           quantizedOProj.bias == nil
+        {
+            return oProj(qwen35AttentionGatedOutput(
+                attention: attentionOutput, qProjOutput: qProjOutput))
+        }
+
+        let output = attentionOutput
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -1784,14 +1875,17 @@ final class Qwen35DecoderLayer: Module {
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
-        // Passes nConfirmed through to the linear-attention sublayer.
+        // Passes nConfirmed through to both attention sublayers; full attention
+        // uses it only to distinguish candidate verify from repair/prefill.
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
                 nConfirmed: nConfirmed)
         } else {
-            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            r = selfAttn!(
+                inputLayerNorm(x), mask: attentionMask, cache: cache,
+                nConfirmed: nConfirmed)
         }
 
         let h = x + r
