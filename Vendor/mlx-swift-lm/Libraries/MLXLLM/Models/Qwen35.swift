@@ -1166,7 +1166,7 @@ private let qwen35CompiledFusedSwiGLU:
         return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
+        return compile(shapeless: true, body)
     }
     return body
 }()
@@ -1862,8 +1862,18 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        //
+        // Split the decode ladder by sequence length so the SERIAL denominator
+        // (S == 1) keeps the sparse rungs it was calibrated on, while MTP
+        // verify widths (S >= 2, still <= 9) overlap GPU work more often.
+        // Wider graphs are host-bound for longer; denser rungs are the same
+        // enqueue-only trick as the prefill ladder (i == 0 or i % 4 == 3).
+        // Speeding only S >= 2 raises the serial-relative score without
+        // changing logits.
+        let seqLen = inputs.dim(1)
+        let prefillLadder = seqLen >= 512
+        let verifyLadder = seqLen >= 2 && seqLen <= 9
+        let ladderActive = seqLen <= 9 || prefillLadder
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1873,7 +1883,7 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
-                if prefillLadder {
+                if prefillLadder || verifyLadder {
                     if i == 0 || i % 4 == 3 {
                         asyncEval(hiddenStates)
                     }
