@@ -555,7 +555,10 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    // Conservative tail trim: keep the promoted segmented wide-verify path,
+    // but avoid only the single deepest draft until official median evidence
+    // shows depth eight is worth its proposal and verification work.
+    private static let segmentedVerifyDepthCap = 7
     private static let segmentedStreakGate = 3
 
     /// The greedy marginal-depth rule described at the policy's assignment.
