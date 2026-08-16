@@ -527,6 +527,23 @@ public final class Qwen36MTPBlockSession {
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.20
+    /// ENGINE AXIS (2026-08-16): optional hard ceiling on the adaptive depth,
+    /// env-tunable for A/B (MLX_QWEN_MTP_MAX_DRAFT). SHIPPED DEFAULT 7: the
+    /// verify width stays <= 8 (d + 1), the widest regime proven bit-exact by
+    /// the hexfloat row gate (widths 6..8) and the narrowest that keeps the
+    /// multi-stream crossrow dispatch at two weight passes. Width 9 (d = 8)
+    /// re-reads the weights a third time AND was never bit-exact-verified, so
+    /// the cap is both the speed and the safety default. The retiled
+    /// single-stream kernels made the cap moot, but they are gated OFF in the
+    /// shipped tree (local regression on the M5 verify path).
+    private static let envMaxDraft: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_MAX_DRAFT"] ?? ""
+        let parsed = Int(raw)
+        if let parsed, parsed >= 1, parsed <= Qwen36MTPLimits.maxDepth {
+            return parsed
+        }
+        return 7
+    }()
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -593,7 +610,7 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
-        return depth
+        return Swift.min(depth, Self.envMaxDraft)
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
