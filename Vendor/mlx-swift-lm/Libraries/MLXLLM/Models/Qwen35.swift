@@ -1166,7 +1166,13 @@ private let qwen35CompiledFusedSwiGLU:
         return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
+        // Shapeless, matching the two compiled GDN helpers above and the
+        // helper's own contract note: the varying dim across calls is the
+        // verify width (a leading dim), while the split offset comes from
+        // the final dim (2 * intermediate), a checkpoint constant. One
+        // trace therefore serves every verify width S in 1...9 instead of
+        // recompiling per width; the elementwise arithmetic is unchanged.
+        return compile(shapeless: true, body)
     }
     return body
 }()

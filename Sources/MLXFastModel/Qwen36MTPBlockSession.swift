@@ -560,13 +560,42 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 4
 
+    /// Marginal-cost ratio CONDITIONED on a streak-qualified (hot) round:
+    /// 0.18 vs the unconditional 0.20. Direction is receipted safe — the
+    /// one priced misfit in public receipts is h = 0.40 HOLDING depth at
+    /// 2-3 where 4 pays (-4.5%), i.e. too shallow on hot prose, never too
+    /// deep — and the per-committed-token cost curve measured on this
+    /// stack falls monotonically to depth 7 at high acceptance. The
+    /// unconditional 0.20 is a fit across hot AND cold rounds; a round
+    /// that just fully accepted twice has near-1 acceptance evidence, so
+    /// its honest marginal draft is cheaper than the blended price. The
+    /// discount is deliberately mild (10%) and applies ONLY to rounds the
+    /// streak gate already qualified, so cold prompts keep the full 0.20
+    /// bar and the over-draft failure mode public receipts warn about
+    /// (deep tails on hard prompts) stays structurally closed. Sized so
+    /// the predicted median lift on the 4th-order prompt (mean draft
+    /// 4.27 -> ~4.6) keeps the published median clear of the 3.0
+    /// plausibility ceiling, which fails a run rather than clamping.
+    private static let hotStreakHeadStepCostRatio = 0.18
+
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+
+    /// TWO, not three. A third consecutive full accept adds no information
+    /// the cost model does not already hold — the per-position EMAs have
+    /// been driven up twice by then — and the extra gating round is spent
+    /// at the cap-4 wall on exactly the median-decider profile: the sealed
+    /// 2.904 run's 4th-order prompt sat at mean draft 4.27 with zero
+    /// non-drafting rounds, i.e. it lived on the cap-4 side of this gate
+    /// and only occasionally qualified. One hot round spent at width 5
+    /// after two perfect rounds is a round the window never gets back.
+    /// Cold prompts are untouched: they never string two full accepts, so
+    /// the deep cap stays closed exactly where depth does not pay.
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -575,14 +604,19 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+        let streakQualified = fullAcceptStreak >= Self.segmentedStreakGate
+        let widthCap = streakQualified
             ? Self.segmentedVerifyDepthCap
             : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        // A hot round prices its marginal drafts at the conditioned ratio;
+        // every other round keeps the unconditional blended fit.
+        let h = streakQualified
+            ? Self.hotStreakHeadStepCostRatio
+            : Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
         var depth = 0
