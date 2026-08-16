@@ -485,7 +485,10 @@ public final class Qwen36MTPBlockSession {
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
-    private static let acceptEMAAlpha = 0.15
+    // Slightly faster in-window adaptation: the score is the median of eight
+    // 512-token prompts, so the scheduler must learn each prompt's acceptance
+    // regime quickly without replacing the promoted marginal-depth rule.
+    private static let acceptEMAAlpha = 0.20
 
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
