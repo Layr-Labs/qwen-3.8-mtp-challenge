@@ -462,6 +462,17 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
     }
 
+    /// The full allocated buffers, UNSLICED (no `[..<offset]` view).
+    /// Preallocated or grown buffers keep their capacity past the current
+    /// offset; `state` intentionally hides that because ordinary callers
+    /// must not observe uncommitted rows. Fixed-capacity consumers (the
+    /// compiled MTP draft step) need the raw capacity instead.
+    /// Empty until the first `update()` or `state` set.
+    public var bufferState: [MLXArray] {
+        guard let keys, let values else { return [] }
+        return [keys, values]
+    }
+
     public override var isTrimmable: Bool { true }
 
     @discardableResult

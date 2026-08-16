@@ -1510,7 +1510,9 @@ final class Qwen35Attention: Module {
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
-    private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    /// Internal (not private): the compiled MTP draft step's
+    /// `attendSingleRow` shares it.
+    func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1610,6 +1612,71 @@ final class Qwen35Attention: Module {
             .transposed(0, 2, 1, 3)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
+    }
+
+    /// Single-row decode attention with EXPLICIT fixed-capacity KV buffer
+    /// state, for the compiled MTP draft step. `keys`/`values` are the full
+    /// `[1, kvHeads, CAP, headDim]` buffers; `offset` is a device array
+    /// holding the number of valid rows — the new row lands at index
+    /// `offset` and attention spans exactly `offset + 1` keys: the additive
+    /// mask below assigns padded rows exactly -inf, which the SDPA vector
+    /// kernel skips before reading the key, i.e. not attending at all.
+    /// The updated buffers REPLACE row `offset` in place (`which`), which
+    /// stays exact under rollback: stale rows are overwritten, never
+    /// appended, and stay masked until overwritten.
+    ///
+    /// This is the non-fused Q/K variant of `callAsFunction` — the same op
+    /// path the quantized head weights already take there (the fused Q/K
+    /// kernel's bf16-only dtype guard) — with the cache update replaced by
+    /// in-graph buffer writes so the whole step is a fixed-shape graph that
+    /// `compile(shapeless: false)` traces once.
+    func attendSingleRow(
+        _ x: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        offset: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let cap = keys.dim(2)
+
+        let (qProjOutput, keysIn, valuesIn) = qkv(x)
+        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1)
+            .split(parts: 2, axis: -1)
+        let gate = qSplit[1].reshaped(B, L, -1)
+        let queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        let newKeys = kNorm(keysIn.reshaped(B, L, kvHeads, -1))
+            .transposed(0, 2, 1, 3)
+        let newValues = valuesIn.reshaped(B, L, kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+        let ropedQueries = rope(queries, offset: offset)
+        let ropedKeys = rope(newKeys, offset: offset)
+
+        // The SDPA mask must broadcast into scores [B,H,qLen,kLen], so its
+        // 1024 sits in the KEY dim (dim3): [1,1,1,cap]. The buffer replace
+        // must broadcast with [B,kvHeads,cap,headDim], so its 1024 sits in
+        // the ROW dim (dim2): [1,1,cap,1]. Two arrays.
+        let rowIdxMask = MLXArray(0 ..< cap).asType(.int32).reshaped([1, 1, 1, cap])
+        let rowIdxRow = MLXArray(0 ..< cap).asType(.int32).reshaped([1, 1, cap, 1])
+        // SDPA rejects a float32 mask (it must PROMOTE to the output dtype),
+        // so cast to the buffer dtype: -inf survives the bf16 cast exactly,
+        // and the vector kernel skips exactly -inf keys (never attends them).
+        let phys = offset.reshaped([1, 1, 1, 1])
+        let mask = which(rowIdxMask .<= phys, MLXArray(0.0), MLXArray(-Float.infinity))
+            .asType(keys.dtype)
+        let oneHot = rowIdxRow .== phys
+        let updatedKeys = which(oneHot, ropedKeys, keys)
+        let updatedValues = which(oneHot, newValues, values)
+
+        let output = MLXFast.scaledDotProductAttention(
+            queries: ropedQueries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: .array(mask))
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+        return (oProj(sigmoidMultiply(output, gate)), updatedKeys, updatedValues)
     }
 
     func callAsFunction(
@@ -2065,6 +2132,113 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
 
+    // Fixed capacity of the MTP head KV buffers: the official window's max
+    // head history is 511 priming rows + 128 committed + 8 deepest drafts
+    // = 647 rows, so 1024 never grows inside a scored window.
+    static let compiledDraftKVCapacity = 1024
+
+    // Shapeful-compiled single-row draft step, resolved once. Nil when the
+    // guards fail; the session then runs the uncompiled head forwards.
+    private var _compiledDraftStep: (([MLXArray]) -> [MLXArray])?
+    private var _compiledDraftStepResolved = false
+
+    /// One compiled steady-state MTP draft step, or nil when unavailable.
+    ///
+    /// Inputs: `(hidden [1,1,H] post-final-norm, token [1,1] int32,
+    /// keys [1,kvHeads,CAP,D], values [1,kvHeads,CAP,D],
+    /// phys [1] int32 = valid-row count)`. Outputs:
+    /// `(draftId [1,1] int32, headHidden [1,1,H] post-mtp.norm,
+    /// newKeys, newValues)`. `headHidden` chains into the next step exactly
+    /// like the uncompiled `mtpHeadHiddenForward` output.
+    ///
+    /// Shapeful compile with ALL input shapes fixed: the KV length is a
+    /// VALUE (`phys`), not a shape — attention spans the valid prefix via
+    /// an additive -inf mask and the new row replaces buffer row `phys`
+    /// in place. One trace, never a retrace (the trace is warmed outside
+    /// every scored window). Proposal side only: the target re-verifies
+    /// every emitted token.
+    public var compiledDraftStep: (([MLXArray]) -> [MLXArray])? {
+        if _compiledDraftStepResolved {
+            return _compiledDraftStep
+        }
+        _compiledDraftStepResolved = true
+        _compiledDraftStep = makeCompiledDraftStep()
+        return _compiledDraftStep
+    }
+
+    private func makeCompiledDraftStep() -> (([MLXArray]) -> [MLXArray])? {
+        guard MLXHardwareInfo.isCompiledDecodeSupported,
+              let mtp, mtp.layers.count == 1,
+              usesCompactDraftVocabulary
+        else { return nil }
+        let layer = mtp.layers[0]
+        let attention = layer.selfAttn
+        // The SAME compact-head instance the uncompiled `draftTokenID` path
+        // uses: build it now so the traced GEMM is the production one.
+        if _compactDraftHead == nil {
+            _compactDraftHead = makeCompactDraftHead()
+        }
+        let draftHead = _compactDraftHead!
+        let prefixCount = Self.compactDraftPrefixCount
+        let controlOffset = Self.compactDraftControlStart - prefixCount
+
+        // Full draft step: pre-fc fusion -> the single MTP decoder layer
+        // (explicit-buffer attention) -> mtp.norm -> compact head argmax
+        // mapped back to the tokenizer's ID space. The argmax total order
+        // (strictly-greater value wins, exact tie to the lower id) is the
+        // one `qwen_mtp_draft_select` documents as identical to `argMax`,
+        // and the padding rows' indices are the largest, so a full argmax
+        // over the padded output equals the bounded-98_330 kernel result.
+        let body: ([MLXArray]) -> [MLXArray] = { inputs in
+            let hidden = inputs[0]
+            let token = inputs[1]
+            let keys = inputs[2]
+            let values = inputs[3]
+            let phys = inputs[4]
+            let embeds = self.model.embedTokens(token)
+            let fused = mtp.fc(
+                concatenated(
+                    [mtp.preFcNormEmbedding(embeds), mtp.preFcNormHidden(hidden)],
+                    axis: -1))
+            let r = attention.attendSingleRow(
+                layer.inputLayerNorm(fused),
+                keys: keys, values: values, offset: phys)
+            var h = fused + r.0
+            h = h + (layer.mlp as! UnaryLayer)(layer.postAttentionLayerNorm(h))
+            let normed = mtp.norm(h)
+            let raw = argMax(draftHead(normed), axis: -1)
+            let mapped = which(raw .< prefixCount, raw, raw + controlOffset)
+            return [mapped, normed, r.1, r.2]
+        }
+        return compile(shapeless: false, body)
+    }
+
+    /// Batched pre-fc fusion over flush rows (embed + both norms + concat +
+    /// fc) — the leading part of `mtpHeadLastHiddenWithKVOnlyHistory`
+    /// without the final full decoder row, which the compiled draft steps
+    /// take over.
+    public func mtpFusedRows(
+        hidden: MLXArray, nextTokenIds: MLXArray
+    ) -> MLXArray {
+        guard let mtp else {
+            fatalError("mtpFusedRows called but the MTP head is not attached.")
+        }
+        let embeds = model.embedTokens(nextTokenIds)
+        let e = mtp.preFcNormEmbedding(embeds)
+        let h = mtp.preFcNormHidden(hidden)
+        return mtp.fc(concatenated([e, h], axis: -1))
+    }
+
+    /// Append fused history rows to the head KV cache without computing
+    /// layer outputs (the `appendHistoryKV` path): committed rows only need
+    /// the K/V side effect.
+    public func mtpAppendHistoryRows(
+        _ fused: MLXArray, cache: [any KVCache]
+    ) {
+        guard let mtp, mtp.layers.count == 1 else { return }
+        mtp.layers[0].appendHistoryKV(fused, cache: cache[0])
+    }
+
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
@@ -2437,8 +2611,24 @@ extension Qwen35TextModel: MTPCapable {
     /// Allocate a fresh KV cache for the MTP head layers.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
     public func makeMTPCache() -> [any KVCache] {
-        guard let mtp else { return [] }
-        return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
+        guard let mtp, let attention = mtp.layers.first?.selfAttn else { return [] }
+        // Preallocated fixed-capacity buffers: the compiled draft step reads
+        // and writes them as fixed-shape arrays (the KV length is a VALUE),
+        // and the ordinary update() path then writes in place instead of
+        // growing the buffer step-by-step (no mid-run reallocation copies).
+        // 2 x [1, kvHeads, CAP, headDim] bf16 is ~4 MB.
+        let shape = [
+            1, attention.kvHeads, Self.compiledDraftKVCapacity, attention.headDim
+        ]
+        return mtp.layers.map { _ in
+            let cache = KVCacheSimple()
+            cache.state = [
+                MLXArray.zeros(shape, dtype: .bfloat16),
+                MLXArray.zeros(shape, dtype: .bfloat16),
+            ]
+            cache.offset = 0
+            return cache as any KVCache
+        }
     }
 }
 
@@ -2578,5 +2768,21 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+
+    public var compiledDraftStep: (([MLXArray]) -> [MLXArray])? {
+        languageModel.compiledDraftStep
+    }
+
+    public func mtpFusedRows(
+        hidden: MLXArray, nextTokenIds: MLXArray
+    ) -> MLXArray {
+        languageModel.mtpFusedRows(hidden: hidden, nextTokenIds: nextTokenIds)
+    }
+
+    public func mtpAppendHistoryRows(
+        _ fused: MLXArray, cache: [any KVCache]
+    ) {
+        languageModel.mtpAppendHistoryRows(fused, cache: cache)
     }
 }

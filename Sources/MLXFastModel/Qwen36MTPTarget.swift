@@ -99,6 +99,31 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
+    /// One compiled steady-state MTP draft step, or nil when the model does
+    /// not provide one (the session runs the uncompiled head forwards then).
+    ///
+    /// Inputs: `(hidden [1,1,H] post-final-norm, token [1,1] int32,
+    /// keys [1,kvHeads,CAP,D], values [1,kvHeads,CAP,D],
+    /// phys [1] int32 = valid-row count)`. Outputs:
+    /// `(draftId [1,1] int32, headHidden [1,1,H] post-mtp.norm,
+    /// newKeys, newValues)`. The `keys`/`values` buffers are the head cache's
+    /// FULL preallocated buffers (see `KVCacheSimple.bufferState`); the new
+    /// row lands at index `phys` and the returned buffers replace it in
+    /// place, so a rollback only moves the cache's offset. Proposal side
+    /// only: the target re-verifies every emitted token.
+    var compiledDraftStep: (([MLXArray]) -> [MLXArray])? { get }
+
+    /// Batched pre-fc fusion over flush rows (embed + both norms + concat +
+    /// fc): the leading part of a head flush without the final decoder row.
+    /// Companion to `mtpAppendHistoryRows` for the compiled draft loop.
+    func mtpFusedRows(
+        hidden: MLXArray, nextTokenIds: MLXArray
+    ) -> MLXArray
+
+    /// Append fused history rows to the head KV cache without computing
+    /// layer outputs: committed rows only need the K/V side effect.
+    func mtpAppendHistoryRows(_ fused: MLXArray, cache: [any KVCache])
+
     /// INVARIANT #2. The backbone's final `model.norm`, applied to a hidden row.
     /// The MTP head's `pre_fc_norm_hidden` weights were trained on POST-norm
     /// input -- the vendored `MTPCapable.mtpForward` documentation says so
@@ -107,6 +132,13 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// inner text model's `model.norm`, i.e. exactly the norm the inner
     /// `callAsFunction` applies; there is no outer norm to pick by mistake.
     func applyFinalNorm(_ x: MLXArray) -> MLXArray
+}
+
+extension Qwen36MTPTarget {
+    // The compiled draft loop is optional: models without a compiled step
+    // (or on unsupported hardware) run the uncompiled head forwards exactly
+    // as before.
+    public var compiledDraftStep: (([MLXArray]) -> [MLXArray])? { nil }
 }
 
 // Both Qwen 3.6 model classes already implement every member; these

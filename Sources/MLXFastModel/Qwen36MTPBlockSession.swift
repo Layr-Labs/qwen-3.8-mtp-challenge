@@ -155,6 +155,18 @@ public final class Qwen36MTPBlockSession {
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
+    // Compiled draft-step state: the head cache's FULL fixed-capacity KV
+    // buffers, held as session arrays so the compiled closure sees fixed
+    // shapes (the KV length is `headKV.offset` — a Swift Int value, never a
+    // shape). The buffers are the SAME underlying arrays as the head cache's
+    // internal storage: `state`/`bufferState` re-syncs are reference writes,
+    // no GPU work. Nil until the first compiled round adopts them;
+    // `compiledHeadDisabled` fails closed if the cache ever stops matching
+    // the compiled buffer geometry (e.g. a grow past CAP).
+    private var compiledHeadKeys: MLXArray?
+    private var compiledHeadValues: MLXArray?
+    private var compiledHeadDisabled = false
+
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
     public private(set) var roundCount = 0
@@ -286,6 +298,42 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // Compiled draft step: the SHAPEFUL trace must happen OUTSIDE every
+        // scored window. One apply at the real buffer geometry traces the
+        // graph; every later apply is a cache hit because all input shapes
+        // are fixed (the KV length is a value, `phys`, not a shape).
+        // The step's inner kernels (packed qkv GEMM, compact-head GEMM,
+        // SDPA vector path) were already JIT-warmed by the head forwards and
+        // draftTokenID above, so only the graph trace lands here.
+        if let step = model.compiledDraftStep,
+           let warmHeadKV = model.makeMTPCache().first as? KVCacheSimple,
+           let warmBuf = warmHeadKV.bufferState.first,
+           let warmBufV = warmHeadKV.bufferState.last,
+           warmBuf.dim(2) > 1
+        {
+            let warmOut = step([
+                row, MLXArray([Int32(0)]).reshaped([1, 1]),
+                warmBuf, warmBufV, MLXArray([Int32(1)]),
+            ])
+            eval(warmOut[0], warmOut[1])
+        }
+        // The compiled loop's batched flush runs the head fc GEMM at
+        // M = 2 ... maxDepth (backlog rows + the current row; the 512-row
+        // priming shape is the `primed` warm above). Warm every legal M so no
+        // JIT or dispatch-family selection lands inside a scored round.
+        if model.compiledDraftStep != nil {
+            for m in 2 ... Swift.max(2, maxDepth) {
+                let f = model.mtpFusedRows(
+                    hidden: MLXArray.zeros([1, m, hDim], dtype: row.dtype),
+                    nextTokenIds: MLXArray(
+                        Array(repeating: Int32(0), count: m))
+                        .reshaped([1, m]))
+                if m > 1 {
+                    model.mtpAppendHistoryRows(
+                        f[0..., 0 ..< (m - 1), 0...], cache: historyWarmCache)
+                }
+            }
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -864,35 +912,117 @@ public final class Qwen36MTPBlockSession {
         // verify block; the ledger reads the values from the round's single
         // batched eval afterwards). `asyncEval` submits the head chain so the
         // GPU works while the host builds the 64-layer verify graph.
-        // (Per-step asyncEval was tried here and measured NEUTRAL — the
-        // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
-        // idea.md V6 journal. Single submission after the loop, as before.)
+        // (Per-step asyncEval of the UNCOMPILED steps was measured NEUTRAL —
+        // the ~2.4 ms/step was host graph BUILD, not GPU work to overlap; see
+        // idea.md V6 journal. Single submission after the loop, as before.
+        // The compiled branch below flips that: each apply is a replay of an
+        // already-traced fixed-shape graph, so per-step asyncEval DOES
+        // pipeline the step's GPU work under the host's next apply and the
+        // verify build.)
         var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
+        var ranCompiledDraft = false
+        if let step = model.compiledDraftStep, !compiledHeadDisabled,
+           let headKV = headCache.first as? KVCacheSimple
+        {
+            let adopted = Self.compiledHeadBuffers(
+                headKV: headKV,
+                keys: compiledHeadKeys, values: compiledHeadValues)
+            if adopted == nil, compiledHeadKeys != nil {
+                // The cache no longer matches the held buffers (geometry
+                // changed under the compiled path). Fail closed: this round
+                // and every later one run the uncompiled path.
+                compiledHeadDisabled = true
+                compiledHeadKeys = nil
+                compiledHeadValues = nil
+            }
+            if let (bufK, bufV) = adopted {
+                // (K, V, phys) — the cache's full buffers and valid count.
+                var K = bufK
+                var V = bufV
+                var phys = headKV.offset
+                let flushRows = draftInputHidden.dim(1)
+                // Pre-check EVERY write this round makes: the append takes
+                // flushRows - 1 rows, the compiled chain takes draftCount.
+                // While it holds, update() can never grow the buffer, so the
+                // geometry below is stable and nothing mutates before the
+                // check passes.
+                if phys + flushRows + draftCount <= K.dim(2) {
+                    // The flush: batched pre-fc fusion over all rows, KV-only
+                    // append of the leading committed rows (one batched
+                    // call), then the compiled chain takes the last row — the
+                    // same split `mtpHeadLastHiddenWithKVOnlyHistory` uses,
+                    // with the final full row replaced by the compiled step.
+                    let fused = model.mtpFusedRows(
+                        hidden: draftInputHidden, nextTokenIds: draftInputTokens)
+                    if flushRows > 1 {
+                        // The append writes the leading rows INTO the cache's
+                        // internal buffer (the session's buffer array, via
+                        // the state sync below) and returns a NEW array, so
+                        // re-read afterwards.
+                        headKV.state = [K, V]
+                        headKV.offset = phys
+                        model.mtpAppendHistoryRows(
+                            fused[0..., 0 ..< (fused.dim(1) - 1), 0...],
+                            cache: headCache)
+                        let state = headKV.bufferState
+                        K = state[0]
+                        V = state[1]
+                        phys = headKV.offset
+                    }
+                    var h = fused[0..., (fused.dim(1) - 1)..., 0...]
+                    var token = draftInputTokens[
+                        0..., (draftInputTokens.dim(1) - 1)..., 0...]
+                    for _ in 0 ..< draftCount {
+                        let out = step([h, token, K, V, MLXArray([Int32(phys)])])
+                        let draftId = out[0]
+                        draftIdArrays.append(draftId)
+                        asyncEval(draftId)
+                        h = out[1]
+                        K = out[2]
+                        V = out[3]
+                        token = draftId
+                        phys += 1
+                    }
+                    // Re-sync: the cache's internal storage becomes the
+                    // session's final buffers (reference write, no GPU
+                    // work); the offset tracks the VALID prefix — the
+                    // speculative deeper-draft rows stay past the offset,
+                    // masked (and get overwritten) until the next write.
+                    headKV.state = [K, V]
+                    headKV.offset = validHistoryOffset
+                    compiledHeadKeys = K
+                    compiledHeadValues = V
+                    ranCompiledDraft = true
+                }
+            }
+        }
+        if !ranCompiledDraft {
+            var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
-        draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache)
+            var draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            var draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
+            // Early submission of the FIRST head step: its graph exists ~2.4 ms
+            // before the rest of the chain is built, and unlike the per-step
+            // variant (measured neutral — nothing but build time between
+            // steps) the first step carries the history flush, which IS real
+            // GPU work the device can start while the host builds steps 2..d.
+            asyncEval(draftId)
+            for _ in 1 ..< draftCount {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                draftHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                draftId = model.draftTokenID(draftHidden)
+                draftIdArrays.append(draftId)
+            }
+            asyncEval(draftIdArrays[draftIdArrays.count - 1])
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1251,6 +1381,39 @@ public final class Qwen36MTPBlockSession {
             let extra = entry.offset - offset
             if extra > 0 { _ = entry.trim(extra) }
         }
+    }
+
+    /// Return the head cache's FULL (un-sliced) KV buffers for the compiled
+    /// step, or nil when the geometry does not match the held buffers.
+    ///
+    /// The compiled closure needs the complete preallocated buffers —
+    /// `state` only exposes the `[..<offset]` slice — so `bufferState` is the
+    /// raw view. The valid-row count stays in `headKV.offset` (the caller
+    /// reads it). The cache's internal arrays are authoritative: an
+    /// uncompiled round may have rewritten them since the buffers were held,
+    /// so the current arrays are adopted, not the stale held ones.
+    private static func compiledHeadBuffers(
+        headKV: KVCacheSimple,
+        keys: MLXArray?, values: MLXArray?
+    ) -> (MLXArray, MLXArray)? {
+        let state = headKV.bufferState
+        guard state.count == 2 else { return nil }
+        let (bufK, bufV) = (state[0], state[1])
+        guard bufK.dim(2) > 0, bufK.dim(2) == bufV.dim(2) else { return nil }
+        guard let keys, let values else {
+            // First use: adopt the cache's buffers as-is (the preallocated
+            // fixed-capacity buffers from makeMTPCache).
+            return (bufK, bufV)
+        }
+        guard keys.dim(2) == bufK.dim(2), values.dim(2) == bufV.dim(2) else {
+            // Geometry changed (a grow past the held capacity): the caller
+            // fails the compiled path closed.
+            return nil
+        }
+        // The cache's internal arrays are authoritative (an uncompiled round
+        // may have rewritten them since the buffers were held): adopt the
+        // current arrays, not the stale held ones.
+        return (bufK, bufV)
     }
 
     /// Offset of the first trimmable (global-attention) cache — the sequence
