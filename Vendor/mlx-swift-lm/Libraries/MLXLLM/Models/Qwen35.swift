@@ -1827,15 +1827,18 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // Decode-width asyncEval. Serial / width-2 keep the crown 8-rung
+        // schedule so the paired denominator does not move.
+        //
+        // Ranked receipt 180edba (S<=9 with ALL eight rungs) scored 2.8318
+        // vs 4eb5448 / 2.8653 (−3.38%). At S=3..9 the verify is already
+        // GPU-heavy. Eight asyncEval of those wide prefixes broke the
+        // remaining 64-layer graph and paid enqueue tax. The leftover is
+        // the FIRST kickoff only: after layer 0 the GPU has work while
+        // the host builds layers 1..63. Prefill S>9 stays off.
+        let seqWidth = inputs.dim(1)
+        let fullCrownRungs = seqWidth <= 2
+        let kickoffOnly = seqWidth >= 3 && seqWidth <= 9
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1844,13 +1847,15 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
+            if fullCrownRungs {
                 switch i {
                 case 0, 1, 9, 19, 29, 39, 49, 57:
                     asyncEval(hiddenStates)
                 default:
                     break
                 }
+            } else if kickoffOnly, i == 0 {
+                asyncEval(hiddenStates)
             }
         }
 
