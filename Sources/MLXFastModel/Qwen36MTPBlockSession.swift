@@ -957,15 +957,16 @@ public final class Qwen36MTPBlockSession {
 
         if Self.traceRounds { tReadDone = DispatchTime.now().uptimeNanoseconds }
 
+        var verifiedTrajectoryIsAuthoritative = false
         if acceptedCount == drafts.count {
             // FULL ACCEPTANCE: the verify state IS the committed state. No
             // rollback, no repair forward; the bonus row carries the next primary
-            // and the last hidden row seeds the next draft.
+            // and the accepted trajectory below seeds the next draft.
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            verifiedTrajectoryIsAuthoritative = true
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -990,7 +991,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                verifiedTrajectoryIsAuthoritative = true
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1023,6 +1024,28 @@ public final class Qwen36MTPBlockSession {
             }
         }
 
+        // Every authoritative verify row on the committed trajectory feeds the
+        // MTP head exactly once: rows 0..<acceptedCount enter its persistent
+        // history, and row acceptedCount is the pending hidden for the next
+        // proposal. RMSNorm is row-local, so normalize that contiguous block in
+        // one dispatch instead of constructing one slice + one final-norm graph
+        // per row. A generic repair keeps its independently-produced pending row
+        // and the legacy history path below.
+        var batchedTrajectoryHidden: MLXArray?
+        if verifiedTrajectoryIsAuthoritative {
+            let trajectoryPreNorm = acceptedCount == drafts.count
+                ? verifyHidden
+                : verifyHidden[0..., 0 ..< (acceptedCount + 1), 0...]
+            let trajectoryHidden = postNorm
+                ? model.applyFinalNorm(trajectoryPreNorm)
+                : trajectoryPreNorm
+            batchedTrajectoryHidden = trajectoryHidden
+            pendingHidden = acceptedCount == 0
+                ? trajectoryHidden
+                : trajectoryHidden[
+                    0..., acceptedCount ..< (acceptedCount + 1), 0...]
+        }
+
         if Self.traceRounds { tCommitDone = DispatchTime.now().uptimeNanoseconds }
 
         // Head-history upkeep. Trim the speculative deeper-draft rows back to
@@ -1032,9 +1055,16 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
-            headHistoryBacklogTokens.append(drafts[index])
+        if acceptedCount > 0, let batchedTrajectoryHidden {
+            headHistoryBacklogHidden.append(
+                batchedTrajectoryHidden[0..., 0 ..< acceptedCount, 0...])
+            headHistoryBacklogTokens.append(
+                contentsOf: drafts.prefix(acceptedCount))
+        } else if acceptedCount > 0 {
+            for index in 0 ..< acceptedCount {
+                headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+                headHistoryBacklogTokens.append(drafts[index])
+            }
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
