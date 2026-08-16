@@ -568,6 +568,38 @@ public final class Qwen36MTPBlockSession {
     private static let segmentedVerifyDepthCap = 8
     private static let segmentedStreakGate = 3
 
+    /// STREAK AS DECAYING EVIDENCE, NOT AN ALL-OR-NOTHING LATCH.
+    ///
+    /// The streak counter qualifies the deep (segmented) width cap. It shipped
+    /// as "increment on a fully-accepted round, reset to 0 on any partial
+    /// accept". That reset is the part being changed here, for one reason: the
+    /// counter is a CONFIDENCE ESTIMATE, and annihilating it throws away every
+    /// observation that produced it. On the hidden pool's real prose the head
+    /// does not accept perfectly forever; a single partial accept after a long
+    /// hot run forced THREE more consecutive perfect rounds before a deep round
+    /// could fire again, so a prompt that is genuinely in the deep regime kept
+    /// falling back to cap 4 and paying the ramp repeatedly. The frontier built
+    /// exact width-6..8 verification (segmented sdpa) precisely to make deep
+    /// rounds available; a latch that rarely unlocks forfeits what it bought.
+    ///
+    /// Note the safety argument is unchanged. `widthCap` is a PERMISSION, not a
+    /// decision: `costModelDepth` still prices each additional draft against the
+    /// per-position acceptance EMAs, so a session whose head is actually missing
+    /// draws a shallow depth no matter how permissive the cap is. Relaxing the
+    /// latch cannot force a deep round; it can only stop forbidding one.
+    ///
+    /// Two bounds keep this from becoming a one-way ratchet:
+    ///   * a reject costs `streakRejectPenalty` (2), so ONE bad round still
+    ///     de-qualifies a just-qualified streak (3 -> 1) and two clean rounds
+    ///     are needed to return — hysteresis is preserved, amnesia is not;
+    ///   * the streak saturates at `streakCeiling` (gate + 2), so a long hot
+    ///     run cannot bank so much credit that a prompt turning hard takes many
+    ///     rejects to respond. Without the ceiling, decay would make the deep
+    ///     regime STICKIER than the latch it replaces on exactly the prompts
+    ///     where that is most expensive.
+    private static let streakRejectPenalty = 2
+    private static let streakCeiling = segmentedStreakGate + 2
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1042,8 +1074,15 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
+        // Decaying evidence rather than a latch — see `streakRejectPenalty`.
+        // A fully-accepted round earns one unit (saturating at `streakCeiling`);
+        // a partial accept spends `streakRejectPenalty` instead of erasing the
+        // whole history. Empty rounds never reach here (the drafts-empty path
+        // returns earlier), so this only scores rounds that actually proposed.
         fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+            acceptedCount == drafts.count
+                ? Swift.min(Self.streakCeiling, fullAcceptStreak + 1)
+                : Swift.max(0, fullAcceptStreak - Self.streakRejectPenalty)
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
