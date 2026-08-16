@@ -1155,9 +1155,11 @@ final class Qwen35GatedDeltaNet: Module {
 /// intermediate materialization) with a single launch. The arithmetic is
 /// elementwise and unchanged — silu first, then multiply, same rounding —
 /// so the values are bit-identical to the two-kernel path; only the
-/// intermediate buffer disappears. Shapeless compilation shares one trace
-/// across verify widths (the fused GEMM's N is constant, so the half-split
-/// offsets are width-invariant).
+/// intermediate buffer disappears. The trace is SHAPE-SPECIALISED (not
+/// shapeless): the half-split slice has no statically inferable shape under
+/// shapeless compilation, so each distinct (B,S,N) input builds one trace.
+/// warmAllDepths warms every legal verify width (backbone, N=34816) and S=1
+/// (head), so no trace is built inside the timed window.
 private let qwen35CompiledFusedSwiGLU:
     @Sendable (MLXArray) -> MLXArray =
 {
@@ -1404,6 +1406,134 @@ func qwen35AttentionQKRMSRoPE(
         grid: (totalRows * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[B, queryHeads, L, D], [B, keyHeads, L, D]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+// MARK: - Fused residual + RMS norm
+
+/// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
+///
+/// Bit-exact with the eager `h = x + r; postAttentionLayerNorm(h)` sequence
+/// because the add is rounded to BF16 BEFORE squaring (matching the write-back
+/// and re-read of `h` in the eager path) and the accumulation / reduction tree
+/// mirrors `rms_norm.metal` exactly.
+private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
+/// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
+/// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
+func qwen35FusedResidualRMSNorm(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray) {
+    let nRows = x.size / x.dim(-1)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormKernel(
+        [x, r, weight, eps],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape],
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
@@ -1794,8 +1924,21 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Fused residual+RMSNorm when shapes and dtype match the common
+        // decode path (hidden 5120, BF16).  Bit-exact with the eager
+        // h = x + r; postAttentionLayerNorm(h) sequence.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
 }
 
@@ -1864,6 +2007,10 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        // Candidate-only densification: verify widths 3..9 fire asyncEval on a
+        // denser stride-4 schedule; serial S=1 and width-2 keep the crown rungs
+        // byte-for-byte (the serial leg is the denominator, so it must not move).
+        let candidateDenseRungs = inputs.dim(1) >= 3
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1875,6 +2022,10 @@ public class Qwen35TextModelInner: Module {
             if ladderActive {
                 if prefillLadder {
                     if i == 0 || i % 4 == 3 {
+                        asyncEval(hiddenStates)
+                    }
+                } else if candidateDenseRungs {
+                    if i <= 1 || i % 4 == 0 {
                         asyncEval(hiddenStates)
                     }
                 } else {
