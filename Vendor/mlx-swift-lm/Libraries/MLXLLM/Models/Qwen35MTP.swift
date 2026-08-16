@@ -67,6 +67,75 @@ final class Qwen35MTPDecoderLayer: Module {
     }
 }
 
+// MARK: - Compiled fusion FC (512-row seed + later multi-row flushes)
+
+/// Compile the still-eager MTP fusion host graph: quantized embed gather +
+/// two pre-FC RMSNorms + concat. `fc` stays a module call so a DFlash
+/// wrapper, if present, keeps its kernel. Same 1e-6 RMS contract as the
+/// eager `RMSNorm` on this model. Serial depth-0 never enters MTP.
+private let qwen35CompiledFusionEmbedNorms:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+{
+    let body:
+        @Sendable (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) ->
+        MLXArray =
+    { ids, hidden, embW, embS, embB, eW, hW in
+        let embeds = dequantized(
+            embW[ids], scales: embS[ids], biases: embB[ids],
+            groupSize: 64, bits: 4, mode: .affine)
+        let e = MLXFast.rmsNorm(embeds, weight: eW, eps: 1e-6)
+        let h = MLXFast.rmsNorm(hidden, weight: hW, eps: 1e-6)
+        return concatenated([e, h], axis: -1)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+/// Fallback when the backbone embed is not 4-bit/g64 affine: compile only
+/// the two pre-FC norms + concat after the eager embed lookup.
+private let qwen35CompiledFusionNormsConcat:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+    { embeds, hidden, eW, hW in
+        let e = MLXFast.rmsNorm(embeds, weight: eW, eps: 1e-6)
+        let h = MLXFast.rmsNorm(hidden, weight: hW, eps: 1e-6)
+        return concatenated([e, h], axis: -1)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+private func qwen35FuseHiddenAndNextToken(
+    hidden: MLXArray,
+    nextTokenIds: MLXArray,
+    embedTokens: Embedding,
+    preFcNormEmbedding: RMSNorm,
+    preFcNormHidden: RMSNorm,
+    fc: Linear
+) -> MLXArray {
+    let concat: MLXArray
+    if let qe = embedTokens as? QuantizedEmbedding,
+       qe.groupSize == 64, qe.bits == 4, qe.mode == .affine,
+       let embB = qe.biases
+    {
+        concat = qwen35CompiledFusionEmbedNorms(
+            nextTokenIds, hidden,
+            qe.weight, qe.scales, embB,
+            preFcNormEmbedding.weight, preFcNormHidden.weight)
+    } else {
+        let embeds = embedTokens(nextTokenIds)
+        concat = qwen35CompiledFusionNormsConcat(
+            embeds, hidden,
+            preFcNormEmbedding.weight, preFcNormHidden.weight)
+    }
+    return fc(concat)
+}
+
 // MARK: - MTPModule
 
 /// Multi-Token Prediction head for Qwen3.5/3.6.
@@ -112,10 +181,13 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = qwen35FuseHiddenAndNextToken(
+            hidden: hidden,
+            nextTokenIds: nextTokenIds,
+            embedTokens: embedTokens,
+            preFcNormEmbedding: preFcNormEmbedding,
+            preFcNormHidden: preFcNormHidden,
+            fc: fc)
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -146,10 +218,13 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused = qwen35FuseHiddenAndNextToken(
+            hidden: hidden,
+            nextTokenIds: nextTokenIds,
+            embedTokens: embedTokens,
+            preFcNormEmbedding: preFcNormEmbedding,
+            preFcNormHidden: preFcNormHidden,
+            fc: fc)
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
