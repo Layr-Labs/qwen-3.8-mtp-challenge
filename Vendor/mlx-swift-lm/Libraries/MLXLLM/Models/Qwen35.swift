@@ -1608,15 +1608,20 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // Decode-width asyncEval ladder. The crown still gates rungs at
+        // S <= 2 with spacing ~10 (0, 1, 9, …, 57). After the 4-bit head
+        // and wide-verify (SDPA-only S=3..9) the draft chain no longer
+        // hides the 64-layer host build, so those medal-path widths were
+        // leaving the GPU idle. Serial S=1 already had the ladder, so
+        // widening the gate is candidate-only on the paired score.
+        // Stride 10→4 with the front pair kept is the denser schedule
+        // mega-dmitriy sized (85729907) but never scored — that row
+        // surface-failed when DawgZter's K/V-only flush promoted.
+        // Pure enqueue timing: no op added/removed, no reduction order
+        // change. Seed-prefill S=512 stays off the ladder.
+        let ladderMaxWidth = 9
+        let ladderStride = 4
+        let ladderActive = inputs.dim(1) <= ladderMaxWidth
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1625,13 +1630,8 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
-                    asyncEval(hiddenStates)
-                default:
-                    break
-                }
+            if ladderActive && (i <= 1 || i % ladderStride == 0) {
+                asyncEval(hiddenStates)
             }
         }
 
