@@ -343,10 +343,10 @@ jobs:
       # delete the worked example the 3.8 re-measurement has to reproduce.
       MLXFAST_QWEN_MTP_CONTRACT_PATH: fixtures/qwen3_8_27b_mtp_track.json
       # The BENCHMARK MANIFEST (editablePaths / scoring), distinct from the track
-      # contract fixture above. Passed as CONTRACT_PATH to BOTH
-      # enforce-modifiable-surface.sh and overlay-editable-paths.sh so a
-      # submission is judged and overlaid against the SAME surface; naming a
-      # different file in one of the two silently drops files the other accepted.
+      # contract fixture above. Passed as CONTRACT_PATH to BOTH the static
+      # review and overlay so a submission is judged and overlaid against the
+      # SAME surface; naming a different file in one of the two silently drops
+      # files the other accepted.
       MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT: benchmark.qwen-mtp.json
       # The manifest file names the pinned artifact in its three pinned header
       # lines (EigenLabs/Qwen3.8-27B-4bit @
@@ -1117,7 +1117,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify submitted commit and modifiable surface
+      - name: Verify submitted commit and capture review base
         id: verify_submission
         if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
@@ -1135,23 +1135,23 @@ jobs:
             echo "::error::submitted checkout cannot resolve trusted main commit ${TRUSTED_MAIN_SHA}" >&2
             exit 1
           fi
-          base_sha="$("${hardened_git}" -C .mlxfast-submission-src merge-base "${TRUSTED_MAIN_SHA}" "${actual_sha}")"
-          if [[ "${base_sha}" != "${TRUSTED_MAIN_SHA}" ]]; then
-            echo "::error::submission must be based on current trusted main ${TRUSTED_MAIN_SHA}; merge-base is ${base_sha}" >&2
+          read -r commit_sha base_sha extra_parent < <(
+            "${hardened_git}" -C .mlxfast-submission-src rev-list --parents -n 1 "${actual_sha}"
+          )
+          if [[ "${commit_sha}" != "${actual_sha}" || -z "${base_sha:-}" || -n "${extra_parent:-}" ]]; then
+            echo "::error::submission must be a single commit with exactly one parent" >&2
             exit 1
           fi
-          # CONTRACT_PATH is load-bearing, not cosmetic: without it the script
-          # defaults to benchmark.json (the DFlash manifest on this branch) and a
-          # Qwen-MTP submitter's edits are judged against the wrong editable
-          # surface -- while the overlay below, reading the same default, silently
-          # does not overlay them. Both invocations must name this track's
-          # manifest.
-          (
-            cd .mlxfast-submission-src
-            BASE_SHA="${base_sha}" HEAD_SHA="${actual_sha}" \
-              CONTRACT_PATH="${MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT}" \
-              "${GITHUB_WORKSPACE}/.github/scripts/enforce-modifiable-surface.sh"
-          )
+          # Yukon creates every submission as one commit on a trusted-main
+          # ancestor and validates archive paths against editablePaths before it
+          # creates that commit. Do not require base_sha to equal the CURRENT
+          # trusted tip: an earlier candidate may have been promoted while this
+          # job was queued. The trusted overlay below copies only editablePaths,
+          # and Yukon separately rejects harness drift before promotion.
+          if ! "${hardened_git}" -C .mlxfast-submission-src merge-base --is-ancestor "${base_sha}" "${TRUSTED_MAIN_SHA}"; then
+            echo "::error::submission parent ${base_sha} is not in trusted main history at ${TRUSTED_MAIN_SHA}" >&2
+            exit 1
+          fi
           if ! "${hardened_git}" cat-file -e "${actual_sha}^{commit}"; then
             "${hardened_git}" fetch --no-tags .mlxfast-submission-src "${actual_sha}"
           fi
@@ -1175,14 +1175,13 @@ jobs:
       # pinned by test: an unrecognised id must never inherit a neighbouring
       # track's speculative-decode policy.
       #
-      # CONTRACT_PATH is set here for the same reason the surface-enforcement and
-      # overlay steps set it: this is the THIRD consumer of an editable surface,
-      # and the three must never disagree about which manifest a submission is
-      # judged against. It happens to be redundant while benchmark.json and
+      # CONTRACT_PATH is set here for the same reason the overlay step sets it:
+      # the two must never disagree about which manifest a submission is judged
+      # and overlaid against. It happens to be redundant while benchmark.json and
       # benchmark.qwen-mtp.json are byte-identical in this repository; it stops
       # being redundant the moment they diverge, and a silent divergence here
-      # would review a submission against a surface it was never enforced or
-      # overlaid under.
+      # would review a submission against a different surface from the one
+      # overlaid into the trusted checkout.
       - name: Review submitted code for benchmark bypasses (Qwen-MTP policy)
         if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
@@ -1203,8 +1202,8 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/heads/submissions/') }}
         env:
           SUBMISSION_WORKTREE: .mlxfast-submission-src
-          # Must match the CONTRACT_PATH the surface enforcement above used, or
-          # the overlay silently drops files the enforcement just accepted.
+          # Must match the CONTRACT_PATH the static review above used, or the
+          # overlay can silently omit files that the review inspected.
           CONTRACT_PATH: ${{ env.MLXFAST_QWEN_MTP_EDITABLE_SURFACE_CONTRACT }}
         run: .github/scripts/overlay-editable-paths.sh
 
