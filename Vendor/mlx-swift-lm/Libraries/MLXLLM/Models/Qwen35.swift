@@ -1274,6 +1274,20 @@ public class Qwen35TextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
 
+    /// asyncEval ladder rung spacing, in layers. Measured optimum is 4 on a
+    /// standalone microbench of this layer stack at real geometry; see the
+    /// sweep table at the ladder site in `callAsFunction`. Retune here.
+    private static let asyncEvalLadderStride = 4
+
+    /// Widest forward the asyncEval ladder fires on. 9 = the widest legal
+    /// verify block: `MLXFastConstants.qwenMTPMaxDraftDepth` (8) drafts plus
+    /// the pending primary. Spelled as a literal because this vendored module
+    /// does not depend on the participant constants target; if that cap ever
+    /// moves, this must move with it. Anything wider than a verify block is
+    /// the seed prefill, which is deliberately out of scope — see the ladder
+    /// site in `callAsFunction`. Independently revertible from the stride.
+    private static let asyncEvalLadderMaxWidth = 9
+
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
 
@@ -1318,15 +1332,100 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
+        // asyncEval ladder. The host builds a ~64-layer graph before anything
+        // reaches the GPU; firing asyncEval at layer boundaries lets the GPU
         // start on the early layers while the host is still building the
         // rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
-        let ladderActive = inputs.dim(1) <= 2
+        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step).
+        //
+        // 2026-08-16, REBASED ONTO THE 2.7967 TIP. Why this gap is open NOW:
+        // the declared 4-bit head made the draft chain cheap and the crossrow
+        // widening made the verify rows cheap, so the per-round HOST BUILD of
+        // the wide verify graph is a larger relative slice than when the
+        // S <= 2 gate was cut — the gate no longer hides it. CREDIT where it
+        // is due: metaspartan's public note (submission d8b947a, GLM 5.3,
+        // stale-failed on ancestry before scoring) published the gate
+        // widening 2 -> 9 with an M5 measurement of -1.1..-1.2 ms/round
+        // (-3.2% / -2.0% at depths 2 / 4) under 4-bit-head economics. The
+        // gate half of this change is their published mechanism, rebased;
+        // the STRIDE half (10 -> 4, front pair kept) is ours, from the
+        // sweep below, and was never in their row.
+        //
+        // 2026-08-16 — TWO CHANGES, both from a standalone microbench that
+        // reconstructs this layer stack at real geometry (affine-4/g64,
+        // hidden 5120, intermediate 17408, 24Q/4KV, head_dim 256, fused
+        // qkv + gate_up) with random weights: 32 distinct layers, arms
+        // interleaved WITHIN one process, min-of-20 per arm, baseline = one
+        // lazy eval per forward:
+        //
+        //     asyncEval every 16 layers    -0.40%
+        //     asyncEval every  8 layers    -1.26%
+        //     asyncEval every  4 layers    -2.30%   <- optimum
+        //     asyncEval every  2 layers    -2.23%
+        //     asyncEval every  1 layer     -2.10%   <- past the optimum
+        //
+        // (1) THE WIDTH GATE IS WIDENED, 2 -> 9. It read `inputs.dim(1) <= 2`,
+        //     so the ladder was OFF for every wide verify — that is, off on
+        //     the whole medal path, where the median run sits near verify
+        //     width 6. Nothing in the mechanism is width-dependent: the host
+        //     still builds all 64 layers before the GPU sees the first one.
+        //
+        //     It is widened to 9 rather than removed outright, deliberately.
+        //     9 covers EVERY legal verify width (8 drafts + 1 primary) and
+        //     excludes exactly one thing: the 512-row seed prefill in
+        //     `begin()`. That prefill is a regime the sweep never covered —
+        //     a large, already well-pipelined graph where the host is not
+        //     the bottleneck — and it sits inside the scored window, so an
+        //     unmeasured change there is a risk taken for no modelled gain.
+        //     The direct cost of either choice is negligible (18 rungs x
+        //     ~1.2 us of dispatch), so this is a question of unmeasured
+        //     regime risk, not of overhead.
+        // (2) RUNG SPACING 10 -> 4. The old schedule (0,1,9,19,29,39,49,57) is
+        //     ~every 10, which the sweep prices near -0.4%; every 4 is -2.3%.
+        //     The two front rungs are kept — the GPU is idle longest at the
+        //     start, so the earliest submissions are the valuable ones.
+        //
+        // CAVEAT, stated rather than hidden: the microbench stack is ALL
+        // FULL-ATTENTION layers. This backbone is 48/64 GatedDeltaNet, whose
+        // recurrence has a different dependency structure and may already
+        // serialise in a way that eats the overlap — so -2.3% is an upper
+        // bound until a paired real-model run confirms it.
+        //
+        // SIZE THIS CONSERVATIVELY ON THIS BASE. The frontier this rides on
+        // already runs the verify GDN, conv and projections as ONE wide
+        // call, splitting only SDPA — which removed a large share of the
+        // per-round host graph-building work this ladder exists to overlap.
+        // The mechanisms do not conflict in correctness, but the ladder's
+        // measured share here should come in under the -2.3% microbench
+        // figure for that reason alone, independent of the GDN
+        // serialisation question above.
+        //
+        // CLOSEST RANKED EVIDENCE AGAINST: a prior submission whose thesis
+        // was INTER-round host pre-issue was rejected at -1.34%, with
+        // identical effective draft lengths and uniform loss across prompts.
+        // That was between rounds rather than within the forward, so it
+        // should not govern this change — but it is direct ranked evidence
+        // that host-overlap lanes can tax rather than pay, and it is the
+        // reason this ships with a stated revert trigger instead of as a
+        // free win. If the paired run comes back under ~1%, revert. If it
+        // regresses, suspect GDN recurrence serialisation first, then the
+        // stride, and narrow the gate back to `inputs.dim(1) <= 2` before
+        // abandoning the stride change. The gate and the stride are
+        // INDEPENDENTLY REVERTIBLE: `asyncEvalLadderStride` back to 10-ish
+        // restores the old spacing, and the gate constant restores the old
+        // width coverage, and neither edit requires touching the other.
+        //
+        // FIDELITY: `asyncEval` changes only WHEN work is submitted, never
+        // what is computed. No op is added or removed, no accumulation order
+        // moves, and MLX does not fuse across ops outside `compile()`, so
+        // forcing materialisation at a layer boundary cannot move a value.
+        // The exact-token gate has nothing to catch.
+        //
+        // A verify block is at most 8 drafts + 1 pending primary = 9 rows, so
+        // this covers every verify width the session can produce. Anything
+        // wider is the seed prefill, deliberately excluded per (1) above.
+        let ladderActive = inputs.dim(1) <= Self.asyncEvalLadderMaxWidth
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1335,13 +1434,8 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                switch i {
-                case 0, 1, 9, 19, 29, 39, 49, 57:
-                    asyncEval(hiddenStates)
-                default:
-                    break
-                }
+            if ladderActive, i <= 1 || (i + 1) % Self.asyncEvalLadderStride == 0 {
+                asyncEval(hiddenStates)
             }
         }
 
