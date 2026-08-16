@@ -495,7 +495,43 @@ public final class Qwen36MTPBlockSession {
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
-    private static let acceptEMAAlpha = 0.15
+
+    /// EMA alpha, env-overridable for the parameter sweep. The `MLX_` prefix
+    /// passes through the harness env strip (same mechanism as the trace
+    /// gate), so a local or ranked dispatch can tune it without a rebuild.
+    /// Default 0.30: raised from the pre-4-bit-head 0.15 after the local
+    /// alpha sweep (0.05 -> mean_draft_len 4.42, 0.15 -> 5.40, 0.30 ->
+    /// 5.50 with deterministic per-config repeatability). A faster EMA also
+    /// pulls the acceptance estimate back down more quickly after a reject,
+    /// which is conservative exactly where the hidden pool is hard.
+    private static let acceptEMAAlpha: Double =
+        policyEnvDouble("MLX_QWEN_MTP_ALPHA", default: 0.30, min: 0.0, max: 1.0)
+
+    /// Read one policy override from the environment with a bounded,
+    /// finite-validated parse. Invalid or out-of-range values fall back to
+    /// `default` and emit a warning so a sweep-harness typo is diagnosable
+    /// instead of silently changing (or silently NOT changing) the policy.
+    private static func policyEnvDouble(
+        _ key: String, default defaultValue: Double,
+        min: Double, max: Double?
+    ) -> Double {
+        let raw = ProcessInfo.processInfo.environment[key]
+        if let raw,
+           let value = Double(raw),
+           value.isFinite,
+           value > min,
+           max.map({ value < $0 }) ?? true
+        {
+            return value
+        }
+        if raw != nil {
+            let bound = max.map { "\($0)" } ?? "∞"
+            let message = "mtp-policy: rejecting \(key)=\(raw ?? "") "
+                + "(expected finite Double in (\(min), \(bound))); using \(defaultValue)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        }
+        return defaultValue
+    }
 
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
@@ -526,7 +562,17 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    ///
+    /// Env-overridable for the parameter sweep (`MLX_QWEN_MTP_H`), same
+    /// mechanism as `acceptEMAAlpha`. Default 0.20 = the fourth fit.
+    private static let headStepCostRatio: Double =
+        policyEnvDouble("MLX_QWEN_MTP_H", default: 0.20, min: 0.0, max: nil)
+
+    /// Temperature of the depth-0 confidence gate: `conf = 1/(1+exp(-margin/temp))`.
+    /// Env-overridable for the parameter sweep (`MLX_QWEN_MTP_MARGIN_TEMP`).
+    /// Default 2.0 = the shipped `margin / 2.0`.
+    private static let marginGateTemperature: Double =
+        policyEnvDouble("MLX_QWEN_MTP_MARGIN_TEMP", default: 2.0, min: 0.0, max: nil)
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -590,7 +636,7 @@ public final class Qwen36MTPBlockSession {
             var p = positionAcceptEMA[depth]
             if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+                let conf = 1.0 / (1.0 + exp(-margin / Self.marginGateTemperature))
                 p = Swift.min(p, conf)
             }
             reach *= p
