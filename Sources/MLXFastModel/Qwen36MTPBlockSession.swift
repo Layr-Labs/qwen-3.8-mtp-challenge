@@ -482,9 +482,15 @@ public final class Qwen36MTPBlockSession {
 
     /// Per-position acceptance EMAs: `positionAcceptEMA[i]` estimates
     /// P(draft i accepted | drafts 0..<i accepted). Seeded with an optimistic,
-    /// gently decaying prior so the first rounds draft rather than stall; the
-    /// EMA half-life (~9 observed rounds at 0.15) adapts well inside a
-    /// 512-token window while surviving one unlucky reject.
+    /// gently decaying prior so the first rounds draft rather than stall.
+    /// EMA ALPHA 0.20: half-life ≈ 3.1 observed rounds (vs 4.3 at 0.15).
+    /// Faster adaptation converges to the prompt's true acceptance rates by
+    /// round ~6 instead of ~9, letting the cost model reach optimal depth
+    /// sooner on hot prose. On cold prompts the adaptive skip (EMA < h = 0.20)
+    /// fires after ~7 consecutive first-draft rejections instead of ~9,
+    /// trimming 2 wasted head steps per cold stretch. Both directions benefit
+    /// without any correctness exposure — the target decides every emitted
+    /// token and alpha affects only the schedule, never the verify forward.
     /// PRIORS: optimistic-decaying, by measurement. The real-prose
     /// production conditionals (0.92/0.70/0.50, MTPLX) were tried and taxed
     /// the ramp two extra rounds on easy prose (22.15 vs 21.5 local) — and
@@ -495,7 +501,7 @@ public final class Qwen36MTPBlockSession {
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
         .map { 0.85 * pow(0.98, Double($0)) }
-    private static let acceptEMAAlpha = 0.15
+    private static let acceptEMAAlpha = 0.20
 
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
@@ -587,13 +593,7 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            }
-            reach *= p
+            reach *= positionAcceptEMA[depth]
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach

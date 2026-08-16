@@ -1147,30 +1147,6 @@ final class Qwen35GatedDeltaNet: Module {
 /// byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
 /// side carries no exactness constraint at all.
-///
-/// Fuse the SiLU gate and product after the fused gate-up GEMM into one
-/// Metal pass: `silu(y[..., :half]) * y[..., half...]` reads each output
-/// element once and writes the activation once, replacing the two-kernel
-/// slice+silu+mul path (one silu launch, one multiply launch, one
-/// intermediate materialization) with a single launch. The arithmetic is
-/// elementwise and unchanged — silu first, then multiply, same rounding —
-/// so the values are bit-identical to the two-kernel path; only the
-/// intermediate buffer disappears. Shapeless compilation shares one trace
-/// across verify widths (the fused GEMM's N is constant, so the half-split
-/// offsets are width-invariant).
-private let qwen35CompiledFusedSwiGLU:
-    @Sendable (MLXArray) -> MLXArray =
-{
-    let body: @Sendable (MLXArray) -> MLXArray = { y in
-        let half = y.dim(-1) / 2
-        return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
-    }
-    if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
-    }
-    return body
-}()
-
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1191,14 +1167,16 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
+    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            return quantizedMM(
+            let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let w = _fbfW {
-            return matmul(x, w.T)
+            let y = matmul(x, w.T)
+            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let g = gateProj as? QuantizedLinear,
            let u = upProj as? QuantizedLinear,
@@ -1225,12 +1203,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // The fused path is only taken when the gate/up split is provably
-        // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
-        // to the exact two-projection expression, preserving the original
-        // slicing semantics in every case.
-        if x.dim(-2) <= 9, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
+            return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
@@ -1633,7 +1607,6 @@ final class Qwen35Attention: Module {
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
-           L <= 16,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
@@ -1862,8 +1835,7 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = inputs.dim(1) <= 2
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1873,17 +1845,11 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
-                if prefillLadder {
-                    if i == 0 || i % 4 == 3 {
-                        asyncEval(hiddenStates)
-                    }
-                } else {
-                    switch i {
-                    case 0, 1, 9, 19, 29, 39, 49, 57:
-                        asyncEval(hiddenStates)
-                    default:
-                        break
-                    }
+                switch i {
+                case 0, 1, 9, 19, 29, 39, 49, 57:
+                    asyncEval(hiddenStates)
+                default:
+                    break
                 }
             }
         }
@@ -1946,84 +1912,61 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     inputNames: ["logits"],
     outputNames: ["token_id"],
     source: """
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_lane = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
+        uint lane = thread_position_in_threadgroup.x;
         float best_value = 0.0f;
         uint  best_id    = 0;
         bool  have       = false;
 
-        for (uint index = thread_id; index < REAL_COUNT; index += TG_SIZE) {
+        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
             float value = float(logits[index]);
-            bool take = !have || qwen_draft_better(
-                value, index, best_value, best_id);
+            bool value_nan = isnan(value);
+            bool take;
+            if (!have) {
+                take = true;
+            } else if (value_nan != isnan(best_value)) {
+                take = !value_nan;
+            } else if (value > best_value) {
+                take = true;
+            } else if (value < best_value) {
+                take = false;
+            } else {
+                take = index < best_id;
+            }
             if (take) { best_value = value; best_id = index; have = true; }
         }
 
-        if (!have) {
-            best_value = NAN;
-            best_id = 0xFFFFFFFFu;
-        }
-
-        // First level: each 32-thread SIMD group reduces its private winners
-        // with shuffle operations, without touching threadgroup memory.
-        for (uint offset = 16; offset > 0; offset >>= 1) {
-            float other_value = simd_shuffle_down(best_value, offset);
-            uint other_id = simd_shuffle_down(best_id, offset);
-            if (simd_lane < offset && qwen_draft_better(
-                    other_value, other_id, best_value, best_id)) {
-                best_value = other_value;
-                best_id = other_id;
-            }
-        }
-
-        // Second level: publish only 32 SIMD winners, synchronize once, and
-        // let the first SIMD group reduce them with the identical total order.
-        threadgroup float scratch_value[TG_SIZE / 32];
-        threadgroup uint  scratch_id[TG_SIZE / 32];
-        if (simd_lane == 0) {
-            scratch_value[simd_group] = best_value;
-            scratch_id[simd_group] = best_id;
-        }
+        threadgroup float scratch_value[TG_SIZE];
+        threadgroup uint  scratch_id[TG_SIZE];
+        scratch_value[lane] = have ? best_value : NAN;
+        scratch_id[lane]    = have ? best_id : 0xFFFFFFFFu;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (simd_group == 0) {
-            best_value = scratch_value[simd_lane];
-            best_id = scratch_id[simd_lane];
-            for (uint offset = 16; offset > 0; offset >>= 1) {
-                float other_value = simd_shuffle_down(best_value, offset);
-                uint other_id = simd_shuffle_down(best_id, offset);
-                if (simd_lane < offset && qwen_draft_better(
-                        other_value, other_id, best_value, best_id)) {
-                    best_value = other_value;
-                    best_id = other_id;
-                }
+        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                float a = scratch_value[lane];
+                float b = scratch_value[lane + stride];
+                uint  ai = scratch_id[lane];
+                uint  bi = scratch_id[lane + stride];
+                bool a_empty = (ai == 0xFFFFFFFFu);
+                bool b_empty = (bi == 0xFFFFFFFFu);
+                bool take_b;
+                if (b_empty)      { take_b = false; }
+                else if (a_empty) { take_b = true; }
+                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
+                else if (b > a)   { take_b = true; }
+                else if (b < a)   { take_b = false; }
+                else              { take_b = bi < ai; }
+                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
             }
-            if (simd_lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint id = scratch_id[0];
+            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
         }
     """,
-    header: """
-        inline bool qwen_draft_better(
-            float candidate_value,
-            uint candidate_id,
-            float current_value,
-            uint current_id
-        ) {
-            if (candidate_id == 0xFFFFFFFFu) { return false; }
-            if (current_id == 0xFFFFFFFFu) { return true; }
-            bool candidate_nan = isnan(candidate_value);
-            bool current_nan = isnan(current_value);
-            if (candidate_nan != current_nan) { return !candidate_nan; }
-            if (candidate_value > current_value) { return true; }
-            if (candidate_value < current_value) { return false; }
-            return candidate_id < current_id;
-        }
-    """,
+    header: "",
     ensureRowContiguous: false
 )
 
