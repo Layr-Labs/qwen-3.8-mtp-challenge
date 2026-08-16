@@ -232,6 +232,170 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+
+// MARK: - packed GDN prework mixer (verify widths 3...9)
+//
+// ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
+// split + Q/K rmsNorm-and-scale + the compiled-g producer — for S in 3...9 on
+// the one-wide-call path. Five outputs: normed/scaled Q and K, activated V,
+// the next 3-row conv state, and fp32 `g`. DESIGN NOTE, load-bearing: `beta`
+// is DELIBERATELY NOT a kernel output. An exhaustive sweep of all 65,280
+// finite bf16 inputs found the in-kernel sigmoid diverges from MLX's by 1 ulp
+// on exactly one input (0xC0DB = -6.84375); silu and softplus are bit-exact
+// everywhere. beta feeds the VERIFY recurrence where fidelity is absolute, so
+// it stays a plain graph `sigmoid(b)` — one [1,S,48] elementwise launch,
+// ~0.06 ms of the ~0.7 ms saving, in exchange for removing an unquantifiable
+// knife-edge. The remaining five outputs measured bit-exact at S=3..9 over
+// 5 seeds x 4 compile modes (12,983,040 element comparisons, zero mismatches)
+// on the vendored MLX version, with a +1-row conv-window negative control
+// failing exactly the three outputs that read the window. S=2 breaks the
+// conv-state copy (a state row would come from the OLD conv state, which the
+// copy loop does not read), hence the hard S >= 3 gate. The fused in-proj
+// carrier's live row stride (16480, not 10240) is consumed via the provided
+// stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
+// would silently insert a full-carrier copy and give back the launch saving.
+private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
+    let header = """
+        typedef bfloat16_t InT;
+
+        inline InT qwen35_prework_sigmoid(InT x) {
+          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          return (x < 0) ? y : 1 - y;
+        }
+
+        inline InT qwen35_prework_logaddexp(InT x, InT y) {
+          if (metal::isnan(x) || metal::isnan(y)) {
+            return metal::numeric_limits<InT>::quiet_NaN();
+          }
+          constexpr InT inf = metal::numeric_limits<InT>::infinity();
+          InT maxval = metal::max(x, y);
+          InT minval = metal::min(x, y);
+          return (minval == -inf || maxval == inf)
+              ? maxval
+              : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        """
+    let source = """
+        const uint lane = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint logical_head = threadgroup_position_in_grid.z;
+
+        constexpr uint q_heads = Hk;
+        constexpr uint k_head_base = Hk;
+        constexpr uint v_head_base = 2 * Hk;
+        const bool is_q = logical_head < q_heads;
+        const bool is_k = logical_head >= k_head_base
+                       && logical_head < v_head_base;
+        const uint head = is_q ? logical_head
+                         : (is_k ? logical_head - k_head_base
+                                 : logical_head - v_head_base);
+        const uint channel_base = is_q ? head * Dk
+                                  : (is_k ? Hk * Dk + head * Dk
+                                          : 2 * Hk * Dk + head * Dv);
+
+        InT activated[4];
+        float sumsq = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+          const uint channel = channel_base + lane * 4 + i;
+          float acc = 0.0f;
+          #pragma clang loop unroll(full)
+          for (uint tap = 0; tap < 4; ++tap) {
+            const uint input_row = row + tap;
+            const ulong input_offset = input_row < NKeep
+                ? ulong(input_row) * ulong(conv_state_strides[1])
+                    + ulong(channel) * ulong(conv_state_strides[2])
+                : ulong(input_row - NKeep) * ulong(qkv_strides[1])
+                    + ulong(channel) * ulong(qkv_strides[2]);
+            const InT xv = input_row < NKeep
+                ? conv_state[input_offset]
+                : qkv[input_offset];
+            const ulong weight_offset =
+                ulong(channel) * ulong(conv_weight_strides[0])
+                + ulong(tap) * ulong(conv_weight_strides[1]);
+            acc += static_cast<float>(xv) * conv_weight[weight_offset];
+          }
+          const InT conv = static_cast<InT>(acc);
+          const InT act = conv * qwen35_prework_sigmoid(conv);
+          activated[i] = act;
+          const float value = static_cast<float>(act);
+          sumsq += value * value;
+        }
+
+        if (is_q || is_k) {
+          threadgroup float local_inv_mean[1];
+          threadgroup float local_sums[32];
+          sumsq = simd_sum(sumsq);
+          local_sums[lane] = 0.0f;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (lane == 0) {
+            local_sums[0] = sumsq;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          sumsq = simd_sum(local_sums[lane]);
+          if (lane == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(sumsq / Dk + 1e-6f);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          const InT scale = is_q ? q_scale : k_scale;
+          const uint output_base = (row * Hk + head) * Dk + lane * 4;
+          #pragma clang loop unroll(full)
+          for (uint i = 0; i < 4; ++i) {
+            const InT rms = InT(1) * static_cast<InT>(
+                static_cast<float>(activated[i]) * local_inv_mean[0]);
+            const InT value = scale * rms;
+            if (is_q) {
+              q_out[output_base + i] = value;
+            } else {
+              k_out[output_base + i] = value;
+            }
+          }
+        } else {
+          const uint output_base = (row * Hv + head) * Dv + lane * 4;
+          #pragma clang loop unroll(full)
+          for (uint i = 0; i < 4; ++i) {
+            v_out[output_base + i] = activated[i];
+          }
+
+          if (lane == 0) {
+            const ulong a_offset = ulong(row) * ulong(a_strides[1])
+                + ulong(head) * ulong(a_strides[2]);
+            const InT shifted = a[a_offset] + dt_bias[head];
+            const InT softplus = qwen35_prework_logaddexp(shifted, InT(0));
+            const float exp_a = metal::precise::exp(
+                static_cast<float>(a_log[head]));
+            const float neg_exp_a = -exp_a;
+            const float product = neg_exp_a * static_cast<float>(softplus);
+            const uint scalar_output = row * Hv + head;
+            g_out[scalar_output] = metal::precise::exp(product);
+          }
+        }
+
+        if (row + NKeep >= uint(T)) {
+          const uint state_row = row + NKeep - T;
+          const ulong raw_base = ulong(row) * ulong(qkv_strides[1])
+              + ulong(channel_base + lane * 4) * ulong(qkv_strides[2]);
+          const uint state_base = state_row * C + channel_base + lane * 4;
+          #pragma clang loop unroll(full)
+          for (uint i = 0; i < 4; ++i) {
+            conv_out[state_base + i] =
+                qkv[raw_base + ulong(i) * ulong(qkv_strides[2])];
+          }
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_packed_gdn_prework",
+        inputNames: [
+            "qkv", "a", "conv_state", "conv_weight", "a_log",
+            "dt_bias", "q_scale", "k_scale",
+        ],
+        outputNames: ["q_out", "k_out", "v_out", "conv_out", "g_out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: false)
+}()
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -593,29 +757,84 @@ final class Qwen35GatedDeltaNet: Module {
         let S = qkv.dim(1)
         let convInput = concatenated([convState, qkv], axis: 1)
         let nKeep = convKernelSize - 1
-        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
-        let convOut = silu(conv1d(convInput))
+        // Packed-prework mixer gate: fail closed onto the stock chain for any
+        // shape, geometry, or dtype outside the byte-receipt envelope. The
+        // S >= 3 lower bound is hard (the kernel's conv-state copy reads only
+        // qkv rows, which is wrong at S < nKeep); above 9 no verify exists.
+        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
+            && B == 1 && S >= 3 && S <= 9 && nKeep == 3
+            && numKHeads == 16 && numVHeads == 48
+            && headKDim == 128 && headVDim == 128
+            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
+            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        let v: MLXArray
+        let g: MLXArray
+        let beta: MLXArray
+        let newConvState: MLXArray
+        if mixerHit {
+            let invScale = pow(Float(headKDim), -0.5)
+            let outs = qwen35PackedGDNPreworkKernel(
+                [qkv, a, convState, conv1d.weight, aLog, dtBias,
+                 MLXArray(pow(invScale, 2)).asType(.bfloat16),
+                 MLXArray(invScale).asType(.bfloat16)],
+                template: [
+                    ("Hk", numKHeads), ("Dk", headKDim),
+                    ("Hv", numVHeads), ("Dv", headVDim),
+                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
+                ],
+                grid: (32, S, 2 * numKHeads + numVHeads),
+                threadGroup: (32, 1, 1),
+                outputShapes: [
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numKHeads, headKDim],
+                    [B, S, numVHeads, headVDim],
+                    [B, nKeep, qkv.dim(2)],
+                    [B, S, numVHeads],
+                ],
+                outputDTypes: [
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                ]
+            )
+            qNormed = outs[0]
+            kNormed = outs[1]
+            v = outs[2]
+            newConvState = outs[3]
+            g = outs[4]
+            // beta stays a plain graph op BY DESIGN — see the kernel's
+            // header comment. Same expression as the compiled producer's
+            // beta half, so the recurrence sees identical bytes.
+            beta = sigmoid(b).asType(.float32)
+        } else {
+            newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+            let convOut = silu(conv1d(convInput))
 
-        let convSplit = MLX.split(
-            convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+            let convSplit = MLX.split(
+                convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+            let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+            v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        // Keep the recurrence and conv prologue wide. The promoted compiled
-        // g/beta launch reduction feeds the same single recurrence, while the
-        // SDPA helper alone bridges the width-sensitive kernel boundary.
-        let (g, beta) = qwen35CompiledGatedDeltaGBeta(
-            a, b, negExpALog, dtBias)
+            // Keep the recurrence and conv prologue wide. The promoted
+            // compiled g/beta launch reduction feeds the same single
+            // recurrence, while the SDPA helper alone bridges the
+            // width-sensitive kernel boundary.
+            let gBeta = qwen35CompiledGatedDeltaGBeta(
+                a, b, negExpALog, dtBias)
+            g = gBeta.0
+            beta = gBeta.1
+        }
         let recurrence: (MLXArray, MLXArray)
         if MLXHardwareInfo.isCompiledDecodeSupported {
             recurrence = qwen35GatedDeltaPrepared(
