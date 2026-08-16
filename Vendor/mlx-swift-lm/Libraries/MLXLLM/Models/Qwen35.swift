@@ -189,6 +189,90 @@ private let qwen35CompiledGatedDeltaGBeta:
     return body
 }()
 
+/// Wide-verify recurrence specialized for Qwen 3.8's three value heads per
+/// key head. The stock kernel dispatches one SIMD group per `(hv, dv)` and
+/// therefore reloads the identical Q/K row three times. This dispatch keeps
+/// three independent fp32 state fragments in registers while sharing each
+/// bf16 Q/K load; every value head retains the stock kernel's timestep,
+/// multiply/add, and SIMD reduction order.
+private let qwen35GroupedHVGatedDeltaKernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hk;
+            auto hk_idx = n % Hk;
+            constexpr int n_per_t = Dk / 32;
+            constexpr int value_heads_per_key = Hv / Hk;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            float state[value_heads_per_key][n_per_t];
+            for (int r = 0; r < value_heads_per_key; ++r) {
+              auto hv_idx = hk_idx * value_heads_per_key + r;
+              auto i_state = state_in
+                  + ((b_idx * Hv + hv_idx) * Dv + dv_idx) * Dk;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[r][i] = static_cast<float>(i_state[s_idx]);
+              }
+            }
+
+            for (int t = 0; t < T; ++t) {
+              InT q_value[n_per_t];
+              InT k_value[n_per_t];
+              auto q_ = q + (b_idx * T * Hk + t * Hk + hk_idx) * Dk;
+              auto k_ = k + (b_idx * T * Hk + t * Hk + hk_idx) * Dk;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                q_value[i] = q_[s_idx];
+                k_value[i] = k_[s_idx];
+              }
+
+              for (int r = 0; r < value_heads_per_key; ++r) {
+                auto hv_idx = hk_idx * value_heads_per_key + r;
+                auto scalar_idx = (b_idx * T + t) * Hv + hv_idx;
+
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[r][i] = state[r][i] * g[scalar_idx];
+                  kv_mem += state[r][i] * k_value[i];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto value_idx =
+                    ((b_idx * T + t) * Hv + hv_idx) * Dv + dv_idx;
+                auto delta = (v[value_idx] - kv_mem) * beta[scalar_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[r][i] = state[r][i] + k_value[i] * delta;
+                  out += state[r][i] * q_value[i];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[value_idx] = static_cast<InT>(out);
+                }
+              }
+            }
+
+            for (int r = 0; r < value_heads_per_key; ++r) {
+              auto hv_idx = hk_idx * value_heads_per_key + r;
+              auto o_state = state_out
+                  + ((b_idx * Hv + hv_idx) * Dv + dv_idx) * Dk;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                o_state[s_idx] = static_cast<StT>(state[r][i]);
+              }
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_grouped_hv_gated_delta_step",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source)
+}()
+
 /// Run the existing recurrence kernel from already-computed fp32 `g`/`beta`.
 /// The official M5 path uses this after the compiled helper; callers retain the
 /// original `gatedDeltaUpdate` fallback when compiled decode is disabled.
@@ -209,6 +293,37 @@ private func qwen35GatedDeltaPrepared(
         ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
     if preparedState.dtype != .float32 {
         preparedState = preparedState.asType(.float32)
+    }
+    let T = q.dim(1)
+    let Hk = q.dim(2)
+    if let groupedKernel = qwen35GroupedHVGatedDeltaKernel,
+       MLXHardwareInfo.isCompiledDecodeSupported,
+       mask == nil,
+       B == 1, T >= 3, T <= 9,
+       Hk == 16, Hv == 48, Dk == 128, Dv == 128,
+       k.shape == q.shape,
+       v.shape == [B, T, Hv, Dv],
+       g.shape == [B, T, Hv], beta.shape == [B, T, Hv],
+       preparedState.shape == [B, Hv, Dv, Dk],
+       q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+       g.dtype == .float32, beta.dtype == .float32,
+       preparedState.dtype == .float32
+    {
+        let outputs = groupedKernel(
+            [q, k, v, g, beta, preparedState, MLXArray(T)],
+            template: [
+                ("InT", DType.bfloat16),
+                ("StT", DType.float32),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid: (32, Dv, B * Hk),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, Hv, Dv], preparedState.shape],
+            outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
     }
     return gatedDeltaKernel(
         q: q, k: k, v: v, g: g, beta: beta,
