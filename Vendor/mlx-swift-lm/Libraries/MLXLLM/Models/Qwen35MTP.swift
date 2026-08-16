@@ -65,6 +65,61 @@ final class Qwen35MTPDecoderLayer: Module {
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
         selfAttn.appendHistoryKV(inputLayerNorm(x), cache: cache)
     }
+
+    // MARK: compiled draft step (proposal side, L == 1)
+
+    /// Compiled residual/MLP tail: attention projection -> residual ->
+    /// post-norm -> fused gate/up GEMM -> silu*mul -> down GEMM -> residual,
+    /// folded into one dispatch. Lazily built; nil until the MLP proves the
+    /// declared quantized head's affine-4/g64 geometry.
+    private var _tailCompiled:
+        (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+
+    /// One full decoder-layer draft step with the elementwise/reshape glue
+    /// compiled away. Head-only; returns nil (caller falls back) unless the
+    /// quantized geometry guards hold.
+    func compiledDraftStep(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> MLXArray? {
+        guard let fusedMLP = mlp as? Qwen35FusedMLP else { return nil }
+        guard let attnProj = selfAttn.headCompiledForward(
+            x,
+            preNormWeight: inputLayerNorm.weight,
+            preNormEps: inputLayerNorm.eps,
+            mask: mask,
+            cache: cache)
+        else { return nil }
+        if _tailCompiled == nil {
+            guard let parts = fusedMLP.headQuantizedParts() else { return nil }
+            let postW = postAttentionLayerNorm.weight
+            let postEps = postAttentionLayerNorm.eps
+            let guW = parts.guW
+            let guS = parts.guS
+            let guZ = parts.guZ
+            let gateOut = parts.gateOut
+            let dW = parts.dW
+            let dS = parts.dS
+            let dZ = parts.dZ
+            _tailCompiled = compile(shapeless: false) {
+                (xIn: MLXArray, attn: MLXArray) -> MLXArray in
+                let h = xIn + attn
+                let n = MLXFast.rmsNorm(h, weight: postW, eps: postEps)
+                let y = quantizedMM(
+                    n, guW, scales: guS, biases: guZ, transpose: true,
+                    groupSize: 64, bits: 4, mode: .affine)
+                let g = y[.ellipsis, ..<gateOut]
+                let u = y[.ellipsis, gateOut...]
+                let d = quantizedMM(
+                    silu(g) * u, dW, scales: dS, biases: dZ, transpose: true,
+                    groupSize: 64, bits: 4, mode: .affine)
+                return h + d
+            }
+        }
+        guard let tail = _tailCompiled else { return nil }
+        return tail(x, attnProj)
+    }
 }
 
 // MARK: - MTPModule
@@ -104,12 +159,70 @@ final class Qwen35MTPModule: Module {
         super.init()
     }
 
+    /// Compiled fuse front: embedding/hidden norms -> concat -> fc GEMM in
+    /// one dispatch. The embedding gather stays outside (it may be a
+    /// quantized embedding whose lookup is its own primitive).
+    private var _frontCompiled:
+        (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+
+    /// Single-draft-step fast path with the chain's elementwise glue
+    /// compiled away. Proposal side only; nil (fall back) unless the head
+    /// is the declared affine-4/g64 quantized geometry with one layer.
+    private func compiledSingleStep(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> MLXArray? {
+        guard layers.count == 1, cache.count == 1,
+              hidden.dim(0) == 1, hidden.dim(1) == 1,
+              nextTokenIds.dim(1) == 1,
+              let fcQ = fc as? QuantizedLinear,
+              fcQ.groupSize == 64, fcQ.bits == 4, fcQ.mode == .affine,
+              let fcZ = fcQ.biases
+        else { return nil }
+        if _frontCompiled == nil {
+            let eW = preFcNormEmbedding.weight
+            let eEps = preFcNormEmbedding.eps
+            let hW = preFcNormHidden.weight
+            let hEps = preFcNormHidden.eps
+            let fcW = fcQ.weight
+            let fcS = fcQ.scales
+            _frontCompiled = compile(shapeless: false) {
+                (embeds: MLXArray, hiddenIn: MLXArray) -> MLXArray in
+                let e = MLXFast.rmsNorm(embeds, weight: eW, eps: eEps)
+                let h = MLXFast.rmsNorm(hiddenIn, weight: hW, eps: hEps)
+                return quantizedMM(
+                    concatenated([e, h], axis: -1), fcW, scales: fcS,
+                    biases: fcZ, transpose: true, groupSize: 64, bits: 4,
+                    mode: .affine)
+            }
+        }
+        guard let front = _frontCompiled else { return nil }
+        let fused = front(embedTokens(nextTokenIds), hidden)
+        let mask = createAttentionMask(h: fused, cache: cache[0])
+        guard let out = layers[0].compiledDraftStep(
+            fused, mask: mask, cache: cache[0])
+        else { return nil }
+        return norm(out)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
         embedTokens: Embedding,
         cache: [any KVCache]
     ) -> MLXArray {
+        // Proposal-side compiled fast path for the chained single-token
+        // draft step (the hot shape: every drafting round runs this once
+        // per draft). Falls back to the ordinary chain whenever any guard
+        // fails, including the pinned bf16 head.
+        if let compiled = compiledSingleStep(
+            hidden: hidden, nextTokenIds: nextTokenIds,
+            embedTokens: embedTokens, cache: cache)
+        {
+            return compiled
+        }
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)

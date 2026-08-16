@@ -990,6 +990,36 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 
+    /// Head-only compiled-step accessor: the fused affine-4/g64 gate/up
+    /// triple plus the quantized down projection, for folding the whole MLP
+    /// into one compiled closure on the proposal head's draft chain. Returns
+    /// nil unless every projection is affine 4-bit group-64 (the declared
+    /// quantized head's geometry); callers fall back to the ordinary path.
+    func headQuantizedParts() -> (
+        guW: MLXArray, guS: MLXArray, guZ: MLXArray, gateOut: Int,
+        dW: MLXArray, dS: MLXArray, dZ: MLXArray
+    )? {
+        guard let g = gateProj as? QuantizedLinear,
+              let u = upProj as? QuantizedLinear,
+              let d = downProj as? QuantizedLinear,
+              g.groupSize == 64, u.groupSize == 64, d.groupSize == 64,
+              g.bits == 4, u.bits == 4, d.bits == 4,
+              g.mode == .affine, u.mode == .affine, d.mode == .affine,
+              let gz = g.biases, let uz = u.biases, let dz = d.biases
+        else { return nil }
+        if _fqW == nil {
+            _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
+            _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
+            _fqZ = concatenated([gz, uz], axis: 0).contiguous()
+            _fqGS = g.groupSize
+            _fqBits = g.bits
+            _fqMode = g.mode
+            _gateOut = g.shape.0
+        }
+        guard let fw = _fqW, let fs = _fqS, let fz = _fqZ else { return nil }
+        return (fw, fs, fz, _gateOut, d.weight, d.scales, dz)
+    }
+
 }
 
 // MARK: - Full-attention Q/K preparation
@@ -1351,6 +1381,137 @@ final class Qwen35Attention: Module {
             return kv(x)
         }
         return (kProj(x), vProj(x))
+    }
+
+    // MARK: proposal-head compiled draft step (L == 1 only)
+    //
+    // The head's per-draft chain is latency-bound: ~25 small dispatches per
+    // step, of which the elementwise/reshape glue between the GEMMs is pure
+    // launch overhead. These lazily-built compiled closures fold the
+    // prologue (input norm -> packed QKV GEMM -> split/reshape) and the
+    // tail (transpose-back -> gate -> o_proj GEMM) into one dispatch each;
+    // the fused Q/K RMSNorm+RoPE dispatch of this base handles the segment
+    // between them, and the cache append + SDPA stay outside (stateful).
+    // HEAD-ONLY: the target verify path never calls these, so nothing here
+    // touches the exactness surface; they engage only for the declared
+    // quantized head's affine-4/g64 geometry and fall back otherwise.
+    private var _headPrologue:
+        (@Sendable (MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray))?
+    private var _headTail: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+
+    /// Compiled draft-step attention for the proposal head. Returns nil when
+    /// the geometry guards fail; the caller falls back to `callAsFunction`.
+    func headCompiledForward(
+        _ x: MLXArray,
+        preNormWeight: MLXArray,
+        preNormEps: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray? {
+        guard x.dim(0) == 1, x.dim(1) == 1,
+              usesFusedQKPreparation,
+              !(cache is CompilableRotatingKVCache),
+              !(cache is CompilableKVCache),
+              !(cache is BatchPositionedKVCache),
+              qNorm.weight.dtype == .bfloat16,
+              kNorm.weight.dtype == .bfloat16,
+              qNorm.eps == kNorm.eps,
+              let q = qProj as? QuantizedLinear,
+              let k = kProj as? QuantizedLinear,
+              let v = vProj as? QuantizedLinear,
+              let o = oProj as? QuantizedLinear,
+              q.groupSize == 64, k.groupSize == 64,
+              v.groupSize == 64, o.groupSize == 64,
+              q.bits == 4, k.bits == 4, v.bits == 4, o.bits == 4,
+              q.mode == .affine, k.mode == .affine,
+              v.mode == .affine, o.mode == .affine,
+              let oz = o.biases
+        else { return nil }
+        // Ensure the packed Q/K/V triple exists (same build as `qkv`).
+        if _qkvW == nil {
+            guard let qz = q.biases, let kz = k.biases, let vz = v.biases
+            else { return nil }
+            _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0)
+                .contiguous()
+            _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0)
+                .contiguous()
+            _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            _qkvGS = q.groupSize
+            _qkvBits = q.bits
+            _qkvMode = q.mode
+            _qOut = q.shape.0
+            _kOut = k.shape.0
+        }
+        guard _qkvGS == 64, _qkvBits == 4, _qkvMode == .affine,
+              let pw = _qkvW, let ps = _qkvS, let pz = _qkvZ
+        else { return nil }
+
+        if _headPrologue == nil {
+            let qOut = _qOut
+            let kOut = _kOut
+            let heads = attentionHeads
+            let kvH = kvHeads
+            _headPrologue = compile(shapeless: false) {
+                (xIn: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) in
+                let normed = MLXFast.rmsNorm(
+                    xIn, weight: preNormWeight, eps: preNormEps)
+                let y = quantizedMM(
+                    normed, pw, scales: ps, biases: pz, transpose: true,
+                    groupSize: 64, bits: 4, mode: .affine)
+                let qEnd = qOut
+                let kEnd = qOut + kOut
+                let qg = y[.ellipsis, ..<qEnd]
+                let keysRaw = y[.ellipsis, qEnd ..< kEnd]
+                let valuesRaw = y[.ellipsis, kEnd...]
+                let qSplit = qg.reshaped(1, 1, heads, -1)
+                    .split(parts: 2, axis: -1)
+                let gate = qSplit[1].reshaped(1, 1, -1)
+                let keys = keysRaw.reshaped(1, 1, kvH, -1)
+                let values = valuesRaw.reshaped(1, 1, kvH, -1)
+                    .transposed(0, 2, 1, 3)
+                return (qSplit[0], keys, values, gate)
+            }
+        }
+        if _headTail == nil {
+            let oW = o.weight
+            let oS = o.scales
+            let oZ = oz
+            _headTail = compile(shapeless: false) {
+                (attn: MLXArray, gate: MLXArray) -> MLXArray in
+                let out = attn.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
+                return quantizedMM(
+                    out * sigmoid(gate), oW, scales: oS, biases: oZ,
+                    transpose: true, groupSize: 64, bits: 4, mode: .affine)
+            }
+        }
+        guard let prologue = _headPrologue, let tail = _headTail else {
+            return nil
+        }
+
+        let (queriesRaw, keysRaw, values, gate) = prologue(x)
+        guard queriesRaw.dtype == .bfloat16, keysRaw.dtype == .bfloat16,
+              queriesRaw.shape == [1, 1, attentionHeads, headDim],
+              keysRaw.shape == [1, 1, kvHeads, headDim]
+        else { return nil }
+        // This base's fused Q/K RMSNorm + partial-RoPE single dispatch.
+        let prepared = qwen35AttentionQKRMSRoPE(
+            queries: queriesRaw,
+            keys: keysRaw,
+            qWeight: qNorm.weight,
+            kWeight: kNorm.weight,
+            eps: qNorm.eps,
+            offset: cache?.offset ?? 0,
+            log2Base: ropeLog2Base
+        )
+        let attnOut = attentionWithCacheUpdate(
+            queries: prepared.queries,
+            keys: prepared.keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
+        return tail(attnOut, gate)
     }
 
     /// Append rows to an attention cache without producing query outputs.
