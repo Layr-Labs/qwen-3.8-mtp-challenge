@@ -273,9 +273,19 @@ public final class Qwen36MTPBlockSession {
         // LOST, because its warm evaluated compact logits while the live graph
         // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
         // the scored window. A new selection kernel resets that hazard exactly.
-        let primedDraftID = model.draftTokenID(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
+        let primedRow = primed[
+            0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]
+        let primedDraftID = model.draftTokenID(primedRow)
         eval(primedDraftID)
+        // BOTH COVERAGE PATHS, warmed here. The session may release the
+        // compact trim mid-window (see the coverage latch), and the released
+        // path dispatches a DIFFERENT expression: a vocabulary-wide argMax
+        // over the exact lm_head instead of the compact selection kernel. If
+        // only the compact form is warmed, the release pays a cold pipeline
+        // JIT inside the scored window on every prompt that trips it —
+        // measured here at +1.1 ms/token, which is larger than the coverage
+        // win it unlocks. Warming the full form costs one untimed dispatch.
+        eval(argMax(model.applyLMHead(primedRow), axis: -1).asType(.int32))
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -641,6 +651,39 @@ public final class Qwen36MTPBlockSession {
             }
         }
     }
+
+    // MARK: - draft vocabulary coverage
+
+    /// The compact draft readout's id space: the low prefix plus Qwen's 26
+    /// text/control tokens. Mirrors the vendored compact head's row layout.
+    private static let compactDraftPrefixCount = 98_304
+    private static let compactDraftControlStart = 248_044
+    private static let compactDraftControlEnd = 248_070
+
+    static func compactDraftVocabularyCanExpress(_ id: Int) -> Bool {
+        id < compactDraftPrefixCount
+            || (id >= compactDraftControlStart && id < compactDraftControlEnd)
+    }
+
+    /// Release policy: STRUCTURAL starvation only. A single unreachable
+    /// correction row is proof the trim dropped a real token, but releasing
+    /// on rare evidence is a net LOSS: the released readout costs ~430 MB
+    /// more per chain step, and on a prompt where only ~0.5% of tokens are
+    /// unreachable (ordinary English text with rare proper nouns measures
+    /// 0.2-0.7% on public-domain literary material) that permanent cost
+    /// outweighs the rare forced reject it prevents. The trim is released
+    /// only when the evidence RATE says the prompt's text itself lives
+    /// outside the row set: at least two proofs AND proofs >= 2% of
+    /// committed tokens. A 57%-unreachable Chinese golden trips both within
+    /// the first rounds (measured: release recovers -11%); a 0.6%
+    /// proper-noun prompt never crosses 2% and keeps the cheap compact
+    /// readout for the whole window.
+    private static let fullVocabularyLatchProofs = 2
+    private static let fullVocabularyLatchMinRate = 0.02
+
+    /// Count of target correction rows the compact vocabulary could not
+    /// express. Session-scoped; never reset (the evidence is monotone).
+    private var unreachableTargetTokenCount = 0
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -1048,6 +1091,37 @@ public final class Qwen36MTPBlockSession {
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+        // COVERAGE EVIDENCE. On a reject, the target's own argmax at the
+        // correction row is already materialised for the ledger. If that id
+        // lies outside what the compact draft vocabulary can express, the
+        // head did not guess wrong — it was structurally unable to propose
+        // the right token, and every later occurrence of such a token is
+        // another forced reject. Two proofs are enough to release the trim
+        // for the rest of the session (one could be a stop-token edge).
+        if acceptedCount < drafts.count, model.draftVocabularyIsCompact,
+           acceptedCount < perRowTop2Tokens.count,
+           let wanted = perRowTop2Tokens[acceptedCount].first,
+           !Self.compactDraftVocabularyCanExpress(wanted)
+        {
+            unreachableTargetTokenCount += 1
+            if Self.traceRounds {
+                Self.traceWrite(
+                    "mtp-vocab: round=\(roundCount) wanted=\(wanted) "
+                    + "unreachable_total=\(unreachableTargetTokenCount)\n")
+            }
+            let starvationRate = Double(unreachableTargetTokenCount)
+                / Double(max(committedTokenCount, 1))
+            if unreachableTargetTokenCount >= Self.fullVocabularyLatchProofs,
+               starvationRate >= Self.fullVocabularyLatchMinRate
+            {
+                model.latchFullDraftVocabulary()
+                if Self.traceRounds {
+                    Self.traceWrite(
+                        "mtp-vocab: LATCHED full draft vocabulary at round "
+                        + "\(roundCount)\n")
+                }
+            }
+        }
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
@@ -1203,11 +1277,6 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
-            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
-                guard let arrays = entry as? ArraysCache else { return nil }
-                return arrays[1]
-            }
-            asyncEval(replayedRecurrentStates)
             return true
         }
 
