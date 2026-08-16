@@ -516,7 +516,17 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.20
+    /// FOURTH FIT — for the declared 4-bit head regime. The 0.20 fit above
+    /// predates the promoted quantized proposal head: a draft step then
+    /// streamed the ~849 MB bf16 head; it now streams ~239 MB through the
+    /// packed-QKV quantized path, removing ~3.1 ms of the ~10.75 ms
+    /// measured marginal (the ~0.64 GB draft lm_head read and the chained
+    /// launch overhead remain). Scaling the empirical 0.20 by the surviving
+    /// marginal fraction (7.6 / 10.75) gives 0.14. Direction of error is
+    /// bounded the same way as before: the per-position acceptance EMAs
+    /// still gate every marginal draft, so an underpriced h costs at most
+    /// a few wasted head steps on a prompt the EMAs are already cooling.
+    private static let headStepCostRatio = 0.14
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -556,7 +566,10 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    /// Gate lowered 3 -> 2 with the same h re-fit: a deep round's marginal
+    /// cost fell with the quantized head, so the qualifying evidence bar
+    /// falls with it. Any reject still resets the streak to zero.
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
