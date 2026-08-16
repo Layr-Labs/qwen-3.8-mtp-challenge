@@ -118,8 +118,18 @@ final class Qwen35MTPModule: Module {
         var fused = fc(concatenated([e, h], axis: -1))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
+        // A CompilableKVCache returns its full fixed-size buffer from
+        // `update()`, so attention MUST mask the unwritten tail; its array
+        // mask is also the compile-traceable form the compiled head step
+        // needs. Every other cache type keeps the stock mask exactly.
         let firstCache: (any KVCache)? = cache.first
-        let mask = createAttentionMask(h: fused, cache: firstCache)
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let compilable = firstCache as? CompilableKVCache {
+            mask = compilable.makeMask(
+                n: fused.dim(1), windowSize: nil, returnArray: true)
+        } else {
+            mask = createAttentionMask(h: fused, cache: firstCache)
+        }
 
         // 3. Run each MTPDecoderLayer.
         for (i, layer) in layers.enumerated() {
@@ -156,7 +166,13 @@ final class Qwen35MTPModule: Module {
             fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
 
         let current = fused[0..., historyCount..., 0...]
-        let mask = createAttentionMask(h: current, cache: cache[0])
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let compilable = cache[0] as? CompilableKVCache {
+            mask = compilable.makeMask(
+                n: current.dim(1), windowSize: nil, returnArray: true)
+        } else {
+            mask = createAttentionMask(h: current, cache: cache[0])
+        }
         return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
 

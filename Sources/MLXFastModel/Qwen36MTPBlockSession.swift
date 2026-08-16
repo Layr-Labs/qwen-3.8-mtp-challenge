@@ -276,6 +276,53 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
+
+        // Compiled [1, 1] head draft step: trace once against the PERSISTENT
+        // committed-history cache, right here, outside every scored window.
+        // The closure compiled below is the same closure object the draft
+        // loop replays, over the same captured cache buffers -- a warm that
+        // dispatched anything else would leave the JIT to pay inside the
+        // first scored round (7b33621).
+        if Self.compiledHeadEnabled, compiledHeadStep == nil,
+           headHistoryCache == nil
+        {
+            let persistent = model.makeMTPCache()
+            if persistent.count == 1,
+               let compilable = persistent.first as? CompilableKVCache
+            {
+                headHistoryCache = persistent
+                let warmRow = primed[
+                    0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]
+                // One eager step lazy-initialises the fixed K/V buffers so
+                // `innerState()` exposes them to the tracer.
+                let seeded = model.mtpHeadHiddenForward(
+                    hidden: warmRow, nextTokenIds: primedDraftID,
+                    cache: persistent)
+                eval(seeded)
+                eval(persistent.flatMap { $0.state })
+                let capturedModel = model
+                let capturedCache = persistent
+                let stateArrays = persistent.flatMap { $0.innerState() }
+                let step = compile(
+                    inputs: stateArrays, outputs: stateArrays
+                ) { (args: [MLXArray]) -> [MLXArray] in
+                    [
+                        capturedModel.mtpHeadHiddenForward(
+                            hidden: args[0], nextTokenIds: args[1],
+                            cache: capturedCache)
+                    ]
+                }
+                // Specialise NOW: `compile` traces on first invocation.
+                let warmOut = step([warmRow, primedDraftID])
+                eval(warmOut)
+                eval(persistent.flatMap { $0.state })
+                // Rewind to empty. Mask validity keys off the offset, so the
+                // two warm rows become unreachable; the buffers and the
+                // offset array keep their traced identities.
+                _ = compilable.trim(compilable.offset)
+                compiledHeadStep = step
+            }
+        }
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -497,6 +544,18 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
+    /// Compiled [1, 1] head draft step: ONE traced graph replayed for chain
+    /// steps 2..d instead of ~50 host-built ops per step (the phase receipts
+    /// price that host build at ~2.4 ms/step). Proposal-side only -- the
+    /// target verify path is untouched, so token fidelity is unaffected by
+    /// construction. Built in `warmAllDepths` against the PERSISTENT head
+    /// cache, outside every scored window (7b33621's warm-mismatch
+    /// post-mortem is the operative hazard). `MLX_QWEN_MTP_COMPILED_HEAD=0`
+    /// falls back to the stock eager chain.
+    private var compiledHeadStep: (([MLXArray]) -> [MLXArray])?
+    private static let compiledHeadEnabled =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_COMPILED_HEAD"] != "0"
+
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
@@ -526,7 +585,7 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    private static let headStepCostRatio = 0.20
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -558,7 +617,7 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
+    private static let sdpaWidthWallDepthCap = 4
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
@@ -566,7 +625,7 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -592,10 +651,6 @@ public final class Qwen36MTPBlockSession {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
@@ -824,19 +879,25 @@ public final class Qwen36MTPBlockSession {
             let fresh = model.makeMTPCache()
             headHistoryCache = fresh
             headCache = fresh
-            if let seedHidden = seedHiddenForPriming,
-               seedTokensForPriming.count > 1
-            {
-                // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
-                // tokens 1..L-1 (hidden at t predicts alongside token t+1).
-                let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
-            }
-            seedHiddenForPriming = nil
-            seedTokensForPriming = []
         }
+        // Seed priming keys off the PENDING SEED ROWS, not cache freshness:
+        // `warmAllDepths` may pre-create the persistent cache (rewound to
+        // offset 0) so the compiled head step traces the live buffers
+        // outside the scored window. Stock behaviour is identical -- `begin`
+        // stages the seed rows exactly once, so this block still fires
+        // exactly once, on the first drafting round.
+        if let seedHidden = seedHiddenForPriming,
+           seedTokensForPriming.count > 1
+        {
+            // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
+            // tokens 1..L-1 (hidden at t predicts alongside token t+1).
+            let primeCount = seedTokensForPriming.count - 1
+            flushHidden.append(
+                model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+            flushTokens.append(contentsOf: seedTokensForPriming[1...])
+        }
+        seedHiddenForPriming = nil
+        seedTokensForPriming = []
         if !headHistoryBacklogHidden.isEmpty {
             flushHidden.append(contentsOf: headHistoryBacklogHidden)
             flushTokens.append(contentsOf: headHistoryBacklogTokens)
@@ -884,13 +945,28 @@ public final class Qwen36MTPBlockSession {
         // the first step carries the history flush, which IS real GPU work
         // the device can start while the host builds steps 2..d.
         asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
-            draftIdArrays.append(draftId)
+        if let step = compiledHeadStep, draftCount > 1,
+           headCache.count == 1, headCache[0] is CompilableKVCache
+        {
+            // Compiled chain: one traced [1, 1] step replayed per draft.
+            // Identical dataflow to the eager loop below -- layer forward
+            // through the live cache; the compact-head selection stays
+            // eager, keeping the custom kernel outside the traced region.
+            // S == 1, so the step's output IS the final hidden row.
+            for _ in 1 ..< draftCount {
+                draftHidden = step([draftHidden, draftId])[0]
+                draftId = model.draftTokenID(draftHidden)
+                draftIdArrays.append(draftId)
+            }
+        } else {
+            for _ in 1 ..< draftCount {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                draftHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                draftId = model.draftTokenID(draftHidden)
+                draftIdArrays.append(draftId)
+            }
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }

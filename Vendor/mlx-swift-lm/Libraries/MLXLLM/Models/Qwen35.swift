@@ -1229,7 +1229,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
-        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+        if x.dim(-2) <= 9, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
             return downProj(qwen35CompiledFusedSwiGLU(y))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -1633,7 +1633,7 @@ final class Qwen35Attention: Module {
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
-           L <= 32,
+           L <= 16,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
@@ -1874,7 +1874,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
                 if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
+                    if i == 0 || i % 4 == 3 {
                         asyncEval(hiddenStates)
                     }
                 } else {
@@ -2438,7 +2438,15 @@ extension Qwen35TextModel: MTPCapable {
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
     public func makeMTPCache() -> [any KVCache] {
         guard let mtp else { return [] }
-        return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
+        // Compilable fixed-buffer cache: the [1, 1] head draft step is then
+        // graph-traceable against it (array offset, array mask), so the
+        // session can replay ONE compiled step per chained draft instead of
+        // rebuilding the layer graph on the host every step. Head side --
+        // proposal-only, no exactness constraint; the attention path already
+        // routes array-offset caches through `applyRotaryPosition`.
+        return mtp.layers.map { _ in
+            CompilableKVCache(maxLength: 4096) as any KVCache
+        }
     }
 }
 

@@ -238,7 +238,10 @@ public class CompilableKVCache: BaseKVCache {
     public override func trim(_ n: Int) -> Int {
         let current: Int = offsetArray[0].item(Int.self)
         let trimmed = min(current, n)
-        offsetArray = MLXArray([Int32(current - trimmed)])
+        // Identity-preserving rewind: compile() captures `offsetArray` as
+        // state, so replacing the object would desynchronise every compiled
+        // closure that traced it. Mirror `update()` and mutate in place.
+        offsetArray._updateInternal(MLXArray([Int32(current - trimmed)]))
         super.offset = current - trimmed
         return trimmed
     }
