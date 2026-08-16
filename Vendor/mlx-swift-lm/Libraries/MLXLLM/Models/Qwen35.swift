@@ -2065,6 +2065,57 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
 
+    /// WARM-TIME re-quantization width for the compact draft-vocabulary
+    /// projection. **Ships at 2 bits by default**; `MLX_QWEN_DRAFT_HEAD_BITS`
+    /// overrides the width, and `MLX_QWEN_DRAFT_HEAD_BITS=4` is the kill
+    /// switch that restores the previous behaviour exactly (a requested width
+    /// equal to the source width returns the untouched object, no work done).
+    ///
+    /// The compact head is 270.1 MiB of the ~498 MiB every DRAFT step
+    /// streams — 54% of the step, and more bytes than the whole declared MTP
+    /// head. It is also HEAD-ONLY: the serial control leg (`--mtp-depth 0`)
+    /// never proposes, never calls `draftTokenID`, and therefore never
+    /// builds this head at all, so anything removed here is removed from the
+    /// candidate leg only. Re-quantizing it 4 -> 3 bits cuts the read to
+    /// ~207 MiB (-13% of the step) and 4 -> 2 bits to ~145 MiB (-25%).
+    ///
+    /// The whole risk is ACCEPTANCE, not correctness: this head only
+    /// PROPOSES. Every emitted token is still re-checked by the trusted
+    /// parent against the exact `lmHead`, so a coarser proposal can only
+    /// cost accept rate, never a wrong token. 0xkydo's `5205c88` measured a
+    /// head requantization dropping accept 0.641 -> 0.600, and the in-tree
+    /// 49,152-row trim regressed for the same reason, so this ships behind a
+    /// flag and is decided by the stopwatch, not by argument.
+    ///
+    /// `MLX_` prefix ON PURPOSE: `sanitizedRuntimeWorkerEnvironment` strips
+    /// every `MLXFAST_*` variable from the sandboxed worker, so an
+    /// `MLXFAST_`-prefixed flag would be permanently at its default with no
+    /// kill switch. The ranked worker does NOT set this variable, so the
+    /// shipped default is what runs there — that is deliberate, and it is
+    /// what was measured.
+    ///
+    /// Every uncertain input resolves to the shipped default rather than
+    /// erroring: variable absent, empty, whitespace, unparseable, negative,
+    /// or a width MLX cannot affine-quantize to. Nothing here throws, and
+    /// the value can only ever be one of `{2, 3, 4, 5, 6, 8}`. A value of 4
+    /// (the source `lm_head` width) is handled downstream by returning the
+    /// untouched compact head, which is byte-for-byte the previous path.
+    private static let compactDraftHeadBits: Int = {
+        // MEASURED default: 2-bit, +0.30% on the candidate leg with an
+        // accept-rate delta of exactly 0.000 (mac-2-ops, ungated,
+        // interleaved). 4 restores the old behaviour.
+        let shippedDefault = 2
+        guard let raw = ProcessInfo.processInfo
+            .environment["MLX_QWEN_DRAFT_HEAD_BITS"]?
+            .trimmingCharacters(in: .whitespaces),
+            !raw.isEmpty,
+            let bits = Int(raw),
+            // MLX affine quantization supports exactly these widths.
+            [2, 3, 4, 5, 6, 8].contains(bits)
+        else { return shippedDefault }
+        return bits
+    }()
+
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
@@ -2419,7 +2470,7 @@ extension Qwen35TextModel: MTPCapable {
         }
 
         if let quantized = full as? QuantizedLinear {
-            return QuantizedLinear(
+            let compact = QuantizedLinear(
                 weight: compactRows(quantized.weight),
                 bias: quantized.bias.map(compactRows),
                 scales: compactRows(quantized.scales),
@@ -2427,10 +2478,108 @@ extension Qwen35TextModel: MTPCapable {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode)
+            // Additive: `nil` when the flag is unset or already matches the
+            // source width, which is the tip's exact object.
+            return Self.requantizedCompactDraftHead(compact) ?? compact
         }
         return Linear(
             weight: compactRows(full.weight),
             bias: full.bias.map(compactRows))
+    }
+
+    /// Warm-time dequantize -> re-quantize of the compact draft-vocabulary
+    /// projection to `compactDraftHeadBits`.
+    ///
+    /// Runs exactly once per session, inside the UNTIMED warm (the first
+    /// `draftTokenID` is issued by `warmAllDepths`, not by the timed
+    /// window), so its cost is not on the scored path. The output is a
+    /// drop-in `QuantizedLinear` of the same `[98_336, 5120]` logical shape
+    /// with the same group size, so `draftTokenID`'s fused
+    /// `qwen_mtp_draft_select` kernel — which reads only the 98,336 output
+    /// logits and knows nothing about the weight encoding — is unchanged,
+    /// as are `REAL_COUNT` / `PREFIX_COUNT` / `CONTROL_OFFSET` and the id
+    /// remap. The exact `lmHead` used for ledger and verify values is not
+    /// touched.
+    ///
+    /// Returns `nil` — meaning "keep the tip's head" — on every condition it
+    /// is not sure about. It never throws and never traps: an unsupported
+    /// mode, a non-64 group size, a shape that is not the compact head, or a
+    /// requested width equal to the source width all fall back.
+    private static func requantizedCompactDraftHead(
+        _ head: QuantizedLinear
+    ) -> QuantizedLinear? {
+        let targetBits = compactDraftHeadBits
+        // Same width = the tip's own encoding; do not spend the warm and do
+        // not perturb a single bit. This is the `=4` kill switch.
+        guard targetBits != head.bits else { return nil }
+        guard head.mode == .affine, head.groupSize == 64 else { return nil }
+        guard let sourceBiases = head.biases else { return nil }
+        // `Linear`'s additive bias is nil for this checkpoint's lm_head
+        // (bias: false); if a future head ships one, keep the old path
+        // rather than guess how to carry it.
+        guard head.bias == nil else { return nil }
+        let rows = head.weight.dim(0)
+        guard rows == compactDraftPaddedCount,
+              head.scales.dim(0) == rows,
+              sourceBiases.dim(0) == rows,
+              head.scales.dim(1) * 64 == head.shape.1
+        else { return nil }
+
+        // Row-chunked: quantization groups run along the INPUT axis, so rows
+        // are independent and a chunked pass is exactly a whole-matrix pass.
+        // The chunk bounds peak memory at ~80 MiB of dequantized fp16
+        // instead of ~1 GiB for the full [98_336, 5120] matrix.
+        let chunkRows = 8_192
+        var weightParts: [MLXArray] = []
+        var scaleParts: [MLXArray] = []
+        var biasParts: [MLXArray] = []
+        weightParts.reserveCapacity((rows + chunkRows - 1) / chunkRows)
+        var start = 0
+        while start < rows {
+            let end = Swift.min(start + chunkRows, rows)
+            let dense = dequantized(
+                head.weight[start ..< end],
+                scales: head.scales[start ..< end],
+                biases: sourceBiases[start ..< end],
+                groupSize: 64, bits: head.bits, mode: .affine)
+            let (wq, qScales, qBiases) = MLX.quantized(
+                dense, groupSize: 64, bits: targetBits, mode: .affine)
+            guard let qBiases else { return nil }
+            // Materialise this chunk before the next one is built so the
+            // dense intermediate is released rather than accumulated.
+            eval(wq, qScales, qBiases)
+            weightParts.append(wq)
+            scaleParts.append(qScales)
+            biasParts.append(qBiases)
+            start = end
+        }
+
+        let newWeight = concatenated(weightParts, axis: 0)
+        let newScales = concatenated(scaleParts, axis: 0)
+        let newBiases = concatenated(biasParts, axis: 0)
+        eval(newWeight, newScales, newBiases)
+        let requantized = QuantizedLinear(
+            weight: newWeight,
+            bias: nil,
+            scales: newScales,
+            biases: newBiases,
+            groupSize: 64,
+            bits: targetBits,
+            mode: .affine)
+        // ONE line, at warm, so a run can PROVE the sandboxed worker actually
+        // took this path. Not per-round: nothing is written inside the timed
+        // window. `fputs` ON PURPOSE rather than
+        // `FileHandle.standardError.write(_:)`: the FileHandle overload
+        // raises an uncatchable ObjC exception if the descriptor is closed or
+        // the pipe is broken, and this line is now on the DEFAULT path, so it
+        // must not be able to convert a degraded stderr into a crash. `fputs`
+        // returns an error code and is ignored.
+        let line = "qwen-draft-head: compact draft vocabulary re-quantized "
+            + "\(head.bits)-bit -> \(targetBits)-bit "
+            + "(rows=\(rows), group=64, "
+            + "bytes=\(rows * head.shape.1 * targetBits / 8))\n"
+        _ = fputs(line, stderr)
+        return requantized
     }
 
 
