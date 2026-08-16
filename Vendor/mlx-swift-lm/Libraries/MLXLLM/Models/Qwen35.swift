@@ -1751,6 +1751,98 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// Margin-emitting variant of `qwen_mtp_draft_select`: the SAME argmax
+// ordering for the token id (strictly-greater wins, exact tie to the lower
+// id, NaN never beats non-NaN), plus a second output — the top1-top2 value
+// gap — for the schedule's margin-aware reject weighting. The id path is
+// byte-for-byte the promoted selection; the margin is PROPOSAL-SIDE
+// confidence telemetry only (it feeds the depth schedule, never a ledger
+// value), so its NaN edge handling may be loose where the id's may not.
+private let qwen35DraftSelectMarginKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_select_margin",
+    inputNames: ["logits"],
+    outputNames: ["token_id", "margin"],
+    source: """
+        uint lane = thread_position_in_threadgroup.x;
+        float best_value = 0.0f;
+        uint  best_id    = 0;
+        bool  have       = false;
+        float second_value = -INFINITY;
+
+        for (uint index = lane; index < REAL_COUNT; index += TG_SIZE) {
+            float value = float(logits[index]);
+            bool value_nan = isnan(value);
+            bool take;
+            if (!have) {
+                take = true;
+            } else if (value_nan != isnan(best_value)) {
+                take = !value_nan;
+            } else if (value > best_value) {
+                take = true;
+            } else if (value < best_value) {
+                take = false;
+            } else {
+                take = index < best_id;
+            }
+            if (take) {
+                if (have && !isnan(best_value)) {
+                    second_value = max(second_value, best_value);
+                }
+                best_value = value; best_id = index; have = true;
+            } else if (!value_nan) {
+                second_value = max(second_value, value);
+            }
+        }
+
+        threadgroup float scratch_value[TG_SIZE];
+        threadgroup uint  scratch_id[TG_SIZE];
+        threadgroup float scratch_second[TG_SIZE];
+        scratch_value[lane]  = have ? best_value : NAN;
+        scratch_id[lane]     = have ? best_id : 0xFFFFFFFFu;
+        scratch_second[lane] = second_value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = TG_SIZE / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                float a = scratch_value[lane];
+                float b = scratch_value[lane + stride];
+                uint  ai = scratch_id[lane];
+                uint  bi = scratch_id[lane + stride];
+                bool a_empty = (ai == 0xFFFFFFFFu);
+                bool b_empty = (bi == 0xFFFFFFFFu);
+                bool take_b;
+                if (b_empty)      { take_b = false; }
+                else if (a_empty) { take_b = true; }
+                else if (isnan(b) != isnan(a)) { take_b = !isnan(b); }
+                else if (b > a)   { take_b = true; }
+                else if (b < a)   { take_b = false; }
+                else              { take_b = bi < ai; }
+                float loser_best = take_b ? a : b;
+                bool  loser_empty = take_b ? a_empty : b_empty;
+                float merged_second =
+                    max(scratch_second[lane], scratch_second[lane + stride]);
+                if (!loser_empty && !isnan(loser_best)) {
+                    merged_second = max(merged_second, loser_best);
+                }
+                if (take_b) { scratch_value[lane] = b; scratch_id[lane] = bi; }
+                scratch_second[lane] = merged_second;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint id = scratch_id[0];
+            token_id[0] = int(id < PREFIX_COUNT ? id : id + CONTROL_OFFSET);
+            float top = scratch_value[0];
+            float second = scratch_second[0];
+            margin[0] = (isnan(top) || second == -INFINITY)
+                ? 0.0f : (top - second);
+        }
+    """,
+    header: "",
+    ensureRowContiguous: false
+)
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2061,9 +2153,17 @@ extension Qwen35TextModel: MTPCapable {
         if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
             let k = s.dim(1) * 64
             let bits = w.dim(1) * 32 / k
-            return quantizedMM(
+            let logits = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: 64, bits: bits, mode: .affine)
+            // A COMPACT-shaped declared draft readout (the runtime compact
+            // vocabulary's padded row count) drops its padding rows before
+            // argmax, exactly as the runtime-derived compact head does; its
+            // ids are then mapped back by `mapDraftTokenIds` below.
+            if w.dim(0) == Self.compactDraftPaddedCount {
+                return logits[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            }
+            return logits
         }
         guard usesCompactDraftVocabulary else { return applyLMHead(x) }
         if _compactDraftHead == nil {
@@ -2110,12 +2210,71 @@ extension Qwen35TextModel: MTPCapable {
         return outputs[0]
     }
 
+    /// `draftTokenID` plus the proposal's confidence margin (top1 - top2 of
+    /// the draft logits) in the SAME single dispatch, via the margin variant
+    /// of the selection kernel. Serves BOTH compact readouts: the
+    /// runtime-derived compact head and a COMPACT-SHAPED declared
+    /// `draft_lm_head` (whose triples load at whatever bit width their
+    /// shapes imply — 2-bit in the declared artifact this ships with). The
+    /// id ordering is byte-identical to `draftTokenID`; the margin feeds
+    /// only the depth schedule.
+    public func draftTokenIDWithMargin(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        let compactLogits: MLXArray?
+        if let w = _draftHeadW, let sc = _draftHeadS, let z = _draftHeadZ,
+           w.dim(0) == Self.compactDraftPaddedCount
+        {
+            let k = sc.dim(1) * 64
+            let bits = w.dim(1) * 32 / k
+            compactLogits = quantizedMM(
+                x, w, scales: sc, biases: z, transpose: true,
+                groupSize: 64, bits: bits, mode: .affine)
+        } else if _draftHeadW == nil, usesCompactDraftVocabulary {
+            if _compactDraftHead == nil {
+                _compactDraftHead = makeCompactDraftHead()
+            }
+            compactLogits = _compactDraftHead!(x)
+        } else {
+            compactLogits = nil
+        }
+        guard let padded = compactLogits else {
+            // Full-vocab declared readout (no remap): plain-chain id, and a
+            // margin from an argPartition top-2 (schedule telemetry only).
+            let logits = applyDraftLMHead(x)
+            let flat = logits.reshaped([logits.dim(-1)])
+            let pair = flat[argPartition(-flat, kth: 1)[0 ..< 2]]
+            let margin = (pair.max() - pair.min()).reshaped([1, 1])
+            return (argMax(logits, axis: -1).asType(.int32), margin)
+        }
+        let tgSize = 1024
+        let outputs = qwen35DraftSelectMarginKernel(
+            [padded.reshaped([Self.compactDraftPaddedCount])],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                ("CONTROL_OFFSET",
+                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ("TG_SIZE", tgSize),
+            ],
+            grid: (tgSize, 1, 1),
+            threadGroup: (tgSize, 1, 1),
+            outputShapes: [[1, 1], [1, 1]],
+            outputDTypes: [.int32, .float32]
+        )
+        return (outputs[0], outputs[1])
+    }
+
     /// Map compact draft IDs back to the tokenizer's full ID space without a
     /// host readback. The low `compactDraftPrefixCount` rows retain their
     /// IDs; the appended rows are Qwen's official text/control tokens
     /// 248,044 ... 248,069.
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
-        guard usesCompactDraftVocabulary else { return ids }
+        // The compact id space applies on the runtime-derived compact path
+        // AND when the DECLARED draft readout is compact-shaped (its rows
+        // are the same prefix + control layout by contract).
+        let declaredCompact =
+            _draftHeadW.map { $0.dim(0) == Self.compactDraftPaddedCount }
+            ?? false
+        guard usesCompactDraftVocabulary || declaredCompact else { return ids }
         return which(
             ids .< Self.compactDraftPrefixCount,
             ids,
@@ -2287,6 +2446,11 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.draftTokenID`.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
         languageModel.draftTokenID(x)
+    }
+
+    /// See `Qwen35TextModel.draftTokenIDWithMargin`.
+    public func draftTokenIDWithMargin(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        languageModel.draftTokenIDWithMargin(x)
     }
 
     /// See `Qwen35TextModel.mapDraftTokenIds`.
