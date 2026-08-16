@@ -232,6 +232,24 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Compiled K RMS + K/V layout for the one-layer MTP-head history flush.
+/// `appendHistoryKV` already skips Q/attn/MLP; the remaining eager kNorm +
+/// two transposes still JIT inside the timed 512-row seed. Serial/target
+/// never call this. Same kNorm contract (weight + 1e-6) as the eager path.
+private let qwen35CompiledHistoryKVLayout:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
+{
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
+    { keys, values, kWeight in
+        let kn = MLXFast.rmsNorm(keys, weight: kWeight, eps: 1e-6)
+        return (kn.transposed(0, 2, 1, 3), values.transposed(0, 2, 1, 3))
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
@@ -1577,13 +1595,13 @@ final class Qwen35Attention: Module {
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
         let B = x.dim(0)
         let L = x.dim(1)
-        var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
-        _ = cache.update(keys: keys, values: values)
+        let (rawKeys, rawValues) = kv(x)
+        let (keys, values) = qwen35CompiledHistoryKVLayout(
+            rawKeys.reshaped(B, L, kvHeads, -1),
+            rawValues.reshaped(B, L, kvHeads, -1),
+            kNorm.weight)
+        let rotated = applyRotaryPosition(rope, to: keys, cache: cache)
+        _ = cache.update(keys: rotated, values: values)
     }
 
     func callAsFunction(
