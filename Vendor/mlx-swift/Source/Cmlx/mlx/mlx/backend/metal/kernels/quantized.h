@@ -1048,6 +1048,101 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
+
+// ENGINE AXIS (2026-08-17, novel-kernel): ONE-WEIGHT-PASS crossrow at FULL
+// grid. The host launches M x-groups per 8-output-row tile; G of them stay
+// active (G=4: rows {8y+x, 8y+x+4}), and the two simdgroups split the M
+// inputs 4/4, so per-lane registers stay at pair-kernel levels while every
+// weight byte is read exactly once for all M inputs (stock: ceil(M/4) passes).
+// Per output element the FP sequence is byte-identical to the stock kernels:
+// same load_vector 4-value sums, same qdot expression per i-step, same
+// per-k-block acc update, ascending k, same 32-lane simd_sum tree. Only the
+// owning group changes (the pair/wide admission argument).
+template <typename T, int M, int G>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_1x(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M >= 5 && M <= 9, "1x multi-row QMV covers M in [5, 9]");
+  static_assert(G == 4 || G == 8, "1x QMV row groups are 4 or 8");
+  constexpr int rows_per_group = 8 / G;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int m0 = simd_gid * 4;
+  const int m1 = min(m0 + 4, M);
+  const int m_count = m1 - m0;
+
+  if (int(tid.x) >= G) { return; }
+  const int tile_base = int(tid.y) * 8;
+  const int out_base = tile_base + int(tid.x);
+  if (out_base >= tile_base + 8) { return; }
+
+  thread float acc[rows_per_group][5];
+  for (int r = 0; r < rows_per_group; r++) {
+    for (int m = 0; m < m_count; m++) acc[r][m] = 0.0f;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_group][4];
+    thread float scale_local[rows_per_group];
+    thread float bias_local[rows_per_group];
+    for (int r = 0; r < rows_per_group; r++) {
+      const int row = out_base + r * G;
+      if (row >= tile_base + 8) break;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) packed[r][i] = ws[i];
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+    thread float xc[values_per_thread];
+    thread float sums[5];
+    for (int m = 0; m < m_count; m++) {
+      const device T* xm =
+          x + (m0 + m) * in_vec_size + k + simd_lid * values_per_thread;
+      sums[m] = load_vector<T, float, values_per_thread, 4>(xm, xc);
+    }
+    for (int m = 0; m < m_count; m++) {
+      for (int r = 0; r < rows_per_group; r++) {
+        const int row = out_base + r * G;
+        if (row >= tile_base + 8) break;
+        float partial = 0.0f;
+        for (int i = 0; i < 4; i++) {
+          partial +=
+              (xc[4 * i] * (packed[r][i] & 0x000f) +
+               xc[4 * i + 1] * (packed[r][i] & 0x00f0) +
+               xc[4 * i + 2] * (packed[r][i] & 0x0f00) +
+               xc[4 * i + 3] * (packed[r][i] & 0xf000));
+        }
+        acc[r][m] += scale_local[r] * partial + sums[m] * bias_local[r];
+      }
+    }
+  }
+
+  for (int r = 0; r < rows_per_group; r++) {
+    const int row = out_base + r * G;
+    if (row >= tile_base + 8) break;
+    for (int m = 0; m < m_count; m++) {
+      const float reduced = simd_sum(acc[r][m]);
+      if (simd_lid == 0) {
+        y[(m0 + m) * out_vec_size + row] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
 // IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
 // with the remainder spread evenly so no group runs a one-row tail.
 template <typename T, int M, int IPG>
@@ -1801,6 +1896,41 @@ template <typename T, int group_size, int bits, bool batched>
         b_strides,
         tid);
   }
+  // ENGINE AXIS (2026-08-17): one-weight-pass crossrow for verify widths
+  // 5..9 (G=4: rows {8y+x, 8y+x+4}, 4/8 x-groups active, all M inputs share
+  // each weight byte once). Bit-exact by the pair/wide admission: the
+  // per-element FP sequence is unchanged. Other shapes keep the stock path.
+  if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
+    switch (ntg.x) {
+      case 5:
+        qmv_fast_crossrow_affine4_g64_1x<T, 5, 4>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return;
+      case 6:
+        qmv_fast_crossrow_affine4_g64_1x<T, 6, 4>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return;
+      case 7:
+        qmv_fast_crossrow_affine4_g64_1x<T, 7, 4>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return;
+      case 8:
+        qmv_fast_crossrow_affine4_g64_1x<T, 8, 4>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return;
+      case 9:
+        qmv_fast_crossrow_affine4_g64_1x<T, 9, 4>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return;
+      default:
+        break;
+    }
+  }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
@@ -1838,20 +1968,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
-          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
-          // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 4>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
