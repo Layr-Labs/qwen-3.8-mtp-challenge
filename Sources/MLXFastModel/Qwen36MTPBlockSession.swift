@@ -1203,11 +1203,6 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
-            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
-                guard let arrays = entry as? ArraysCache else { return nil }
-                return arrays[1]
-            }
-            asyncEval(replayedRecurrentStates)
             return true
         }
 

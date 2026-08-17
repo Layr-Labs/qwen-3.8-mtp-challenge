@@ -1,9 +1,10 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:lowskillcoding/qwen38-mtp-head-4bit-g64@0966ddaff972fd3ca2be08f3640603b47e9ce70a",
-  "sha256": "cc209e30d8a7def1fc4d785be22b0ec40e16ae6763f9591255a1996a34f08f0d",
-  "bytes": 238934093,
+  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
+  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
+  "bytes": 238934129,
   "max_bytes": 2147483648,
-  "note": "4-bit/group-64 MLX-affine requantization of the pinned bf16 head; matches the backbone quantization geometry so the stock scales-keyed walk loads it with zero code changes. rev2 post-#56 (f2be121)."
+
+  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
 }
