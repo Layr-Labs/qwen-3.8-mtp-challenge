@@ -1095,25 +1095,37 @@ public final class Qwen36MTPBlockSession {
         // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
-        Self.trimTrimmable(headCache, to: validHistoryOffset)
-        if acceptedCount > 0 {
+        //
+        // PROPOSAL-CACHE RETENTION: the draft chain already appended one head
+        // cache row per drafted position (rows validHistoryOffset + 0 ... +
+        // draftCount - 2). On acceptance those rows ARE the head's committed
+        // history for the accepted prefix, so instead of trimming them and
+        // re-flushing the same positions from target verify hidden next round,
+        // keep them in place and queue only the transitions whose rows were
+        // never generated. This matches MTPLX's "persistent" mtp_cache_policy:
+        // the head cache carries the chain's own hidden states across rounds.
+        // It is proposal-side only — the target still verifies every row and
+        // the parent still pins emitted tokens to the serial trajectory.
+        let retained = min(acceptedCount, drafts.count - 1)
+        Self.trimTrimmable(headCache, to: validHistoryOffset + retained)
+        if acceptedCount > retained {
             // Keep accepted post-norm rows as one contiguous block. The backlog
             // already supports multi-row blocks (seed priming uses one), while
             // the token list remains flat and preserves the same row order.
             if let block = normedRows(
-                verifyHidden, verifyNormed, 0 ..< acceptedCount)
+                verifyHidden, verifyNormed, retained ..< acceptedCount)
             {
                 headHistoryBacklogHidden.append(block)
             } else {
                 // Preserve the exact pre-existing per-row normalization path
                 // whenever no matching published block is available.
-                for index in 0 ..< acceptedCount {
+                for index in retained ..< acceptedCount {
                     headHistoryBacklogHidden.append(
                         hiddenRow(verifyHidden, index))
                 }
             }
             headHistoryBacklogTokens.append(
-                contentsOf: drafts.prefix(acceptedCount))
+                contentsOf: drafts[retained ..< acceptedCount])
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
