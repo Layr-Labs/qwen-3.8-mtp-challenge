@@ -104,6 +104,13 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// instead of six. Proposal side only.
     func draftTokenID(_ x: MLXArray) -> MLXArray
 
+    /// Proposal-only token selection with the token that conditioned `x`.
+    /// Conformers without a context adapter inherit the exact legacy selector
+    /// below; the target verifier never consumes this side channel.
+    func draftTokenID(
+        _ x: MLXArray, previousTokenID: MLXArray
+    ) -> MLXArray
+
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
@@ -124,6 +131,12 @@ extension Qwen36MTPTarget {
         let (logits, hidden) = callWithHidden(
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
+    }
+
+    public func draftTokenID(
+        _ x: MLXArray, previousTokenID: MLXArray
+    ) -> MLXArray {
+        draftTokenID(x)
     }
 }
 

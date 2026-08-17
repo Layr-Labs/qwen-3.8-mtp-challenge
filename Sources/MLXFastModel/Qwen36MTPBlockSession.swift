@@ -274,7 +274,8 @@ public final class Qwen36MTPBlockSession {
         // differed: first MTP block 0.941 s vs 0.402 s, the JIT paid inside
         // the scored window. A new selection kernel resets that hazard exactly.
         let primedDraftID = model.draftTokenID(
-            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
+            primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...],
+            previousTokenID: primeTokens[0..., 511 ..< 512])
         eval(primedDraftID)
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
@@ -285,37 +286,21 @@ public final class Qwen36MTPBlockSession {
                 hidden: foldHidden, nextTokenIds: foldTokens,
                 cache: historyWarmCache)
         eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...],
+            previousTokenID: foldTokens[0..., 1 ..< 2]))
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the SAME expression scored rounds dispatch:
-            // `callWithHiddenAndNormed` (E). Warming only `callWithHidden`
-            // leaves the published post-norm output to cold-JIT inside
-            // the first timed verify — the 7b33621 failure mode.
-            let verifyLogits: MLXArray
-            let verifyNormed: MLXArray?
-            if width >= 2 {
-                let triple = model.callWithHiddenAndNormed(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 1)
-                verifyLogits = triple.0
-                verifyNormed = triple.2
-            } else {
-                let pair = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 0)
-                verifyLogits = pair.0
-                verifyNormed = nil
-            }
+            // tape. Warm the same shapes the scored rounds dispatch.
+            let (verifyLogits, _) = model.callWithHidden(
+                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
+                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
+            // Compile the two top-2 reduction kernels outside the scored window
+            // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
-            if let verifyNormed { warmBundle.append(verifyNormed) }
-            eval(warmBundle)
+            eval(verifyLogits, warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -336,13 +321,10 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _, oneRowReplayNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-                cache: oneRowReplayCache, nConfirmed: 1)
-        var oneRowBundle = [oneRowReplayLogits]
-        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
-        eval(oneRowBundle)
+        let (oneRowReplayLogits, _) = model.callWithHidden(
+            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+            cache: oneRowReplayCache, nConfirmed: 1)
+        eval(oneRowReplayLogits)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -923,7 +905,10 @@ public final class Qwen36MTPBlockSession {
                 cache: headCache)
         var draftHidden = headHidden[
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
+        var draftId = model.draftTokenID(
+            draftHidden,
+            previousTokenID: draftInputTokens[
+                0..., (draftInputTokens.dim(1) - 1) ..< draftInputTokens.dim(1)])
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
         // before the rest of the chain is built, and unlike the per-step
@@ -932,11 +917,13 @@ public final class Qwen36MTPBlockSession {
         // the device can start while the host builds steps 2..d.
         asyncEval(draftId)
         for _ in 1 ..< draftCount {
+            let previousDraftID = draftId
             headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                hidden: draftHidden, nextTokenIds: previousDraftID, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            draftId = model.draftTokenID(
+                draftHidden, previousTokenID: previousDraftID)
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
