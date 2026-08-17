@@ -1117,7 +1117,7 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if nConfirmed == 1 && S >= 2 {
+        if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
@@ -2368,7 +2368,7 @@ extension Qwen35TextModel: MTPCapable {
             _compactDraftHead = makeCompactDraftHead()
         }
         let padded = _compactDraftHead!(x)
-        let tgSize = 1024
+        let tgSize = 896
         let outputs = qwen35DraftSelectKernel(
             [padded.reshaped([Self.compactDraftPaddedCount])],
             template: [
