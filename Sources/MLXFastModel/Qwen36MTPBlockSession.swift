@@ -1252,6 +1252,16 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
+            // Replay installs new recurrent roots lazily. Submit only those
+            // already-required restored SSM boundary states now, overlapping
+            // their evaluation with the remaining reject-path host work. This
+            // changes neither arithmetic nor cache offsets and leaves the
+            // serial and full-accept paths untouched.
+            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
+                guard let arrays = entry as? ArraysCache else { return nil }
+                return arrays[1]
+            }
+            asyncEval(replayedRecurrentStates)
             return true
         }
 
