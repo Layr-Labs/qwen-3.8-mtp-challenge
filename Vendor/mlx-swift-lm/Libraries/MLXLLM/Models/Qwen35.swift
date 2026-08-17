@@ -1961,8 +1961,9 @@ public class Qwen35TextModelInner: Module {
 // value. See `applyDraftLMHead`'s doc comment for the same argument applied
 // to the compact row set (promoted 7b33621).
 //
-// It replaces SIX MLX primitives that existed only to turn a 98,336-wide row
-// into one integer:
+// It replaces SIX generic MLX primitives that existed only to turn a
+// 98,336-wide row into one integer. The first kernel reduces 32 vocabulary
+// stripes in parallel; the second merges those exact winners:
 //     padded[0..., 0..., 0 ..< 98_330]     // slice off the fast-shape padding
 //     argMax(axis: -1)                     // uint32
 //     .asType(.int32)
@@ -1973,19 +1974,40 @@ public class Qwen35TextModelInner: Module {
 // goes to the LOWER id, and a NaN never beats a non-NaN. Bounding at
 // `REAL_COUNT` in the kernel is exactly what the pre-argmax slice did, so the
 // six duplicated padding rows stay unreachable even on a tie.
-private let qwen35DraftSelectKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_select",
+private let qwen35DraftSelectHeader = """
+    inline bool qwen_draft_better(
+        float candidate_value,
+        uint candidate_id,
+        float current_value,
+        uint current_id
+    ) {
+        if (candidate_id == 0xFFFFFFFFu) { return false; }
+        if (current_id == 0xFFFFFFFFu) { return true; }
+        bool candidate_nan = isnan(candidate_value);
+        bool current_nan = isnan(current_value);
+        if (candidate_nan != current_nan) { return !candidate_nan; }
+        if (candidate_value > current_value) { return true; }
+        if (candidate_value < current_value) { return false; }
+        return candidate_id < current_id;
+    }
+"""
+
+private let qwen35DraftSelectPartialKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_select_partial",
     inputNames: ["logits"],
-    outputNames: ["token_id"],
+    outputNames: ["partial_values", "partial_ids"],
     source: """
         uint thread_id = thread_position_in_threadgroup.x;
+        uint group_id = threadgroup_position_in_grid.x;
         uint simd_lane = thread_index_in_simdgroup;
         uint simd_group = simdgroup_index_in_threadgroup;
         float best_value = 0.0f;
         uint  best_id    = 0;
         bool  have       = false;
 
-        for (uint index = thread_id; index < REAL_COUNT; index += TG_SIZE) {
+        for (uint index = group_id * TG_SIZE + thread_id;
+             index < REAL_COUNT;
+             index += GROUPS * TG_SIZE) {
             float value = float(logits[index]);
             bool take = !have || qwen_draft_better(
                 value, index, best_value, best_id);
@@ -2020,8 +2042,13 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (simd_group == 0) {
-            best_value = scratch_value[simd_lane];
-            best_id = scratch_id[simd_lane];
+            if (simd_lane < TG_SIZE / 32) {
+                best_value = scratch_value[simd_lane];
+                best_id = scratch_id[simd_lane];
+            } else {
+                best_value = NAN;
+                best_id = 0xFFFFFFFFu;
+            }
             for (uint offset = 16; offset > 0; offset >>= 1) {
                 float other_value = simd_shuffle_down(best_value, offset);
                 uint other_id = simd_shuffle_down(best_id, offset);
@@ -2032,30 +2059,41 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
                 }
             }
             if (simd_lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
+                partial_values[group_id] = best_value;
+                partial_ids[group_id] = int(best_id);
             }
         }
     """,
-    header: """
-        inline bool qwen_draft_better(
-            float candidate_value,
-            uint candidate_id,
-            float current_value,
-            uint current_id
-        ) {
-            if (candidate_id == 0xFFFFFFFFu) { return false; }
-            if (current_id == 0xFFFFFFFFu) { return true; }
-            bool candidate_nan = isnan(candidate_value);
-            bool current_nan = isnan(current_value);
-            if (candidate_nan != current_nan) { return !candidate_nan; }
-            if (candidate_value > current_value) { return true; }
-            if (candidate_value < current_value) { return false; }
-            return candidate_id < current_id;
+    header: qwen35DraftSelectHeader,
+    ensureRowContiguous: false
+)
+
+private let qwen35DraftSelectFinalizeKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_select_finalize",
+    inputNames: ["partial_values", "partial_ids"],
+    outputNames: ["token_id"],
+    source: """
+        uint lane = thread_position_in_threadgroup.x;
+        float best_value = partial_values[lane];
+        uint best_id = uint(partial_ids[lane]);
+
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_value = simd_shuffle_down(best_value, offset);
+            uint other_id = simd_shuffle_down(best_id, offset);
+            if (lane < offset && qwen_draft_better(
+                    other_value, other_id, best_value, best_id)) {
+                best_value = other_value;
+                best_id = other_id;
+            }
+        }
+        if (lane == 0) {
+            token_id[0] = int(
+                best_id < PREFIX_COUNT
+                    ? best_id
+                    : best_id + CONTROL_OFFSET);
         }
     """,
+    header: qwen35DraftSelectHeader,
     ensureRowContiguous: false
 )
 
@@ -2405,7 +2443,8 @@ extension Qwen35TextModel: MTPCapable {
     /// to the tokenizer's ID space, as a device-resident `[1, 1]` int32.
     ///
     /// Same value as `mapDraftTokenIds(argMax(applyDraftLMHead(x), axis: -1))`,
-    /// produced in ONE dispatch instead of six. `applyDraftLMHead` and
+    /// produced by a two-stage parallel reduction instead of six generic
+    /// primitives. `applyDraftLMHead` and
     /// `mapDraftTokenIds` are unchanged and still serve the declared-head path
     /// and the untimed warm.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
@@ -2418,20 +2457,30 @@ extension Qwen35TextModel: MTPCapable {
             _compactDraftHead = makeCompactDraftHead()
         }
         let padded = _compactDraftHead!(x)
-        let tgSize = 1024
-        let outputs = qwen35DraftSelectKernel(
+        let groups = 32
+        let tgSize = 256
+        let partials = qwen35DraftSelectPartialKernel(
             [padded.reshaped([Self.compactDraftPaddedCount])],
             template: [
                 ("REAL_COUNT", Self.compactDraftRealCount),
+                ("GROUPS", groups),
+                ("TG_SIZE", tgSize),
+            ],
+            grid: (groups * tgSize, 1, 1),
+            threadGroup: (tgSize, 1, 1),
+            outputShapes: [[groups], [groups]],
+            outputDTypes: [.float32, .int32]
+        )
+        let outputs = qwen35DraftSelectFinalizeKernel(
+            partials,
+            template: [
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
-                ("TG_SIZE", tgSize),
             ],
-            grid: (tgSize, 1, 1),
-            threadGroup: (tgSize, 1, 1),
-            outputShapes: [[1, 1]],
-            outputDTypes: [.int32]
+            grid: (groups, 1, 1),
+            threadGroup: (groups, 1, 1),
+            outputShapes: [[1, 1]], outputDTypes: [.int32]
         )
         return outputs[0]
     }
