@@ -1041,6 +1041,14 @@ public final class Qwen36MTPBlockSession {
                 )
                 perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
                 perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
+                // Restore installed lazy GDN roots on purpose (see the
+                // trailing-eval note). Submit them NOW so the device
+                // walks the tape during this round's host upkeep and
+                // the next round's head-graph build, instead of on the
+                // next verify's critical path. Not a snapshot: no
+                // copies. Not eval-trim: the round bundle already
+                // materialised the verify leaves.
+                Self.asyncEvalRecurrent(cache)
             } else {
                 // Generic K>1 / defensive fallback: undo the whole verify window
                 // and re-forward the committed block. This rare path pays a
@@ -1129,11 +1137,13 @@ public final class Qwen36MTPBlockSession {
                 + "round_us=\((tTailDone - tRound0) / 1000)\n"
             Self.traceWrite(line)
         }
-        // No trailing eval: every host-read value was materialised by the
-        // round bundle above. A successful wide-prefix replay intentionally
-        // installs lazy recurrent roots; only the next GPU graph consumes
-        // them. The rare generic-repair path ran its own second eval.
-        // `pendingHidden` is likewise device-only until the next round.
+        // No trailing BLOCKING eval: every host-read value was materialised
+        // by the round bundle above. A successful wide-prefix replay
+        // still installs lazy recurrent roots; those are submitted with
+        // `asyncEvalRecurrent` on the restore path so the next consumer
+        // does not pay the tape on its verify wall. The rare generic-
+        // repair path ran its own second eval. `pendingHidden` stays
+        // device-only until the next round.
 
         // Truncate after the first committed stop token, keeping the stop token
         // itself — the same rule the serial reference applies.
@@ -1176,6 +1186,21 @@ public final class Qwen36MTPBlockSession {
     ///
     /// See `Qwen36MTPRollbackContractTests` for the synthetic-cache regression
     /// that fails against a bare-reference snapshot.
+    /// Submit live GDN leaves without copying them. Used after a prefix
+    /// replay so the restored tape is not the first work in the next
+    /// verify eval. Already-materialised leaves are a cheap no-op.
+    private static func asyncEvalRecurrent(_ cache: [any KVCache]) {
+        var leaves: [MLXArray] = []
+        for entry in cache {
+            guard let arrays = entry as? ArraysCache else { continue }
+            if let conv = arrays[0] { leaves.append(conv) }
+            if let ssm = arrays[1] { leaves.append(ssm) }
+        }
+        if !leaves.isEmpty {
+            asyncEval(leaves)
+        }
+    }
+
     public static func snapshotRecurrent(_ cache: [any KVCache]) -> [Int: [MLXArray?]] {
         var snapshot: [Int: [MLXArray?]] = [:]
         for (index, entry) in cache.enumerated() {
