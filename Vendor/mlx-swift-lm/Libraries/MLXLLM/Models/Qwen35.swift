@@ -189,6 +189,134 @@ private let qwen35CompiledGatedDeltaGBeta:
     return body
 }()
 
+/// Qwen 3.8 wide-verify recurrence specialization. A 512-thread group owns a
+/// 64-row Dv tile for one value head: each of its 16 SIMD groups strip-mines
+/// four independent rows while keeping only the stock four fp32 state values
+/// live per lane. Q/K and the scalar gates are staged once in threadgroup
+/// memory, but the recurrence statement order and BF16/FP32 stores stay stock.
+private let qwen35GatedDeltaDv64Kernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+            constexpr int max_t = 9;
+            constexpr int threads_per_tg = 512;
+            constexpr int rows_per_simd = 4;
+
+            auto q_head = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_head = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto v_head = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            auto y_head = y + b_idx * T * Hv * Dv + hv_idx * Dv;
+            auto g_head = g + b_idx * T * Hv + hv_idx;
+            auto beta_head = beta + b_idx * T * Hv + hv_idx;
+
+            threadgroup InT q_shared[max_t * Dk];
+            threadgroup InT k_shared[max_t * Dk];
+            threadgroup float g_shared[max_t];
+            threadgroup float beta_shared[max_t];
+
+            auto thread_idx = thread_position_in_threadgroup.x;
+            for (int idx = int(thread_idx); idx < T * Dk; idx += threads_per_tg) {
+              auto t = idx / Dk;
+              auto dk = idx - t * Dk;
+              q_shared[idx] = q_head[t * Hk * Dk + dk];
+              k_shared[idx] = k_head[t * Hk * Dk + dk];
+            }
+            if (thread_idx < T) {
+              g_shared[thread_idx] = g_head[thread_idx * Hv];
+              beta_shared[thread_idx] = beta_head[thread_idx * Hv];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            auto tile_idx = thread_position_in_grid.y;
+            auto simd_group = simdgroup_index_in_threadgroup;
+            auto dk_idx = thread_index_in_simdgroup;
+
+            // This loop must stay serial: unrolling it recreates E018's
+            // multi-row live-state pressure and defeats the Dv64 schedule.
+            #pragma clang loop unroll(disable)
+            for (int row = 0; row < rows_per_simd; ++row) {
+              auto dv_idx = tile_idx * 64 + simd_group * rows_per_simd + row;
+              auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+              auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+              float state[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = static_cast<float>(i_state[s_idx]);
+              }
+
+              for (int t = 0; t < T; ++t) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] * g_shared[t];
+                  kv_mem += state[i] * k_shared[t * Dk + s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta =
+                    (v_head[t * Hv * Dv + dv_idx] - kv_mem) * beta_shared[t];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] + k_shared[t * Dk + s_idx] * delta;
+                  out += state[i] * q_shared[t * Dk + s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y_head[t * Hv * Dv + dv_idx] = static_cast<InT>(out);
+                }
+              }
+
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                o_state[s_idx] = static_cast<StT>(state[i]);
+              }
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gated_delta_step_dv64",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source)
+}()
+
+private func qwen35CanUseGatedDeltaDv64(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    originalState: MLXArray?,
+    preparedState: MLXArray,
+    mask: MLXArray?
+) -> Bool {
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Hk = q.dim(2)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let stateInputIsFP32 = originalState.map { $0.dtype == .float32 } ?? true
+    let measuredPositiveWidth = T == 8 || T == 9
+    return qwen35GatedDeltaDv64Kernel != nil
+        && MLXHardwareInfo.isCompiledDecodeSupported
+        && mask == nil
+        && B == 1 && measuredPositiveWidth
+        && Hk == 16 && Hv == 48 && Dk == 128 && Dv == 128
+        && k.shape == q.shape
+        && v.shape == [B, T, Hv, Dv]
+        && g.shape == [B, T, Hv] && beta.shape == [B, T, Hv]
+        && preparedState.shape == [B, Hv, Dv, Dk]
+        && q.dtype == .bfloat16 && k.dtype == .bfloat16 && v.dtype == .bfloat16
+        && g.dtype == .float32 && beta.dtype == .float32
+        && stateInputIsFP32 && preparedState.dtype == .float32
+}
+
 /// Run the existing recurrence kernel from already-computed fp32 `g`/`beta`.
 /// The official M5 path uses this after the compiled helper; callers retain the
 /// original `gatedDeltaUpdate` fallback when compiled decode is disabled.
@@ -209,6 +337,29 @@ private func qwen35GatedDeltaPrepared(
         ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
     if preparedState.dtype != .float32 {
         preparedState = preparedState.asType(.float32)
+    }
+    if qwen35CanUseGatedDeltaDv64(
+        q: q, k: k, v: v, g: g, beta: beta,
+        originalState: state, preparedState: preparedState, mask: mask),
+       let dv64Kernel = qwen35GatedDeltaDv64Kernel
+    {
+        let T = q.dim(1)
+        let Hk = q.dim(2)
+        let outputs = dv64Kernel(
+            [q, k, v, g, beta, preparedState, MLXArray(T)],
+            template: [
+                ("InT", DType.bfloat16),
+                ("StT", DType.float32),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid: (512, 2, B * Hv),
+            threadGroup: (512, 1, 1),
+            outputShapes: [[B, T, Hv, Dv], preparedState.shape],
+            outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
     }
     return gatedDeltaKernel(
         q: q, k: k, v: v, g: g, beta: beta,
