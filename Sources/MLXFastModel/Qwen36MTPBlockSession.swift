@@ -198,6 +198,14 @@ public final class Qwen36MTPBlockSession {
             guard let self else { return Swift.min(offeredDepth, 1) }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
+        // Local measurement override: pins the schedule to a constant depth
+        // for calibration runs. Inert unless the environment sets it.
+        if let forcedRaw = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_FORCED_DEPTH"],
+            let forced = Int(forcedRaw), forced >= 0
+        {
+            draftPolicy = { offeredDepth, _ in Swift.min(forced, offeredDepth) }
+        }
     }
 
     // MARK: - warm
@@ -494,7 +502,7 @@ public final class Qwen36MTPBlockSession {
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
+        .map { 0.93 * pow(0.99, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
@@ -1203,11 +1211,6 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
-            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
-                guard let arrays = entry as? ArraysCache else { return nil }
-                return arrays[1]
-            }
-            asyncEval(replayedRecurrentStates)
             return true
         }
 
