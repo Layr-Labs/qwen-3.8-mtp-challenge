@@ -916,7 +916,7 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
+        let (verifyLogits, verifyHidden, verifyPostNorm) = model.callWithHiddenPostNorm(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
@@ -975,7 +975,7 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            pendingHidden = postNorm ? verifyPostNorm[0..., (verifyPostNorm.dim(1) - 1) ..< verifyPostNorm.dim(1), 0...] : hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1000,7 +1000,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingHidden = postNorm ? verifyPostNorm[0..., acceptedCount ..< (acceptedCount + 1), 0...] : hiddenRow(verifyHidden, acceptedCount)
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1042,9 +1042,11 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
-            headHistoryBacklogTokens.append(drafts[index])
+        if acceptedCount > 0 {
+            // Coalesce accepted post-norm history into one contiguous block (E)
+            let contiguousHidden = verifyPostNorm[0..., 0 ..< acceptedCount, 0...]
+            headHistoryBacklogHidden.append(contiguousHidden)
+            headHistoryBacklogTokens.append(contentsOf: drafts[0 ..< acceptedCount])
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0

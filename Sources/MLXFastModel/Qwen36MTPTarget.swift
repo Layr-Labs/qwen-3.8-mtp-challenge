@@ -51,6 +51,11 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// E variant: returns (logits, preNorm, postNorm) reusing batched final norm.
+    func callWithHiddenPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -121,3 +126,14 @@ public protocol Qwen36MTPTarget: AnyObject {
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
 extension Qwen35TextModel: Qwen36MTPTarget {}
 extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}
+
+
+extension Qwen36MTPTarget {
+    public func callWithHiddenPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (logits, hidden) = callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+        let post = applyFinalNorm(hidden)
+        return (logits, hidden, post)
+    }
+}

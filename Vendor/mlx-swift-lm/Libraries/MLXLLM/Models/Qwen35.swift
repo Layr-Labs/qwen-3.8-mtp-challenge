@@ -1184,6 +1184,18 @@ private let qwen35CompiledFusedSwiGLU:
     return body
 }()
 
+// MARK: - Attention output gate (C3)
+
+private let qwen35CompiledAttnOutGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
+        x * sigmoid(gate)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1687,7 +1699,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35CompiledAttnOutGate(output, gate))
     }
 }
 
@@ -2260,6 +2272,17 @@ extension Qwen35TextModel: MTPCapable {
         model.norm(x)
     }
 
+    /// E: publish verify post-final-norm block (schedule-neutral).
+    /// Returns (logits, hiddenPreNorm, hiddenPostNorm) so caller can reuse the
+    /// already-computed batched norm instead of re-running per-row RMSNorm.
+    public func callWithHiddenPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (logits, hidden) = callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+        let post = applyFinalNorm(hidden)
+        return (logits, hidden, post)
+    }
+
     /// Run the MTP head forward, returning `(logits, headHidden)`.
     ///
     /// `headHidden` is the MTP head's own post-`mtp.norm` output, which is what MTPLX
@@ -2381,7 +2404,7 @@ extension Qwen35TextModel: MTPCapable {
             _compactDraftHead = makeCompactDraftHead()
         }
         let padded = _compactDraftHead!(x)
-        let tgSize = 1024
+        let tgSize = 896
         let outputs = qwen35DraftSelectKernel(
             [padded.reshaped([Self.compactDraftPaddedCount])],
             template: [
