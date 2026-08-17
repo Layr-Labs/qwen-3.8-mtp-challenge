@@ -1,10 +1,10 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
-  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
-  "bytes": 238934129,
+  "source_url": "hf:Lie24/qwen38-mtp-head-4bit-mse@905b9a7e734d2c15f12f6cf337ad2e0fe02420a7",
+  "sha256": "60e6dd6d19edfb48606c532b6977d5960f32ad588fe53e54d8d04a3481d19503",
+  "bytes": 238934093,
   "max_bytes": 2147483648,
 
-  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
+  "note": "Error-minimising 4-bit affine group-64 requantisation of the organizer-pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e0). IDENTICAL GEOMETRY to the 4-bit heads already on the board -- 8 quantised 2D matrices (fc, q/k/v/o_proj, gate/up/down_proj) plus 7 bf16 norms, 31 tensors, 238,934,093 bytes, one bare model.safetensors -- so the scales-keyed loader walk, the packed-QKV fast path and every downstream kernel see exactly the shapes they see today, and the decode cost is unchanged. The ONLY difference is how each group's (scale, bias) is chosen: instead of min/max, a per-group search over a symmetric shrink of the range, scored by the reconstruction error AFTER scale and bias have been rounded to bf16 (the precision at which they are stored and read). Mean relative-L2 dequantisation error 5.72% lower than mx.quantize. The head only PROPOSES tokens; the pinned target re-verifies every emitted token against the hidden serial trajectory, so a more faithful head shows up purely as a higher draft acceptance rate. Local paired measurement on this tree, public 301-token gate, identical binary and prompt: acceptance 0.952206 -> 0.962963 and 42 -> 41 rounds against the board's mx.quantize head, recovering 74% of the bf16-to-4-bit acceptance loss (bf16 reference: 0.966667, 40 rounds) at 4-bit size and speed. all_tokens_matched true, residual_divergence_count 0 on every leg. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is that file's size."
 }
