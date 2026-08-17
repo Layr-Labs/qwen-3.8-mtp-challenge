@@ -1022,6 +1022,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     }
 
     VF sums = VF(0.0f);
+    thread float xc_all[NA][values_per_thread];
+    for (int m = 0; m < NA; m++) {
+      const device T* xm = x + (first_m + m) * in_vec_size + k +
+          simd_lid * values_per_thread;
+      sums[m] = load_vector<T, float, values_per_thread, 4>(xm, xc_all[m]);
+    }
+
     VF partial[rows_per_simd];
     for (int r = 0; r < rows_per_simd; r++) {
       partial[r] = VF(0.0f);
@@ -1029,14 +1036,10 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     for (int i = 0; i < 4; i++) {
       VF a0, a1, a2, a3;
       for (int m = 0; m < NA; m++) {
-        const device T* xm = x + (first_m + m) * in_vec_size + k +
-            simd_lid * values_per_thread + 4 * i;
-        thread float xc[4];
-        sums[m] += load_vector<T, float, 4, 4>(xm, xc);
-        a0[m] = xc[0];
-        a1[m] = xc[1];
-        a2[m] = xc[2];
-        a3[m] = xc[3];
+        a0[m] = xc_all[m][4 * i];
+        a1[m] = xc_all[m][4 * i + 1];
+        a2[m] = xc_all[m][4 * i + 2];
+        a3[m] = xc_all[m][4 * i + 3];
       }
       for (int r = 0; r < rows_per_simd; r++) {
         partial[r] += (a0 * (packed[r][i] & 0x000f) +
