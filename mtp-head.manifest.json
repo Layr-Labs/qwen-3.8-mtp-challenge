@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-ext-islands@5860e08fe30342ea17b0c1edc956f9240a48845c",
+  "sha256": "e6c6bdc77f6e46cf8072021a3009b7ffc160fd115cebb423f7b72b35f81fa425",
+  "bytes": 339627888,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "The promoted 4-bit/group-64 proposal head (dwsdubey) is preserved tensor-for-tensor. Fourteen additional bare tensors provide BF16 proposal-only precision islands covering every head projection: Q (1,024 AW-selected rows), K/V (all 1,024 rows), o_proj (1,024 AW rows), gate/up (1,024 AW rows each), and down_proj (1,024 AW rows). Row selection is activation-weighted over 3,456 real head-input hidden states. End-to-end final-hidden MSE vs the bf16 head: 51.6% of the un-islanded 4-bit error (vs 85% for QKV-only islands), i.e. ~48% of the proposal error removed. Candidate code replaces the selected proposal Q/K/V/o/gate/up/down projection output rows after the unchanged packed GEMMs (putAlong with matmul(input, bf16Rows.T)). The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
 }
