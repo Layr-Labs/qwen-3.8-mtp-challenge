@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:Artemishehe/qwen38-mtp-head-q4-islands-v3a@d2e85ee2064856209dd46a2a14a2fef89007972e",
+  "sha256": "e7b431230c5670b3b812347f378881c09feb170fe05d9b0073aa0b0f8257d370",
+  "bytes": 270404296,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor, with the same six bare BF16 precision-island tensors (precision_islands.{q,k,v}.{weight,indices}) in the identical layout and the same total island-row budget (3,072 rows) as the promoted islands artifact; this file is 328 bytes smaller. The only change is which rows are carried exact, chosen by measured contribution to the head's fp32 OUTPUT error: all 1,024 V rows (dropping V collapses the benefit), 128 K rows (K islands are nearly worthless: K1024→K128 at fixed rows costs 0.0 pp; 128 is the smallest count that keeps all six island tensors present as the loader requires), and 1,920 q_proj rows restricted to the sigmoid output-GATE half of each head (row r is a gate row iff r % 512 >= 256): gate error passes a sigmoid and then multiplies the attention output into o_proj and the residual stream with nothing to normalise it away, whereas query error passes q_norm and a shift-invariant softmax and is suppressed. Measured on the fp32 head forward against the pinned bf16 head, this removes 13.55% of head output error vs 12.71% for the promoted selection at the same bytes. Candidate code is unchanged. The head only proposes; the pinned target re-verifies every emitted token. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size."
 }
