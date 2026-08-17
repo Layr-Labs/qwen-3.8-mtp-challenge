@@ -232,40 +232,21 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
-/// Fuse the full-attention output gate `x * sigmoid(gate)` into one compiled
-/// elementwise pass, replacing the separate sigmoid and multiply launches (and
-/// their intermediate materialization) in every full-attention layer call.
-/// Same primitive arithmetic as `sigmoidMultiply` — sigmoid first, then
-/// multiply — so the values are bit-identical to the two-launch path; only
-/// the launches and the intermediate buffer disappear. Shapeless compilation
-/// shares one trace across prefill and verify widths.
-private let qwen35CompiledSigmoidMultiply:
-    @Sendable (MLXArray, MLXArray) -> MLXArray =
-{
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
-        x * sigmoid(gate)
-    }
-    if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(shapeless: true, body)
-    }
-    return body
-}()
-
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
 // ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
-// split + Q/K rmsNorm-and-scale + the g/beta producer — for S in 3...9 on
-// the one-wide-call path. Six outputs: normed/scaled Q and K, activated V,
-// the next 3-row conv state, and fp32 `g` and `beta`. An exhaustive sweep of
-// all 65,280 finite bf16 inputs found the in-kernel sigmoid diverges from MLX's
-// graph sigmoid by 1 ulp on exactly one input (0xC0DB = -6.84375). The helper
-// below maps that input directly to MLX's bf16 output word (0x3A8B) before the
-// lossless fp32 expansion; every other input retains the inherited expression.
-// This removes the final [1,S,48] elementwise launch without changing the
-// recurrence's beta bytes. The original five outputs measured bit-exact at
-// S=3...9 over 5 seeds x 4 compile modes (12,983,040 element comparisons,
-// zero mismatches)
+// split + Q/K rmsNorm-and-scale + the compiled-g producer — for S in 3...9 on
+// the one-wide-call path. Five outputs: normed/scaled Q and K, activated V,
+// the next 3-row conv state, and fp32 `g`. DESIGN NOTE, load-bearing: `beta`
+// is DELIBERATELY NOT a kernel output. An exhaustive sweep of all 65,280
+// finite bf16 inputs found the in-kernel sigmoid diverges from MLX's by 1 ulp
+// on exactly one input (0xC0DB = -6.84375); silu and softplus are bit-exact
+// everywhere. beta feeds the VERIFY recurrence where fidelity is absolute, so
+// it stays a plain graph `sigmoid(b)` — one [1,S,48] elementwise launch,
+// ~0.06 ms of the ~0.7 ms saving, in exchange for removing an unquantifiable
+// knife-edge. The remaining five outputs measured bit-exact at S=3..9 over
+// 5 seeds x 4 compile modes (12,983,040 element comparisons, zero mismatches)
 // on the vendored MLX version, with a +1-row conv-window negative control
 // failing exactly the three outputs that read the window. S=2 breaks the
 // conv-state copy (a state row would come from the OLD conv state, which the
@@ -280,14 +261,6 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         inline InT qwen35_prework_sigmoid(InT x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
           return (x < 0) ? y : 1 - y;
-        }
-
-        inline InT qwen35_prework_beta(InT x) {
-          const uint16_t bits = as_type<uint16_t>(x);
-          if (bits == uint16_t(0xC0DB)) {
-            return as_type<InT>(uint16_t(0x3A8B));
-          }
-          return qwen35_prework_sigmoid(x);
         }
 
         inline InT qwen35_prework_logaddexp(InT x, InT y) {
@@ -388,8 +361,6 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           if (lane == 0) {
             const ulong a_offset = ulong(row) * ulong(a_strides[1])
                 + ulong(head) * ulong(a_strides[2]);
-            const ulong b_offset = ulong(row) * ulong(b_strides[1])
-                + ulong(head) * ulong(b_strides[2]);
             const InT shifted = a[a_offset] + dt_bias[head];
             const InT softplus = qwen35_prework_logaddexp(shifted, InT(0));
             const float exp_a = metal::precise::exp(
@@ -398,8 +369,6 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
             const float product = neg_exp_a * static_cast<float>(softplus);
             const uint scalar_output = row * Hv + head;
             g_out[scalar_output] = metal::precise::exp(product);
-            beta_out[scalar_output] = static_cast<float>(
-                qwen35_prework_beta(b[b_offset]));
           }
         }
 
@@ -418,12 +387,10 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
     return MLXFast.metalKernel(
         name: "qwen35_packed_gdn_prework",
         inputNames: [
-            "qkv", "a", "b", "conv_state", "conv_weight", "a_log",
+            "qkv", "a", "conv_state", "conv_weight", "a_log",
             "dt_bias", "q_scale", "k_scale",
         ],
-        outputNames: [
-            "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out",
-        ],
+        outputNames: ["q_out", "k_out", "v_out", "conv_out", "g_out"],
         source: source,
         header: header,
         ensureRowContiguous: false)
@@ -810,7 +777,7 @@ final class Qwen35GatedDeltaNet: Module {
         if mixerHit {
             let invScale = pow(Float(headKDim), -0.5)
             let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
+                [qkv, a, convState, conv1d.weight, aLog, dtBias,
                  MLXArray(pow(invScale, 2)).asType(.bfloat16),
                  MLXArray(invScale).asType(.bfloat16)],
                 template: [
@@ -826,11 +793,9 @@ final class Qwen35GatedDeltaNet: Module {
                     [B, S, numVHeads, headVDim],
                     [B, nKeep, qkv.dim(2)],
                     [B, S, numVHeads],
-                    [B, S, numVHeads],
                 ],
                 outputDTypes: [
                     .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
-                    .float32,
                 ]
             )
             qNormed = outs[0]
@@ -838,7 +803,10 @@ final class Qwen35GatedDeltaNet: Module {
             v = outs[2]
             newConvState = outs[3]
             g = outs[4]
-            beta = outs[5]
+            // beta stays a plain graph op BY DESIGN — see the kernel's
+            // header comment. Same expression as the compiled producer's
+            // beta half, so the recurrence sees identical bytes.
+            beta = sigmoid(b).asType(.float32)
         } else {
             newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
             let convOut = silu(conv1d(convInput))
@@ -1149,7 +1117,7 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if S >= 2 {
+        if nConfirmed == 1 && S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
@@ -1706,7 +1674,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
+        return oProj(sigmoidMultiply(output, gate))
     }
 }
 
@@ -2247,24 +2215,6 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
-    /// Publish the post-norm block this same forward already needs for its
-    /// vocabulary projection. The verify session can reuse its rows on the
-    /// proposal side instead of launching identical single-row RMSNorms.
-    public func callWithHiddenAndNormed(
-        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
-    ) -> (MLXArray, MLXArray, MLXArray?) {
-        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
-        let logits: MLXArray
-        if let lmHead {
-            logits = lmHead(normed)
-        } else {
-            logits = model.embedTokens.asLinear(normed)
-        }
-        return (logits, hidden, normed)
-    }
-
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -2560,14 +2510,6 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
-    }
-
-    /// See `Qwen35TextModel.callWithHiddenAndNormed`.
-    public func callWithHiddenAndNormed(
-        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
-    ) -> (MLXArray, MLXArray, MLXArray?) {
-        languageModel.callWithHiddenAndNormed(
-            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.
