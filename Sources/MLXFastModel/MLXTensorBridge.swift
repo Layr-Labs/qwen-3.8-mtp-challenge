@@ -14,7 +14,15 @@ public struct MLXArrayTensorBridge: MLXTensorBridge {
     public init() {}
 
     public func makeArray(from tensor: MaterializedTensor) throws -> MLXArray {
-        MLXArray(tensor.bytes, tensor.shape, dtype: Self.mlxDType(for: tensor.dtype))
+        let nsData = tensor.bytes as NSData
+        let pointer = UnsafeMutableRawPointer(mutating: nsData.bytes)
+        return MLXArray(
+            rawPointer: pointer,
+            tensor.shape,
+            dtype: Self.mlxDType(for: tensor.dtype)
+        ) {
+            _ = nsData
+        }
     }
 
     public static func mlxDType(for dtype: TensorDType) -> DType {

@@ -602,39 +602,38 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
         var y: MLXArray
         if let fusedWeight = _fusedRoutedGateUpWeight,
             let fusedScales = _fusedRoutedGateUpScales,
-            let downProj = _routedDownProj,
-            x.dim(1) == 1, inds.size < 64
+            let downProj = _routedDownProj
         {
-            // DECODE-ONLY fused gate/up: replicate exactly SwitchGLU's
-            // unsorted small-batch path (`indices.size < 64`, so no
-            // gatherSort/scatterUnsort) with one gather-QMM over the
-            // row-concatenated [gate; up] bank instead of two. The gather
-            // call mirrors `QuantizedSwitchLinear.callAsFunction` (biases
-            // nil, rhsIndices, transpose, group 16, 4-bit, .nvfp4,
-            // sortedIndices false; the prepare guards pin those literals).
-            // Each gathered output row is computed independently, so the
-            // split halves (gate rows first) are bit-exact vs. the separate
-            // banks; down_proj is the stock module invoked exactly as
-            // SwitchGLU does. Multi-token forwards (prefill) below keep the
-            // fully stock sorted gather-GEMM path and never see the fused
-            // bank.
-            let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
+            var expanded = MLX.expandedDimensions(x, axes: [-2, -3])
+            let doSort = inds.size >= 64
+            var idx = inds
+            var inverseOrder = MLXArray()
+
+            if doSort {
+                (expanded, idx, inverseOrder) = gatherSort(x: expanded, indices: inds)
+            }
+
             let gateUp = MLX.gatherQuantizedMM(
                 expanded,
                 fusedWeight,
                 scales: fusedScales,
                 biases: nil,
-                rhsIndices: inds,
+                rhsIndices: idx,
                 transpose: true,
                 groupSize: 16,
                 bits: 4,
                 mode: .nvfp4,
-                sortedIndices: false
+                sortedIndices: doSort
             )
             let xGate = gateUp[.ellipsis, 0 ..< _fusedRoutedGateUpSplit]
             let xUp = gateUp[.ellipsis, _fusedRoutedGateUpSplit...]
             let activated = compiledSiluProduct(xGate, xUp)
-            y = MLX.squeezed(downProj(activated, inds, sortedIndices: false), axis: -2)
+            var yExp = downProj(activated, idx, sortedIndices: doSort)
+
+            if doSort {
+                yExp = scatterUnsort(x: yExp, invOrder: inverseOrder, shape: inds.shape)
+            }
+            y = MLX.squeezed(yExp, axis: -2)
         } else {
             y = switchMLP(x, inds)
         }
@@ -831,7 +830,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
             if configuration.layerTypes[layerIndex] == .full {
                 StandardKVCache()
             } else {
-                RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
+                CompilableRotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
             }
         }
     }

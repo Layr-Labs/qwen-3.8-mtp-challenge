@@ -277,17 +277,10 @@ public class SwitchLinear: Module, Quantizable {
         self.outputDims = outputDims
         self.numExperts = numExperts
 
-        let scale = sqrt(1.0 / Float(inputDims))
-        self._weight.wrappedValue = MLXRandom.uniform(
-            low: -scale,
-            high: scale,
-            [numExperts, outputDims, inputDims]
-        )
-
+        self._weight.wrappedValue = MLXArray(0)
         if bias {
-            self._bias.wrappedValue = MLXArray.zeros([numExperts, outputDims])
+            self._bias.wrappedValue = MLXArray(0)
         }
-
         super.init()
     }
 
@@ -340,15 +333,12 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         self.bits = bits
         self.mode = mode
 
-        let (quantizedWeight, scales, biases) = MLX.quantized(
-            other.weight, groupSize: groupSize, bits: bits, mode: mode)
-
-        self._scales.wrappedValue = scales
-        self._biases.wrappedValue = biases
+        self._scales.wrappedValue = MLXArray(0)
+        self._biases.wrappedValue = MLXArray(0)
 
         super.init(
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
-            weight: quantizedWeight, bias: other.bias)
+            weight: MLXArray(0), bias: other.bias != nil ? MLXArray(0) : nil)
 
         self.freeze()
     }
