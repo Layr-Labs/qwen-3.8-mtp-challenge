@@ -91,6 +91,17 @@ final class Qwen35MTPModule: Module {
     let layers: [Qwen35MTPDecoderLayer]
     let norm: RMSNorm
 
+    // Proposal-only derived cache. Compact draft IDs are confined to the
+    // 98,304-token prefix plus Qwen's 26 control tokens, so the embedding half
+    // of the bias-free fusion FC is input-independent for each possible draft.
+    // Materialise that half once during untimed warmup and stream only the
+    // hidden half of FC on chained proposal steps.
+    private var compactEmbeddingFC: MLXArray?
+    private var compactHiddenFC: QuantizedLinear?
+    private static let compactPrefixCount = 98_304
+    private static let compactControlStart = 248_044
+    private static let compactControlEnd = 248_070
+
     init(_ args: Qwen35TextConfiguration) {
         _preFcNormHidden.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -128,6 +139,90 @@ final class Qwen35MTPModule: Module {
         }
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
+        return norm(fused)
+    }
+
+    /// Build the input-independent embedding-half FC table used by chained
+    /// compact-vocabulary proposals. Returns false without changing execution
+    /// when the declared head does not have the promoted affine/g64 geometry.
+    func prepareCompactFusionLookup(embedTokens: Embedding) -> Bool {
+        if compactEmbeddingFC != nil { return true }
+        guard let quantized = fc as? QuantizedLinear,
+              quantized.bias == nil,
+              quantized.groupSize == 64,
+              quantized.bits == 4,
+              quantized.mode == .affine,
+              quantized.biases != nil,
+              quantized.shape.1 == 10_240,
+              quantized.shape.0 == 5_120
+        else { return false }
+
+        let half = quantized.shape.1 / 2
+        let packedHalf = half * quantized.bits / 32
+        let groupsHalf = half / quantized.groupSize
+        let embeddingFC = QuantizedLinear(
+            weight: quantized.weight[0..., 0 ..< packedHalf],
+            scales: quantized.scales[0..., 0 ..< groupsHalf],
+            biases: quantized.biases.map { $0[0..., 0 ..< groupsHalf] },
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            mode: quantized.mode)
+        compactHiddenFC = QuantizedLinear(
+            weight: quantized.weight[0..., packedHalf...],
+            scales: quantized.scales[0..., groupsHalf...],
+            biases: quantized.biases.map { $0[0..., groupsHalf...] },
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            mode: quantized.mode)
+
+        let ids = Array(Int32(0) ..< Int32(Self.compactPrefixCount))
+            + Array(Int32(Self.compactControlStart) ..< Int32(Self.compactControlEnd))
+        let chunkSize = 2_048
+        var chunks: [MLXArray] = []
+        chunks.reserveCapacity((ids.count + chunkSize - 1) / chunkSize)
+        for start in stride(from: 0, to: ids.count, by: chunkSize) {
+            let end = min(start + chunkSize, ids.count)
+            let tokenIDs = MLXArray(Array(ids[start ..< end])).reshaped([1, end - start])
+            let normalized = preFcNormEmbedding(embedTokens(tokenIDs))
+            let contribution = embeddingFC(normalized)[0]
+            eval(contribution)
+            chunks.append(contribution)
+        }
+        let table = concatenated(chunks, axis: 0)
+        eval(table)
+        compactEmbeddingFC = table
+        return true
+    }
+
+    /// Chained proposal step whose token ID came from the compact draft
+    /// selector. Falls back to the ordinary head before cache mutation if the
+    /// untimed lookup preparation was unavailable.
+    func compactTokenForward(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> MLXArray {
+        guard let compactEmbeddingFC, let compactHiddenFC else {
+            return callAsFunction(
+                hidden: hidden, nextTokenIds: nextTokenIds,
+                embedTokens: embedTokens, cache: cache)
+        }
+        let compactIDs = which(
+            nextTokenIds .< Self.compactPrefixCount,
+            nextTokenIds,
+            nextTokenIds
+                - (Self.compactControlStart - Self.compactPrefixCount))
+        let embeddingContribution = take(
+            compactEmbeddingFC, compactIDs, axis: 0)
+        let h = preFcNormHidden(hidden)
+        var fused = embeddingContribution + compactHiddenFC(h)
+        let firstCache: (any KVCache)? = cache.first
+        let mask = createAttentionMask(h: fused, cache: firstCache)
+        for (i, layer) in layers.enumerated() {
+            let c: (any KVCache)? = i < cache.count ? cache[i] : nil
+            fused = layer(fused, mask: mask, cache: c)
+        }
         return norm(fused)
     }
 

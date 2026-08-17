@@ -237,6 +237,21 @@ public final class Qwen36MTPBlockSession {
         eval(warmCache.flatMap { $0.state })
         eval(row)
 
+        // Build the proposal-only compact-token fusion-FC lookup outside every
+        // scored window. Unsupported declared-head geometries retain the
+        // ordinary full FC path.
+        _ = model.prepareMTPCompactFusionLookup()
+
+        // Compile/materialise the specialized chained-step graph as well. The
+        // first live proposal still uses the ordinary history-flush path; only
+        // proposal IDs after it are compact-domain guaranteed.
+        let compactWarmCache = model.makeMTPCache()
+        let compactWarm = model.mtpHeadHiddenForwardCompactToken(
+            hidden: row,
+            nextTokenIds: MLXArray([Int32(0)]).reshaped([1, 1]),
+            cache: compactWarmCache)
+        eval(compactWarm, compactWarmCache.flatMap { $0.state })
+
         let headCache = model.makeMTPCache()
         for _ in 0 ..< maxDepth {
             let (draftLogits, draftHidden) = model.mtpForwardWithHidden(
@@ -912,7 +927,7 @@ public final class Qwen36MTPBlockSession {
         // the device can start while the host builds steps 2..d.
         asyncEval(draftId)
         for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
+            headHidden = model.mtpHeadHiddenForwardCompactToken(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
