@@ -1328,6 +1328,30 @@ public final class Qwen36MTPBlockSession {
     // stripes, one small threadgroup merges the partials. Ordering contract
     // is identical to `argMax` and to `topTwoRead`: value-descending, then
     // id-ascending on exact ties, NaN sorted last.
+    //
+    // 2026-08-16 — three exact changes on top of that promoted geometry. The
+    // stripe geometry, the ordering contract and the output bytes are all
+    // unchanged; only how the same selection is computed moves.
+    //   1. The stripe scan strides its byte offset instead of rebuilding it
+    //      from two 64-bit multiplies per element, and uses the scan
+    //      specialisation `qwen_top2_scan` — inside a stripe the id strictly
+    //      increases, so both of `qwen_top2_insert`'s dedupe tests are dead.
+    //   2. Both reduction stages merge with `qwen_top2_pair_merge`: two
+    //      comparisons rather than two full inserts, gated on
+    //      `qwen_top2_pair_ok`, so any state that is short or shares an id
+    //      falls back to the original insert sequence untouched.
+    //   3. Stage two drops its threadgroup array and all six barriers for a
+    //      SIMD shuffle reduction — the transfer of DawgZter's promoted
+    //      `aa7c3e0c` pattern (two-level shuffle argmax on the draft select)
+    //      to this readout. Its threadgroup is exactly one 32-lane SIMD group,
+    //      so no barrier is required at all.
+    //      The same transfer applied to STAGE ONE was implemented, measured
+    //      and REJECTED: stage one's 256-thread tree masks whole SIMD groups
+    //      off at every stride, so shuffling makes all eight groups pay the
+    //      merge where the tree makes one. Measured on M4 Pro at V=248320 it
+    //      is a regression at every verify width above one row (-1.3% at 3
+    //      rows, -11.2% at 5). Stage one keeps the threadgroup tree on
+    //      purpose; do not "finish the job" there without re-measuring.
 
     /// Shared exact ordering for the two-stage candidate-only top-2 reduction.
     private static let linearTopTwoHeader = """
@@ -1400,6 +1424,121 @@ public final class Qwen36MTPBlockSession {
                 state.count = 2;
             }
         }
+
+        // --- scan specialisation -------------------------------------------
+        // Inside a stripe scan the id is strictly increasing, so neither
+        // dedupe test in `qwen_top2_insert` can ever fire and, once the state
+        // is full, the count arithmetic is dead. This is that specialisation;
+        // it delegates to the original for the two priming steps.
+        inline void qwen_top2_scan(
+            thread qwen_top2_state &state,
+            float value,
+            uint id
+        ) {
+            if (state.count == 2) {
+                if (qwen_top2_better(
+                        value, id, state.first_value, state.first_id)) {
+                    state.second_value = state.first_value;
+                    state.second_id = state.first_id;
+                    state.first_value = value;
+                    state.first_id = id;
+                } else if (qwen_top2_better(
+                        value, id, state.second_value, state.second_id)) {
+                    state.second_value = value;
+                    state.second_id = id;
+                }
+                return;
+            }
+            qwen_top2_insert(state, value, id);
+        }
+
+        // --- pair merge ----------------------------------------------------
+        // Merging two FULL states whose four ids are pairwise distinct needs
+        // two comparisons, not two inserts: each state already satisfies
+        // first > second under the total order, so the merged winner is
+        // max(first, first') and the merged runner-up is the larger of the
+        // losing first and the winner's own second. `qwen_top2_pair_ok` is
+        // what makes the substitution exact rather than exact-on-the-shapes-
+        // we-happen-to-ship: when it fails, control falls through to the
+        // original insert sequence unchanged.
+        inline bool qwen_top2_pair_ok(
+            qwen_top2_state a,
+            qwen_top2_state b
+        ) {
+            return a.count == 2 && b.count == 2
+                && a.first_id != b.first_id && a.first_id != b.second_id
+                && a.second_id != b.first_id && a.second_id != b.second_id;
+        }
+
+        inline void qwen_top2_pair_merge(
+            thread qwen_top2_state &state,
+            qwen_top2_state other
+        ) {
+            if (qwen_top2_better(other.first_value, other.first_id,
+                                 state.first_value, state.first_id)) {
+                bool keep = qwen_top2_better(
+                    state.first_value, state.first_id,
+                    other.second_value, other.second_id);
+                state.second_value =
+                    keep ? state.first_value : other.second_value;
+                state.second_id = keep ? state.first_id : other.second_id;
+                state.first_value = other.first_value;
+                state.first_id = other.first_id;
+            } else if (qwen_top2_better(
+                    other.first_value, other.first_id,
+                    state.second_value, state.second_id)) {
+                state.second_value = other.first_value;
+                state.second_id = other.first_id;
+            }
+        }
+
+        // Stage-one merge. Fallback is the shipped COUNT-GUARDED insert pair.
+        inline void qwen_top2_absorb(
+            thread qwen_top2_state &state,
+            qwen_top2_state other
+        ) {
+            if (qwen_top2_pair_ok(state, other)) {
+                qwen_top2_pair_merge(state, other);
+                return;
+            }
+            if (other.count > 0) {
+                qwen_top2_insert(state, other.first_value, other.first_id);
+            }
+            if (other.count > 1) {
+                qwen_top2_insert(state, other.second_value, other.second_id);
+            }
+        }
+
+        // Stage-two merge. Fallback is the shipped UNCONDITIONAL insert pair:
+        // stage two never received the partials' counts, so it has always
+        // treated a short partial's (0.0f, id 0) filler as a real candidate.
+        // That behaviour is preserved byte for byte.
+        inline void qwen_top2_absorb_final(
+            thread qwen_top2_state &state,
+            qwen_top2_state other
+        ) {
+            if (qwen_top2_pair_ok(state, other)) {
+                qwen_top2_pair_merge(state, other);
+                return;
+            }
+            qwen_top2_insert(state, other.first_value, other.first_id);
+            qwen_top2_insert(state, other.second_value, other.second_id);
+        }
+
+        // Field-wise lane shift, so a whole state can ride the SIMD shuffle
+        // network (credit DawgZter, promoted aa7c3e0c).
+        inline qwen_top2_state qwen_top2_shuffle_down(
+            qwen_top2_state state,
+            uint delta
+        ) {
+            qwen_top2_state other;
+            other.first_value = simd_shuffle_down(state.first_value, delta);
+            other.second_value = simd_shuffle_down(state.second_value, delta);
+            other.first_id = simd_shuffle_down(state.first_id, delta);
+            other.second_id = simd_shuffle_down(state.second_id, delta);
+            other.count = simd_shuffle_down(state.count, delta);
+            return other;
+        }
     """
 
     /// Stage one: 32 threadgroups per row each reduce a disjoint vocabulary
@@ -1417,12 +1556,16 @@ public final class Qwen36MTPBlockSession {
             uint vocab = uint(logits_shape[2]);
             qwen_top2_state local = qwen_top2_empty();
 
-            for (uint index = group * 256 + lane;
-                 index < vocab;
-                 index += 32 * 256) {
-                ulong offset = ulong(row) * ulong(logits_strides[1])
-                    + ulong(index) * ulong(logits_strides[2]);
-                qwen_top2_insert(local, float(logits[offset]), index);
+            // Stride the byte offset instead of re-deriving it. The shipped
+            // loop paid two 64-bit multiplies per element for an address that
+            // advances by a loop-invariant amount.
+            ulong row_base = ulong(row) * ulong(logits_strides[1]);
+            ulong value_stride = ulong(logits_strides[2]);
+            ulong offset_step = ulong(32u * 256u) * value_stride;
+            uint index = group * 256 + lane;
+            ulong offset = row_base + ulong(index) * value_stride;
+            for (; index < vocab; index += 32 * 256, offset += offset_step) {
+                qwen_top2_scan(local, float(logits[offset]), index);
             }
 
             threadgroup qwen_top2_state scratch[256];
@@ -1432,13 +1575,7 @@ public final class Qwen36MTPBlockSession {
             for (uint stride = 128; stride > 0; stride >>= 1) {
                 if (lane < stride) {
                     qwen_top2_state merged = scratch[lane];
-                    qwen_top2_state other = scratch[lane + stride];
-                    if (other.count > 0) {
-                        qwen_top2_insert(merged, other.first_value, other.first_id);
-                    }
-                    if (other.count > 1) {
-                        qwen_top2_insert(merged, other.second_value, other.second_id);
-                    }
+                    qwen_top2_absorb(merged, scratch[lane + stride]);
                     scratch[lane] = merged;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1457,12 +1594,23 @@ public final class Qwen36MTPBlockSession {
     )
 
     /// Stage two: one small threadgroup per row merges the 32 partial pairs.
+    ///
+    /// The threadgroup is exactly 32 threads, i.e. exactly ONE SIMD group, so
+    /// the whole reduction fits in registers: the shuffle network replaces the
+    /// 32-state threadgroup array and all six barriers with zero of each
+    /// (the shuffle-reduction pattern is DawgZter's, promoted aa7c3e0c on the
+    /// draft argmax; this is its transfer to the verify-side top-2 readout).
+    /// The combining order changes, which is exact here because the merge is
+    /// selection under a strict total order with no arithmetic reassociated —
+    /// see `qwen_top2_pair_ok` for the one precondition that is checked rather
+    /// than assumed.
     private static let linearTopTwoFinalizeKernel = MLXFast.metalKernel(
         name: "qwen_mtp_linear_top2_finalize",
         inputNames: ["partial_ids", "partial_values"],
         outputNames: ["top_ids", "top_values"],
         source: """
             uint lane = thread_position_in_threadgroup.x;
+            uint simd_lane = thread_index_in_simdgroup;
             uint row = threadgroup_position_in_grid.x;
             uint base = (row * 32 + lane) * 2;
             qwen_top2_state local = qwen_top2_empty();
@@ -1470,27 +1618,19 @@ public final class Qwen36MTPBlockSession {
             qwen_top2_insert(
                 local, partial_values[base + 1], uint(partial_ids[base + 1]));
 
-            threadgroup qwen_top2_state scratch[32];
-            scratch[lane] = local;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint stride = 16; stride > 0; stride >>= 1) {
-                if (lane < stride) {
-                    qwen_top2_state merged = scratch[lane];
-                    qwen_top2_state other = scratch[lane + stride];
-                    qwen_top2_insert(merged, other.first_value, other.first_id);
-                    qwen_top2_insert(merged, other.second_value, other.second_id);
-                    scratch[lane] = merged;
+            for (uint delta = 16; delta > 0; delta >>= 1) {
+                qwen_top2_state other = qwen_top2_shuffle_down(local, delta);
+                if (simd_lane < delta) {
+                    qwen_top2_absorb_final(local, other);
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
 
             if (lane == 0) {
                 uint output_base = row * 2;
-                top_ids[output_base] = int(scratch[0].first_id);
-                top_ids[output_base + 1] = int(scratch[0].second_id);
-                top_values[output_base] = scratch[0].first_value;
-                top_values[output_base + 1] = scratch[0].second_value;
+                top_ids[output_base] = int(local.first_id);
+                top_ids[output_base + 1] = int(local.second_id);
+                top_values[output_base] = local.first_value;
+                top_values[output_base + 1] = local.second_value;
             }
         """,
         header: linearTopTwoHeader,

@@ -1267,6 +1267,45 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 
+    /// MTP-head proposal path ONLY (called from `Qwen35MTPDecoderLayer`; the
+    /// trunk never reaches this). Runs the fused gate/up projection and then
+    /// collapses `silu(g) * u` into one dispatch. The SwiGLU kernel is a
+    /// byte-exact transcription of the stock chain (per-op bf16 rounding,
+    /// precise exp/divide; sigmoid verified over all 65,536 bf16 inputs — see
+    /// `qwen35MTPSwiGLUKernel`). Returns nil so the caller falls back to the
+    /// stock chain whenever the fused projection or geometry is unavailable.
+    func headFusedForward(_ x: MLXArray) -> MLXArray? {
+        guard x.dtype == .bfloat16, x.ndim == 3, x.dim(0) == 1,
+              x.dim(-2) <= 9
+        else { return nil }
+        if _fqW == nil && _fbfW == nil {
+            // Build the fused projection caches via the stock builder; the
+            // discarded probe graph is lazy and never evaluated.
+            guard fusedGateUp(x) != nil else { return nil }
+        }
+        let y: MLXArray
+        if let w = _fqW, let s = _fqS, let z = _fqZ {
+            y = quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
+                groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+        } else if let w = _fbfW {
+            y = matmul(x, w.T)
+        } else {
+            return nil
+        }
+        guard _gateOut > 0, y.dim(-1) == 2 * _gateOut, y.dtype == .bfloat16
+        else { return nil }
+        let S = y.dim(1)
+        let fusedSilu = qwen35MTPSwiGLUKernel(
+            [y, MLXArray([UInt32(_gateOut)])],
+            grid: (_gateOut, S, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[1, S, _gateOut]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        return downProj(fusedSilu)
+    }
+
 }
 
 // MARK: - Full-attention Q/K preparation
