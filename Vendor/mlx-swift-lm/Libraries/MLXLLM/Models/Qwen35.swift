@@ -1490,6 +1490,15 @@ final class Qwen35Attention: Module {
     private var _kvOut = 0
     private var _kvDenseW: MLXArray?
 
+    // Proposal-head-only precision islands.  The declared BF16 MTP head is
+    // requantized at load time, then the output rows with the largest affine-4
+    // reconstruction error are retained here.  Target-model attention never
+    // installs these arrays.
+    private var _exactQKVWeight: MLXArray?
+    private var _exactQKVIndices: MLXArray?
+    private var _exactKVIndices: MLXArray?
+    private var _exactQRowCount = 0
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -1544,9 +1553,10 @@ final class Qwen35Attention: Module {
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
-            let y = quantizedMM(
+            var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
@@ -1593,9 +1603,10 @@ final class Qwen35Attention: Module {
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
         if let w = _kvW, let s = _kvS, let z = _kvZ {
-            let y = quantizedMM(
+            var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _kvGS, bits: _kvBits, mode: _kvMode)
+            y = replaceExactRows(y, input: x, kvOnly: true)
             return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
         }
         if let w = _kvDenseW {
@@ -1628,6 +1639,65 @@ final class Qwen35Attention: Module {
             return kv(x)
         }
         return (kProj(x), vProj(x))
+    }
+
+    private func replaceExactRows(
+        _ base: MLXArray, input: MLXArray, kvOnly: Bool
+    ) -> MLXArray {
+        guard let exactWeight = _exactQKVWeight else { return base }
+        let weight: MLXArray
+        let indices: MLXArray?
+        if kvOnly {
+            weight = exactWeight[_exactQRowCount...]
+            indices = _exactKVIndices
+        } else {
+            weight = exactWeight
+            indices = _exactQKVIndices
+        }
+        guard let indices else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactQKVRows(
+        qWeight: MLXArray, qPacked: MLXArray, qScales: MLXArray, qBiases: MLXArray,
+        kWeight: MLXArray, kPacked: MLXArray, kScales: MLXArray, kBiases: MLXArray,
+        vWeight: MLXArray, vPacked: MLXArray, vScales: MLXArray, vBiases: MLXArray,
+        rowsPerProjection: Int
+    ) {
+        func select(
+            exact: MLXArray, packed: MLXArray, scales: MLXArray, biases: MLXArray
+        ) -> (weight: MLXArray, indices: MLXArray) {
+            let restored = dequantized(
+                packed, scales: scales, biases: biases,
+                groupSize: 64, bits: 4, mode: .affine, dtype: .float32)
+            let delta = exact.asType(.float32) - restored
+            let error = (delta * delta).sum(axis: -1)
+            let count = min(rowsPerProjection, exact.dim(0))
+            let indices = argPartition(-error, kth: count - 1, axis: -1)[..<count]
+                .asType(.int32)
+            return (exact.take(indices, axis: 0).contiguous(), indices)
+        }
+
+        let q = select(exact: qWeight, packed: qPacked, scales: qScales, biases: qBiases)
+        let k = select(exact: kWeight, packed: kPacked, scales: kScales, biases: kBiases)
+        let v = select(exact: vWeight, packed: vPacked, scales: vScales, biases: vBiases)
+        let qOut = qWeight.dim(0)
+        let kOut = kWeight.dim(0)
+
+        let weight = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
+        let qkvIndices = concatenated(
+            [q.indices, k.indices + qOut, v.indices + qOut + kOut], axis: 0)
+            .contiguous()
+        let kvIndices = concatenated([k.indices, v.indices + kOut], axis: 0).contiguous()
+        eval(weight, qkvIndices, kvIndices)
+
+        _exactQKVWeight = weight
+        _exactQKVIndices = qkvIndices
+        _exactKVIndices = kvIndices
+        _exactQRowCount = q.weight.dim(0)
     }
 
     /// Append rows to an attention cache without producing query outputs.
@@ -2059,6 +2129,38 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+private struct Qwen35Affine4Weight {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+}
+
+/// The public acceptance-winning head quantizer: per-group FP32 min/max,
+/// round-to-even affine-4 codes, and BF16 scale/bias storage.  This runs only
+/// while loading a declared BF16 MTP head; it never touches target weights.
+private func qwen35MinMaxAffine4(_ weight: MLXArray) -> Qwen35Affine4Weight {
+    precondition(weight.ndim == 2 && weight.dim(1) % 64 == 0)
+    let rows = weight.dim(0)
+    let groups = weight.dim(1) / 64
+    let grouped = weight.asType(.float32).reshaped(rows, groups, 64)
+    let lo = grouped.min(axis: -1, keepDims: true)
+    let range = grouped.max(axis: -1, keepDims: true) - lo
+    let scale = range / 15
+    let safeScale = MLX.where(range .== 0, MLXArray(1, dtype: .float32), scale)
+    let codes = clip(((grouped - lo) / safeScale).round(), min: 0, max: 15)
+        .asType(.uint32)
+        .reshaped(rows, groups, 8, 8)
+    let shifts = MLXArray([UInt32(0), 4, 8, 12, 16, 20, 24, 28])
+        .reshaped(1, 1, 1, 8)
+    let packed = (codes << shifts).sum(axis: -1).reshaped(rows, groups * 8)
+        .asType(.uint32)
+        .contiguous()
+    return Qwen35Affine4Weight(
+        weight: packed,
+        scales: scale.squeezed(axis: -1).asType(.bfloat16).contiguous(),
+        biases: lo.squeezed(axis: -1).asType(.bfloat16).contiguous())
+}
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2180,6 +2282,58 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 "[WARNING] Qwen35TextModel.sanitize: MTP head is enabled but no mtp.* "
                 + "weights found. Load will likely fail or produce garbage. "
                 + "Re-convert the checkpoint with a converter that preserves MTP weights.")
+        }
+
+        // A declared BF16 head is legal competitive surface. Requantize it to
+        // the stronger min/max affine-4 layout at load time, and preserve a
+        // small set of high-error Q/K/V output rows as proposal-only BF16
+        // precision islands. Existing packed heads pass through unchanged.
+        let mtpLinearKeys = [
+            "mtp.fc.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "mtp.layers.0.mlp.up_proj.weight",
+            "mtp.layers.0.mlp.down_proj.weight",
+        ]
+        let hasPackedMTPHead = weights.keys.contains { key in
+            key.hasPrefix("mtp.") && key.hasSuffix(".scales")
+        }
+        let hasCompleteBF16Head = mtp != nil && mtpLinearKeys.allSatisfy { key in
+            weights[key]?.ndim == 2
+        }
+        if hasCompleteBF16Head && !hasPackedMTPHead {
+            var packed: [String: Qwen35Affine4Weight] = [:]
+            var exactWeights: [String: MLXArray] = [:]
+            for key in mtpLinearKeys {
+                guard let exact = weights[key] else { continue }
+                exactWeights[key] = exact
+                let q = qwen35MinMaxAffine4(exact)
+                packed[key] = q
+                weights[key] = q.weight
+                let prefix = String(key.dropLast("weight".count))
+                weights[prefix + "scales"] = q.scales
+                weights[prefix + "biases"] = q.biases
+            }
+
+            let env = ProcessInfo.processInfo.environment
+            if env["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] != "0",
+               let layer = mtp?.layers.first,
+               let exactQ = exactWeights["mtp.layers.0.self_attn.q_proj.weight"],
+               let exactK = exactWeights["mtp.layers.0.self_attn.k_proj.weight"],
+               let exactV = exactWeights["mtp.layers.0.self_attn.v_proj.weight"],
+               let q = packed["mtp.layers.0.self_attn.q_proj.weight"],
+               let k = packed["mtp.layers.0.self_attn.k_proj.weight"],
+               let v = packed["mtp.layers.0.self_attn.v_proj.weight"]
+            {
+                layer.selfAttn.installExactQKVRows(
+                    qWeight: exactQ, qPacked: q.weight, qScales: q.scales, qBiases: q.biases,
+                    kWeight: exactK, kPacked: k.weight, kScales: k.scales, kBiases: k.biases,
+                    vWeight: exactV, vPacked: v.weight, vScales: v.scales, vBiases: v.biases,
+                    rowsPerProjection: 256)
+            }
         }
 
         if configuration.tieWordEmbeddings {
