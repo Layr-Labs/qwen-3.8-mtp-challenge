@@ -1357,7 +1357,7 @@ public final class Qwen36MTPBlockSession {
     /// stripe. This exposes enough work to occupy the GPU instead of making two
     /// threadgroups serially scan almost a thousand logits per lane.
     private static let linearTopTwoPartialKernel = MLXFast.metalKernel(
-        name: "qwen_mtp_linear_top2_partial",
+        name: "qwen_mtp_linear_top2_partial_v2",
         inputNames: ["logits"],
         outputNames: ["partial_ids", "partial_values"],
         source: """
@@ -1376,31 +1376,47 @@ public final class Qwen36MTPBlockSession {
                 qwen_top2_insert(local, float(logits[offset]), index);
             }
 
-            threadgroup qwen_top2_state scratch[256];
-            scratch[lane] = local;
+            // Two-level SIMD combination (same narrowing as the promoted
+            // compact-selector reduction): shuffle within each of the eight
+            // SIMD groups, one barrier, then the first group shuffles the
+            // eight partials. Top-2 merge under the shared total order is
+            // associative and commutative over disjoint ids, so the result
+            // is bit-identical to the old 9-barrier tree.
+            uint simd_lane = thread_index_in_simdgroup;
+            uint simd_group = simdgroup_index_in_threadgroup;
+            for (ushort off = 16; off > 0; off >>= 1) {
+                float o_fv = simd_shuffle_down(local.first_value, off);
+                uint o_fi = simd_shuffle_down(local.first_id, off);
+                float o_sv = simd_shuffle_down(local.second_value, off);
+                uint o_si = simd_shuffle_down(local.second_id, off);
+                uint o_c = simd_shuffle_down(local.count, off);
+                if (o_c > 0) { qwen_top2_insert(local, o_fv, o_fi); }
+                if (o_c > 1) { qwen_top2_insert(local, o_sv, o_si); }
+            }
+            threadgroup qwen_top2_state scratch[8];
+            if (simd_lane == 0) { scratch[simd_group] = local; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint stride = 128; stride > 0; stride >>= 1) {
-                if (lane < stride) {
-                    qwen_top2_state merged = scratch[lane];
-                    qwen_top2_state other = scratch[lane + stride];
-                    if (other.count > 0) {
-                        qwen_top2_insert(merged, other.first_value, other.first_id);
-                    }
-                    if (other.count > 1) {
-                        qwen_top2_insert(merged, other.second_value, other.second_id);
-                    }
-                    scratch[lane] = merged;
+            if (simd_group == 0) {
+                local = (simd_lane < 8) ? scratch[simd_lane]
+                                        : qwen_top2_empty();
+                for (ushort off = 4; off > 0; off >>= 1) {
+                    float o_fv = simd_shuffle_down(local.first_value, off);
+                    uint o_fi = simd_shuffle_down(local.first_id, off);
+                    float o_sv = simd_shuffle_down(local.second_value, off);
+                    uint o_si = simd_shuffle_down(local.second_id, off);
+                    uint o_c = simd_shuffle_down(local.count, off);
+                    if (o_c > 0) { qwen_top2_insert(local, o_fv, o_fi); }
+                    if (o_c > 1) { qwen_top2_insert(local, o_sv, o_si); }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
 
             if (lane == 0) {
                 uint base = (row * 32 + group) * 2;
-                partial_ids[base] = int(scratch[0].first_id);
-                partial_ids[base + 1] = int(scratch[0].second_id);
-                partial_values[base] = scratch[0].first_value;
-                partial_values[base + 1] = scratch[0].second_value;
+                partial_ids[base] = int(local.first_id);
+                partial_ids[base + 1] = int(local.second_id);
+                partial_values[base] = local.first_value;
+                partial_values[base + 1] = local.second_value;
             }
         """,
         header: linearTopTwoHeader,
@@ -1409,7 +1425,7 @@ public final class Qwen36MTPBlockSession {
 
     /// Stage two: one small threadgroup per row merges the 32 partial pairs.
     private static let linearTopTwoFinalizeKernel = MLXFast.metalKernel(
-        name: "qwen_mtp_linear_top2_finalize",
+        name: "qwen_mtp_linear_top2_finalize_v2",
         inputNames: ["partial_ids", "partial_values"],
         outputNames: ["top_ids", "top_values"],
         source: """
@@ -1421,27 +1437,23 @@ public final class Qwen36MTPBlockSession {
             qwen_top2_insert(
                 local, partial_values[base + 1], uint(partial_ids[base + 1]));
 
-            threadgroup qwen_top2_state scratch[32];
-            scratch[lane] = local;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint stride = 16; stride > 0; stride >>= 1) {
-                if (lane < stride) {
-                    qwen_top2_state merged = scratch[lane];
-                    qwen_top2_state other = scratch[lane + stride];
-                    qwen_top2_insert(merged, other.first_value, other.first_id);
-                    qwen_top2_insert(merged, other.second_value, other.second_id);
-                    scratch[lane] = merged;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+            // One SIMD group: pure shuffle combination, zero barriers.
+            for (ushort off = 16; off > 0; off >>= 1) {
+                float o_fv = simd_shuffle_down(local.first_value, off);
+                uint o_fi = simd_shuffle_down(local.first_id, off);
+                float o_sv = simd_shuffle_down(local.second_value, off);
+                uint o_si = simd_shuffle_down(local.second_id, off);
+                uint o_c = simd_shuffle_down(local.count, off);
+                if (o_c > 0) { qwen_top2_insert(local, o_fv, o_fi); }
+                if (o_c > 1) { qwen_top2_insert(local, o_sv, o_si); }
             }
 
             if (lane == 0) {
                 uint output_base = row * 2;
-                top_ids[output_base] = int(scratch[0].first_id);
-                top_ids[output_base + 1] = int(scratch[0].second_id);
-                top_values[output_base] = scratch[0].first_value;
-                top_values[output_base + 1] = scratch[0].second_value;
+                top_ids[output_base] = int(local.first_id);
+                top_ids[output_base + 1] = int(local.second_id);
+                top_values[output_base] = local.first_value;
+                top_values[output_base + 1] = local.second_value;
             }
         """,
         header: linearTopTwoHeader,
