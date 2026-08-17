@@ -1,10 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
-  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
-  "bytes": 238934129,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-aw-islands@f0a8831f4f1592cdd68f6925599cf0b1fccb1cb0",
+  "sha256": "4238d334f13cef559592b9479a5b91e9a0c0336f6e48400549dd18b9692f063e",
+  "bytes": 270404276,
   "max_bytes": 2147483648,
-
-  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
+  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest ACTIVATION-WEIGHTED reconstruction error (sum over 3,456 real head-input hidden states of the per-row squared output error, X^T X weighting) versus the pinned organizer BF16 head, rather than the unweighted FP32 row SSE of the previous island artifact. The row subset differs (451/1024 overlap with the SSE-selected rows) and covers 38.9% of the total Q-projection output error on real activations versus 28.9% for the SSE selection, with identical BF16 payload size. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
 }

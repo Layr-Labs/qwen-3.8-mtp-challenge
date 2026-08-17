@@ -1490,6 +1490,14 @@ final class Qwen35Attention: Module {
     private var _kvOut = 0
     private var _kvDenseW: MLXArray?
 
+    // Proposal-head-only precision islands.  The declared artifact preserves
+    // the promoted affine-4 head and additionally carries selected exact BF16
+    // output rows. Target-model attention never installs these arrays.
+    private var _exactQKVWeight: MLXArray?
+    private var _exactQKVIndices: MLXArray?
+    private var _exactKVIndices: MLXArray?
+    private var _exactQRowCount = 0
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -1544,9 +1552,10 @@ final class Qwen35Attention: Module {
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
-            let y = quantizedMM(
+            var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
             return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
@@ -1593,9 +1602,10 @@ final class Qwen35Attention: Module {
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
         if let w = _kvW, let s = _kvS, let z = _kvZ {
-            let y = quantizedMM(
+            var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _kvGS, bits: _kvBits, mode: _kvMode)
+            y = replaceExactRows(y, input: x, kvOnly: true)
             return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
         }
         if let w = _kvDenseW {
@@ -1628,6 +1638,52 @@ final class Qwen35Attention: Module {
             return kv(x)
         }
         return (kProj(x), vProj(x))
+    }
+
+    private func replaceExactRows(
+        _ base: MLXArray, input: MLXArray, kvOnly: Bool
+    ) -> MLXArray {
+        guard let exactWeight = _exactQKVWeight else { return base }
+        let weight: MLXArray
+        let indices: MLXArray?
+        if kvOnly {
+            weight = exactWeight[_exactQRowCount...]
+            indices = _exactKVIndices
+        } else {
+            weight = exactWeight
+            indices = _exactQKVIndices
+        }
+        guard let indices else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactQKVRows(
+        qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
+        kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
+        vWeight: MLXArray, vIndices: MLXArray
+    ) {
+        precondition(
+            qWeight.dim(0) == qIndices.dim(0)
+                && kWeight.dim(0) == kIndices.dim(0)
+                && vWeight.dim(0) == vIndices.dim(0),
+            "Qwen MTP precision-island weights and indices must have equal row counts")
+        let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
+        let qkvIndices = concatenated(
+            [qIndices, kIndices + qOutputCount,
+             vIndices + qOutputCount + kOutputCount], axis: 0)
+            .asType(.int32).contiguous()
+        let kvIndices = concatenated(
+            [kIndices, vIndices + kOutputCount], axis: 0)
+            .asType(.int32).contiguous()
+        eval(weight, qkvIndices, kvIndices)
+
+        _exactQKVWeight = weight
+        _exactQKVIndices = qkvIndices
+        _exactKVIndices = kvIndices
+        _exactQRowCount = qWeight.dim(0)
     }
 
     /// Append rows to an attention cache without producing query outputs.
@@ -2180,6 +2236,36 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 "[WARNING] Qwen35TextModel.sanitize: MTP head is enabled but no mtp.* "
                 + "weights found. Load will likely fail or produce garbage. "
                 + "Re-convert the checkpoint with a converter that preserves MTP weights.")
+        }
+
+        // A declared packed head may carry a compact BF16 correction set for
+        // its proposal attention.  Side-channel these non-parameter tensors
+        // out of the strict Module update, then install them only on the MTP
+        // layer.  The target model never sees or consumes this artifact.
+        let islandPrefix = "mtp.precision_islands."
+        let islandKeys = weights.keys.filter { $0.hasPrefix(islandPrefix) }
+        if !islandKeys.isEmpty {
+            let qWeight = weights.removeValue(forKey: islandPrefix + "q.weight")
+            let qIndices = weights.removeValue(forKey: islandPrefix + "q.indices")
+            let kWeight = weights.removeValue(forKey: islandPrefix + "k.weight")
+            let kIndices = weights.removeValue(forKey: islandPrefix + "k.indices")
+            let vWeight = weights.removeValue(forKey: islandPrefix + "v.weight")
+            let vIndices = weights.removeValue(forKey: islandPrefix + "v.indices")
+            guard let qWeight, let qIndices, let kWeight, let kIndices,
+                  let vWeight, let vIndices, let layer = mtp?.layers.first
+            else {
+                fatalError(
+                    "Qwen MTP precision-island artifact is incomplete; expected "
+                        + "Q/K/V weight+indices tensors")
+            }
+            if ProcessInfo.processInfo.environment[
+                "MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] != "0"
+            {
+                layer.selfAttn.installExactQKVRows(
+                    qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
+                    kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
+                    vWeight: vWeight, vIndices: vIndices)
+            }
         }
 
         if configuration.tieWordEmbeddings {
