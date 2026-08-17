@@ -1115,8 +1115,29 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogTokens.append(
                 contentsOf: drafts.prefix(acceptedCount))
         }
-        fullAcceptStreak =
-            acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
+        // DEPTH-NORMALISED CREDIT, not a binary reset. The old rule
+        // (`full accept ? +1 : 0`) measured its qualifying event at the cap it
+        // grants: a depth-8 round that accepts 7 of 8 is exactly the evidence
+        // that justifies drafting past the width wall, yet it zeroed the
+        // streak and dropped the cap 5 for two rounds — the published
+        // per-prompt mean draft lengths (4.35-5.78) are that 5<->8 oscillator,
+        // not an h-limited equilibrium. Three properties of the replacement:
+        //   1. A full accept still credits (the opening ramp is unchanged —
+        //      gate 0/1/3 receipts stay comparable).
+        //   2. Accepting at least the width-wall cap ALSO credits, so a deep
+        //      round that proves >= 5 drafts sustains its own eligibility.
+        //   3. Anything else decays by one instead of resetting, and credit
+        //      is clamped so a hot stretch cannot bank unbounded grace: a
+        //      cold or hard prompt still never opens the cap (it never
+        //      accepts 5 in a row), and a hot->hard transition closes it
+        //      within two rounds.
+        if acceptedCount == drafts.count
+            || acceptedCount >= Self.sdpaWidthWallDepthCap
+        {
+            fullAcceptStreak = Swift.min(fullAcceptStreak + 1, 4)
+        } else {
+            fullAcceptStreak = Swift.max(fullAcceptStreak - 1, 0)
+        }
         recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
