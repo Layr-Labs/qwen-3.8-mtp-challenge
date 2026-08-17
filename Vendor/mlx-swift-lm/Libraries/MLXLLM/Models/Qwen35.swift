@@ -1441,6 +1441,138 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Fused residual + RMS norm
+
+/// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
+///
+/// Bit-exact with the eager `h = x + r; postAttentionLayerNorm(h)` sequence
+/// because the add is rounded to BF16 BEFORE squaring (matching the write-back
+/// and re-read of `h` in the eager path) and the accumulation / reduction tree
+/// mirrors `rms_norm.metal` exactly. Official isolated-positive provenance is
+/// Yukon PR #250 (score 2.90834 on the 2.90421 frontier). The dense asyncEval
+/// rungs that shipped in that same PR are deliberately omitted: later official
+/// receipts showed verify graphs on this frontier are exec-bound, and widening
+/// those rungs regresses.
+private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Wraps the fused residual+RMSNorm kernel. Returns `(residual, normed)` where
+/// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
+/// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
+func qwen35FusedResidualRMSNorm(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray) {
+    let nRows = x.size / x.dim(-1)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormKernel(
+        [x, r, weight, eps],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -1826,8 +1958,20 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Fused residual+RMSNorm on the common BF16 hidden-5120 path.
+        // Bit-exact with h = x + r; postAttentionLayerNorm(h).
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
 }
 

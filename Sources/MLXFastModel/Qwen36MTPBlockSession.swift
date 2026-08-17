@@ -1252,6 +1252,16 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
+            // Official +0.10% isolated promotion (Amal-David / 776d716 on 033f622).
+            // Replay installs new recurrent roots and leaves them lazy; kicking
+            // only those restored SSM boundary states lets the GPU start that
+            // already-required work while the host finishes the reject path.
+            // Arithmetic, offsets, and the serial control are unchanged.
+            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
+                guard let arrays = entry as? ArraysCache else { return nil }
+                return arrays[1]
+            }
+            asyncEval(replayedRecurrentStates)
             return true
         }
 
