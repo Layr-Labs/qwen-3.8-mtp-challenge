@@ -83,10 +83,36 @@ public struct BaseConfiguration: Codable, Sendable {
             self.perLayerQuantization = perLayerQuantization
         }
 
+        /// Affine precision a DECLARED MTP head asks for, keyed by module path.
+        ///
+        /// The backbone's `config.json` carries ONE `quantization` block, and
+        /// `loadWeights` hands it to every submodule whose weights arrive with a
+        /// `.scales` sibling -- including the head's, which are merged into the
+        /// same tree by `_additionalWeightSources`. That is correct for the
+        /// pinned head (it is affine group-64 4-bit, same as the backbone) but
+        /// it silently constrains a DECLARED head to the backbone's precision:
+        /// a head whose matrices were re-quantised at some other width would be
+        /// built as group-64 4-bit layers and rejected by `update(parameters:
+        /// verify:)` on the packed-weight shape.
+        ///
+        /// The head declares its own precision in its own artifact (see
+        /// `Qwen35TextModel.sanitize`, `mtp.head_precision.*`), which is read
+        /// before the quantization walk and lands here. Only `mtp.`-prefixed
+        /// module paths are ever present, so nothing about the target model's
+        /// precision can be reached through this map. Same global idiom and the
+        /// same lifetime discipline as `_qwen35MTPEnabled` and
+        /// `_additionalWeightSources`: written immediately before the load, read
+        /// during it, reset at the start of every `sanitize`.
+        public nonisolated(unsafe) static var declaredMTPHeadQuantization:
+            [String: Quantization] = [:]
+
         /// Resolves the quantization parameters for a specific layer.
         /// - Parameter layer: The path/name of the layer.
         /// - Returns: The `Quantization` settings to apply, or `nil` if the layer should be skipped.
         public func quantization(layer: String) -> Quantization? {
+            if let declared = Self.declaredMTPHeadQuantization[layer] {
+                return declared
+            }
             if let perLayer = perLayerQuantization[layer] {
                 switch perLayer {
                 case .skip:
