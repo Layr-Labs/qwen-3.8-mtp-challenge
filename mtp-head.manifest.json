@@ -1,10 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
-  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
-  "bytes": 238934129,
+  "source_url": "hf:Cyleux/qwen38-mtp-head-fcbf16@50cd9845ef8cd7bd9928c08d2946f0d3251b6baf",
+  "sha256": "7ce00d91927a5bfa5ed235daecebbd71d6c5044377f7d9cc5abe1556fc524015",
+  "bytes": 314300361,
   "max_bytes": 2147483648,
-
-  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
+  "note": "Mixed-precision repack of the pinned bf16 MTP head (EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e0): fc.weight kept in original bf16, the seven other 2D projections at affine 4-bit group-64 (MLX 0.32.0 mx.quantize, the current frontier head's geometry), 1D norms bf16. Per-tensor session measurements attribute the entire draft-acceptance cost of uniform 4-bit quantization to fc.weight alone; keeping fc exact recovers the full bf16 drafting behavior for +75 MB per draft step over the frontier head, and every kernel this head dispatches is already exercised by promoted runs (bf16 GEMV by the pinned head, 4-bit group-64 by the frontier head and the backbone) - no loader or kernel code changes, stock quantization-walk semantics. The head only proposes: every emitted token is the pinned target's own greedy continuation, and the committed stream is measured identical to the stock head's stream on both test windows."
 }
