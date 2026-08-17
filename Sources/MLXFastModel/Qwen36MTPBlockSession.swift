@@ -566,7 +566,36 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    /// 2, not 3 — and this is the THIRD time it has had to be restored.
+    ///
+    /// Ranked history of this exact literal: newjordan's 3 -> 2 was PROMOTED at
+    /// 2.91995 (base 2.90421), then reverted by the accept commit of the 6-way
+    /// composite that followed, whose archive happened to carry 3. hadakang's
+    /// restore then scored 2.92976 against the 2.92622 frontier of its day —
+    /// beating its contemporary crown — and lost only the race to the head
+    /// re-quantisation that landed at 2.93361. The mechanism has never lost on
+    /// its merits; it keeps losing to ancestry.
+    ///
+    /// A THIRD, independent line of evidence now supports it, from a negative
+    /// result of my own. I raised `headStepCostRatio` 0.18 -> 0.32 on the
+    /// directly measured marginal (submission `fc62d1aa`) and it scored 2.84585,
+    /// a clean -3% with the baseline leg flat (0.038092 -> 0.038070, so not a
+    /// draw artifact). Its per-prompt effect was to shorten every draft —
+    /// 4.35/4.89/5.78/5.33/5.04 -> 3.36/4.01/4.53/4.03/4.76 — and candidate
+    /// decode time ROSE 0.95%. **This pool rewards depth**; the marginal draft is
+    /// worth more than its verify row costs. Together with 0.15 (2.667) and 0.14
+    /// (2.766) failing on the other side, h = 0.18 is now bracketed as a true
+    /// local optimum, and the way to buy depth is not the price — it is the cap.
+    ///
+    /// Which is exactly what this gate is, and why it is the safe way to do it.
+    /// `h` moves the marginal rule on EVERY round, including the hard prompts
+    /// that set the median's lower half — that is why 0.32 dragged prompt 6 from
+    /// 0.17 to 0.06 drafts. This gate is conditioned on OBSERVED perfect
+    /// acceptance and any reject resets `fullAcceptStreak` to 0, so it cannot
+    /// touch a cold or hard prompt at all; it only shortens the re-qualification
+    /// ramp on stretches the head is already proving. Gate 1 is measured dead
+    /// (2.833, -7.1%) and gate 0 only tied (2.9200), so 2 is the receipted point.
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
