@@ -51,6 +51,14 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// `callWithHidden` plus the post-norm block the same forward already
+    /// computed on its way to the vocabulary projection. A nil third element
+    /// preserves the existing `applyFinalNorm` fallback for conformers that do
+    /// not publish it.
+    func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -107,6 +115,16 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// inner text model's `model.norm`, i.e. exactly the norm the inner
     /// `callAsFunction` applies; there is no outer norm to pick by mistake.
     func applyFinalNorm(_ x: MLXArray) -> MLXArray
+}
+
+extension Qwen36MTPTarget {
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let (logits, hidden) = callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+        return (logits, hidden, nil)
+    }
 }
 
 // Both Qwen 3.6 model classes already implement every member; these

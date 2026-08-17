@@ -232,6 +232,25 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Fuse the full-attention output gate `x * sigmoid(gate)` into one compiled
+/// elementwise pass, replacing the separate sigmoid and multiply launches (and
+/// their intermediate materialization) in every full-attention layer call.
+/// Same primitive arithmetic as `sigmoidMultiply` — sigmoid first, then
+/// multiply — so the values are bit-identical to the two-launch path; only
+/// the launches and the intermediate buffer disappear. Shapeless compilation
+/// shares one trace across prefill and verify widths.
+private let qwen35CompiledSigmoidMultiply:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
+        x * sigmoid(gate)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
@@ -1687,7 +1706,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
     }
 }
 
@@ -2228,6 +2247,24 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// Publish the post-norm block this same forward already needs for its
+    /// vocabulary projection. The verify session can reuse its rows on the
+    /// proposal side instead of launching identical single-row RMSNorms.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -2523,6 +2560,14 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenAndNormed`.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        languageModel.callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.
