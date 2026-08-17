@@ -527,6 +527,24 @@ public final class Qwen36MTPBlockSession {
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.18
+    /// ENGINE AXIS (2026-08-16): hard ceiling on the adaptive depth,
+    /// env-tunable (MLX_QWEN_MTP_MAX_DRAFT), SHIPPED DEFAULT 7. Verify width
+    /// = depth + 1, so the cap keeps the multi-stream crossrow dispatch at
+    /// two weight passes (width 9 re-reads the weights a third time) and
+    /// stays inside the widest hexfloat-gate-verified regime (widths 6..8).
+    /// The streak-gated depth policy is otherwise the promoted frontier's
+    /// exactly (h = 0.18, cold cap 5, streak-qualified 8, first- and
+    /// second-position confidence tempering): an aggressive streak-free
+    /// variant measured -0.6% ranked (2.9071 vs 2.9252 on the identical
+    /// tree), so the cautious policy ships untouched.
+    private static let envMaxDraft: Int = {
+        let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_MAX_DRAFT"] ?? ""
+        let parsed = Int(raw)
+        if let parsed, parsed >= 1, parsed <= Qwen36MTPLimits.maxDepth {
+            return parsed
+        }
+        return 7
+    }()
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -603,7 +621,7 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
-        return depth
+        return Swift.min(depth, Self.envMaxDraft)
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
