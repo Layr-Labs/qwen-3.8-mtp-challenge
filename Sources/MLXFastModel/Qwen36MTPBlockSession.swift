@@ -292,9 +292,22 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
+            // For width >= 2 (drafting verify widths), use callWithHiddenAndNormed
+            // so the norm+lm_head graph compiles here, not inside the scored window.
+            // Width 1 (serial control) stays on callWithHidden.
+            let verifyLogits: MLXArray
+            if width >= 2 {
+                let (vl, _, warmNormed) = model.callWithHiddenAndNormed(
+                    input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 1)
+                verifyLogits = vl
+                if let warmNormed { eval(warmNormed) }
+            } else {
+                let (vl, _) = model.callWithHidden(
+                    input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0)
+                verifyLogits = vl
+            }
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
@@ -319,7 +332,7 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
+        let (oneRowReplayLogits, _, _) = model.callWithHiddenAndNormed(
             input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
             cache: oneRowReplayCache, nConfirmed: 1)
         eval(oneRowReplayLogits)
