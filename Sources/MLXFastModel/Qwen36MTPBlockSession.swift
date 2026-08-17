@@ -497,8 +497,8 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
-    /// h = (one head draft step) / (one batched verify forward), the only
-    /// constant the marginal rule needs. Derivation from the campaign's
+    /// h(d) = (marginal cost of draft d) / (one batched verify forward), the
+    /// only constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
     /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
     /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
@@ -526,7 +526,21 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    ///
+    /// ROW-SPECIFIC FIT (ratacat, validated a451f3b, re-applied here): the
+    /// flat 0.18 prices every row at the STEADY-STATE marginal, but the
+    /// forced-width curve (f930deb: 34.50/37.00/44.87/52.44/62.68/70.03/
+    /// 77.14/87.21 ms at widths 2..9) shows the FIRST draft row adds only
+    /// ~+2.5 ms over the round base while later rows add ~+7.4 ms each —
+    /// the first head step's build overlaps the verify graph build and the
+    /// first verify row rides the same weight streams the primary row
+    /// already pays. Row 0 and 1 at 0.09, rows 2-3 at 0.17, rows 4+ at the
+    /// flat 0.18 optimum. The per-row denominator is the exact cumulative
+    /// cost 1 + sum(h[0..<d]) rather than 1 + d*h, so the threshold ratio
+    /// stays the rule's marginal-cost fraction.
+    private static let headStepCostRatios = [
+        0.09, 0.09, 0.17, 0.17, 0.18, 0.18, 0.18, 0.18,
+    ]
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -609,9 +623,9 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
+        var cost = 1.0
         var depth = 0
         while depth < cap {
             var p = positionAcceptEMA[depth]
@@ -625,9 +639,11 @@ public final class Qwen36MTPBlockSession {
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            let h = Self.headStepCostRatios[depth]
+            let threshold = h * (1.0 + expected) / cost
             guard reach > threshold else { break }
             expected += reach
+            cost += h
             depth += 1
         }
         return depth
