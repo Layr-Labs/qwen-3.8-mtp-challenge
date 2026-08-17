@@ -86,6 +86,14 @@ public protocol Qwen36MTPTarget: AnyObject {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray?
 
+    /// Terminal multi-draft proposal step: preserve attention and its cache
+    /// update while omitting the final MLP whose hidden has no later consumer.
+    /// The result still selects a proposal and therefore may change acceptance;
+    /// target verification remains the emitted-token authority.
+    func mtpTerminalProposalAttentionHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray?
+
     /// The backbone's lm_head applied to hidden rows (draft sampling side).
     func applyLMHead(_ x: MLXArray) -> MLXArray
 

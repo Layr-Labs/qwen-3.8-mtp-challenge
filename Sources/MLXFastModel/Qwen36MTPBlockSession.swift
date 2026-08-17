@@ -247,6 +247,18 @@ public final class Qwen36MTPBlockSession {
             eval(draftLogits, row)
         }
 
+        // The live chain uses an attention-only terminal proposal step at
+        // draft depth 5. Warm that exact expression (including draft
+        // selection) on the throwaway head cache.
+        if let terminalHidden = model.mtpTerminalProposalAttentionHidden(
+            hidden: row,
+            nextTokenIds: MLXArray([Int32(0)]).reshaped([1, 1]),
+            cache: headCache)
+        {
+            eval(model.draftTokenID(terminalHidden))
+            eval(headCache.flatMap { $0.state })
+        }
+
         // Committed-history head shapes: compile both the K/V-only leading-row
         // path and final full row for the full seed and a 2-row accept fold.
         let hDim = row.dim(-1)
@@ -884,9 +896,23 @@ public final class Qwen36MTPBlockSession {
         // the first step carries the history flush, which IS real GPU work
         // the device can start while the host builds steps 2..d.
         asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+        for step in 1 ..< draftCount {
+            // The terminal step's hidden is not chained into another head
+            // step. Preserve its attention/KV update, but omit the MLP and use
+            // the attention residual only to select the final proposal token.
+            // Every other depth remains entirely stock; unsupported head
+            // geometries fail closed to the ordinary full forward.
+            headHidden =
+                step == draftCount - 1 && draftCount == 5
+                ? model.mtpTerminalProposalAttentionHidden(
+                    hidden: draftHidden, nextTokenIds: draftId,
+                    cache: headCache)
+                    ?? model.mtpHeadHiddenForward(
+                        hidden: draftHidden, nextTokenIds: draftId,
+                        cache: headCache)
+                : model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId,
+                    cache: headCache)
             draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
             draftId = model.draftTokenID(draftHidden)

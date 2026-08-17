@@ -60,6 +60,19 @@ final class Qwen35MTPDecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
+    /// Run the attention half of a terminal proposal step. The attention
+    /// update is still required because it appends the consumed draft row to
+    /// the persistent head cache. The MLP output is proposal-only and may be
+    /// omitted only when no later head step consumes this hidden state.
+    func terminalProposalAttention(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> MLXArray {
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        return x + r
+    }
+
     /// Populate this layer's K/V history without computing a dead layer
     /// output. Only valid when no later MTP layer consumes that output.
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
@@ -158,6 +171,29 @@ final class Qwen35MTPModule: Module {
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
         return norm(layers[0](current, mask: mask, cache: cache[0]))
+    }
+
+    /// Produce a final proposal hidden while preserving the consumed row's
+    /// attention/KV update and omitting only the now-dead MLP. This changes
+    /// proposal numerics, not target verification. Fail closed before cache
+    /// mutation unless the current one-layer, one-row head geometry applies.
+    func terminalProposalAttentionHidden(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> MLXArray? {
+        guard layers.count == 1, cache.count == 1,
+              hidden.dim(1) == 1, nextTokenIds.dim(1) == 1
+        else { return nil }
+
+        let embeds = embedTokens(nextTokenIds)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
+        let fused = fc(concatenated([e, h], axis: -1))
+        let mask = createAttentionMask(h: fused, cache: cache[0])
+        return norm(layers[0].terminalProposalAttention(
+            fused, mask: mask, cache: cache[0]))
     }
 
 }

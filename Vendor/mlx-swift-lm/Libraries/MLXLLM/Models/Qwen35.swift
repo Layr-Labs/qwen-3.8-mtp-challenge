@@ -2370,6 +2370,20 @@ extension Qwen35TextModel: MTPCapable {
             cache: cache)
     }
 
+    /// Run the last step of a multi-draft chain without its terminal MLP.
+    /// The returned hidden is used only to choose the final proposal token;
+    /// attention still appends the consumed row to the head cache.
+    public func mtpTerminalProposalAttentionHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray? {
+        guard let mtp else { return nil }
+        return mtp.terminalProposalAttentionHidden(
+            hidden: hidden,
+            nextTokenIds: nextTokenIds,
+            embedTokens: model.embedTokens,
+            cache: cache)
+    }
+
     /// The backbone's lm_head (or tied-embedding projection) applied to hidden
     /// rows. Companion to `mtpHeadHiddenForward` for the rows that need logits.
     public func applyLMHead(_ x: MLXArray) -> MLXArray {
@@ -2605,6 +2619,14 @@ extension Qwen35Model: MTPCapable {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray? {
         languageModel.mtpHeadLastHiddenWithKVOnlyHistory(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.mtpTerminalProposalAttentionHidden`.
+    public func mtpTerminalProposalAttentionHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray? {
+        languageModel.mtpTerminalProposalAttentionHidden(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
 
