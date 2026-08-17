@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:Artemishehe/qwen38-mtp-head-q4-queryonly-islands@e3e3c933713cb2494741523649272573ac38af07",
+  "sha256": "1626402885b74812bc0160c75645b010d29a60d13d5ea23a70702226ae7b2ab1",
+  "bytes": 270404296,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor, with the same six bare BF16 precision-island tensors as the promoted islands artifact (all 1,024 K rows, all 1,024 V rows, 1,024 Q rows) in the identical layout and byte budget. The only change is the Q row selection: q_proj interleaves 256 query rows and 256 sigmoid output-gate rows per head (row r is a query row iff r % 512 < 256); the promoted selection ranked all 12,288 rows by reconstruction SSE and placed 639 of its 1,024 islands on gate rows. This artifact restricts the ranking to query rows only (it contains every one of the promoted artifact's 385 query rows and replaces its 639 gate rows with the next 639 worst query rows), because query-row error is amplified through the softmax while gate-row error is damped by the sigmoid. Candidate code is unchanged. The head only proposes; the pinned target re-verifies every emitted token. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size."
 }
