@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:morgan/qwen38-27b-mtp-dev20-k4b06-lr1e5-q4-g64-islands@97aa5363461b98808da57ef9fce1a525ec0fd4ae",
+  "sha256": "5cbc55373ad5bc3339d9143e2cc0216c57ba29206d9e93a10d6e464feac84765",
+  "bytes": 270404736,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "Candidate A fine-tunes the native Qwen 3.8 27B MTP head for four speculative positions over 2,000 updates on a seed-42 random 20,000-row Dev20 sample with step_weight_beta=0.6 and learning_rate=1e-5. MLX 0.32.0 affine 4-bit/group-64 quantization produces the 31-tensor packed base; six BF16 proposal-only Q/K/V precision-island tensors reuse the promoted incumbent's index arrays byte-for-byte and gather those rows from the fine-tuned BF16 source. The fixed target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and model-only-tree-digest pinned, contains no executable remote code, and was anonymously downloaded and verified byte-for-byte after publication."
 }
