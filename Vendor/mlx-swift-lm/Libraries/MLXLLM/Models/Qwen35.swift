@@ -2357,6 +2357,26 @@ extension Qwen35TextModel: MTPCapable {
             cache: cache)
     }
 
+    /// Prepare the input-independent embedding-half fusion-FC table used by
+    /// compact chained draft tokens. Called only during untimed warmup.
+    public func prepareMTPCompactFusionLookup() -> Bool {
+        guard usesCompactDraftVocabulary, let mtp else { return false }
+        return mtp.prepareCompactFusionLookup(embedTokens: model.embedTokens)
+    }
+
+    /// Proposal-head forward for an ID produced by `draftTokenID`, and thus
+    /// guaranteed to belong to the compact proposal domain.
+    public func mtpHeadHiddenForwardCompactToken(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        guard let mtp else {
+            fatalError("compact MTP forward called without an attached head")
+        }
+        return mtp.compactTokenForward(
+            hidden: hidden, nextTokenIds: nextTokenIds,
+            embedTokens: model.embedTokens, cache: cache)
+    }
+
     /// Return the final proposal hidden row while populating preceding history
     /// through a K/V-only path. Returns nil before mutation when unavailable.
     public func mtpHeadLastHiddenWithKVOnlyHistory(
@@ -2597,6 +2617,17 @@ extension Qwen35Model: MTPCapable {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
         languageModel.mtpHeadHiddenForward(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    public func prepareMTPCompactFusionLookup() -> Bool {
+        languageModel.prepareMTPCompactFusionLookup()
+    }
+
+    public func mtpHeadHiddenForwardCompactToken(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        languageModel.mtpHeadHiddenForwardCompactToken(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
 

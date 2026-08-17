@@ -79,6 +79,16 @@ public protocol Qwen36MTPTarget: AnyObject {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray
 
+    /// Materialise the proposal-only compact-token embedding-half FC table
+    /// during untimed warmup. Returns false when the declared head geometry
+    /// cannot use the optimization.
+    func prepareMTPCompactFusionLookup() -> Bool
+
+    /// MTP head forward for a token produced by the compact draft selector.
+    func mtpHeadHiddenForwardCompactToken(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray
+
     /// Return the final proposal hidden row while preceding rows only append
     /// K/V state. Returns nil without mutation when the head architecture
     /// requires the ordinary full-history forward.
