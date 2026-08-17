@@ -1147,30 +1147,6 @@ final class Qwen35GatedDeltaNet: Module {
 /// byte-for-byte. The bf16 `Linear` variant (the MTP head's MLP)
 /// fuses the plain weights the same way; the head only proposes, so that
 /// side carries no exactness constraint at all.
-///
-/// Fuse the SiLU gate and product after the fused gate-up GEMM into one
-/// Metal pass: `silu(y[..., :half]) * y[..., half...]` reads each output
-/// element once and writes the activation once, replacing the two-kernel
-/// slice+silu+mul path (one silu launch, one multiply launch, one
-/// intermediate materialization) with a single launch. The arithmetic is
-/// elementwise and unchanged — silu first, then multiply, same rounding —
-/// so the values are bit-identical to the two-kernel path; only the
-/// intermediate buffer disappears. Shapeless compilation shares one trace
-/// across verify widths (the fused GEMM's N is constant, so the half-split
-/// offsets are width-invariant).
-private let qwen35CompiledFusedSwiGLU:
-    @Sendable (MLXArray) -> MLXArray =
-{
-    let body: @Sendable (MLXArray) -> MLXArray = { y in
-        let half = y.dim(-1) / 2
-        return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
-    }
-    if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
-    }
-    return body
-}()
-
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1191,14 +1167,16 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
+    private func fusedGateUp(_ x: MLXArray) -> (MLXArray, MLXArray)? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            return quantizedMM(
+            let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let w = _fbfW {
-            return matmul(x, w.T)
+            let y = matmul(x, w.T)
+            return (y[.ellipsis, ..<_gateOut], y[.ellipsis, _gateOut...])
         }
         if let g = gateProj as? QuantizedLinear,
            let u = upProj as? QuantizedLinear,
@@ -1225,12 +1203,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // The fused path is only taken when the gate/up split is provably
-        // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
-        // to the exact two-projection expression, preserving the original
-        // slicing semantics in every case.
-        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+        if x.dim(-2) <= 9, let (g, u) = fusedGateUp(x) {
+            return downProj(silu(g) * u)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
@@ -1633,7 +1607,6 @@ final class Qwen35Attention: Module {
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
-           L <= 32,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
@@ -1862,8 +1835,7 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = inputs.dim(1) <= 2
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1873,17 +1845,11 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
-                if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
-                        asyncEval(hiddenStates)
-                    }
-                } else {
-                    switch i {
-                    case 0, 1, 9, 19, 29, 39, 49, 57:
-                        asyncEval(hiddenStates)
-                    default:
-                        break
-                    }
+                switch i {
+                case 0, 1, 9, 19, 29, 39, 49, 57:
+                    asyncEval(hiddenStates)
+                default:
+                    break
                 }
             }
         }
