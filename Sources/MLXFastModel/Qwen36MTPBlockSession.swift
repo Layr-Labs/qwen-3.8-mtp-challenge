@@ -194,9 +194,8 @@ public final class Qwen36MTPBlockSession {
         // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
-        draftPolicy = { [weak self] offeredDepth, _ in
-            guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+        draftPolicy = { offeredDepth, _ in
+            return 0
         }
     }
 
@@ -445,7 +444,7 @@ public final class Qwen36MTPBlockSession {
     // parent derives every ledger quantity from the drafts actually proposed.
     public var draftPolicy: (_ offeredDepth: Int, _ round: Int) -> Int = {
         offeredDepth, _ in
-        Swift.min(offeredDepth, 1)
+        0
     }
 
     /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
