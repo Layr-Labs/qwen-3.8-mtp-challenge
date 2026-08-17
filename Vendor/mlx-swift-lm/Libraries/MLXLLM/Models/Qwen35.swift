@@ -1490,13 +1490,14 @@ final class Qwen35Attention: Module {
     private var _kvOut = 0
     private var _kvDenseW: MLXArray?
 
-    // Proposal-head-only precision islands.  The declared artifact preserves
-    // the promoted affine-4 head and additionally carries selected exact BF16
-    // output rows. Target-model attention never installs these arrays.
-    private var _exactQKVWeight: MLXArray?
+    // Proposal-head-only K/V precision islands. The declared artifact also
+    // carries selected exact Q rows, but this candidate deliberately leaves Q
+    // on the packed affine path: K/V affect every later proposal through the
+    // head cache, while omitting the Q correction removes one third of the
+    // auxiliary BF16 projection work from each proposal invocation.
+    private var _exactKVWeight: MLXArray?
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
-    private var _exactQRowCount = 0
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1643,16 +1644,8 @@ final class Qwen35Attention: Module {
     private func replaceExactRows(
         _ base: MLXArray, input: MLXArray, kvOnly: Bool
     ) -> MLXArray {
-        guard let exactWeight = _exactQKVWeight else { return base }
-        let weight: MLXArray
-        let indices: MLXArray?
-        if kvOnly {
-            weight = exactWeight[_exactQRowCount...]
-            indices = _exactKVIndices
-        } else {
-            weight = exactWeight
-            indices = _exactQKVIndices
-        }
+        guard let weight = _exactKVWeight else { return base }
+        let indices = kvOnly ? _exactKVIndices : _exactQKVIndices
         guard let indices else { return base }
         let exact = matmul(input, weight.transposed(1, 0))
         let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
@@ -1670,9 +1663,12 @@ final class Qwen35Attention: Module {
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
             "Qwen MTP precision-island weights and indices must have equal row counts")
-        let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
+        // Preserve the artifact's Q metadata validation while intentionally
+        // keeping only K/V rows in the live correction pack.
+        _ = qWeight
+        let weight = concatenated([kWeight, vWeight], axis: 0).contiguous()
         let qkvIndices = concatenated(
-            [qIndices, kIndices + qOutputCount,
+            [kIndices + qOutputCount,
              vIndices + qOutputCount + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
         let kvIndices = concatenated(
@@ -1680,10 +1676,9 @@ final class Qwen35Attention: Module {
             .asType(.int32).contiguous()
         eval(weight, qkvIndices, kvIndices)
 
-        _exactQKVWeight = weight
+        _exactKVWeight = weight
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
-        _exactQRowCount = qWeight.dim(0)
     }
 
     /// Append rows to an attention cache without producing query outputs.
