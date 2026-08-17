@@ -1886,16 +1886,32 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
-        // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
+        // Decode-width asyncEval ladder: the host builds a ~64-layer graph
+        // before anything reaches the GPU. Firing asyncEval at a few layer
+        // boundaries lets the GPU start on the early layers while the host is
+        // still building the rest. Pure enqueue-timing change — no op is
+        // added, no reduction order moves, so the emitted stream is
+        // bit-identical (Laguna receipt for the same schedule shape: off
+        // 10.37 ms vs ladder 9.45 ms/step; schedule scaled from 40 to 64
+        // layers, front rungs kept).
+        //
+        // The rung schedule is width-conditioned. S <= 2 covers every shape
+        // the paired measurement's serial control leg dispatches (its
+        // width-1 step, and the candidate's own non-drafting and depth-1
+        // rounds), so that regime keeps the promoted rung set byte-identical
+        // and the denominator leg of the score is untouched by construction.
+        // Wide verifies (S >= 3) exist only on the candidate leg; there the
+        // ladder is densified to every-4 (front pair kept), the measured
+        // optimum of the rung-spacing curve (−0.40% at every-16, −1.26% at
+        // every-8, −2.30% at every-4, reversing to −2.23%/−2.10% at
+        // every-2/every-1 as per-submit cost takes over). Ranked receipts
+        // bracket the direction: removing the S=3...5 rungs outright lost
+        // 1.76% officially, and the gate widening that first exposed wide
+        // widths to this ladder measured −1.1..−1.2 ms/round on M5-class
+        // silicon under current 4-bit-head economics.
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let wideVerify = inputs.dim(1) >= 3
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -1907,6 +1923,10 @@ public class Qwen35TextModelInner: Module {
             if ladderActive {
                 if prefillLadder {
                     if i == 0 || i % 3 == 2 {
+                        asyncEval(hiddenStates)
+                    }
+                } else if wideVerify {
+                    if i == 0 || i % 4 == 1 {
                         asyncEval(hiddenStates)
                     }
                 } else {
