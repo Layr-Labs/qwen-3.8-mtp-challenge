@@ -1,10 +1,10 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
-  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
-  "bytes": 238934129,
+  "source_url": "hf:Frosty40/qwen3.8-27b-mtp-4bit-g32@8f697452140fd0d05762d707c57691203cbf4335",
+  "sha256": "ac2bb581d70eda550df19015ccacf672b8685b610875fa273d95e35a697546ae",
+  "bytes": 265476337,
   "max_bytes": 2147483648,
 
-  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
+  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16 @ 26a328e070875b0314d652a039b6b59902690f03) to 4-bit affine group-32 with MLX mx.quantize(group_size=32, bits=4), keeping the exact uint32-packed geometry of the shipped 4-bit g64 head (w [out, in/8] uint32 + bf16 scales/biases; 31 tensors) so the scales-keyed loader walk needs no code change. Finer groups (64 -> 32) fit each scale to half the values, moving the approximation between 4-bit g64 (measured acceptance 0.956 vs bf16 0.991) and bf16 at a scale-traffic cost of ~3% of head bytes (the head is ~6-7% of a candidate round). The head only proposes; the pinned target re-verifies every emitted token. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Loadcheck on the M4 rig: all 31 tensors load through MLX's affine loader and dequantize at group 32; worst max-abs error vs bf16 = 0.086 (4-bit step-bounded; o_proj). Prior 8-bit g64 arm (b58565d, eb9ecd7c) failed ranked validation twice; this arm deliberately reuses the PROVEN g64 packing (same loader contract) with only the group size changed."
 }
