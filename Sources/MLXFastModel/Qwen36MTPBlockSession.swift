@@ -78,6 +78,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case alreadyBegun
     case invalidDepth(Int)
     case emptySeed
+    case prefixReplayFailed(accepted: Int, draftCount: Int, round: Int)
 
     public var description: String {
         switch self {
@@ -94,6 +95,10 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
             return "MTP draft depth \(depth) is out of range"
         case .emptySeed:
             return "MTP seed prefill requires a non-empty seed"
+        case .prefixReplayFailed(let accepted, let draftCount, let round):
+            return "MTP prefix replay failed at round \(round): "
+                + "accepted \(accepted) of \(draftCount) drafts; "
+                + "nConfirmed=1 tape is a hard invariant, not a cue to snapshot-repair"
         }
     }
 }
@@ -922,11 +927,15 @@ public final class Qwen36MTPBlockSession {
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        // 2. No pre-verify recurrent snapshot. Every drafting width already
+        //    verifies with nConfirmed: 1, which writes a complete prefix-
+        //    replay tape (eager K=1 checkpoint or the K>=2 exact tape).
+        //    `restoreAfterPrefixReject` is the only rollback. The generic
+        //    snapshot+repair path is dead work on the hot path: 48 GDN
+        //    layers × two slice expressions, every drafting round, whose
+        //    only consumer is a fallback the tape made unreachable.
+        //    A false restore is now a hard session poison, not a cue to
+        //    pay that host walk "just in case".
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
@@ -1042,28 +1051,13 @@ public final class Qwen36MTPBlockSession {
                 perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
                 perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
             } else {
-                // Generic K>1 / defensive fallback: undo the whole verify window
-                // and re-forward the committed block. This rare path pays a
-                // second blocking eval for its own readout.
-                Self.rollbackAfterVerify(
-                    cache, snapshot, verifiedTokens: draftCount + 1, to: base)
-                let (repairLogits, repairHidden) = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(committed).reshaped([1, committed.count])),
-                    cache: cache, nConfirmed: 0)
-                pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
-                let repairLastRow = repairLogits[
-                    0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1),
-                    0...]
-                let (tailIDs, tailValues) = Self.linearTopTwoRows(repairLastRow)
-                eval(cache.flatMap { $0.state } + [tailIDs, tailValues])
-                let ids = tailIDs.asArray(Int32.self).map { Int($0) }
-                let values = tailValues.asArray(Float.self).map { Double($0) }
-                // Top-2 first ID == row argmax; no separate argMax launch.
-                pendingPrimary = ids[0]
-                pendingTop2 = (ids, values)
-                perRowTop2Tokens.append(ids)
-                perRowTop2Logits.append(values)
+                // Tape-complete is an invariant of nConfirmed: 1, not a
+                // hint to walk every GDN leaf "just in case". Poison
+                // rather than silently repair from a snapshot we no
+                // longer take.
+                throw Qwen36MTPSessionError.prefixReplayFailed(
+                    accepted: acceptedCount, draftCount: draftCount,
+                    round: roundCount)
             }
         }
 
