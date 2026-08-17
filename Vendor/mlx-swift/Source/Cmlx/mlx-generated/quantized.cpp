@@ -1849,7 +1849,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 4:
-          qmv_fast_crossrow_affine4_g64_m<T, 4, 2>(
+          qmv_fast_crossrow_affine4_g64_m<T, 4, 4>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
