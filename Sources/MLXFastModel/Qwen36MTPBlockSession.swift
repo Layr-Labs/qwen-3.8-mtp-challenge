@@ -526,7 +526,42 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    ///
+    /// SIXTH FIT — 0.18 -> 0.32, from a DIRECT marginal measurement rather than
+    /// another round-time regression. Every fit above divides total window time
+    /// by round counts, which cannot separate the marginal cost of one more
+    /// draft from the round's fixed cost. That is the shared defect behind both
+    /// named mispricings, and it is why this constant has already moved five
+    /// times.
+    ///
+    /// Measured on the ranked box at the 512-seeded warm (ivanfioravanti,
+    /// ranked 2.92976 against the 2.92622 frontier of the time):
+    ///
+    ///     verify forward, steady state:  w1 ~31ms, w3 ~37, w4 ~44, w5 ~50,
+    ///                                    w6 ~57, w7 ~65, w8 ~74, w9 ~81
+    ///                                    -> slope ~7.4 ms per additional row
+    ///     head draft step:               ~2.5 ms
+    ///     marginal per extra draft:      2.5 + 7.4 = ~10 ms
+    ///     V (one serial-step forward):   ~31 ms      =>  h_true = 10/31 = 0.32
+    ///
+    /// Note the fourth-fit paragraph above is internally inconsistent with the
+    /// value it shipped: it records ~10.75 ms marginal on a ~27 ms base, which
+    /// IS ~0.40, and then ships 0.20. The 0.40 arm was separately rejected for
+    /// measuring -4.5% on easy prose (it held d2-3 where d4 pays). 0.32 is the
+    /// directly measured marginal and sits between that failed arm and the
+    /// shipped underprice.
+    ///
+    /// Direction matters. Every previous experiment moved this constant DOWN to
+    /// draft more (0.15 scored 2.667; 0.14 scored 2.766 — both dead). This moves
+    /// it UP, so the schedule stops buying draft positions whose verify row
+    /// costs more than they return. That targets the prompts that actually set
+    /// the score: the published median is the mean of the 4th and 5th of eight
+    /// per-prompt ratios, and on a ranked run of this stack those two were the
+    /// moderate-acceptance prompts at effective draft lengths 4.35 and 4.89 —
+    /// exactly the band an underpriced marginal over-drafts. The four prompts
+    /// above them already sit at ~3.0 and cannot improve; the three below cannot
+    /// reach the median. Re-fit after any head change.
+    private static let headStepCostRatio = 0.32
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
