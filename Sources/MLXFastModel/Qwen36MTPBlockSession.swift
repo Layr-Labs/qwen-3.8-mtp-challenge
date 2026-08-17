@@ -770,13 +770,15 @@ public final class Qwen36MTPBlockSession {
             // this backlog (the head cache is never created).
             headHistoryBacklogHidden.append(hidden)
             headHistoryBacklogTokens.append(primary)
-            let (serialLogits, serialHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray([primary]).reshaped([1, 1])),
-                cache: cache, nConfirmed: 0)
-            // Still produced, still post-norm: keeping the hidden chain identical
-            // means switching depth is the ONLY difference between the two sides.
-            pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
+            let (serialLogits, serialHidden, serialPost) =
+                model.callWithHiddenAndPostNorm(
+                    input: LMInput.Text(
+                        tokens: MLXArray([primary]).reshaped([1, 1])),
+                    cache: cache, nConfirmed: 0)
+            // Width 1: published post-norm is the same tensor the logits already
+            // paid for. Slice it instead of re-running RMSNorm on the last row.
+            pendingHidden = publishedRow(
+                serialPost, serialHidden, index: serialHidden.dim(1) - 1)
             // Single batched readout: next primary, tail top-2, cache roots —
             // one blocking eval instead of the previous 3-4 boundaries.
             let serialLastRow = serialLogits[
@@ -916,9 +918,10 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
-            input: LMInput.Text(tokens: verifyTokens),
-            cache: cache, nConfirmed: 1)
+        let (verifyLogits, verifyHidden, verifyPost) =
+            model.callWithHiddenAndPostNorm(
+                input: LMInput.Text(tokens: verifyTokens),
+                cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -975,7 +978,8 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            pendingHidden = publishedRow(
+                verifyPost, verifyHidden, index: verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1000,7 +1004,8 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingHidden = publishedRow(
+                    verifyPost, verifyHidden, index: acceptedCount)
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1042,9 +1047,15 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
-            headHistoryBacklogTokens.append(drafts[index])
+        // One contiguous accepted-prefix slice instead of acceptedCount
+        // one-row RMSNorms + one-row appends. Values are identical:
+        // RMSNorm is row-local and the published block is the same tensor
+        // the verify logits already evaluated.
+        if acceptedCount > 0 {
+            headHistoryBacklogHidden.append(
+                publishedPrefix(verifyPost, verifyHidden, count: acceptedCount))
+            headHistoryBacklogTokens.append(
+                contentsOf: drafts.prefix(acceptedCount))
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
@@ -1510,6 +1521,23 @@ public final class Qwen36MTPBlockSession {
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
         let row = hidden[0..., index ..< (index + 1), 0...]
         return postNorm ? model.applyFinalNorm(row) : row
+    }
+
+    /// Slice a row out of the published post-norm block (or the pre-norm
+    /// hidden when this session is in the pre-norm variant). Used on paths
+    /// that already evaluate the matching logits, so the RMSNorm is paid.
+    private func publishedRow(
+        _ post: MLXArray, _ pre: MLXArray, index: Int
+    ) -> MLXArray {
+        let source = postNorm ? post : pre
+        return source[0..., index ..< (index + 1), 0...]
+    }
+
+    private func publishedPrefix(
+        _ post: MLXArray, _ pre: MLXArray, count: Int
+    ) -> MLXArray {
+        let source = postNorm ? post : pre
+        return source[0..., 0 ..< count, 0...]
     }
 
     private func lastRow(_ logits: MLXArray) -> MLXArray {

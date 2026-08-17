@@ -232,6 +232,21 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Fuse the attention output gate `x * sigmoid(gate)` as one shapeless
+/// compiled pass. Primitive order is identical to `sigmoidMultiply`;
+/// environments without compiled decode keep the original closure.
+private let qwen35CompiledSigmoidMultiply:
+    @Sendable (MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { x, gate in
+        x * sigmoid(gate)
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
@@ -1687,7 +1702,7 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(sigmoidMultiply(output, gate))
+        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
     }
 }
 
@@ -2214,6 +2229,18 @@ extension Qwen35TextModel: MTPCapable {
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
+        let published = callWithHiddenAndPostNorm(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+        return (published.logits, published.preNorm)
+    }
+
+    /// Same forward as `callWithHidden`, but keeps the already-computed
+    /// post-`model.norm` block so a caller can slice rows instead of
+    /// re-running RMSNorm. Row-local, so `postNorm[i] == applyFinalNorm(preNorm[i])`
+    /// bit-for-bit. The 2-tuple `callWithHidden` contract is unchanged.
+    public func callWithHiddenAndPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (logits: MLXArray, preNorm: MLXArray, postNorm: MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
         let normed = model.norm(hidden)
@@ -2223,9 +2250,7 @@ extension Qwen35TextModel: MTPCapable {
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
-        // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
-        // is the normalization step — it expects the raw backbone output as input.
-        return (logits, hidden)
+        return (logits, hidden, normed)
     }
 
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
@@ -2523,6 +2548,14 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenAndPostNorm`.
+    public func callWithHiddenAndPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (logits: MLXArray, preNorm: MLXArray, postNorm: MLXArray) {
+        languageModel.callWithHiddenAndPostNorm(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

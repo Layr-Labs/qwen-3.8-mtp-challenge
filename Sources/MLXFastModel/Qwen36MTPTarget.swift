@@ -51,6 +51,14 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Same backbone forward as `callWithHidden`, plus the already-computed
+    /// post-`model.norm` block. RMSNorm is row-local, so a caller that already
+    /// evaluates the logits can slice this instead of re-running `applyFinalNorm`
+    /// per row. `callWithHidden` stays the 2-tuple for MTPCapable / GenerationBatch.
+    func callWithHiddenAndPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (logits: MLXArray, preNorm: MLXArray, postNorm: MLXArray)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
