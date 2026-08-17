@@ -1256,7 +1256,12 @@ public class ArraysCache: BaseKVCache {
     public var prefixReplayTape: PrefixReplayTape? = nil
 
     public struct PrefixReplayTape {
-        public let convInput: MLXArray
+        /// The pre-verify convolution state and projected verify rows are kept
+        /// separately. A rejected prefix needs exactly `convStateRows` rows,
+        /// so retaining a materializable `[convState | qkv]` concatenation
+        /// would add a wide carrier that full-accept rounds never consume.
+        public let convState: MLXArray
+        public let qkv: MLXArray
         public let q: MLXArray
         public let k: MLXArray
         public let v: MLXArray
@@ -1270,7 +1275,8 @@ public class ArraysCache: BaseKVCache {
         public let convStateRows: Int
 
         public init(
-            convInput: MLXArray,
+            convState: MLXArray,
+            qkv: MLXArray,
             q: MLXArray,
             k: MLXArray,
             v: MLXArray,
@@ -1283,7 +1289,8 @@ public class ArraysCache: BaseKVCache {
             rowCount: Int,
             convStateRows: Int
         ) {
-            self.convInput = convInput
+            self.convState = convState
+            self.qkv = qkv
             self.q = q
             self.k = k
             self.v = v
