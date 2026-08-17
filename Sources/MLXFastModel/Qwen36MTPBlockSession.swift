@@ -528,6 +528,23 @@ public final class Qwen36MTPBlockSession {
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.18
 
+    /// SEVENTH FIT — convex marginal, drift-free. The flat h overcharges the
+    /// cheap early drafts: interleaved forced-depth medians (rotated arms,
+    /// same-session, acceptance-rate confound removed) put the true per-row
+    /// marginal at h ~= 0.09 rising to h ~= 0.17 across the depth range, so
+    /// flat 0.18 is calibrated at the top of the range and roughly twice too
+    /// expensive at the bottom, biasing the schedule toward stopping early
+    /// exactly where drafting is cheapest. Two ranked probes bracket the flat
+    /// response and agree with convexity: flat 0.12 (underprices the
+    /// expensive tail) measured -7.18%; flat 0.32 (overprices the cheap
+    /// head) measured -0.39%. The ramp prices each draft at its measured
+    /// marginal: cheap early, full price late. The greedy threshold
+    /// generalizes with per-step marginals m_k as
+    ///   reach_{k+1} > m_k * (1 + E_k) / (1 + M_k),  M_k = sum_{i<k} m_i
+    /// which reduces to the shipped flat formula when all m_k equal h.
+    private static let marginalCostRamp: [Double] =
+        [0.09, 0.11, 0.13, 0.15, 0.17, 0.17, 0.17, 0.17]
+
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -582,9 +599,10 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        let ramp = Self.marginalCostRamp
         var reach = 1.0
         var expected = 0.0
+        var costSum = 0.0
         var depth = 0
         while depth < cap {
             var p = positionAcceptEMA[depth]
@@ -598,9 +616,11 @@ public final class Qwen36MTPBlockSession {
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            let m = ramp[Swift.min(depth, ramp.count - 1)]
+            let threshold = m * (1.0 + expected) / (1.0 + costSum)
             guard reach > threshold else { break }
             expected += reach
+            costSum += m
             depth += 1
         }
         return depth
