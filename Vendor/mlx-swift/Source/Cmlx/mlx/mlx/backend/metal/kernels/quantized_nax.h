@@ -573,12 +573,15 @@ template <
     short group_size,
     short bits>
 struct QuantizedBlockLoader {
+  MLX_MTL_CONST bool wide_reduction =
+      reduction_dim == 1 && BCOLS > group_size;
   static_assert(
-      BCOLS <= group_size,
-      "The group size should be larger than the columns");
+      BCOLS <= group_size ||
+          (reduction_dim == 1 && BCOLS % group_size == 0),
+      "Wide columns are only supported along the reduction dimension");
   static_assert(
-      group_size % BCOLS == 0,
-      "The group size should be divisible by the columns");
+      wide_reduction || group_size % BCOLS == 0,
+      "The group size and columns should divide evenly");
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -589,7 +592,12 @@ struct QuantizedBlockLoader {
   MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
   MLX_MTL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+  MLX_MTL_CONST short group_steps = wide_reduction ? 1 : group_size / BCOLS;
+  MLX_MTL_CONST short n_groups = wide_reduction ? BCOLS / group_size : 1;
+
+  static_assert(
+      !wide_reduction || group_size % (n_reads * pack_factor) == 0,
+      "Each thread's reads must stay within one quantization group");
 
   const int src_ld;
   const int tile_stride;
@@ -599,6 +607,7 @@ struct QuantizedBlockLoader {
   const short thread_idx;
   const short bi;
   const short bj;
+  const short group_id;
 
   threadgroup T* dst;
   const device uint8_t* src;
@@ -622,11 +631,12 @@ struct QuantizedBlockLoader {
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(n_reads * thread_idx / BCOLS_PACKED),
         bj((n_reads * thread_idx) % BCOLS_PACKED),
+        group_id(wide_reduction ? (bj * pack_factor) / group_size : 0),
         dst(dst_ + bi * dst_ld + bj * pack_factor),
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
+        scales(scales_ + bi * src_ld / group_size + group_id),
+        biases(biases_ + bi * src_ld / group_size + group_id) {}
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -674,7 +684,10 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if (group_steps > 1) {
+      if (wide_reduction) {
+        scales += n_groups;
+        biases += n_groups;
+      } else if (group_steps > 1) {
         group_step_cnt++;
         if (group_step_cnt == group_steps) {
           group_step_cnt = 0;
@@ -1246,6 +1259,25 @@ template <
         s_strides,
         b_strides,
         tid);
+  }
+  // The frozen host launches a 64x64 grid with four SIMD groups. At the
+  // 512-row seed shape, remap each pair of host M groups into the two N halves
+  // of one 128x32 tile. Four SIMD groups still compute one 32x32 output tile
+  // each, so accumulator shape and K reduction order are unchanged, while a
+  // dequantized weight tile is reused across twice as many prompt rows.
+  if constexpr (
+      group_size == 64 && bits == 4 && aligned_N && !batched &&
+      BM == 64 && BK == 64 && BN == 64 && WM == 2 && WN == 2) {
+    if (M == 512) {
+      const uint host_n_tiles = uint(N / BN);
+      const uint3 mapped_tid(
+          (tid.y & 1) * host_n_tiles + tid.x, tid.y >> 1, tid.z);
+      qmm_t_nax_tgp_impl<
+          T, group_size, bits, true, 128, 128, 32, 4, 1>(
+          w, scales, biases, x, y, Ws, K, N, M,
+          mapped_tid, lid, simd_gid, simd_lid);
+      return;
+    }
   }
   qmm_t_nax_tgp_impl<T, group_size, bits, aligned_N, BM, BK, BN, WM, WN>(
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
