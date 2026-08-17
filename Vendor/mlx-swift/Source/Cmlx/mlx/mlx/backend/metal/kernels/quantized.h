@@ -1065,6 +1065,114 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
+// Five-input specialization for the width-nine verifier. Keep only two output
+// rows live per SIMD group so the five input accumulators remain below the
+// register cliff. This retains the frontier's direct-nibble arithmetic while
+// one weight stream serves five independent input rows.
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide5_direct(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    int first_m,
+    int out_row,
+    uint simd_lid) {
+  constexpr int NA = 5;
+  constexpr int rows_per_simd = 2;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float2 acc[NA];
+  for (int m = 0; m < NA; m++) {
+    acc[m] = float2(0.0f);
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    float2 scale_local;
+    float2 bias_local;
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index =
+          row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    for (int m = 0; m < NA; m++) {
+      const device T* xm = x + (first_m + m) * in_vec_size + k +
+          simd_lid * values_per_thread;
+      float sum = 0.0f;
+      float2 partial = float2(0.0f);
+      for (int i = 0; i < 4; i++) {
+        const float x0 = static_cast<float>(xm[4 * i]);
+        const float x1 = static_cast<float>(xm[4 * i + 1]);
+        const float x2 = static_cast<float>(xm[4 * i + 2]);
+        const float x3 = static_cast<float>(xm[4 * i + 3]);
+        sum += xm[4 * i] + xm[4 * i + 1] + xm[4 * i + 2] + xm[4 * i + 3];
+        const uint2 p = uint2(packed[0][i], packed[1][i]);
+        partial +=
+            x0 * float2(p & 0x000f) +
+            x1 * float2((p >> 4) & 0x000f) +
+            x2 * float2((p >> 8) & 0x000f) +
+            x3 * float2((p >> 12) & 0x000f);
+      }
+      acc[m] += scale_local * partial + sum * bias_local;
+    }
+  }
+
+  for (int m = 0; m < NA; m++) {
+    for (int r = 0; r < rows_per_simd; r++) {
+      const float reduced = simd_sum(acc[m][r]);
+      if (simd_lid == 0) {
+        y[(first_m + m) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m9_fivefour_direct(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  if (tid.x > 2) {
+    return;
+  }
+  if (tid.x < 2) {
+    const int out_row =
+        int(tid.y) * 8 + int(tid.x) * 4 + int(simd_gid) * 2;
+    qmv_fast_crossrow_affine4_g64_wide5_direct<T>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        0, out_row, simd_lid);
+  } else {
+    qmv_fast_crossrow_affine4_g64_wide<T, 4, true>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        5, int(tid.y) * 8 + int(simd_gid) * 4, simd_lid);
+  }
+}
+
 // IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
 // with the remainder spread evenly so no group runs a one-row tail.
 template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
@@ -1874,7 +1982,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 9:
-          qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
+          qmv_fast_crossrow_affine4_g64_m9_fivefour_direct<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
