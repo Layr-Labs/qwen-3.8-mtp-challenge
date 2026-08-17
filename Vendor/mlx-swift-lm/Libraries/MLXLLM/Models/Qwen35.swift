@@ -1229,7 +1229,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
-        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+        if x.dim(-2) <= 9, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
             return downProj(qwen35CompiledFusedSwiGLU(y))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -1633,7 +1633,7 @@ final class Qwen35Attention: Module {
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
         if usesFusedQKPreparation,
-           L <= 32,
+           L <= 16,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
@@ -1874,7 +1874,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
                 if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
+                    if i == 0 || i % 4 == 3 {
                         asyncEval(hiddenStates)
                     }
                 } else {
@@ -2047,6 +2047,21 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftHeadS: MLXArray?
     private var _draftHeadZ: MLXArray?
 
+    // Two-matrix draft head, M ≈ B @ A over the compact vocabulary.
+    // Declared as `mtp.draft_lm_head_{a,b}.*`. A may be bf16 or affine-4;
+    // B is affine-4. Zero-training SVD of the compact head was measured at
+    // rank 1024/2048 (hold 0.031/0.078, relerr 0.80/0.66 on 128 RMS probes)
+    // and is NOT auto-installed — argmax does not survive. Proposal-only.
+    private var _draftHeadA: MLXArray?
+    private var _draftHeadAW: MLXArray?
+    private var _draftHeadAS: MLXArray?
+    private var _draftHeadAZ: MLXArray?
+    private var _draftHeadB: MLXArray?
+    private var _draftHeadBW: MLXArray?
+    private var _draftHeadBS: MLXArray?
+    private var _draftHeadBZ: MLXArray?
+    private var _lowRankDraftResolved = false
+
     // Input-independent compact copy of the loaded exact lm_head, used only
     // for draft proposals when no declared draft_lm_head is present. It is not
     // ModuleInfo because it is derived during warmup, not checkpoint state.
@@ -2140,6 +2155,17 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             _draftHeadW = draftW
             _draftHeadS = weights.removeValue(forKey: "mtp.draft_lm_head.scales")
             _draftHeadZ = weights.removeValue(forKey: "mtp.draft_lm_head.biases")
+        } else {
+            takeDraftFactor(
+                from: &weights, stem: "mtp.draft_lm_head_a",
+                dense: &_draftHeadA,
+                weight: &_draftHeadAW, scales: &_draftHeadAS,
+                biases: &_draftHeadAZ)
+            takeDraftFactor(
+                from: &weights, stem: "mtp.draft_lm_head_b",
+                dense: &_draftHeadB,
+                weight: &_draftHeadBW, scales: &_draftHeadBS,
+                biases: &_draftHeadBZ)
         }
         if mtp != nil, !weights.keys.contains(where: { $0.contains("mtp.") }) {
             // MTP enabled but no mtp.* keys in checkpoint → needs re-conversion.
@@ -2182,6 +2208,27 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return weights
+    }
+
+    /// Pull a declared `stem.{weight,scales,biases}` triple (affine-4) or a
+    /// bare `stem.weight` (bf16) out of the checkpoint dict so it never
+    /// becomes a Module parameter.
+    private func takeDraftFactor(
+        from weights: inout [String: MLXArray],
+        stem: String,
+        dense: inout MLXArray?,
+        weight: inout MLXArray?,
+        scales: inout MLXArray?,
+        biases: inout MLXArray?
+    ) {
+        guard let w = weights.removeValue(forKey: stem + ".weight") else { return }
+        if let s = weights.removeValue(forKey: stem + ".scales") {
+            weight = w
+            scales = s
+            biases = weights.removeValue(forKey: stem + ".biases")
+        } else {
+            dense = w
+        }
     }
 }
 
@@ -2334,6 +2381,11 @@ extension Qwen35TextModel: MTPCapable {
     /// the exact lm_head otherwise. ONLY used to choose draft proposals —
     /// never for ledger or verify values.
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
+        if let padded = twoMatrixDraftLogits(x) {
+            // Padding exists only to retain qmv_fast's N % 8 shape. Removing it
+            // before argmax makes the duplicate rows semantically unreachable.
+            return padded[0..., 0..., 0 ..< Self.compactDraftRealCount]
+        }
         if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
             let k = s.dim(1) * 64
             let bits = w.dim(1) * 32 / k
@@ -2346,8 +2398,6 @@ extension Qwen35TextModel: MTPCapable {
             _compactDraftHead = makeCompactDraftHead()
         }
         let padded = _compactDraftHead!(x)
-        // Padding exists only to retain qmv_fast's N % 8 shape. Removing it
-        // before argmax makes the duplicate rows semantically unreachable.
         return padded[0..., 0..., 0 ..< Self.compactDraftRealCount]
     }
 
@@ -2359,31 +2409,19 @@ extension Qwen35TextModel: MTPCapable {
     /// `mapDraftTokenIds` are unchanged and still serve the declared-head path
     /// and the untimed warm.
     public func draftTokenID(_ x: MLXArray) -> MLXArray {
-        // A declared `draft_lm_head` is full-vocabulary and needs no remap, so
-        // the fused path (which bakes in the compact bounds) does not apply.
+        // Two-matrix (declared or SVD-derived) and the compact head both live
+        // in the compact ID space and MUST keep the fused select. A full-vocab
+        // declared `draft_lm_head` is the only path that bails to argMax.
+        if let padded = twoMatrixDraftLogits(x) {
+            return fusedDraftSelect(padded)
+        }
         guard _draftHeadW == nil, usesCompactDraftVocabulary else {
             return argMax(applyDraftLMHead(x), axis: -1).asType(.int32)
         }
         if _compactDraftHead == nil {
             _compactDraftHead = makeCompactDraftHead()
         }
-        let padded = _compactDraftHead!(x)
-        let tgSize = 1024
-        let outputs = qwen35DraftSelectKernel(
-            [padded.reshaped([Self.compactDraftPaddedCount])],
-            template: [
-                ("REAL_COUNT", Self.compactDraftRealCount),
-                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                ("CONTROL_OFFSET",
-                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
-                ("TG_SIZE", tgSize),
-            ],
-            grid: (tgSize, 1, 1),
-            threadGroup: (tgSize, 1, 1),
-            outputShapes: [[1, 1]],
-            outputDTypes: [.int32]
-        )
-        return outputs[0]
+        return fusedDraftSelect(_compactDraftHead!(x))
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
@@ -2433,12 +2471,160 @@ extension Qwen35TextModel: MTPCapable {
             bias: full.bias.map(compactRows))
     }
 
+    private var hasTwoMatrixDraftHead: Bool {
+        (_draftHeadA != nil || _draftHeadAW != nil)
+            && (_draftHeadB != nil || _draftHeadBW != nil)
+    }
+
+    private func fusedDraftSelect(_ paddedLogits: MLXArray) -> MLXArray {
+        let tgSize = 1024
+        return qwen35DraftSelectKernel(
+            [paddedLogits.reshaped([Self.compactDraftPaddedCount])],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                ("CONTROL_OFFSET",
+                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ("TG_SIZE", tgSize),
+            ],
+            grid: (tgSize, 1, 1),
+            threadGroup: (tgSize, 1, 1),
+            outputShapes: [[1, 1]],
+            outputDTypes: [.int32]
+        )[0]
+    }
+
+    /// h1 = A·x, logits = B·h1, padded to `compactDraftPaddedCount`.
+    /// Builds the SVD factors on first use when none were declared.
+    private func twoMatrixDraftLogits(_ x: MLXArray) -> MLXArray? {
+        ensureLowRankDraftHead()
+        guard hasTwoMatrixDraftHead else { return nil }
+        let h1: MLXArray
+        if let a = _draftHeadA {
+            h1 = matmul(x, a.transposed())
+        } else if let w = _draftHeadAW, let s = _draftHeadAS, let z = _draftHeadAZ {
+            let k = s.dim(1) * 64
+            let bits = w.dim(1) * 32 / k
+            h1 = quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
+                groupSize: 64, bits: bits, mode: .affine)
+        } else {
+            return nil
+        }
+        if let b = _draftHeadB {
+            return matmul(h1, b.transposed())
+        }
+        if let w = _draftHeadBW, let s = _draftHeadBS, let z = _draftHeadBZ {
+            let k = s.dim(1) * 64
+            let bits = w.dim(1) * 32 / k
+            return quantizedMM(
+                h1, w, scales: s, biases: z, transpose: true,
+                groupSize: 64, bits: bits, mode: .affine)
+        }
+        return nil
+    }
+
+    private func ensureLowRankDraftHead() {
+        if _lowRankDraftResolved { return }
+        _lowRankDraftResolved = true
+        guard hasTwoMatrixDraftHead else { return }
+        var mats: [MLXArray] = []
+        if let a = _draftHeadA { mats.append(a) }
+        if let w = _draftHeadAW { mats.append(w) }
+        if let s = _draftHeadAS { mats.append(s) }
+        if let z = _draftHeadAZ { mats.append(z) }
+        if let b = _draftHeadB { mats.append(b) }
+        if let w = _draftHeadBW { mats.append(w) }
+        if let s = _draftHeadBS { mats.append(s) }
+        if let z = _draftHeadBZ { mats.append(z) }
+        eval(mats)
+    }
 
     /// Allocate a fresh KV cache for the MTP head layers.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
     public func makeMTPCache() -> [any KVCache] {
         guard let mtp else { return [] }
-        return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
+        return mtp.layers.map { _ in
+            // COMPILE-SHAPED. The head's per-draft step is replayed through
+            // `compile()` (see `compiledMTPDraftStep`), and `KVCacheSimple`
+            // cannot be traced: its `update()` returns `keys[..<offset]`, a
+            // slice whose size changes every step. `CompilableKVCache` returns
+            // the whole fixed buffer and lets the device-offset mask decide
+            // which rows are live, so every step has identical shapes.
+            //
+            // 2048 covers the ranked window (512 seed + 512 decode plus the
+            // speculative draft tail) with headroom, and it is preallocated in
+            // one shot, so the head cache never reallocates during scored
+            // decode. A mid-round reallocation would copy the whole KV history
+            // and — worse for the speculative pre-build — a build-time
+            // reallocation triggered by a discarded chain corrupts the cache
+            // reference. Allocation is shape-only, no numeric effect.
+            CompilableKVCache(maxLength: 2048, step: 1024) as any KVCache
+        }
+    }
+
+    /// A compiled single-step MTP draft, bound to `cache`.
+    ///
+    /// Maps `[hidden [1, 1, H], nextTokenIds [1, 1]]` to
+    /// `[lastHidden [1, 1, H], draftId [1, 1]]`, mutating the captured cache in
+    /// place. This is the chained sub-step of a draft round — the ~6 ms whose
+    /// host graph build and per-op launches dominate the ~1 ms of actual
+    /// bandwidth — collapsed into one replayed graph.
+    ///
+    /// The per-round history flush is deliberately NOT covered: it takes
+    /// `[1, M, H]` with a round-dependent M, so it would force a retrace on
+    /// nearly every round. It stays on the eager path.
+    ///
+    /// Returns nil when the head is absent or any layer's cache is not a
+    /// `CompilableKVCache`, in which case the caller keeps the eager path.
+    ///
+    /// - Precondition: the caller restates each cache's host offset mirror
+    ///   after every call (`setHostOffsetMirror`); a compiled replay advances
+    ///   the device offset without re-running `update()`'s Swift body.
+    public func compiledMTPDraftStep(
+        cache: [any KVCache]
+    ) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+        guard let mtp else { return nil }
+        guard !cache.isEmpty, cache.allSatisfy({ $0 is CompilableKVCache })
+        else { return nil }
+
+        // Materialize every lazily-derived tensor BEFORE the trace. The head's
+        // attention fuses its K/V weights on first use and the compact draft
+        // head is built on first use; anything first created inside the trace
+        // would be stored as a TRACER array and poison the module for every
+        // later call.
+        warmMTPHeadDerivedState()
+
+        let head = mtp
+        let embed = model.embedTokens
+        let captured = cache
+        let owner = self
+        return compile(inputs: captured, outputs: captured) { args in
+            let hidden = head(
+                hidden: args[0], nextTokenIds: args[1],
+                embedTokens: embed, cache: captured)
+            let last = hidden[
+                0..., (hidden.dim(1) - 1) ..< hidden.dim(1), 0...]
+            return [last, owner.draftTokenID(last)]
+        }
+    }
+
+    /// Run one throwaway head step so every lazily-built module tensor and
+    /// every JIT-compiled kernel on the head's draft path already exists.
+    /// Uses its own scratch cache, so no live cache state is touched.
+    private func warmMTPHeadDerivedState() {
+        guard let mtp else { return }
+        let scratch: [any KVCache] = mtp.layers.map { _ in
+            CompilableKVCache(maxLength: 8, step: 8) as any KVCache
+        }
+        let hidden = MLXArray.zeros(
+            [1, 1, configuration.hiddenSize], dtype: .bfloat16)
+        let tokens = MLXArray([Int32(0)]).reshaped([1, 1])
+        let out = mtp(
+            hidden: hidden, nextTokenIds: tokens,
+            embedTokens: model.embedTokens, cache: scratch)
+        let last = out[0..., (out.dim(1) - 1) ..< out.dim(1), 0...]
+        eval(draftTokenID(last))
     }
 }
 
@@ -2578,5 +2764,12 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+
+    /// See `Qwen35TextModel.compiledMTPDraftStep`.
+    public func compiledMTPDraftStep(
+        cache: [any KVCache]
+    ) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+        languageModel.compiledMTPDraftStep(cache: cache)
     }
 }

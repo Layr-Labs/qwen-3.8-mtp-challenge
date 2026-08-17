@@ -97,7 +97,7 @@ public class CompilableKVCache: BaseKVCache {
             self.keys![.ellipsis, ..<seqLen, 0...] = existingKeys
             self.values![.ellipsis, ..<seqLen, 0...] = existingValues
 
-            self.offsetArray = MLXArray([Int32(seqLen)])
+            self.offset = seqLen
         }
     }
 
@@ -106,12 +106,41 @@ public class CompilableKVCache: BaseKVCache {
     public override var offset: Int {
         get {
             // Materialize for compatibility with code that reads offset as Int.
-            // This triggers synchronous readback — avoid inside compiled paths.
+            // This triggers synchronous readback — avoid inside compiled paths;
+            // see `hostOffset` for the readback-free mirror.
             offsetArray[0].item(Int.self)
         }
         set {
-            offsetArray = MLXArray([Int32(newValue)])
+            super.offset = newValue
+            // In place: `compile()` re-reads `innerState()` each call and
+            // mutates those objects, so the offset array's identity is part
+            // of the contract with any compiled graph capturing this cache.
+            offsetArray._updateInternal(MLXArray([Int32(newValue)]))
         }
+    }
+
+    /// Host-side mirror of `offsetArray`, readable without a GPU round trip.
+    ///
+    /// `offset` reads the device value back with `.item()`, which is a
+    /// synchronous sync point: a caller that needs the row count once per
+    /// decode step (trim arithmetic, the base position of the next write)
+    /// would stall the host on the whole submitted graph every step. The
+    /// mirror is maintained by `update()`, the `offset` setter, `trim` and
+    /// `state` — i.e. by every EAGER mutation.
+    ///
+    /// It is NOT maintained by a step replayed through `compile()`: the tracer
+    /// runs the traced closure once, not once per call, so `update()`'s Swift
+    /// body does not re-run and only the device offset advances. Drivers of a
+    /// compiled step restate the mirror with `setHostOffsetMirror`; drivers
+    /// that do not simply keep reading `offset`, whose meaning is unchanged.
+    public var hostOffset: Int { super.offset }
+
+    /// Restate `hostOffset` WITHOUT touching `offsetArray`, for a caller
+    /// driving compiled steps that advance the device offset on their own.
+    /// This SETS rather than increments precisely so the tracing call, which
+    /// does run `update()`'s body, cannot double-count.
+    public func setHostOffsetMirror(_ value: Int) {
+        super.offset = value
     }
 
     public override func innerState() -> [MLXArray] {
@@ -147,6 +176,7 @@ public class CompilableKVCache: BaseKVCache {
             dynamicSliceUpdate(self.values!, update: newValues, start: prev, axes: [2]))
 
         self.offsetArray._updateInternal(newOffset)
+        super.offset += nTokens
 
         // OVERFLOW BIN: return the full static-size buffer.
         // The attention mask from makeMask() handles which positions are valid.
@@ -228,7 +258,7 @@ public class CompilableKVCache: BaseKVCache {
             self.values = MLXArray.zeros([B, H, maxLength, vD], dtype: newValue[1].dtype)
             self.keys![.ellipsis, ..<seqLen, 0...] = newValue[0]
             self.values![.ellipsis, ..<seqLen, 0...] = newValue[1]
-            self.offsetArray = MLXArray([Int32(seqLen)])
+            self.offset = seqLen
         }
     }
 
@@ -236,10 +266,20 @@ public class CompilableKVCache: BaseKVCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let current: Int = offsetArray[0].item(Int.self)
-        let trimmed = min(current, n)
-        offsetArray = MLXArray([Int32(current - trimmed)])
-        super.offset = current - trimmed
+        guard n > 0 else { return 0 }
+        // MUTATE, do not replace. A compiled graph captures this cache's
+        // `innerState()` arrays and mutates them in place, so the offset
+        // array's identity is part of the contract: handing the cache a fresh
+        // object after a speculative rollback would leave the compiled step
+        // writing at a position the cache no longer believes in.
+        //
+        // Both the clamp and the subtraction stay ON DEVICE, so trimming costs
+        // no readback and stays correct even for a caller whose host mirror is
+        // behind (a compiled driver that has not restated it).
+        offsetArray._updateInternal(
+            maximum(offsetArray - MLXArray([Int32(n)]), MLXArray([Int32(0)])))
+        let trimmed = min(super.offset, n)
+        super.offset -= trimmed
         return trimmed
     }
 
@@ -248,6 +288,7 @@ public class CompilableKVCache: BaseKVCache {
         c.keys = keys
         c.values = values
         c.offsetArray = offsetArray
+        c.setHostOffsetMirror(hostOffset)
         return c
     }
 

@@ -155,6 +155,26 @@ public final class Qwen36MTPBlockSession {
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
+    /// Pre-built next-round draft chain, produced during the current round's
+    /// verify eval by speculating FULL acceptance. Adopted (and truncated to the
+    /// fresh cost-model depth) at the next round's draft phase; discarded — with
+    /// the head cache trimmed back — on a partial accept. `draftIdArrays` are
+    /// device-resident lazy arrays, so a discarded chain costs only the host
+    /// build time already spent, and the head cache was preallocated
+    /// (step 1024) so a speculative build can never reallocate it.
+    private struct PrebuiltDraftChain {
+        var draftIdArrays: [MLXArray]
+        var validHistoryOffset: Int
+        var lastDraftHidden: MLXArray
+    }
+    private var prebuiltDraftChain: PrebuiltDraftChain?
+
+    /// The compiled fixed-shape head draft step, bound to `headHistoryCache`.
+    /// Built lazily on first use — the trace captures the cache's
+    /// `innerState()`, which is empty until the round's history flush has
+    /// allocated the K/V buffers — and torn down with the cache it captures.
+    private var compiledHeadStep: (@Sendable ([MLXArray]) -> [MLXArray])?
+
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
     public private(set) var roundCount = 0
@@ -287,6 +307,29 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+
+        // COMPILED HEAD STEP. Build and run the compiled draft step against a
+        // throwaway cache so the trace, the graph compilation and every kernel
+        // it JITs happen here rather than inside the first scored round. The
+        // live closure is still built per head cache (it captures the cache
+        // objects), but only the cheap re-trace remains by then.
+        let compileWarmCache = model.makeMTPCache()
+        _ = model.mtpHeadHiddenForward(
+            hidden: MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+            nextTokenIds: MLXArray([Int32(0)]).reshaped([1, 1]),
+            cache: compileWarmCache)
+        eval(compileWarmCache.flatMap { $0.state })
+        if let warmStep = model.compiledMTPDraftStep(cache: compileWarmCache) {
+            var warmHidden = MLXArray.zeros([1, 1, hDim], dtype: row.dtype)
+            var warmToken = MLXArray([Int32(0)]).reshaped([1, 1])
+            for _ in 0 ..< 2 {
+                let outputs = warmStep([warmHidden, warmToken])
+                warmHidden = outputs[0]
+                warmToken = outputs[1]
+                eval(outputs)
+            }
+        }
+
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
@@ -526,7 +569,7 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    private static let headStepCostRatio = 0.20
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -558,7 +601,7 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
+    private static let sdpaWidthWallDepthCap = 4
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
@@ -566,7 +609,7 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    private static let segmentedStreakGate = 0
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -592,10 +635,6 @@ public final class Qwen36MTPBlockSession {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
@@ -815,84 +854,118 @@ public final class Qwen36MTPBlockSession {
         //    forward. Only the last row's logits are projected through the
         //    lm_head. Deeper sub-steps chain the head's OWN post-`mtp.norm`
         //    hidden exactly as before.
+        //
+        //    PREBUILD PATH: the previous round speculatively pre-built this
+        //    round's head chain during its verify eval, assuming FULL acceptance.
+        //    When that speculation held, `prebuiltDraftChain` is set and we adopt
+        //    it directly — the ~2.4 ms/step host build time was already spent
+        //    under the previous verify, so this round's host overlaps its own
+        //    verify instead of paying for the draft graph. When it did not hold,
+        //    the field is nil and this round rebuilds fresh, exactly as before.
         let headCache: [any KVCache]
-        var flushHidden: [MLXArray] = []
-        var flushTokens: [Int] = []
-        if let existing = headHistoryCache {
-            headCache = existing
-        } else {
-            let fresh = model.makeMTPCache()
-            headHistoryCache = fresh
-            headCache = fresh
-            if let seedHidden = seedHiddenForPriming,
-               seedTokensForPriming.count > 1
-            {
-                // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
-                // tokens 1..L-1 (hidden at t predicts alongside token t+1).
-                let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
+        var draftIdArrays: [MLXArray]
+        var validHistoryOffset: Int
+        if let prebuilt = prebuiltDraftChain {
+            prebuiltDraftChain = nil
+            // Invariant: a pre-built chain is only ever produced with an
+            // established head cache, so `headHistoryCache` is non-nil here.
+            headCache = headHistoryCache!
+            draftIdArrays = prebuilt.draftIdArrays
+            validHistoryOffset = prebuilt.validHistoryOffset
+            // The pre-built chain is a prefix built to the PREVIOUS round's
+            // depth. Truncate to this round's fresh cost-model depth (the
+            // head's greedy proposals are independent of the depth decision,
+            // so a prefix is exact), or extend it when the fresh depth grew
+            // past the speculation — chaining from the last pre-built hidden,
+            // byte-identical to the non-prebuilt path's step loop.
+            if draftIdArrays.count > draftCount {
+                draftIdArrays = Array(draftIdArrays.prefix(draftCount))
+            } else {
+                var draftHidden = prebuilt.lastDraftHidden
+                var draftId = draftIdArrays[draftIdArrays.count - 1]
+                while draftIdArrays.count < draftCount {
+                    (draftHidden, draftId) = headDraftStep(
+                        hidden: draftHidden, tokenIds: draftId, cache: headCache)
+                    draftIdArrays.append(draftId)
+                }
             }
-            seedHiddenForPriming = nil
-            seedTokensForPriming = []
-        }
-        if !headHistoryBacklogHidden.isEmpty {
-            flushHidden.append(contentsOf: headHistoryBacklogHidden)
-            flushTokens.append(contentsOf: headHistoryBacklogTokens)
-            headHistoryBacklogHidden.removeAll(keepingCapacity: true)
-            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
-        }
-        flushHidden.append(hidden)
-        flushTokens.append(primary)
+        } else {
+            var flushHidden: [MLXArray] = []
+            var flushTokens: [Int] = []
+            if let existing = headHistoryCache {
+                headCache = existing
+            } else {
+                let fresh = model.makeMTPCache()
+                headHistoryCache = fresh
+                headCache = fresh
+                // The compiled step captures the cache objects it was built
+                // against; a new cache invalidates it.
+                compiledHeadStep = nil
+                if let seedHidden = seedHiddenForPriming,
+                   seedTokensForPriming.count > 1
+                {
+                    // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
+                    // tokens 1..L-1 (hidden at t predicts alongside token t+1).
+                    let primeCount = seedTokensForPriming.count - 1
+                    flushHidden.append(
+                        model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+                    flushTokens.append(contentsOf: seedTokensForPriming[1...])
+                }
+                seedHiddenForPriming = nil
+                seedTokensForPriming = []
+            }
+            if !headHistoryBacklogHidden.isEmpty {
+                flushHidden.append(contentsOf: headHistoryBacklogHidden)
+                flushTokens.append(contentsOf: headHistoryBacklogTokens)
+                headHistoryBacklogHidden.removeAll(keepingCapacity: true)
+                headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+            }
+            flushHidden.append(hidden)
+            flushTokens.append(primary)
 
-        let draftBase = headCache.first?.offset ?? 0
-        // Every flushed position is committed history plus the (pendingHidden,
-        // primary) row — primary commits unconditionally — so all of them stay
-        // valid whatever the verify decides. Deeper drafted positions are
-        // speculative and are trimmed after the round (MTPLX
-        // `_rollback_mtp_cache(cycle_offset + 1)`).
-        let validHistoryOffset = draftBase + flushTokens.count
-        let draftInputHidden =
-            flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
-        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
-            .reshaped([1, flushTokens.count])
+            let draftBase = Self.headCacheOffset(headCache)
+            // Every flushed position is committed history plus the (pendingHidden,
+            // primary) row — primary commits unconditionally — so all of them stay
+            // valid whatever the verify decides. Deeper drafted positions are
+            // speculative and are trimmed after the round (MTPLX
+            // `_rollback_mtp_cache(cycle_offset + 1)`).
+            validHistoryOffset = draftBase + flushTokens.count
+            let draftInputHidden =
+                flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
+            let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
+                .reshaped([1, flushTokens.count])
 
-        // Draft ids stay ON DEVICE and chain straight into the verify input —
-        // no host readback between the head forward and the verify forward
-        // (MTPLX batched_decode: the draft id is an mx.array stacked into the
-        // verify block; the ledger reads the values from the round's single
-        // batched eval afterwards). `asyncEval` submits the head chain so the
-        // GPU works while the host builds the 64-layer verify graph.
-        // (Per-step asyncEval was tried here and measured NEUTRAL — the
-        // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
-        // idea.md V6 journal. Single submission after the loop, as before.)
-        var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
+            // Draft ids stay ON DEVICE and chain straight into the verify input —
+            // no host readback between the head forward and the verify forward
+            // (MTPLX batched_decode: the draft id is an mx.array stacked into the
+            // verify block; the ledger reads the values from the round's single
+            // batched eval afterwards). `asyncEval` submits the head chain so the
+            // GPU works while the host builds the 64-layer verify graph.
+            var ids: [MLXArray] = []
+            let headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
-        draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache)
+            var draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
-            draftIdArrays.append(draftId)
+            var draftId = model.draftTokenID(draftHidden)
+            ids.append(draftId)
+            // Early submission of the FIRST head step: its graph exists ~2.4 ms
+            // before the rest of the chain is built, and unlike the per-step
+            // variant (measured neutral — nothing but build time between steps)
+            // the first step carries the history flush, which IS real GPU work
+            // the device can start while the host builds steps 2..d.
+            asyncEval(draftId)
+            for _ in 1 ..< draftCount {
+                (draftHidden, draftId) = headDraftStep(
+                    hidden: draftHidden, tokenIds: draftId, cache: headCache)
+                ids.append(draftId)
+            }
+            asyncEval(ids[ids.count - 1])
+            draftIdArrays = ids
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -931,7 +1004,66 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        // Submit the verify to the GPU, then overlap this round's blocking read
+        // with the NEXT round's head-chain build (speculating FULL acceptance).
+        // The trim must land before the speculative build so the build reads the
+        // correct post-round offset. A wrong speculation is a discarded graph —
+        // the head only proposes, so it can never change an emitted token.
+        asyncEval(cache.flatMap { $0.state } + bundle)
+        Self.trimTrimmable(headCache, to: validHistoryOffset)
+        do {
+            // Next round's inputs under full acceptance, as device-resident lazy
+            // arrays: primary = bonus-row argmax, hidden = last verify row, and
+            // the accepted draft transitions as the history flush.
+            var nextFlushHidden: [MLXArray] = []
+            var nextFlushTokens: [MLXArray] = []
+            nextFlushHidden.reserveCapacity(draftCount + 1)
+            nextFlushTokens.reserveCapacity(draftCount + 1)
+            for i in 0 ..< draftCount {
+                nextFlushHidden.append(hiddenRow(verifyHidden, i))
+                nextFlushTokens.append(draftIdArrays[i])
+            }
+            nextFlushHidden.append(hiddenRow(verifyHidden, verifyHidden.dim(1) - 1))
+            nextFlushTokens.append(
+                top2IDs[draftCount, 0].reshaped([1, 1]))
+            let nextDraftBase = Self.headCacheOffset(headCache)
+            let nextValidHistoryOffset = nextDraftBase + nextFlushTokens.count
+            let nextInputHidden =
+                nextFlushHidden.count == 1
+                ? nextFlushHidden[0]
+                : concatenated(nextFlushHidden, axis: 1)
+            let nextInputTokens = concatenated(nextFlushTokens, axis: 1)
+            var nextIds: [MLXArray] = []
+            let nextHeadHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: nextInputHidden, nextTokenIds: nextInputTokens,
+                cache: headCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: nextInputHidden, nextTokenIds: nextInputTokens,
+                    cache: headCache)
+            var nextDraftHidden = nextHeadHidden[
+                0..., (nextHeadHidden.dim(1) - 1) ..< nextHeadHidden.dim(1), 0...]
+            var nextDraftId = model.draftTokenID(nextDraftHidden)
+            nextIds.append(nextDraftId)
+            // Pre-build only as many next-round steps as THIS round actually
+            // drafted. Building to the offered depth (8) on a round that
+            // drafted 2 leaves 5-6 dead speculative head steps whose cache
+            // writes still materialise when the next round's flush reads the
+            // whole head-cache state — pure waste on the hard prompts that set
+            // the median. When the next round's fresh depth grows past this,
+            // the adoption path extends the chain from `lastDraftHidden`.
+            let prebuiltMaxDepth = Swift.min(draftCount, Qwen36MTPLimits.maxDepth)
+            for _ in 1 ..< prebuiltMaxDepth {
+                (nextDraftHidden, nextDraftId) = headDraftStep(
+                    hidden: nextDraftHidden, tokenIds: nextDraftId,
+                    cache: headCache)
+                nextIds.append(nextDraftId)
+            }
+            prebuiltDraftChain = PrebuiltDraftChain(
+                draftIdArrays: nextIds,
+                validHistoryOffset: nextValidHistoryOffset,
+                lastDraftHidden: nextDraftHidden)
+        }
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
@@ -1035,16 +1167,23 @@ public final class Qwen36MTPBlockSession {
 
         if Self.traceRounds { tCommitDone = DispatchTime.now().uptimeNanoseconds }
 
-        // Head-history upkeep. Trim the speculative deeper-draft rows back to
-        // the valid prefix, then queue the ACCEPTED transitions for the next
-        // drafting round's flush: row i of the verify output is the trunk
-        // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
-        // committed pair. The rejecting round queues nothing — the next
-        // round's own (pendingHidden, primary) row covers that transition.
-        Self.trimTrimmable(headCache, to: validHistoryOffset)
-        for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
-            headHistoryBacklogTokens.append(drafts[index])
+        // Head-history upkeep. On FULL acceptance the pre-built next-round chain
+        // already flushed the accepted transitions (and advanced the head cache
+        // past them), so nothing is trimmed and nothing is queued. On PARTIAL
+        // acceptance the pre-built chain is wrong: discard it, trim the head
+        // cache back to the committed boundary, and queue the accepted
+        // transitions for the next round's fresh build. Row i of the verify
+        // output is the trunk hidden at draft i's position, so
+        // (hiddenRow(i), drafts[i]) is the committed pair.
+        if acceptedCount == drafts.count {
+            // Full acceptance: the pre-built chain stands.
+        } else {
+            prebuiltDraftChain = nil
+            Self.trimTrimmable(headCache, to: validHistoryOffset)
+            for index in 0 ..< acceptedCount {
+                headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+                headHistoryBacklogTokens.append(drafts[index])
+            }
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
@@ -1243,14 +1382,76 @@ public final class Qwen36MTPBlockSession {
         }
     }
 
+    /// One chained head draft step: `(hidden [1, 1, H], tokenIds [1, 1])` in,
+    /// `(lastHidden [1, 1, H], draftId [1, 1])` out, with the head cache
+    /// advanced by one row.
+    ///
+    /// Runs through the compiled closure whenever the head cache is traceable,
+    /// which is once the round's history flush has allocated its K/V buffers —
+    /// before that `innerState()` is just the offset and a trace would capture
+    /// the buffers as tracer arrays. The eager fallback is the exact same
+    /// expression, so a session that never compiles is unchanged.
+    ///
+    /// The head only PROPOSES: every token here is re-decided by the target,
+    /// so nothing on this path can move an emitted token.
+    private func headDraftStep(
+        hidden: MLXArray, tokenIds: MLXArray, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        if compiledHeadStep == nil,
+           cache.allSatisfy({ ($0 as? CompilableKVCache)?.keys != nil })
+        {
+            compiledHeadStep = model.compiledMTPDraftStep(cache: cache)
+            if Self.traceRounds {
+                Self.traceWrite(
+                    "mtp-trace compiled-head-step="
+                        + "\(compiledHeadStep == nil ? "unavailable" : "built")\n")
+            }
+        }
+        if let step = compiledHeadStep {
+            // Restate the host offset mirror around the call: the compiled
+            // replay advances the DEVICE offset without re-running
+            // `update()`'s Swift body, so the mirror the trim arithmetic and
+            // the flush base read from would otherwise freeze at trace time.
+            let before = Self.headCacheOffset(cache)
+            let outputs = step([hidden, tokenIds])
+            for entry in cache {
+                (entry as? CompilableKVCache)?.setHostOffsetMirror(before + 1)
+            }
+            return (outputs[0], outputs[1])
+        }
+        let headHidden = model.mtpHeadHiddenForward(
+            hidden: hidden, nextTokenIds: tokenIds, cache: cache)
+        let draftHidden = headHidden[
+            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        return (draftHidden, model.draftTokenID(draftHidden))
+    }
+
     /// Trim every trimmable cache in the stack back to `offset`. Used on the
     /// persistent head-history cache to discard speculative deeper-draft rows
-    /// after a round (the head stack is all `KVCacheSimple`).
+    /// after a round (the head stack is all `CompilableKVCache`, whose `offset`
+    /// answers from its host mirror — no readback inside the round).
     private static func trimTrimmable(_ cache: [any KVCache], to offset: Int) {
         for entry in cache where entry.isTrimmable {
-            let extra = entry.offset - offset
+            let extra = headCacheOffset(entry) - offset
             if extra > 0 { _ = entry.trim(extra) }
         }
+    }
+
+    /// The head cache's row count WITHOUT a device readback.
+    ///
+    /// `CompilableKVCache.offset` materialises `offsetArray` with `.item()`,
+    /// which would put a synchronous GPU sync in the middle of a round — the
+    /// exact thing this round is built to avoid (one blocking eval, at the
+    /// end). Its host mirror carries the same value; `headDraftStep` restates
+    /// the mirror after each compiled step, which is the one mutation the
+    /// mirror cannot see for itself.
+    private static func headCacheOffset(_ entry: any KVCache) -> Int {
+        (entry as? CompilableKVCache)?.hostOffset ?? entry.offset
+    }
+
+    private static func headCacheOffset(_ cache: [any KVCache]) -> Int {
+        guard let first = cache.first else { return 0 }
+        return headCacheOffset(first)
     }
 
     /// Offset of the first trimmable (global-attention) cache — the sequence
