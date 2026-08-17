@@ -1874,7 +1874,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[i], nConfirmed: nConfirmed)
             if ladderActive {
                 if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
+                    if i == 0 || i % 4 == 3 {
                         asyncEval(hiddenStates)
                     }
                 } else {
