@@ -1838,20 +1838,25 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
+          // 2+2+2+2, not 3+3+2 (the previous frontier) or 4+4. M = 8 is the hot
+          // width whose splits are register-cliff sensitive: 4+4 needs two
+          // simultaneous vec<float,4> accumulators in every active worker, and
+          // 3+3+2 still pays for TWO vec<float,3> accumulators — Metal has no
+          // native three-lane vector, so each vec3 reserves a padded 16-byte
+          // lane and wastes a quarter of its registers. IPG = 2 is the only M = 8
+          // split built entirely from native vec2 lanes (8 % 2 == 0, no tail),
+          // which measures CHEAPER than 3+3+2 on Apple Silicon.
           // Exact: these lanes carry INDEPENDENT input rows and are never reduced
           // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
+          // one lane group to another cannot reorder its scalar chain. Template
+          // admits it: M in [3,9], 8 % 2 == 0 (no one-row tail), IPG 2 inside
+          // the wide helper's [2,4].
+          // Receipts: 85d5bca3 2.91143 and yzxoi 2.92675 established the width-8
+          // cliff (4+4 -> 3+3+2); interleaved forced-width A/B on the 2.9534
+          // frontier extends it 3+3+2 -> 2+2+2+2 (two consistent ~0.3% pairs).
           // SYNERGY with the streak gate above, which is why they ship together:
           // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
