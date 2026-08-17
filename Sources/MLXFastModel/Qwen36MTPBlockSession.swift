@@ -494,7 +494,7 @@ public final class Qwen36MTPBlockSession {
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
+        .map { 0.93 * pow(0.99, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
