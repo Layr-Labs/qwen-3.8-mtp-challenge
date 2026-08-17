@@ -1851,7 +1851,8 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4>(
+          // Public PR #256: 3+3+2 avoids the M=8 four-lane register cliff.
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
