@@ -965,7 +965,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
 // footprint stays near the two-input kernel's. load_vector, the qdot
 // expression, the K accumulation order and simd_sum are unchanged for every
 // output element.
-template <typename T, int NA>
+template <typename T, int NA, bool DIRECT_NIBBLES = false>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     const device uint32_t* w,
     const device T* scales,
@@ -1019,17 +1019,34 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         const device T* xm = x + (first_m + m) * in_vec_size + k +
             simd_lid * values_per_thread + 4 * i;
         thread float xc[4];
-        sums[m] += load_vector<T, float, 4, 4>(xm, xc);
+        if (DIRECT_NIBBLES) {
+          xc[0] = static_cast<float>(xm[0]);
+          xc[1] = static_cast<float>(xm[1]);
+          xc[2] = static_cast<float>(xm[2]);
+          xc[3] = static_cast<float>(xm[3]);
+          // Preserve the incumbent BF16 expression tree used for the affine
+          // bias correction; only the qdot nibble extraction changes.
+          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+        } else {
+          sums[m] += load_vector<T, float, 4, 4>(xm, xc);
+        }
         a0[m] = xc[0];
         a1[m] = xc[1];
         a2[m] = xc[2];
         a3[m] = xc[3];
       }
       for (int r = 0; r < rows_per_simd; r++) {
-        partial[r] += (a0 * (packed[r][i] & 0x000f) +
-                       a1 * (packed[r][i] & 0x00f0) +
-                       a2 * (packed[r][i] & 0x0f00) +
-                       a3 * (packed[r][i] & 0xf000));
+        if (DIRECT_NIBBLES) {
+          partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                         a1 * ((packed[r][i] >> 4) & 0x000f) +
+                         a2 * ((packed[r][i] >> 8) & 0x000f) +
+                         a3 * ((packed[r][i] >> 12) & 0x000f));
+        } else {
+          partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                         a1 * (packed[r][i] & 0x00f0) +
+                         a2 * (packed[r][i] & 0x0f00) +
+                         a3 * (packed[r][i] & 0xf000));
+        }
       }
     }
     for (int r = 0; r < rows_per_simd; r++) {
@@ -1050,7 +1067,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 
 // IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
 // with the remainder spread evenly so no group runs a one-row tail.
-template <typename T, int M, int IPG>
+template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
     const device uint32_t* w,
     const device T* scales,
@@ -1071,11 +1088,12 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
   const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
   if (TAIL == 0 || M - first_m >= IPG) {
-    qmv_fast_crossrow_affine4_g64_wide<T, IPG>(
+    qmv_fast_crossrow_affine4_g64_wide<T, IPG, DIRECT_NIBBLES>(
         w, scales, biases, x, y, in_vec_size, out_vec_size,
         first_m, out_row, simd_lid);
   } else {
-    qmv_fast_crossrow_affine4_g64_wide<T, (TAIL >= 2 ? TAIL : 2)>(
+    qmv_fast_crossrow_affine4_g64_wide<
+        T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
         w, scales, biases, x, y, in_vec_size, out_vec_size,
         first_m, out_row, simd_lid);
   }
@@ -1828,7 +1846,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64_m<T, 6, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1856,7 +1874,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 9:
-          qmv_fast_crossrow_affine4_g64_m<T, 9, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
