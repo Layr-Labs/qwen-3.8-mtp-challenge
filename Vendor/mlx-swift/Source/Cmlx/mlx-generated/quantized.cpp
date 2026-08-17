@@ -1112,6 +1112,47 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+// M = 7 custom grouping: 3+2+2, not 4+3. The M = 7 arm of the M = 8
+// register-cliff fix above: the 4+3 dispatch still runs one vec<float,4>
+// accumulator bank per worker (M = 7 profiles 319 us vs M = 9's 216 us in
+// the public cross-row study despite LESS work). No even IPG reaches 3+2+2
+// (7 % 3 == 1 and 7 % 2 == 1 both trip the one-row-tail assert), so the
+// fixed-stride first_m = tid.x * IPG model cannot express it; this
+// dispatcher keys the three uneven groups directly on tid.x instead.
+// Exactness is the same row-independence argument: lanes carry INDEPENDENT
+// input rows and are never reduced across (simd_sum reduces along K WITHIN
+// a row), and every row keeps the wide helper's arithmetic unchanged --
+// same weights/scales/biases indexing, same K accumulation order -- so
+// moving rows between vector lanes cannot reorder any row's scalar chain.
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m7(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+  const int group = int(tid.x);
+  if (group == 0) {
+    qmv_fast_crossrow_affine4_g64_wide<T, 3, true>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        0, out_row, simd_lid);
+  } else if (group == 1) {
+    qmv_fast_crossrow_affine4_g64_wide<T, 2, true>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        3, out_row, simd_lid);
+  } else if (group == 2) {
+    qmv_fast_crossrow_affine4_g64_wide<T, 2, true>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        5, out_row, simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1844,17 +1885,17 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 3:
-          qmv_fast_crossrow_affine4_g64_m<T, 3, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 4:
-          qmv_fast_crossrow_affine4_g64_m<T, 4, 4>(
+          qmv_fast_crossrow_affine4_g64_m<T, 4, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1864,7 +1905,12 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 7:
-          qmv_fast_crossrow_affine4_g64_m<T, 7, 4>(
+          // 3+2+2, not 4+3 -- the M = 7 arm of the M = 8 register-cliff fix;
+          // see qmv_fast_crossrow_affine4_g64_m7 above for the rationale and
+          // the row-independence exactness argument. The .metal/.h and
+          // mlx-generated/quantized.cpp twins must stay byte-identical in
+          // this region.
+          qmv_fast_crossrow_affine4_g64_m7<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
