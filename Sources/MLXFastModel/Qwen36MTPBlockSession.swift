@@ -566,34 +566,7 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    /// 2, not 3 — the FOURTH restore of this literal, and it has still never
-    /// lost on its merits.
-    ///
-    /// Ranked history: newjordan 2.91995 (PROMOTED, then reverted by a later
-    /// archive that happened to carry 3); hadakang 2.92976 against the 2.92622
-    /// frontier of its day (beat its contemporary crown, lost the race); and my
-    /// own `4650c96e` scored 2.93524 against the 2.93429 base it was built on
-    /// (+0.03%) and again lost only because the crown moved to 2.94662 while it
-    /// validated. Three independent runs, three times ahead of its own base.
-    ///
-    /// A fourth, independent line of evidence, from a negative result of mine.
-    /// I raised `headStepCostRatio` 0.18 -> 0.32 on the directly measured
-    /// marginal (`fc62d1aa`): it scored 2.84585, a clean -3% with the baseline
-    /// leg FLAT (0.038092 -> 0.038070, so not a draw artifact). It shortened
-    /// every draft — 4.35/4.89/5.78/5.33/5.04 -> 3.36/4.01/4.53/4.03/4.76 — and
-    /// candidate decode time ROSE 0.95%. **This pool rewards depth**: the
-    /// marginal draft is worth more than its verify row costs. With 0.15 (2.667)
-    /// and 0.14 (2.766) failing below, h is now bracketed on both sides and 0.18
-    /// is a true local optimum — so the way to buy depth is NOT the price.
-    ///
-    /// It is the cap, and that is what makes it safe. `h` moves the marginal
-    /// rule on EVERY round including the hard prompts (0.32 dragged prompt 6
-    /// from 0.17 drafts to 0.06). This gate is conditioned on OBSERVED perfect
-    /// acceptance and any reject resets `fullAcceptStreak` to 0, so it cannot
-    /// touch a cold or hard prompt at all — it only shortens the
-    /// re-qualification ramp on stretches the head is already proving. Gate 1 is
-    /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
-    private static let segmentedStreakGate = 2
+    private static let segmentedStreakGate = 3
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -943,14 +916,9 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        // Publish the post-norm block this verify forward already computes so
-        // accepted head-history rows do not each repeat the same row-local
-        // RMSNorm through applyFinalNorm. Conformers that return nil retain the
-        // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: verifyTokens),
-                cache: cache, nConfirmed: 1)
+        let (verifyLogits, verifyHidden) = model.callWithHidden(
+            input: LMInput.Text(tokens: verifyTokens),
+            cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -1007,8 +975,7 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(
-                verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
+            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1033,8 +1000,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(
-                    verifyHidden, verifyNormed, acceptedCount)
+                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1076,24 +1042,9 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        if acceptedCount > 0 {
-            // Keep accepted post-norm rows as one contiguous block. The backlog
-            // already supports multi-row blocks (seed priming uses one), while
-            // the token list remains flat and preserves the same row order.
-            if let block = normedRows(
-                verifyHidden, verifyNormed, 0 ..< acceptedCount)
-            {
-                headHistoryBacklogHidden.append(block)
-            } else {
-                // Preserve the exact pre-existing per-row normalization path
-                // whenever no matching published block is available.
-                for index in 0 ..< acceptedCount {
-                    headHistoryBacklogHidden.append(
-                        hiddenRow(verifyHidden, index))
-                }
-            }
-            headHistoryBacklogTokens.append(
-                contentsOf: drafts.prefix(acceptedCount))
+        for index in 0 ..< acceptedCount {
+            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+            headHistoryBacklogTokens.append(drafts[index])
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
@@ -1559,32 +1510,6 @@ public final class Qwen36MTPBlockSession {
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
         let row = hidden[0..., index ..< (index + 1), 0...]
         return postNorm ? model.applyFinalNorm(row) : row
-    }
-
-    /// Slice rows from a matching post-norm block when the verify forward
-    /// published one. RMSNorm reduces only over the final axis, so these are
-    /// the same values as normalizing each row again.
-    private func normedRows(
-        _ hidden: MLXArray, _ normed: MLXArray?, _ range: Range<Int>
-    ) -> MLXArray? {
-        guard postNorm, let normed,
-              hidden.ndim == 3, normed.ndim == 3,
-              normed.dim(0) == hidden.dim(0),
-              normed.dim(1) == hidden.dim(1),
-              normed.dim(2) == hidden.dim(2),
-              range.lowerBound >= 0,
-              range.upperBound <= normed.dim(1),
-              !range.isEmpty
-        else { return nil }
-        return normed[0..., range, 0...]
-    }
-
-    /// Any shape surprise falls back to the pre-existing per-row path.
-    private func hiddenRow(
-        _ hidden: MLXArray, _ normed: MLXArray?, _ index: Int
-    ) -> MLXArray {
-        normedRows(hidden, normed, index ..< (index + 1))
-            ?? hiddenRow(hidden, index)
     }
 
     private func lastRow(_ logits: MLXArray) -> MLXArray {
