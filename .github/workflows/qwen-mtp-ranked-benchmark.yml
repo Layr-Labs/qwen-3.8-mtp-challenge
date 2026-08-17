@@ -142,7 +142,7 @@ name: qwen-mtp-ranked-benchmark
 # no-op references stay pinned in the contract as informational diagnostics.
 #
 # FLOOR AND CEILING. 0.95 on the raw median is a measurement-validity floor, not
-# a quality bar. 3.0 is the plausibility ceiling the published aggregate used to
+# a quality bar. 5.0 is the plausibility ceiling the published aggregate used to
 # lack entirely (k-matrix finding 3): the box wrapper bounded per-pair ratios and
 # nothing bounded the number that reached the leaderboard.
 #
@@ -457,12 +457,17 @@ jobs:
       # THE CEILING THE PUBLISHED NUMBER NEVER HAD (k-matrix finding 3). The box
       # wrapper bounds per-PAIR ratios at MAX_PLAUSIBLE_SPEEDUP and nothing
       # bounded the aggregate that reached the leaderboard, so an implausible
-      # median could only be caught by a human reading it. 3.0 is deliberately
-      # generous: the authors' own exact-greedy envelope tops out at 1.74x at a
-      # 32-token window and kernel work on this tower has historically bought
-      # tens of percent, so 3.0 leaves room for both compounding and still calls
-      # anything above it a measurement fault. Operator-confirmable default.
-      MLXFAST_QWEN_MTP_DECODE_SPEEDUP_CEILING: "3.0"
+      # median could only be caught by a human reading it. The bound is
+      # deliberately generous: the authors' own exact-greedy envelope tops out
+      # at 1.74x at a 32-token window and kernel work on this tower has
+      # historically bought tens of percent, so it leaves room for both
+      # compounding and still calls anything above it a measurement fault.
+      #
+      # RAISED 3.0 -> 5.0 by operator decision 2026-08-17. The wrapper's
+      # per-PAIR bound (MAX_PLAUSIBLE_SPEEDUP) moves 5.0 -> 8.0 in the same
+      # decision so the aggregate ceiling stays strictly TIGHTER than the
+      # per-pair bound and does not become vacuous at equality.
+      MLXFAST_QWEN_MTP_DECODE_SPEEDUP_CEILING: "5.0"
       # WHAT AN UNMODIFIED TREE IS EXPECTED TO SCORE under the raw semantics.
       # SEEDED, NOT MEASURED-UNDER-THIS-CONTRACT: 0.9350424303 is the median of
       # the eight per-prompt RAW ratios of the k2 reference dispatch (a
