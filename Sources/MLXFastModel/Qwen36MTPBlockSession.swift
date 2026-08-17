@@ -177,20 +177,21 @@ public final class Qwen36MTPBlockSession {
         // that maximizes expected committed tokens per unit round time under
         // the round's measured economics:
         //
-        //   T(d) = V + Σ H_i      one width-(d+1) verify + d head steps
+        //   T(d) = V + d·H        one width-(d+1) verify + d head steps
         //   E[tokens](d) = 1 + Σ_{k=1..d} Π_{i<k} p_i
         //
         // where p_i is the EMA-estimated acceptance of draft position i GIVEN
-        // the prefix before it was accepted, and h_i = H_i/V is that draft
-        // row's marginal cost relative to the weight-stream-bound verify
-        // forward. Greedy marginal rule: extend to position k+1 exactly while
+        // the prefix before it was accepted, and h = H/V is the head step's
+        // cost relative to the weight-stream-bound verify forward (near-flat
+        // in width up to the qmv limit). Greedy marginal rule: extend to
+        // position k+1 exactly while
         //
-        //   Π_{i<=k+1} p_i  >  h_{k+1} · (1 + S_k) / (1 + Σ_{i<=k} h_i)
+        //   Π_{i<=k+1} p_i  >  h · (1 + S_k) / (1 + k·h)
         //
         // which is f(k+1) > f(k) rearranged. On hot prose (p→0.9) this runs
         // straight to the offer; on cold prompts it collapses to 1, and to a
         // free adaptive skip (0) only when even the first draft's odds are
-        // below h_1. The streak ladder's behavior is the degenerate one-EMA
+        // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
@@ -496,8 +497,8 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
-    /// h_i = (one head draft step) / (one batched verify forward). Derivation
-    /// from the campaign's
+    /// h = (one head draft step) / (one batched verify forward), the only
+    /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
     /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
     /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
@@ -525,15 +526,7 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    ///
-    /// FINAL M5 WIDTH FIT: interleaved forced-width rounds resolve the early
-    /// marginal at about 0.09 and rows 3-4 at about 0.17. Later rows retain the
-    /// promoted 0.18 fit. Keeping the cumulative cost in the denominator is
-    /// required when h varies: it compares each next row with the efficiency of
-    /// the exact prefix already selected.
-    private static let headStepCostRatios = [
-        0.09, 0.09, 0.17, 0.17, 0.18, 0.18, 0.18, 0.18,
-    ]
+    private static let headStepCostRatio = 0.18
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -573,7 +566,34 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    /// 2, not 3 — the FOURTH restore of this literal, and it has still never
+    /// lost on its merits.
+    ///
+    /// Ranked history: newjordan 2.91995 (PROMOTED, then reverted by a later
+    /// archive that happened to carry 3); hadakang 2.92976 against the 2.92622
+    /// frontier of its day (beat its contemporary crown, lost the race); and my
+    /// own `4650c96e` scored 2.93524 against the 2.93429 base it was built on
+    /// (+0.03%) and again lost only because the crown moved to 2.94662 while it
+    /// validated. Three independent runs, three times ahead of its own base.
+    ///
+    /// A fourth, independent line of evidence, from a negative result of mine.
+    /// I raised `headStepCostRatio` 0.18 -> 0.32 on the directly measured
+    /// marginal (`fc62d1aa`): it scored 2.84585, a clean -3% with the baseline
+    /// leg FLAT (0.038092 -> 0.038070, so not a draw artifact). It shortened
+    /// every draft — 4.35/4.89/5.78/5.33/5.04 -> 3.36/4.01/4.53/4.03/4.76 — and
+    /// candidate decode time ROSE 0.95%. **This pool rewards depth**: the
+    /// marginal draft is worth more than its verify row costs. With 0.15 (2.667)
+    /// and 0.14 (2.766) failing below, h is now bracketed on both sides and 0.18
+    /// is a true local optimum — so the way to buy depth is NOT the price.
+    ///
+    /// It is the cap, and that is what makes it safe. `h` moves the marginal
+    /// rule on EVERY round including the hard prompts (0.32 dragged prompt 6
+    /// from 0.17 drafts to 0.06). This gate is conditioned on OBSERVED perfect
+    /// acceptance and any reject resets `fullAcceptStreak` to 0, so it cannot
+    /// touch a cold or hard prompt at all — it only shortens the
+    /// re-qualification ramp on stretches the head is already proving. Gate 1 is
+    /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -589,9 +609,9 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
+        let h = Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
-        var cost = 1.0
         var depth = 0
         while depth < cap {
             var p = positionAcceptEMA[depth]
@@ -605,11 +625,9 @@ public final class Qwen36MTPBlockSession {
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let h = Self.headStepCostRatios[depth]
-            let threshold = h * (1.0 + expected) / cost
+            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
-            cost += h
             depth += 1
         }
         return depth
