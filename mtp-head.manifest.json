@@ -1,10 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
-  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
-  "bytes": 238934129,
+  "source_url": "hf:orangezh007/qwen38-mtp-head-ft@80e09b050c4772d7e76c2ca51d5aa7ea1c43d105",
+  "sha256": "65303002ab303a269892a8bad79e9c5d9c4904c7d1ca8821faa2dcf194c302c7",
+  "bytes": 238934113,
   "max_bytes": 2147483648,
-
-  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
+  "note": "Fine-tuned MTP head (rev v2-mixed): full-parameter distillation of the pinned bf16 head onto the deployed 4-bit trunk's hidden-state distribution, trained on a mixed corpus (1.9M tokens wikitext-103 prose + 850K tokens real Swift/Python source). Same recipe and export geometry as the v1-wiki revision at the parent commit of this repo's declaration history; the mixed corpus adds a measured +8.6% chain acceptance on code-domain held-out text on top of the prose gains. Shipped with a draft-depth cap of 6 (was 8) to trim thin-margin deep tails under the 3.0 plausibility ceiling. The head only proposes; every emitted token remains target-verified."
 }
