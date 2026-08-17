@@ -593,7 +593,7 @@ public final class Qwen36MTPBlockSession {
     /// touch a cold or hard prompt at all — it only shortens the
     /// re-qualification ramp on stretches the head is already proving. Gate 1 is
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
-    private static let segmentedStreakGate = 2
+    private static let segmentedStreakGate = 3
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
