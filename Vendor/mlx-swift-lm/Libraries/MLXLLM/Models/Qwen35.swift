@@ -2017,21 +2017,14 @@ public class Qwen35TextModelInner: Module {
 // value. See `applyDraftLMHead`'s doc comment for the same argument applied
 // to the compact row set (promoted 7b33621).
 //
-// It replaces SIX MLX primitives that existed only to turn a 98,336-wide row
-// into one integer:
-//     padded[0..., 0..., 0 ..< 98_330]     // slice off the fast-shape padding
-//     argMax(axis: -1)                     // uint32
-//     .asType(.int32)
-//     ids .< 98_304                        // mapDraftTokenIds
-//     ids + 149_740
-//     which(...)
-// Ordering is identical to `argMax`: strictly-greater value wins, an exact tie
-// goes to the LOWER id, and a NaN never beats a non-NaN. Bounding at
-// `REAL_COUNT` in the kernel is exactly what the pre-argmax slice did, so the
-// six duplicated padding rows stay unreachable even on a tie.
+// It replaces the generic compact-logits argmax/cast/remap chain. Ordering is
+// identical to `argMax`: strictly-greater value wins, an exact tie goes to the
+// LOWER compact id, and a NaN never beats a non-NaN. The selected rows are
+// ordered by target token id, so compact tie order is target tie order. The
+// final winner is translated through the prompt-specific token map.
 private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_select",
-    inputNames: ["logits"],
+    inputNames: ["logits", "token_map"],
     outputNames: ["token_id"],
     source: """
         uint thread_id = thread_position_in_threadgroup.x;
@@ -2088,10 +2081,7 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
                 }
             }
             if (simd_lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
+                token_id[0] = token_map[best_id];
             }
         }
     """,
@@ -2135,23 +2125,19 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftHeadS: MLXArray?
     private var _draftHeadZ: MLXArray?
 
-    // Input-independent compact copy of the loaded exact lm_head, used only
-    // for draft proposals when no declared draft_lm_head is present. It is not
-    // ModuleInfo because it is derived during warmup, not checkpoint state.
+    // Prompt-specific compact copy of the exact lm_head, used only for draft
+    // proposals. Its shape is fixed so the input-independent warm compiles the
+    // same QMV and selector variants used after seed-tail installation.
     private var _compactDraftHead: Linear?
-    // Prefix 98_304, the promoted trim. A 49_152 halving was measured on the
-    // public longcopy gate and REGRESSED: three of its committed argmax ids
-    // live in [49_152, 248_044), the head could no longer propose them, and
-    // the forced rejects cost more round-bases than the halved compact-head
-    // read saved (accept 1.00 -> 0.877, 21.1 -> 22.8 ms/token). The read is
-    // ~315 MB of affine-4 rows per draft step (~0.6 ms), so the ceiling of
-    // any further trim is small and the acceptance downside is not.
-    private static let compactDraftPrefixCount = 98_304
+    private var _compactDraftTokenMap: MLXArray?
+    private static let compactDraftPrefixCount = 49_152
+    private static let compactDraftContextSlots = 512
     private static let compactDraftControlStart = 248_044
     private static let compactDraftControlEnd = 248_070
     private static let compactDraftRealCount =
-        compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
-    private static let compactDraftPaddedCount = 98_336
+        compactDraftPrefixCount + compactDraftContextSlots
+        + compactDraftControlEnd - compactDraftControlStart
+    private static let compactDraftPaddedCount = 49_696
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2465,10 +2451,51 @@ extension Qwen35TextModel: MTPCapable {
         return model.embedTokens.asLinear(x)
     }
 
+    /// Install the fixed-shape proposal vocabulary for one seed. Common tokens
+    /// retain the low prefix; rare seed terms occupy sorted sparse tail slots;
+    /// official controls remain available. Unused and QMV-padding slots repeat
+    /// row zero, whose earlier compact index wins every exact tie.
+    public func configureDraftVocabulary(seedTokenIDs: [Int]) {
+        guard usesCompactDraftVocabulary else { return }
+        var seen = Set<Int>()
+        var contextTail: [Int] = []
+        for token in seedTokenIDs.reversed()
+        where token >= Self.compactDraftPrefixCount
+            && token < Self.compactDraftControlStart
+            && seen.insert(token).inserted
+        {
+            contextTail.append(token)
+            if contextTail.count == Self.compactDraftContextSlots { break }
+        }
+        contextTail.sort()
+
+        var tokenIDs = (0 ..< Self.compactDraftPrefixCount).map(Int32.init)
+        tokenIDs.append(contentsOf: contextTail.map(Int32.init))
+        tokenIDs.append(contentsOf: repeatElement(
+            Int32(0),
+            count: Self.compactDraftContextSlots - contextTail.count))
+        tokenIDs.append(contentsOf:
+            (Self.compactDraftControlStart ..< Self.compactDraftControlEnd)
+                .map(Int32.init))
+        tokenIDs.append(contentsOf: repeatElement(
+            Int32(0), count: Self.compactDraftPaddedCount - tokenIDs.count))
+        precondition(tokenIDs.count == Self.compactDraftPaddedCount)
+
+        let tokenMap = MLXArray(tokenIDs)
+        _compactDraftTokenMap = tokenMap
+        _compactDraftHead = makeCompactDraftHead(rowIndices: tokenMap)
+    }
+
+    private func ensureCompactDraftVocabulary() {
+        if _compactDraftHead == nil || _compactDraftTokenMap == nil {
+            configureDraftVocabulary(seedTokenIDs: [])
+        }
+    }
+
     /// Draft-only vocabulary projection: the declared head's coarser lm_head
     /// copy when it ships one (`draft_lm_head.*` in the declared head tree),
-    /// the exact lm_head otherwise. ONLY used to choose draft proposals —
-    /// never for ledger or verify values.
+    /// the prompt-augmented compact exact head otherwise. ONLY used to choose
+    /// draft proposals — never for ledger or verify values.
     public func applyDraftLMHead(_ x: MLXArray) -> MLXArray {
         if let w = _draftHeadW, let s = _draftHeadS, let z = _draftHeadZ {
             let k = s.dim(1) * 64
@@ -2478,9 +2505,7 @@ extension Qwen35TextModel: MTPCapable {
                 groupSize: 64, bits: bits, mode: .affine)
         }
         guard usesCompactDraftVocabulary else { return applyLMHead(x) }
-        if _compactDraftHead == nil {
-            _compactDraftHead = makeCompactDraftHead()
-        }
+        ensureCompactDraftVocabulary()
         let padded = _compactDraftHead!(x)
         // Padding exists only to retain qmv_fast's N % 8 shape. Removing it
         // before argmax makes the duplicate rows semantically unreachable.
@@ -2500,18 +2525,16 @@ extension Qwen35TextModel: MTPCapable {
         guard _draftHeadW == nil, usesCompactDraftVocabulary else {
             return argMax(applyDraftLMHead(x), axis: -1).asType(.int32)
         }
-        if _compactDraftHead == nil {
-            _compactDraftHead = makeCompactDraftHead()
-        }
+        ensureCompactDraftVocabulary()
         let padded = _compactDraftHead!(x)
         let tgSize = 1024
         let outputs = qwen35DraftSelectKernel(
-            [padded.reshaped([Self.compactDraftPaddedCount])],
+            [
+                padded.reshaped([Self.compactDraftPaddedCount]),
+                _compactDraftTokenMap!,
+            ],
             template: [
                 ("REAL_COUNT", Self.compactDraftRealCount),
-                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                ("CONTROL_OFFSET",
-                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
                 ("TG_SIZE", tgSize),
             ],
             grid: (tgSize, 1, 1),
@@ -2522,16 +2545,12 @@ extension Qwen35TextModel: MTPCapable {
         return outputs[0]
     }
 
-    /// Map compact draft IDs back to the tokenizer's full ID space without a
-    /// host readback. The low `compactDraftPrefixCount` rows retain their
-    /// IDs; the appended rows are Qwen's official text/control tokens
-    /// 248,044 ... 248,069.
+    /// Map compact proposal IDs through the same prompt-specific row map used
+    /// by the fused selector. Full-vocabulary proposal heads pass through.
     public func mapDraftTokenIds(_ ids: MLXArray) -> MLXArray {
         guard usesCompactDraftVocabulary else { return ids }
-        return which(
-            ids .< Self.compactDraftPrefixCount,
-            ids,
-            ids + (Self.compactDraftControlStart - Self.compactDraftPrefixCount))
+        ensureCompactDraftVocabulary()
+        return take(_compactDraftTokenMap!, ids)
     }
 
     private var usesCompactDraftVocabulary: Bool {
@@ -2539,19 +2558,13 @@ extension Qwen35TextModel: MTPCapable {
             && lmHead != nil && _draftHeadW == nil
     }
 
-    private func makeCompactDraftHead() -> Linear {
+    private func makeCompactDraftHead(rowIndices: MLXArray) -> Linear {
         guard let full = lmHead else {
             fatalError("compact draft vocabulary requires an untied lm_head")
         }
 
         func compactRows(_ array: MLXArray) -> MLXArray {
-            let prefix = array[0 ..< Self.compactDraftPrefixCount]
-            let controls = array[
-                Self.compactDraftControlStart ..< Self.compactDraftControlEnd]
-            let paddingCount =
-                Self.compactDraftPaddedCount - Self.compactDraftRealCount
-            let padding = array[0 ..< paddingCount]
-            return concatenated([prefix, controls, padding], axis: 0)
+            take(array, rowIndices, axis: 0)
         }
 
         if let quantized = full as? QuantizedLinear {
@@ -2697,6 +2710,11 @@ extension Qwen35Model: MTPCapable {
     /// See `Qwen35TextModel.applyLMHead`.
     public func applyLMHead(_ x: MLXArray) -> MLXArray {
         languageModel.applyLMHead(x)
+    }
+
+    /// See `Qwen35TextModel.configureDraftVocabulary`.
+    public func configureDraftVocabulary(seedTokenIDs: [Int]) {
+        languageModel.configureDraftVocabulary(seedTokenIDs: seedTokenIDs)
     }
 
     /// See `Qwen35TextModel.applyDraftLMHead`.

@@ -89,6 +89,10 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// The backbone's lm_head applied to hidden rows (draft sampling side).
     func applyLMHead(_ x: MLXArray) -> MLXArray
 
+    /// Install a fixed-shape prompt-augmented proposal vocabulary before the
+    /// first drafting round. Serial control never calls this method.
+    func configureDraftVocabulary(seedTokenIDs: [Int])
+
     /// Draft-only vocabulary projection (the declared head's coarser lm_head
     /// copy when present, exact lm_head otherwise). Proposal side only.
     func applyDraftLMHead(_ x: MLXArray) -> MLXArray
