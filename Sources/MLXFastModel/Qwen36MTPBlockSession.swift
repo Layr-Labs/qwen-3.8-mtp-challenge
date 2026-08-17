@@ -177,21 +177,20 @@ public final class Qwen36MTPBlockSession {
         // that maximizes expected committed tokens per unit round time under
         // the round's measured economics:
         //
-        //   T(d) = V + d·H        one width-(d+1) verify + d head steps
+        //   T(d) = V + Σ H_i      one width-(d+1) verify + d head steps
         //   E[tokens](d) = 1 + Σ_{k=1..d} Π_{i<k} p_i
         //
         // where p_i is the EMA-estimated acceptance of draft position i GIVEN
-        // the prefix before it was accepted, and h = H/V is the head step's
-        // cost relative to the weight-stream-bound verify forward (near-flat
-        // in width up to the qmv limit). Greedy marginal rule: extend to
-        // position k+1 exactly while
+        // the prefix before it was accepted, and h_i = H_i/V is that draft
+        // row's marginal cost relative to the weight-stream-bound verify
+        // forward. Greedy marginal rule: extend to position k+1 exactly while
         //
-        //   Π_{i<=k+1} p_i  >  h · (1 + S_k) / (1 + k·h)
+        //   Π_{i<=k+1} p_i  >  h_{k+1} · (1 + S_k) / (1 + Σ_{i<=k} h_i)
         //
         // which is f(k+1) > f(k) rearranged. On hot prose (p→0.9) this runs
         // straight to the offer; on cold prompts it collapses to 1, and to a
         // free adaptive skip (0) only when even the first draft's odds are
-        // below h. The streak ladder's behavior is the degenerate one-EMA
+        // below h_1. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
@@ -497,8 +496,8 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
-    /// h = (one head draft step) / (one batched verify forward), the only
-    /// constant the marginal rule needs. Derivation from the campaign's
+    /// h_i = (one head draft step) / (one batched verify forward). Derivation
+    /// from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
     /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
     /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
@@ -526,7 +525,17 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    ///
+    /// FINAL M5 WIDTH FIT (Ratacat `a451f3b`, official +0.16% on 32b94cb):
+    /// interleaved forced-width rounds resolve the early marginal at about
+    /// 0.09 and rows 3-4 at about 0.17. Later rows retain 0.18. Keeping the
+    /// cumulative cost in the denominator is required when h varies: it
+    /// compares each next row with the efficiency of the prefix already
+    /// selected. This is not a global h retune (0.14/0.15/0.32/0.40 are
+    /// ranked-dead). Gate 2 and M=8 stay as on 156b5b7.
+    private static let headStepCostRatios = [
+        0.09, 0.09, 0.17, 0.17, 0.18, 0.18, 0.18, 0.18,
+    ]
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -609,9 +618,9 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
+        var cost = 1.0
         var depth = 0
         while depth < cap {
             var p = positionAcceptEMA[depth]
@@ -625,9 +634,11 @@ public final class Qwen36MTPBlockSession {
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            let h = Self.headStepCostRatios[depth]
+            let threshold = h * (1.0 + expected) / cost
             guard reach > threshold else { break }
             expected += reach
+            cost += h
             depth += 1
         }
         return depth
