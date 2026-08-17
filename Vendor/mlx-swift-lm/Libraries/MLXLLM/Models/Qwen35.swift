@@ -1863,7 +1863,9 @@ public class Qwen35TextModelInner: Module {
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = inputs.dim(1) <= 2
+            || (inputs.dim(1) >= 6 && inputs.dim(1) <= 9)
+            || prefillLadder
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
