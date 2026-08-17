@@ -328,6 +328,16 @@ public final class Qwen36MTPBlockSession {
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
 
+        // Decode crosses K=1024 near the end of the scored window, where full
+        // attention switches to its two-pass kernel. Warm that AOT pipeline on
+        // throwaway state instead of paying its first use in a timed round.
+        let longQ = MLXArray.zeros([1, 24, 1, 256], dtype: .bfloat16)
+        let longK = MLXArray.zeros([1, 4, 1024, 256], dtype: .bfloat16)
+        let longV = MLXArray.zeros([1, 4, 1024, 256], dtype: .bfloat16)
+        eval(MLXFast.scaledDotProductAttention(
+            queries: longQ, keys: longK, values: longV,
+            scale: 0.0625, mask: .causal))
+
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
         // The phase trace measured
