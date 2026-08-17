@@ -566,7 +566,15 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    private static let segmentedStreakGate = 3
+    /// 2, not 3. Gate 3 -> 2 has its own ranked receipt (submission f03469a9,
+    /// 2.91995 against the 2.90421 frontier) and was PROMOTED; it was then
+    /// reverted by the accept commit of the 6-way composite that followed,
+    /// whose archive carried gate 3. The gate is evidence-conditioned — any
+    /// reject resets `fullAcceptStreak` to 0 — so it can only fire on stretches
+    /// where the head has already proved perfect, which is why the tail-prompt
+    /// risk that killed the `h` axis is structurally out of scope here.
+    /// Gate 1 is measured DEAD (-7.1%); gate 0 only tied (2.9200).
+    private static let segmentedStreakGate = 2
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -916,7 +924,14 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
+        // Ask for the POST-NORM block too. The forward normalises all S rows on its
+        // way to the vocabulary projection and then discards the result; without this
+        // the round re-derives `acceptedCount + 1` of those exact rows one at a time
+        // through `applyFinalNorm`, each its own one-threadgroup dispatch. Publishing
+        // the array it already built is exact -- RMSNorm reduces along the last axis
+        // only, so a row of the block norm IS the norm of that row. `verifyNormed` is
+        // nil for any conformer that does not publish it, and every use falls back.
+        let (verifyLogits, verifyHidden, verifyNormed) = model.callWithHiddenAndNormed(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
@@ -931,7 +946,18 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        // Cache roots are deliberately NOT eval roots on the speculative path.
+        // The verify forward already evaluates the primitives that produce
+        // them, so listing ~130 recurrent/KV state arrays here only makes the
+        // host walk every GDN conv/ssm slot and every attention cache before it
+        // can `.item()` the drafts — always-on host work, never extra GPU math.
+        // The cache and tape objects keep their lazy state for rollback and
+        // repair, and the next round's first consumer forces anything still
+        // outstanding. The SERIAL control (the scoring denominator) and the
+        // rare repair path keep `cache.state` in their eval roots on purpose:
+        // the denominator must not be given a matching gift.
+        // Receipt: submission 3a7f09f4, 2.91177 / 3880df57, 2.90630.
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
@@ -975,7 +1001,7 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            pendingHidden = hiddenRow(verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1000,7 +1026,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingHidden = hiddenRow(verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1043,7 +1069,7 @@ public final class Qwen36MTPBlockSession {
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
         for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, verifyNormed, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
         fullAcceptStreak =
@@ -1515,6 +1541,31 @@ public final class Qwen36MTPBlockSession {
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
         let row = hidden[0..., index ..< (index + 1), 0...]
         return postNorm ? model.applyFinalNorm(row) : row
+    }
+
+    /// `hiddenRow`, taking the post-norm block the SAME forward already produced.
+    ///
+    /// Slices row `index` out of `normed` instead of re-normalising it. Bit-exact by
+    /// row-locality of RMSNorm; see `callWithHiddenAndNormed`.
+    ///
+    /// Pure guard-and-fall-through: `normed` must be present, 3-D, the same shape as the
+    /// pre-norm block, and the row must be in range. Anything unexpected -- a conformer
+    /// that publishes nothing, a shape that does not match -- returns to the untouched
+    /// `hiddenRow` above, so this can degrade but cannot throw. `!postNorm` also falls
+    /// through, since then no normalisation was wanted in the first place.
+    private func hiddenRow(
+        _ hidden: MLXArray, _ normed: MLXArray?, _ index: Int
+    ) -> MLXArray {
+        guard postNorm, let normed,
+            normed.ndim == 3, hidden.ndim == 3,
+            normed.dim(0) == hidden.dim(0),
+            normed.dim(1) == hidden.dim(1),
+            normed.dim(2) == hidden.dim(2),
+            index >= 0, index < normed.dim(1)
+        else {
+            return hiddenRow(hidden, index)
+        }
+        return normed[0..., index ..< (index + 1), 0...]
     }
 
     private func lastRow(_ logits: MLXArray) -> MLXArray {

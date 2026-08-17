@@ -107,6 +107,33 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// inner text model's `model.norm`, i.e. exactly the norm the inner
     /// `callAsFunction` applies; there is no outer norm to pick by mistake.
     func applyFinalNorm(_ x: MLXArray) -> MLXArray
+
+    /// `callWithHidden` plus the POST-norm block the forward already computed, when the
+    /// conformer can publish it.
+    ///
+    /// Exists so the session can slice post-norm rows out of an array that ALREADY EXISTS
+    /// instead of re-deriving each one through `applyFinalNorm`. Exact by row-locality:
+    /// RMSNorm reduces along the last axis only, so row `i` of a block normalisation and the
+    /// normalisation of row `i` alone are the same arithmetic on the same inputs in the same
+    /// order.
+    ///
+    /// Optional BY CONSTRUCTION -- the extension below supplies a `nil` third element, so a
+    /// conformer that does not publish its post-norm block silently keeps the previous
+    /// behaviour and this requirement cannot break a conformance.
+    func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)
+}
+
+extension Qwen36MTPTarget {
+    /// Default: publish no post-norm block; callers fall back to `applyFinalNorm`.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let (logits, hidden) = callWithHidden(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+        return (logits, hidden, nil)
+    }
 }
 
 // Both Qwen 3.6 model classes already implement every member; these

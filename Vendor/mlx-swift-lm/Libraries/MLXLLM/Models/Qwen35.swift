@@ -1117,7 +1117,19 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if nConfirmed == 1 && S >= 2 {
+        // S >= 2 at EVERY width, prefill included — the `nConfirmed == 1`
+        // conjunct is gone. The compiled body is not new code: it is the
+        // already-promoted verify-width path, and the ranked exact-value replay
+        // has been passing it MIXED with the eager chain inside single
+        // trajectories (serial anchor eager, verify rounds compiled) since it
+        // landed. Its math is elementwise and the closure is `shapeless`, so
+        // applying it at S = 512 changes which rows it processes, not how any
+        // element is computed. At the scored 512-token seed that removes four
+        // launches and three materialised fp32/bf16 intermediates per GDN
+        // layer, across 48 gated-delta layers.
+        // S == 1 (the serial step) deliberately keeps the eager chain.
+        // Receipt: submission 28194351, 2.91377 / ecae5f0e, 2.91017.
+        if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
@@ -2215,6 +2227,37 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// `callWithHidden`, additionally publishing the post-norm block it already computes.
+    ///
+    /// The body above normalises ALL S rows on its way to the vocabulary projection and then
+    /// throws `normed` away. The MTP session then asks for post-norm rows and re-derives them
+    /// ONE AT A TIME through `applyFinalNorm` — the same `model.norm` — so a fully-accepted
+    /// depth-`d` round runs the block normalisation once and then `d + 1` single-row
+    /// normalisations of rows it already had, each its own one-threadgroup dispatch on
+    /// `[1, 1, H]`, plus the slices feeding them and a `d + 1`-way concatenation at the next
+    /// flush.
+    ///
+    /// Publishing the array that already exists removes all of that. It is EXACT, not merely
+    /// close: RMSNorm reduces along the LAST axis only, so row `i` of a block normalisation
+    /// and the normalisation of row `i` alone are the same arithmetic on the same inputs in
+    /// the same order. This repo already banks that identity in the other direction, in the
+    /// seed last-row vocabulary projection. No op is added, no reduction order moves, and no
+    /// new kernel shape is introduced.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -2510,6 +2553,14 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenAndNormed`.
+    public func callWithHiddenAndNormed(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        languageModel.callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.
