@@ -1494,9 +1494,14 @@ final class Qwen35Attention: Module {
     // the promoted affine-4 head and additionally carries selected exact BF16
     // output rows. Target-model attention never installs these arrays.
     private var _exactQKVWeight: MLXArray?
+    private var _exactQKVWeightT: MLXArray?
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    private var _exactKRowCount = 0
+    // True when the sidecar restores every K and V output row. Those packed
+    // Q4 K/V results are then fully overwritten and can be skipped.
+    private var _islandsCoverFullKV = false
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1551,6 +1556,19 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        // Crown #401 restores every K/V row from BF16 islands. Paying the
+        // packed Q4 K/V slice (or even building that pack) is dead work.
+        if _islandsCoverFullKV,
+           let q = qProj as? QuantizedLinear,
+           let qz = q.biases
+        {
+            var qy = quantizedMM(
+                x, q.weight, scales: q.scales, biases: qz, transpose: true,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            qy = replaceExactQRows(qy, input: x)
+            let (k, v) = exactIslandKV(x)
+            return (qy, k, v)
+        }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1601,6 +1619,9 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if _islandsCoverFullKV, _exactQKVWeightT != nil {
+            return exactIslandKV(x)
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1654,10 +1675,52 @@ final class Qwen35Attention: Module {
             indices = _exactQKVIndices
         }
         guard let indices else { return base }
-        let exact = matmul(input, weight.transposed(1, 0))
+        let exact: MLXArray
+        if let packedT = _exactQKVWeightT {
+            let cols = kvOnly
+                ? packedT[.ellipsis, _exactQRowCount...]
+                : packedT
+            exact = matmul(input, cols)
+        } else {
+            exact = matmul(input, weight.transposed(1, 0))
+        }
         let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
         return putAlong(
             base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    /// Replace only the selected Q rows. Used when packed K/V is skipped.
+    private func replaceExactQRows(_ base: MLXArray, input: MLXArray) -> MLXArray {
+        guard _exactQRowCount > 0, let indices = _exactQKVIndices else {
+            return base
+        }
+        let qIdx = indices[..<_exactQRowCount]
+        let exact: MLXArray
+        if let packedT = _exactQKVWeightT {
+            exact = matmul(input, packedT[.ellipsis, ..<_exactQRowCount])
+        } else if let weight = _exactQKVWeight {
+            exact = matmul(input, weight[..<_exactQRowCount].transposed(1, 0))
+        } else {
+            return base
+        }
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, qIdx.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    /// Full-cover K/V islands: the BF16 sidecar *is* the K/V projection.
+    private func exactIslandKV(_ input: MLXArray) -> (MLXArray, MLXArray) {
+        let y: MLXArray
+        if let packedT = _exactQKVWeightT {
+            y = matmul(input, packedT[.ellipsis, _exactQRowCount...])
+        } else if let weight = _exactQKVWeight {
+            y = matmul(input, weight[_exactQRowCount...].transposed(1, 0))
+        } else {
+            fatalError("exactIslandKV requires installed precision islands")
+        }
+        return (
+            y[.ellipsis, ..<_exactKRowCount],
+            y[.ellipsis, _exactKRowCount...])
     }
 
     func installExactQKVRows(
@@ -1678,12 +1741,18 @@ final class Qwen35Attention: Module {
         let kvIndices = concatenated(
             [kIndices, vIndices + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
-        eval(weight, qkvIndices, kvIndices)
+        let weightT = weight.transposed(1, 0).contiguous()
+        eval(weight, weightT, qkvIndices, kvIndices)
 
         _exactQKVWeight = weight
+        _exactQKVWeightT = weightT
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+        _exactKRowCount = kWeight.dim(0)
+        // #401 restores every K row and every V row (both 1,024).
+        _islandsCoverFullKV =
+            kWeight.dim(0) == kOutputCount && vWeight.dim(0) == 1_024
     }
 
     /// Append rows to an attention cache without producing query outputs.
