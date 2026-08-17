@@ -76,9 +76,9 @@ inline U load_vector(const device T* x, thread U* x_thread) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
     }
   }
 
@@ -156,9 +156,9 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
     for (int i = 0; i < N; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
     }
   }
 
@@ -250,9 +250,9 @@ inline U qdot(
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
           (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+           x_thread[4 * i + 1] * ((ws[i] >> 4) & 0x000f) +
+           x_thread[4 * i + 2] * ((ws[i] >> 8) & 0x000f) +
+           x_thread[4 * i + 3] * ((ws[i] >> 12) & 0x000f));
     }
   }
 
@@ -352,9 +352,9 @@ inline U qdot_safe(
     for (int i = 0; i < (N / 4); i++) {
       accum +=
           (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+           x_thread[4 * i + 1] * ((ws[i] >> 4) & 0x000f) +
+           x_thread[4 * i + 2] * ((ws[i] >> 8) & 0x000f) +
+           x_thread[4 * i + 3] * ((ws[i] >> 12) & 0x000f));
     }
   }
 
@@ -844,9 +844,9 @@ inline U qdot_affine4_loaded(
   for (int i = 0; i < 4; i++) {
     accum +=
         (x_thread[4 * i] * (ws[i] & 0x000f) +
-         x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-         x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-         x_thread[4 * i + 3] * (ws[i] & 0xf000));
+         x_thread[4 * i + 1] * ((ws[i] >> 4) & 0x000f) +
+         x_thread[4 * i + 2] * ((ws[i] >> 8) & 0x000f) +
+         x_thread[4 * i + 3] * ((ws[i] >> 12) & 0x000f));
   }
   return scale * accum + sum * bias;
 }
@@ -862,9 +862,9 @@ inline float2 qdot_affine4_loaded_pair(
   for (int i = 0; i < 4; i++) {
     accum +=
         (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
-         float2(x0[4 * i + 1], x1[4 * i + 1]) * (ws[i] & 0x00f0) +
-         float2(x0[4 * i + 2], x1[4 * i + 2]) * (ws[i] & 0x0f00) +
-         float2(x0[4 * i + 3], x1[4 * i + 3]) * (ws[i] & 0xf000));
+         float2(x0[4 * i + 1], x1[4 * i + 1]) * ((ws[i] >> 4) & 0x000f) +
+         float2(x0[4 * i + 2], x1[4 * i + 2]) * ((ws[i] >> 8) & 0x000f) +
+         float2(x0[4 * i + 3], x1[4 * i + 3]) * ((ws[i] >> 12) & 0x000f));
   }
   return scale * accum + sum * bias;
 }
@@ -1056,9 +1056,9 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
                          a3 * ((packed[r][i] >> 12) & 0x000f));
         } else {
           partial[r] += (a0 * (packed[r][i] & 0x000f) +
-                         a1 * (packed[r][i] & 0x00f0) +
-                         a2 * (packed[r][i] & 0x0f00) +
-                         a3 * (packed[r][i] & 0xf000));
+                         a1 * ((packed[r][i] >> 4) & 0x000f) +
+                         a2 * ((packed[r][i] >> 8) & 0x000f) +
+                         a3 * ((packed[r][i] >> 12) & 0x000f));
         }
       }
     }
@@ -1844,17 +1844,17 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 3:
-          qmv_fast_crossrow_affine4_g64_m<T, 3, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 4:
-          qmv_fast_crossrow_affine4_g64_m<T, 4, 4>(
+          qmv_fast_crossrow_affine4_g64_m<T, 4, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1864,7 +1864,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 7:
-          qmv_fast_crossrow_affine4_g64_m<T, 7, 4>(
+          qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
