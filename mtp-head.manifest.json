@@ -1,9 +1,10 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
+  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
+  "bytes": 238934129,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+
+  "note": "PIPELINE CONTROL: declares the exact dwsdubey affine-4/group-64 MTP head that previously validated and scored (43f655f, 2.8719), to diagnose three consecutive account-side remote-head failures (b58565d, eb9ecd7c, 5cf1b9fd). Every gate of those artifacts was verified byte-perfect at the pinned revisions; the g32 arm reused the proven packing, so the remote shipping path itself is the remaining suspect. If this control validates, the fault is in account-hosted artifacts (bisect: identical-bytes copy staged at Frosty40/qwen38-4bit-g64-control@430fe17e). If it fails, the remote-source declaration path is broken and the campaign switches to in_branch shipping under mtp-head/. The head only proposes; the pinned target re-verifies every emitted token."
 }
