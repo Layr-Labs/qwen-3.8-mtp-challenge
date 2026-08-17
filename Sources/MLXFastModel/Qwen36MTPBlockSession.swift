@@ -196,7 +196,7 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            return self.costTableDepth(offeredDepth: offeredDepth)
         }
     }
 
@@ -604,6 +604,77 @@ public final class Qwen36MTPBlockSession {
             depth += 1
         }
         return depth
+    }
+
+    /// Measured round wall-cost at draft depth d, relative to the depth-0
+    /// round (C[0] = 1). The linear model T(d) = V(1 + d·h) misprices the
+    /// ends of the curve: the first added draft rides work the round does
+    /// anyway (measured marginal ~0.08–0.11 of a serial-shaped round), while
+    /// interior extensions cost ~0.20–0.25. Values are fit from forced-depth
+    /// arms (median per-round wall, depths rotated within repetitions) on
+    /// this stack; refit after any head or kernel change.
+    private static let roundCostByDepth: [Double] = [
+        1.000, 1.113, 1.194, 1.448, 1.692, 2.022, 2.259, 2.489, 2.813,
+    ]
+
+    /// Cost-table depth rule: exact argmax over d of expected committed
+    /// tokens per unit round cost, E(d)/C(d), with E(d) = 1 + Σ reach_k and
+    /// the same per-position EMAs and first-two-position confidence
+    /// tempering the marginal rule uses. Replacing the greedy marginal walk
+    /// with a full argmax also removes its local-dip hazard on a non-convex
+    /// measured table.
+    private func costTableDepth(offeredDepth: Int) -> Int {
+        // Saturated-regime guard, on the signal that actually separates the
+        // regimes: cumulative chain acceptance. The measured-table rule is
+        // validated on mid-acceptance streams (~0.55–0.85 observed); on
+        // near-saturated streams (~0.92+) its post-reject trims cut deep
+        // drafts the verify was about to accept (measured −3.5% on the
+        // public longcopy with a streak-based guard, which leaks exactly
+        // there), and those prompts sit just above the published median,
+        // where a small regression can move the median while an equal-sized
+        // gain cannot. Above the threshold — and during the first rounds,
+        // before the ratio is meaningful — the shipped marginal rule runs
+        // verbatim, so a saturated stream is schedule-identical to the base.
+        let observedDrafts = acceptedDraftTotal + rejectedDraftTotal
+        if observedDrafts < 24 {
+            return costModelDepth(offeredDepth: offeredDepth)
+        }
+        let cumulativeAccept =
+            Double(acceptedDraftTotal) / Double(observedDrafts)
+        if cumulativeAccept > 0.88 {
+            return costModelDepth(offeredDepth: offeredDepth)
+        }
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
+        let cap = Swift.min(
+            Swift.min(
+                Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
+                widthCap),
+            Self.roundCostByDepth.count - 1)
+        guard cap > 0 else { return 0 }
+        var reach = 1.0
+        var expected = 0.0
+        var bestDepth = 0
+        var bestRate = 1.0 / Self.roundCostByDepth[0]
+        for depth in 1 ... cap {
+            var p = positionAcceptEMA[depth - 1]
+            if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 2.0)))
+            } else if depth == 2, let tail = pendingTop2, tail.1.count >= 2 {
+                let margin = tail.1[0] - tail.1[1]
+                p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 3.0)))
+            }
+            reach *= p
+            expected += reach
+            let rate = (1.0 + expected) / Self.roundCostByDepth[depth]
+            if rate > bestRate {
+                bestRate = rate
+                bestDepth = depth
+            }
+        }
+        return bestDepth
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
