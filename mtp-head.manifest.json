@@ -1,10 +1,10 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:dwsdubey/qwen3.8-27b-mtp-4bit@34ee76f6c87a438caa28f975c1cea9b0b005bc71",
-  "sha256": "7d62702795865b9036afe4bddcd16a2a8eb973c0caced15e5243139dda067f47",
-  "bytes": 238934129,
+  "source_url": "hf:Frosty40/qwen3.8-27b-mtp-8bit@cc8671b4eb46353c8d90d5e6b8d1983140fab7b6",
+  "sha256": "f810ddae9d6932f3c9587d173ae2e3823b68f6a5fa5200f02ce8bd3b9fddad9d",
+  "bytes": 451270899,
   "max_bytes": 2147483648,
 
-  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 4-bit affine group-64 with MLX 0.32.0 mx.quantize(group_size=64, bits=4), matching the backbone geometry so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Local paired measurement on the frontier tree (128-token window): 4-bit head MTP 0.01505 s/token vs bf16 0.01572 (4.5% faster), speedup 2.42 vs 2.30, at a 3.5pp acceptance cost (0.956 vs 0.991) that the frontier's h=0.18 schedule already prices."
+  "note": "Independent re-quantisation of the pinned bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16) to 8-bit affine group-64 with MLX mx.quantize(group_size=64, bits=8), matching the backbone's uint32-packed affine layout so the scales-keyed loader walk needs no code change. The 8 2D Linear weights become packed U32 weights (4 values/word) plus bf16 scales/biases (31 tensors); the 7 1D norms stay bf16. The head only proposes; the pinned target re-verifies every emitted token against the hidden serial trajectory. sha256 is the tree digest over the single fetched model.safetensors per the documented rule; bytes is the fetched file size. Rationale vs the previous 4-bit arm: the 4-bit head traded 3.5pp acceptance (0.956 vs 0.991 bf16) for ~4.5% head-step cost. 8-bit affine g64 keeps the packed-uint32 geometry (so zero loader changes) while cutting the quantization error ~16x, buying back most of that acceptance (worst per-tensor max-abs error 7.8e-3 vs bf16 reference, loadcheck-verified through MLX affine dequantize) at roughly half the head-cost saving of the 4-bit arm. Net expectation on the h=0.18 frontier schedule: acceptance closer to bf16 (0.98+) at head cost closer to 4-bit, i.e. a positive move on the candidate/serial ratio versus both shipped heads; measured A/B pending on the local paired run (score.json)."
 }
