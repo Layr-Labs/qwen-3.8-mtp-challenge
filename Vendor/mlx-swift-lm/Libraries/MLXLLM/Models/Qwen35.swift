@@ -2215,6 +2215,25 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
+    /// Identical graph to `callWithHidden`, also handing back the `normed`
+    /// tensor logits already depend on. Callers that only need `(logits,
+    /// pre-norm)` keep `callWithHidden`; the speculative verify uses this so
+    /// it can slice post-norm rows without a second `model.norm` launch.
+    public func callWithHiddenAndPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed)
+    }
+
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
     public func replayRecurrentPrefix(
         cache: [any KVCache], committedRows: Int
@@ -2510,6 +2529,14 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    /// See `Qwen35TextModel.callWithHiddenAndPostNorm`.
+    public func callWithHiddenAndPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        languageModel.callWithHiddenAndPostNorm(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

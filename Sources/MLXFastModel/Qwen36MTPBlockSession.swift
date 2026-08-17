@@ -916,7 +916,7 @@ public final class Qwen36MTPBlockSession {
         // by the exactness chunk inside `attentionWithCacheUpdate` (two
         // <= 5-row sdpa calls, byte-identical windows). One tape, one
         // rollback story, one readout, no second weight pass.
-        let (verifyLogits, verifyHidden) = model.callWithHidden(
+        let (verifyLogits, verifyHidden, verifyNormed) = model.callWithHiddenAndPostNorm(
             input: LMInput.Text(tokens: verifyTokens),
             cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
@@ -929,7 +929,16 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
+        // Speculative-only: slice the post-norm the verify forward already
+        // ran for the lm_head. That tensor is the same `model.norm(hidden)`
+        // `hiddenRow` would re-launch per accepted row after this eval.
+        // Folding the already-built array into the existing sync deletes
+        // those after-eval RMSNorm trips. SERIAL still uses callWithHidden
+        // + hiddenRow — Gumbii's reuse sped the denominator and died at
+        // 2.913. Keep cache roots: isolated eval(bundle) measured 2.92794
+        // (−0.57%) on this crown.
+        let verifyPost = postNorm ? verifyNormed : verifyHidden
+        var bundle: [MLXArray] = [top2IDs, top2Values, verifyPost]
         bundle.append(contentsOf: draftIdArrays)
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
@@ -975,7 +984,7 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
-            pendingHidden = hiddenRow(verifyHidden, verifyHidden.dim(1) - 1)
+            pendingHidden = rawRow(verifyPost, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1000,7 +1009,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
-                pendingHidden = hiddenRow(verifyHidden, acceptedCount)
+                pendingHidden = rawRow(verifyPost, acceptedCount)
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1043,7 +1052,7 @@ public final class Qwen36MTPBlockSession {
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
         for index in 0 ..< acceptedCount {
-            headHistoryBacklogHidden.append(hiddenRow(verifyHidden, index))
+            headHistoryBacklogHidden.append(rawRow(verifyPost, index))
             headHistoryBacklogTokens.append(drafts[index])
         }
         fullAcceptStreak =
@@ -1510,6 +1519,12 @@ public final class Qwen36MTPBlockSession {
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
         let row = hidden[0..., index ..< (index + 1), 0...]
         return postNorm ? model.applyFinalNorm(row) : row
+    }
+
+    /// Slice a already-normalised (or intentionally pre-norm) row. Used only
+    /// after the speculative round's blocking eval materialised `verifyPost`.
+    private func rawRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
+        hidden[0..., index ..< (index + 1), 0...]
     }
 
     private func lastRow(_ logits: MLXArray) -> MLXArray {

@@ -51,6 +51,14 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray)
 
+    /// Same backbone forward as `callWithHidden`, plus the `model.norm(hidden)`
+    /// tensor the logits were already built from. Speculative verify slices
+    /// this instead of launching a second RMSNorm. Serial / repair stay on
+    /// `callWithHidden` so the paired denominator is untouched.
+    func callWithHiddenAndPostNorm(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
