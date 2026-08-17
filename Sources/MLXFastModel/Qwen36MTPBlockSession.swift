@@ -344,14 +344,17 @@ public final class Qwen36MTPBlockSession {
         // same contract as every warm above.
         let seedWarmCache = model.newCache(parameters: nil)
         let seedWarmTokens = Array(repeating: 0, count: 512)
-        let (seedWarmLogits, seedWarmHidden) = model.callWithHidden(
+        let (seedWarmLogits, seedWarmHidden, seedWarmNormed) =
+            model.callWithHiddenAndNormed(
             input: LMInput.Text(
                 tokens: MLXArray(seedWarmTokens).reshaped([1, 512])),
             cache: seedWarmCache, nConfirmed: 0)
         _ = seedWarmLogits
-        let seedWarmRow = hiddenRow(seedWarmHidden, seedWarmHidden.dim(1) - 1)
-        let seedWarmNorm = model.applyFinalNorm(
-            seedWarmHidden[0..., 0 ..< 511, 0...])
+        let seedWarmRow = hiddenRow(
+            seedWarmHidden, seedWarmNormed, seedWarmHidden.dim(1) - 1)
+        let seedWarmNorm = normedRows(
+            seedWarmHidden, seedWarmNormed, 0 ..< 511)
+            ?? model.applyFinalNorm(seedWarmHidden[0..., 0 ..< 511, 0...])
         let (seedWarmIDs, seedWarmValues) =
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
@@ -370,7 +373,7 @@ public final class Qwen36MTPBlockSession {
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
+        let (seedLogits, hidden, normed) = model.callWithHiddenAndNormed(
             input: LMInput.Text(
                 tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
             cache: cache, nConfirmed: 0)
@@ -382,7 +385,7 @@ public final class Qwen36MTPBlockSession {
         // RMSNorm is row-local, so norm(row)+lmHead == the sliced full
         // projection bit-for-bit (ranked receipt b5130678: +0.09%).
         _ = seedLogits
-        pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
+        pendingHidden = hiddenRow(hidden, normed, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
         // Retain the full pre-norm seed hidden for lazy head-history priming.
         // ~5 MB at 512x5120 bf16; released at the first drafting round. The
