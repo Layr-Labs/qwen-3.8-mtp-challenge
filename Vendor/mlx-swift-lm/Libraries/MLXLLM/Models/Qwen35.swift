@@ -1941,6 +1941,208 @@ public class Qwen35TextModelInner: Module {
 // goes to the LOWER id, and a NaN never beats a non-NaN. Bounding at
 // `REAL_COUNT` in the kernel is exactly what the pre-argmax slice did, so the
 // six duplicated padding rows stay unreachable even on a tie.
+private let qwen35DraftLMHeadSelectPartialCount = 4096
+
+private let qwen35DraftLMHeadSelectHeader = """
+    struct qwen_draft_candidate {
+        float value;
+        uint id;
+    };
+
+    inline qwen_draft_candidate qwen_draft_empty_candidate() {
+        qwen_draft_candidate candidate;
+        candidate.value = NAN;
+        candidate.id = 0xFFFFFFFFu;
+        return candidate;
+    }
+
+    inline bool qwen_draft_qmv_better(
+        float candidate_value,
+        uint candidate_id,
+        float current_value,
+        uint current_id
+    ) {
+        if (candidate_id == 0xFFFFFFFFu) { return false; }
+        if (current_id == 0xFFFFFFFFu) { return true; }
+        bool candidate_nan = isnan(candidate_value);
+        bool current_nan = isnan(current_value);
+        if (candidate_nan != current_nan) { return !candidate_nan; }
+        if (candidate_value > current_value) { return true; }
+        if (candidate_value < current_value) { return false; }
+        return candidate_id < current_id;
+    }
+
+    inline void qwen_draft_candidate_insert(
+        thread qwen_draft_candidate &current,
+        float value,
+        uint id
+    ) {
+        if (qwen_draft_qmv_better(
+                value, id, current.value, current.id)) {
+            current.value = value;
+            current.id = id;
+        }
+    }
+"""
+
+/// Stage one: exact affine4/g64 QMV over one compact-head input row. Every
+/// completed dot product is rounded to BF16 before comparison, but only one
+/// winner per vocabulary stripe is written instead of all 98,336 logits.
+private let qwen35DraftLMHeadSelectPartialKernel = MLXFast.metalKernel(
+    name: "qwen35_draft_lm_head_select_partial_v1",
+    inputNames: ["x", "w_q", "scales", "biases"],
+    outputNames: ["partial_ids", "partial_values"],
+    source: """
+        constexpr uint qwen_hidden = 5120;
+        constexpr uint qwen_padded_count = 98336;
+        constexpr uint qwen_real_count = 98330;
+        constexpr uint qwen_partial_count =
+            \(qwen35DraftLMHeadSelectPartialCount);
+
+        uint partial_index = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        qwen_draft_candidate local = qwen_draft_empty_candidate();
+
+        for (uint tile = partial_index;
+             tile < qwen_padded_count / 8;
+             tile += qwen_partial_count) {
+            uint output_base = tile * 8 + simd_group * 4;
+            float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            // Verbatim qmv_fast affine4/g64 organization: 16 input values per
+            // lane, K blocks of 512, four outputs per SIMD group.
+            for (uint k = 0; k < qwen_hidden; k += 512) {
+                float x_thread[16];
+                float sum = 0.0f;
+                for (uint i = 0; i < 4; ++i) {
+                    uint element = k + simd_lane * 16 + i * 4;
+                    ulong x_offset = ulong(element) * ulong(x_strides[2]);
+                    float x0 = float(x[x_offset]);
+                    float x1 = float(x[
+                        x_offset + ulong(x_strides[2])]);
+                    float x2 = float(x[
+                        x_offset + 2 * ulong(x_strides[2])]);
+                    float x3 = float(x[
+                        x_offset + 3 * ulong(x_strides[2])]);
+                    sum += x0 + x1 + x2 + x3;
+                    x_thread[i * 4] = x0;
+                    x_thread[i * 4 + 1] = x1 / 16.0f;
+                    x_thread[i * 4 + 2] = x2 / 256.0f;
+                    x_thread[i * 4 + 3] = x3 / 4096.0f;
+                }
+
+                for (uint r = 0; r < 4; ++r) {
+                    uint output_row = output_base + r;
+                    uint packed_column = (k + simd_lane * 16) / 8;
+                    ulong w_offset =
+                        ulong(output_row) * ulong(w_q_strides[0])
+                        + ulong(packed_column) * ulong(w_q_strides[1]);
+                    uint word0 = w_q[w_offset];
+                    uint word1 =
+                        w_q[w_offset + ulong(w_q_strides[1])];
+                    ushort packed[4] = {
+                        ushort(word0 & 0xffffu),
+                        ushort(word0 >> 16),
+                        ushort(word1 & 0xffffu),
+                        ushort(word1 >> 16)
+                    };
+                    float accum = 0.0f;
+                    for (uint i = 0; i < 4; ++i) {
+                        accum +=
+                            x_thread[i * 4] * (packed[i] & 0x000f)
+                            + x_thread[i * 4 + 1] * (packed[i] & 0x00f0)
+                            + x_thread[i * 4 + 2] * (packed[i] & 0x0f00)
+                            + x_thread[i * 4 + 3] * (packed[i] & 0xf000);
+                    }
+                    uint group_column = k / 64 + simd_lane / 4;
+                    ulong scale_offset =
+                        ulong(output_row) * ulong(scales_strides[0])
+                        + ulong(group_column) * ulong(scales_strides[1]);
+                    ulong bias_offset =
+                        ulong(output_row) * ulong(biases_strides[0])
+                        + ulong(group_column) * ulong(biases_strides[1]);
+                    result[r] +=
+                        float(scales[scale_offset]) * accum
+                        + sum * float(biases[bias_offset]);
+                }
+            }
+
+            for (uint r = 0; r < 4; ++r) {
+                float reduced = simd_sum(result[r]);
+                uint id = output_base + r;
+                if (simd_lane == 0 && id < qwen_real_count) {
+                    T rounded = T(reduced);
+                    qwen_draft_candidate_insert(local, float(rounded), id);
+                }
+            }
+        }
+
+        threadgroup qwen_draft_candidate scratch[2];
+        if (simd_lane == 0) {
+            scratch[simd_group] = local;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_id == 0) {
+            qwen_draft_candidate merged = scratch[0];
+            qwen_draft_candidate other = scratch[1];
+            qwen_draft_candidate_insert(merged, other.value, other.id);
+            partial_ids[partial_index] = int(merged.id);
+            partial_values[partial_index] = merged.value;
+        }
+    """,
+    header: qwen35DraftLMHeadSelectHeader,
+    ensureRowContiguous: false
+)
+
+/// Stage two: merge the bounded stripe winners and apply the existing compact
+/// prefix/control-token ID mapping once to the final winner.
+private let qwen35DraftLMHeadSelectFinalizeKernel = MLXFast.metalKernel(
+    name: "qwen35_draft_lm_head_select_finalize_v1",
+    inputNames: ["partial_ids", "partial_values"],
+    outputNames: ["token_id"],
+    source: """
+        constexpr uint qwen_partial_count =
+            \(qwen35DraftLMHeadSelectPartialCount);
+        constexpr uint qwen_threads = 256;
+        constexpr uint qwen_prefix_count = 98304;
+        constexpr uint qwen_control_offset = 149740;
+
+        uint lane = thread_position_in_threadgroup.x;
+        qwen_draft_candidate local = qwen_draft_empty_candidate();
+        for (uint partial = lane;
+             partial < qwen_partial_count;
+             partial += qwen_threads) {
+            qwen_draft_candidate_insert(
+                local, partial_values[partial], uint(partial_ids[partial]));
+        }
+
+        threadgroup qwen_draft_candidate scratch[qwen_threads];
+        scratch[lane] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = qwen_threads / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                qwen_draft_candidate merged = scratch[lane];
+                qwen_draft_candidate other = scratch[lane + stride];
+                qwen_draft_candidate_insert(
+                    merged, other.value, other.id);
+                scratch[lane] = merged;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            uint compact_id = scratch[0].id;
+            token_id[0] = int(
+                compact_id < qwen_prefix_count
+                    ? compact_id
+                    : compact_id + qwen_control_offset);
+        }
+    """,
+    header: qwen35DraftLMHeadSelectHeader,
+    ensureRowContiguous: false
+)
+
 private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_select",
     inputNames: ["logits"],
@@ -2064,6 +2266,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
+
+    private static let draftLMHeadSelectEnabled: Bool = {
+        switch ProcessInfo.processInfo.environment["MLXFAST_QWEN_DRAFT_LMHEAD_SELECT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }()
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2367,6 +2581,11 @@ extension Qwen35TextModel: MTPCapable {
         if _compactDraftHead == nil {
             _compactDraftHead = makeCompactDraftHead()
         }
+        if let compact = _compactDraftHead as? QuantizedLinear,
+           let fused = compactDraftTokenID(x, head: compact)
+        {
+            return fused
+        }
         let padded = _compactDraftHead!(x)
         let tgSize = 1024
         let outputs = qwen35DraftSelectKernel(
@@ -2384,6 +2603,53 @@ extension Qwen35TextModel: MTPCapable {
             outputDTypes: [.int32]
         )
         return outputs[0]
+    }
+
+    /// Exact compact affine4/g64 QMV plus mapped argmax. Returns nil before
+    /// adding a custom graph node outside the pinned proposal geometry.
+    private func compactDraftTokenID(
+        _ x: MLXArray, head: QuantizedLinear
+    ) -> MLXArray? {
+        guard Self.draftLMHeadSelectEnabled,
+              x.ndim == 3,
+              x.shape == [1, 1, 5120],
+              x.dtype == .bfloat16,
+              type(of: head) == QuantizedLinear.self,
+              head.groupSize == 64,
+              head.bits == 4,
+              head.mode == .affine,
+              head.bias == nil,
+              head.weight.ndim == 2,
+              head.weight.dtype == .uint32,
+              head.weight.shape == [Self.compactDraftPaddedCount, 5120 / 8],
+              head.scales.ndim == 2,
+              head.scales.dtype == .bfloat16,
+              head.scales.shape == [Self.compactDraftPaddedCount, 5120 / 64],
+              let biases = head.biases,
+              biases.ndim == 2,
+              biases.dtype == .bfloat16,
+              biases.shape == head.scales.shape
+        else { return nil }
+
+        let partials = qwen35DraftLMHeadSelectPartialKernel(
+            [x, head.weight, head.scales, biases],
+            template: [("T", x.dtype)],
+            grid: (qwen35DraftLMHeadSelectPartialCount * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [
+                [qwen35DraftLMHeadSelectPartialCount],
+                [qwen35DraftLMHeadSelectPartialCount],
+            ],
+            outputDTypes: [.int32, .float32]
+        )
+        let output = qwen35DraftLMHeadSelectFinalizeKernel(
+            partials,
+            grid: (256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1]],
+            outputDTypes: [.int32]
+        )
+        return output[0]
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
