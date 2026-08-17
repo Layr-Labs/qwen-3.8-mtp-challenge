@@ -1872,7 +1872,7 @@ template <typename T, int group_size, int bits, bool batched>
           // 3+3+2, not 4+4 -- see quantized.h for the register-cliff rationale,
           // the row-independence exactness argument, and the streak-gate synergy.
           // This JIT twin is the runtime-effective source.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
