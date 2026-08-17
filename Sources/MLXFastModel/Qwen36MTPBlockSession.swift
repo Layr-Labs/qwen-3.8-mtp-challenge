@@ -291,10 +291,16 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
+            // tape. At semantic width 7, also warm the repair's M=9 row-local
+            // projections and pad/slice graph outside the scored window.
+            let (verifyLogits, _) =
+                Qwen35MTPVerifyDispatch.withDepth6RowLocalPadding(width == 7) {
+                    model.callWithHidden(
+                        input: LMInput.Text(
+                            tokens: MLXArray(block).reshaped([1, width])),
+                        cache: warmCache,
+                        nConfirmed: width >= 2 ? 1 : 0)
+                }
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
@@ -453,6 +459,15 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// One semantic-width repair for the measured depth-6 projection dispatch
+    /// cliff. The cost model still selects six drafts and every target/cache/
+    /// ledger tensor still has seven rows; only row-local dense projections are
+    /// padded during graph construction. The one-shot qualifier avoids changing
+    /// the cost model's observations or turning the repair into a schedule.
+    private var consecutiveComputedDepth6Rounds = 0
+    private var usedDepth6DispatchRepair = false
+    private var pendingDepth6DispatchRepair = false
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -603,6 +618,20 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
+
+        // Qualify one repair only after the cost model independently computes
+        // depth 6 twice in succession while the full depth-8 offer is legal.
+        // Unlike the retired escape experiment, this does not change `depth`
+        // and therefore needs no scheduler-observation shadowing.
+        if !usedDepth6DispatchRepair, cap >= 8, depth == 6 {
+            consecutiveComputedDepth6Rounds += 1
+            if consecutiveComputedDepth6Rounds == 2 {
+                usedDepth6DispatchRepair = true
+                pendingDepth6DispatchRepair = true
+            }
+        } else if !usedDepth6DispatchRepair {
+            consecutiveComputedDepth6Rounds = 0
+        }
         return depth
     }
 
@@ -714,6 +743,9 @@ public final class Qwen36MTPBlockSession {
                 && draftCount <= Qwen36MTPLimits.maxDepth,
             "draftPolicy returned \(draftCount) for an offer of \(depth); a "
                 + "round may propose 0 ... min(offer, maxDepth) drafts")
+        let repairDepth6Dispatch =
+            pendingDepth6DispatchRepair && draftCount == 6
+        pendingDepth6DispatchRepair = false
 
         // A stop token as the primary ends the run BEFORE any drafting: there is
         // nothing after it to predict, and drafting past it would charge the
@@ -921,9 +953,13 @@ public final class Qwen36MTPBlockSession {
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
         let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: verifyTokens),
-                cache: cache, nConfirmed: 1)
+            Qwen35MTPVerifyDispatch.withDepth6RowLocalPadding(
+                repairDepth6Dispatch
+            ) {
+                model.callWithHiddenAndNormed(
+                    input: LMInput.Text(tokens: verifyTokens),
+                    cache: cache, nConfirmed: 1)
+            }
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read

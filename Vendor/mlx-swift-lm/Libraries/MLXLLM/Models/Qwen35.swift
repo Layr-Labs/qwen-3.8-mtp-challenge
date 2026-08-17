@@ -12,6 +12,39 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Dynamically scopes the depth-6 verify dispatch repair to one target graph.
+///
+/// The flag is read only while Swift constructs row-local projection nodes.
+/// Attention, gated-delta recurrence, caches, and every public tensor width
+/// remain at the semantic seven rows for six drafts plus the bonus row.
+public enum Qwen35MTPVerifyDispatch {
+    @TaskLocal fileprivate static var padDepth6RowLocalProjections = false
+
+    public static func withDepth6RowLocalPadding<R>(
+        _ enabled: Bool,
+        operation: () throws -> R
+    ) rethrows -> R {
+        try $padDepth6RowLocalProjections.withValue(
+            enabled, operation: operation)
+    }
+}
+
+/// Execute one row-local projection at the measured M=9 fast dispatch while
+/// preserving the semantic M=7 result. Duplicated tail rows cannot influence
+/// any retained row because every wrapped operation is row-local.
+fileprivate func qwen35Depth6PaddedRowLocalProjection(
+    _ x: MLXArray,
+    operation: (MLXArray) -> MLXArray
+) -> MLXArray {
+    guard Qwen35MTPVerifyDispatch.padDepth6RowLocalProjections,
+          x.ndim == 3, x.dim(0) == 1, x.dim(1) == 7
+    else { return operation(x) }
+
+    let tail = x[0..., 6 ..< 7, 0...]
+    let padded = concatenated([x, tail, tail], axis: 1)
+    return operation(padded)[0..., 0 ..< 7, 0...]
+}
+
 // MARK: - Configuration
 
 private enum RopeParametersCodingKey: String, CodingKey {
@@ -1257,14 +1290,20 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // The fused path is only taken when the gate/up split is provably
-        // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
-        // to the exact two-projection expression, preserving the original
-        // slicing semantics in every case.
-        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+        qwen35Depth6PaddedRowLocalProjection(x) { projectionInput in
+            // The fused path is only taken when the gate/up split is provably
+            // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
+            // to the exact two-projection expression, preserving the original
+            // slicing semantics in every case.
+            if projectionInput.dim(-2) <= 16,
+               let y = fusedGateUp(projectionInput),
+               _gateOut * 2 == y.dim(-1)
+            {
+                return downProj(qwen35CompiledFusedSwiGLU(y))
+            }
+            return downProj(
+                silu(gateProj(projectionInput)) * upProj(projectionInput))
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
     }
 
 }
@@ -2238,9 +2277,13 @@ extension Qwen35TextModel: MTPCapable {
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(normed)
+            logits = qwen35Depth6PaddedRowLocalProjection(normed) {
+                lmHead($0)
+            }
         } else {
-            logits = model.embedTokens.asLinear(normed)
+            logits = qwen35Depth6PaddedRowLocalProjection(normed) {
+                model.embedTokens.asLinear($0)
+            }
         }
         // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
         // is the normalization step — it expects the raw backbone output as input.
@@ -2258,9 +2301,13 @@ extension Qwen35TextModel: MTPCapable {
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(normed)
+            logits = qwen35Depth6PaddedRowLocalProjection(normed) {
+                lmHead($0)
+            }
         } else {
-            logits = model.embedTokens.asLinear(normed)
+            logits = qwen35Depth6PaddedRowLocalProjection(normed) {
+                model.embedTokens.asLinear($0)
+            }
         }
         return (logits, hidden, normed)
     }
