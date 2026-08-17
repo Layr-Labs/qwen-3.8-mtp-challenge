@@ -860,12 +860,14 @@ struct QwenMTPTrackNamingTests {
             // QWEN38-VERIFY-AT-RELEASE, still a 3.6 measurement:
             ("MLXFAST_SEMANTIC_GPQA_MIN_PASS", "8"),
             // The floor and ceiling are POLICY bounds ("do not regress serial by
-            // more than 10%"; "anything above 3.0x is a measurement fault"), not
+            // more than 10%"; "anything above 5.0x is a measurement fault"), not
             // measurements, so they survive the model change as decisions. They
             // are still marked QWEN38-VERIFY-AT-RELEASE in the workflow because
-            // the 0.90 choice was justified by a 3.6 launch requirement.
+            // the 0.90 choice was justified by a 3.6 launch requirement. The
+            // ceiling was raised 3.0 -> 5.0 by operator decision 2026-08-17
+            // (per-pair wrapper bound raised 5.0 -> 8.0 in the same decision).
             ("MLXFAST_QWEN_MTP_DECODE_SPEEDUP_FLOOR", "0.90"),
-            ("MLXFAST_QWEN_MTP_DECODE_SPEEDUP_CEILING", "3.0"),
+            ("MLXFAST_QWEN_MTP_DECODE_SPEEDUP_CEILING", "5.0"),
         ] {
             #expect(
                 environment[pin] == expected,
@@ -1323,7 +1325,7 @@ struct QwenMTPScoringSemanticsTests {
         // The floor and the NEW ceiling are both declared, and the ceiling is
         // the thing the published number never had (k-matrix finding 3).
         #expect((semantics["floor"] as? Double) == 0.90)
-        #expect((semantics["ceiling"] as? Double) == 3.0)
+        #expect((semantics["ceiling"] as? Double) == 5.0)
         #expect((semantics["score_anchor"] as? String) == "serial = 1.0")
 
         // The pool itself is untouched: 8 distinct entries, each with a
