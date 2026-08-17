@@ -175,21 +175,85 @@ public enum Qwen36MTPHeadAttachment {
     ) throws -> T {
         let layout = try backboneLayout(directory: backboneDirectory)
         try verifyHeadTree(headDirectory)
+        let fcQuantization = try declaredHeadFCQuantization(headDirectory)
         let previousSources = _additionalWeightSources
         let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
+        let previousFCQuantization = _qwen35MTPFCQuantizationOverride
         _additionalWeightSources = [
             AdditionalWeightSource(
                 directory: headDirectory, keyPrefix: headKeyPrefix)
         ]
         _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
         _qwen35MTPEnabled = true
+        _qwen35MTPFCQuantizationOverride = fcQuantization
         defer {
             _additionalWeightSources = previousSources
             _primaryWeightKeyPrefixStrip = previousStrip
             _qwen35MTPEnabled = previousEnabled
+            _qwen35MTPFCQuantizationOverride = previousFCQuantization
         }
         return try body(layout)
+    }
+
+    /// Read the declared head's `fc` representation before model construction.
+    ///
+    /// Stock and current declared heads use affine4/group64 (or BF16) and
+    /// deliberately return `nil`, following the unchanged loader path. The only
+    /// additional geometry this candidate admits is affine6/group64 for the
+    /// proposal-only MTP fusion projection. Flat and indexed safetensors trees
+    /// are both validated; partial triples, unexpected dimensions, and every
+    /// other geometry fail closed before any model or cache state exists.
+    static func declaredHeadFCQuantization(
+        _ headDirectory: URL
+    ) throws -> Qwen35MTPFCQuantizationOverride? {
+        let descriptors = try declaredHeadFCDescriptors(headDirectory)
+        let weight = descriptors.weight
+        let scales = descriptors.scales
+        let biases = descriptors.biases
+
+        if scales == nil && biases == nil {
+            guard weight.dtype == "BF16",
+                  weight.shape == [5_120, 10_240]
+            else {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head carries an unsupported unquantized "
+                        + "fc geometry \(weight.dtype) \(weight.shape)")
+            }
+            return nil
+        }
+        guard let scales, let biases else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head fc quantization declaration is incomplete; "
+                    + "weight, scales, and biases must be supplied together")
+        }
+        guard weight.dtype == "U32", scales.dtype == "BF16",
+              biases.dtype == "BF16",
+              weight.shape.count == 2, scales.shape.count == 2,
+              biases.shape == scales.shape,
+              weight.shape[0] == 5_120, scales.shape[0] == 5_120,
+              scales.shape[1] > 0,
+              10_240 % scales.shape[1] == 0,
+              weight.shape[1] > 0,
+              (weight.shape[1] * 32) % 10_240 == 0
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head carries a malformed fc quantization geometry")
+        }
+
+        let groupSize = 10_240 / scales.shape[1]
+        let bits = weight.shape[1] * 32 / 10_240
+        if groupSize == 64, bits == 4 {
+            return nil
+        }
+        guard groupSize == 64, bits == 6 else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head declares unsupported fc affine\(bits)/group\(groupSize); "
+                    + "only stock affine4/group64 and declared affine6/group64 "
+                    + "representations are accepted")
+        }
+        return Qwen35MTPFCQuantizationOverride(
+            groupSize: groupSize, bits: bits)
     }
 
     /// Structural checks that do not need MLX and are therefore unit-testable.
@@ -268,6 +332,119 @@ public enum Qwen36MTPHeadAttachment {
     /// header length, then a JSON object whose keys are the tensor names plus
     /// an optional `__metadata__`).
     static func safetensorsTensorNames(_ url: URL) throws -> Set<String> {
+        Set(try safetensorsHeader(url).keys.filter { $0 != "__metadata__" })
+    }
+
+    private struct SafetensorsTensorDescriptor {
+        let dtype: String
+        let shape: [Int]
+    }
+
+    private struct HeadFCDescriptors {
+        let weight: SafetensorsTensorDescriptor
+        let scales: SafetensorsTensorDescriptor?
+        let biases: SafetensorsTensorDescriptor?
+    }
+
+    private static func declaredHeadFCDescriptors(
+        _ headDirectory: URL
+    ) throws -> HeadFCDescriptors {
+        let indexURL = headDirectory.appendingPathComponent(
+            "model.safetensors.index.json")
+        if let indexData = try? Data(contentsOf: indexURL) {
+            guard let root = try? JSONSerialization.jsonObject(with: indexData)
+                    as? [String: Any],
+                  let weightMap = root["weight_map"] as? [String: Any]
+            else {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head index is not a JSON object with a weight_map")
+            }
+            return HeadFCDescriptors(
+                weight: try indexedTensorDescriptor(
+                    "fc.weight", weightMap: weightMap,
+                    headDirectory: headDirectory, required: true)!,
+                scales: try indexedTensorDescriptor(
+                    "fc.scales", weightMap: weightMap,
+                    headDirectory: headDirectory, required: false),
+                biases: try indexedTensorDescriptor(
+                    "fc.biases", weightMap: weightMap,
+                    headDirectory: headDirectory, required: false))
+        }
+
+        let header = try safetensorsHeader(
+            headDirectory.appendingPathComponent("model.safetensors"))
+        return HeadFCDescriptors(
+            weight: try tensorDescriptor("fc.weight", in: header),
+            scales: try optionalTensorDescriptor("fc.scales", in: header),
+            biases: try optionalTensorDescriptor("fc.biases", in: header))
+    }
+
+    private static func indexedTensorDescriptor(
+        _ name: String,
+        weightMap: [String: Any],
+        headDirectory: URL,
+        required: Bool
+    ) throws -> SafetensorsTensorDescriptor? {
+        guard let rawShard = weightMap[name] else {
+            if required {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head index is missing \(name)")
+            }
+            return nil
+        }
+        guard let shard = rawShard as? String, !shard.isEmpty,
+              !shard.hasPrefix("/")
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head index has an invalid shard path for \(name)")
+        }
+        let root = headDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let url = headDirectory.appendingPathComponent(shard)
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard url.path.hasPrefix(root.path + "/") else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head index shard for \(name) escapes its head directory")
+        }
+        return try tensorDescriptor(name, in: safetensorsHeader(url))
+    }
+
+    private static func tensorDescriptor(
+        _ name: String, in header: [String: Any]
+    ) throws -> SafetensorsTensorDescriptor {
+        guard let descriptor = try optionalTensorDescriptor(name, in: header)
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head safetensors is missing \(name)")
+        }
+        return descriptor
+    }
+
+    private static func optionalTensorDescriptor(
+        _ name: String, in header: [String: Any]
+    ) throws -> SafetensorsTensorDescriptor? {
+        guard let raw = header[name] else { return nil }
+        guard let object = raw as? [String: Any],
+              let dtype = object["dtype"] as? String,
+              let rawShape = object["shape"] as? [Any]
+        else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head safetensors has malformed metadata for \(name)")
+        }
+        let shape = try rawShape.map { value -> Int in
+            guard let number = value as? NSNumber else {
+                throw MLXFastError.invalidInput(
+                    "the Qwen MTP head safetensors has a non-integer \(name) shape")
+            }
+            return number.intValue
+        }
+        guard shape.allSatisfy({ $0 > 0 }) else {
+            throw MLXFastError.invalidInput(
+                "the Qwen MTP head safetensors has a non-positive \(name) shape")
+        }
+        return SafetensorsTensorDescriptor(dtype: dtype, shape: shape)
+    }
+
+    private static func safetensorsHeader(_ url: URL) throws -> [String: Any] {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         guard let lengthData = try handle.read(upToCount: 8),
@@ -293,7 +470,7 @@ public enum Qwen36MTPHeadAttachment {
             throw MLXFastError.invalidInput(
                 "the Qwen MTP head safetensors header is not readable JSON")
         }
-        return Set(header.keys.filter { $0 != "__metadata__" })
+        return header
     }
 
     /// The head index must name exactly the pinned tensor set, under BARE names.

@@ -17,6 +17,26 @@ import MLXNN
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
+/// Optional declared-head geometry for the MTP fusion projection.
+///
+/// The backbone configuration supplies one global quantization tuple, but a
+/// separately declared proposal head may use a different affine geometry for
+/// `mtp.fc`. The attachment layer validates that geometry from the pinned
+/// safetensors metadata before model construction and installs this override
+/// only for the duration of the load.
+public struct Qwen35MTPFCQuantizationOverride: Equatable, Sendable {
+    public let groupSize: Int
+    public let bits: Int
+
+    public init(groupSize: Int, bits: Int) {
+        self.groupSize = groupSize
+        self.bits = bits
+    }
+}
+
+public nonisolated(unsafe) var _qwen35MTPFCQuantizationOverride:
+    Qwen35MTPFCQuantizationOverride? = nil
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -96,7 +116,15 @@ final class Qwen35MTPModule: Module {
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
         _preFcNormEmbedding.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
-        _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
+        if let geometry = _qwen35MTPFCQuantizationOverride {
+            _fc.wrappedValue = QuantizedLinear(
+                args.hiddenSize * 2, args.hiddenSize, bias: false,
+                groupSize: geometry.groupSize, bits: geometry.bits,
+                mode: .affine)
+        } else {
+            _fc.wrappedValue = Linear(
+                args.hiddenSize * 2, args.hiddenSize, bias: false)
+        }
         self.layers = (0 ..< args.mtpNumHiddenLayers).map { _ in
             Qwen35MTPDecoderLayer(args)
         }
