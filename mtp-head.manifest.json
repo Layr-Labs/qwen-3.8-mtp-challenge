@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-ext-islands@8559fa27583bb6affd5199c5db2fd61065216702",
+  "sha256": "c357d4146b0236d9b23228488cd59b4ddb19b3c6e2360f41463fc8b5313806df",
+  "bytes": 371093584,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "v3 breakthrough head. The promoted 4-bit/group-64 proposal head (dwsdubey) is preserved tensor-for-tensor. BF16 proposal-only precision islands now cover EVERY head projection: fc (1,024 AW rows), Q (2,048 AW rows), K/V (all 1,024 rows), o_proj (1,024 AW rows), gate/up (1,024 AW rows each), down_proj (1,024 AW rows). Row selection is activation-weighted over 3,456 real head-input hidden states. End-to-end final-hidden MSE vs the bf16 head: 44.7% of the un-islanded 4-bit error (vs 85% for QKV-only, 51% for the previous submission). fc islands required a new proposal-side hook in the MTP fusion projection (Qwen35MTPModule.replaceExactFCRows); local acceptance unchanged at 0.9818 and decode speedup the best measured (2.21). The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
 }
