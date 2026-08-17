@@ -1841,7 +1841,12 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64_m<T, 6, 3>(
+          // M=6 exception to the fewest-streams IPG rule: IPG=3 lands BOTH
+          // groups on NA=3 (padded float3 lanes) and measured well below the
+          // M=5/M=7 cells; three NA=2 groups reuse the rank-proven wide<2>
+          // arm (M=5's tail) with byte-identical per-output arithmetic,
+          // trading one extra weight stream for full vector lanes.
+          qmv_fast_crossrow_affine4_g64_m<T, 6, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
