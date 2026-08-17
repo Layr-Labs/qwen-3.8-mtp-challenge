@@ -1766,6 +1766,132 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 // MARK: - Decoder Layer
 
+// MARK: - fused residual-add + RMSNorm (stream junctions)
+//
+// ONE launch replacing the (binary add, rms_looped) pair at each decoder-layer
+// stream junction: `h = x + res` and `normed = rmsNorm(h) * w`. The decode
+// window is host-dispatch-bound (~50-60 us of host lazy-graph eval per op,
+// measured 2026-08-17), so removing one of the two junction dispatches per
+// norm site — 128 dispatches per 64-layer verify forward — cuts the host
+// critical path directly.
+//
+// Bit-exactness receipt vs the stock two-kernel path:
+//   - The add: MLX's binary Add<bfloat16_t> computes `x + y` in bf16; both
+//     are the unique correctly-rounded sum, so `T(x[i] + res[i])` here is the
+//     same bit pattern the separate add kernel would store.
+//   - The norm: this body replicates `rms_looped` (normalization.cpp dispatches
+//     it for axis 5120 > RMS_LOOPED_LIMIT 4096) term for term: N_READS = 4,
+//     the same `r += lsize * N_READS` strided accumulation, simd_sum, the same
+//     two-stage threadgroup reduction, `metal::precise::rsqrt(acc / H + eps)`,
+//     and the same `w * T(float(h) * inv_mean)` store sequence. `lsize` is read
+//     from `threads_per_threadgroup` and the dispatch uses 1024 threads, the
+//     stock kernel's maxTotalThreadsPerThreadgroup on this generation.
+//   Verified elementwise bit-identical over random bf16 inputs at S in
+//   1...9, 128, 512 (see the local differential test) and end-to-end through
+//   mtp-timed (all_tokens_matched).
+private let qwen35FusedAddRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_add_rmsnorm",
+    inputNames: ["x", "res", "w", "eps"],
+    outputNames: ["h", "normed"],
+    source: """
+        constexpr int N_READS = 4;
+        constexpr int SIMD_SIZE = 32;
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+        const uint lsize = threads_per_threadgroup.x;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const size_t base = size_t(gid) * H;
+        const uint start = lid * N_READS;
+
+        float acc = 0;
+        for (uint rr = 0; rr < uint(H); rr += lsize * N_READS) {
+          if (rr + start + N_READS <= uint(H)) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              float xi = float(x[base + rr + start + i] + res[base + rr + start + i]);
+              acc += xi * xi;
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              if (rr + start + i < uint(H)) {
+                float xi = float(x[base + rr + start + i] + res[base + rr + start + i]);
+                acc += xi * xi;
+              }
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / H + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv_mean = local_inv_mean[0];
+
+        for (uint rr = 0; rr < uint(H); rr += lsize * N_READS) {
+          if (rr + start + N_READS <= uint(H)) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              const uint idx = rr + start + i;
+              T hv = x[base + idx] + res[base + idx];
+              h[base + idx] = hv;
+              normed[base + idx] = w[idx] * static_cast<T>(float(hv) * inv_mean);
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              if (rr + start + i < uint(H)) {
+                const uint idx = rr + start + i;
+                T hv = x[base + idx] + res[base + idx];
+                h[base + idx] = hv;
+                normed[base + idx] = w[idx] * static_cast<T>(float(hv) * inv_mean);
+              }
+            }
+          }
+        }
+        """)
+
+/// Dispatch the fused add+RMSNorm at a stream junction. Falls back to the
+/// stock two-op path for any shape/dtype outside the receipt envelope
+/// (bf16 stream, last dim == norm width, matching shapes).
+private func qwen35FusedAddRMSNorm(
+    _ x: MLXArray, _ res: MLXArray, norm: RMSNorm
+) -> (h: MLXArray, normed: MLXArray)? {
+    let hidden = norm.weight.dim(0)
+    guard x.dtype == .bfloat16,
+        res.dtype == .bfloat16,
+        norm.weight.dtype == .bfloat16,
+        x.shape == res.shape,
+        x.ndim >= 1,
+        x.dim(-1) == hidden
+    else { return nil }
+    let rows = x.size / hidden
+    let outs = qwen35FusedAddRMSNormKernel(
+        [x, res, norm.weight, MLXArray(norm.eps)],
+        template: [("T", DType.bfloat16), ("H", hidden)],
+        grid: (1024 * rows, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [x.shape, x.shape],
+        outputDTypes: [.bfloat16, .bfloat16])
+    return (outs[0], outs[1])
+}
+
 final class Qwen35DecoderLayer: Module {
     let isLinear: Bool
 
@@ -1829,6 +1955,54 @@ final class Qwen35DecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
+
+    /// Fused-junction forward. `carry` is the PREVIOUS layer's un-added MLP
+    /// output; the input norm fuses its add. Returns this layer's
+    /// post-attention stream and this layer's MLP output as the next carry.
+    /// Composing the returned pair with one final add reproduces
+    /// `callAsFunction`'s stream bit-for-bit (see the kernel receipt above);
+    /// any input outside the fused envelope falls back to the stock ops.
+    func callFused(
+        _ x: MLXArray,
+        carry: MLXArray?,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int = 0
+    ) -> (stream: MLXArray, carry: MLXArray) {
+        var h = x
+        let normedIn: MLXArray
+        if let carry,
+            let fused = qwen35FusedAddRMSNorm(x, carry, norm: inputLayerNorm)
+        {
+            h = fused.h
+            normedIn = fused.normed
+        } else {
+            if let carry {
+                h = x + carry
+            }
+            normedIn = inputLayerNorm(h)
+        }
+
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(
+                normedIn, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
+        } else {
+            r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
+        }
+
+        let normedPost: MLXArray
+        if let fused = qwen35FusedAddRMSNorm(h, r, norm: postAttentionLayerNorm) {
+            h = fused.h
+            normedPost = fused.normed
+        } else {
+            h = h + r
+            normedPost = postAttentionLayerNorm(h)
+        }
+        return (h, (mlp as! UnaryLayer)(normedPost))
+    }
 }
 
 // MARK: - Text Model
@@ -1841,6 +2015,13 @@ public class Qwen35TextModelInner: Module {
 
     let ssmIdx: Int
     let faIdx: Int
+
+    /// Local ablation switch for the fused add+RMSNorm junctions. Default ON;
+    /// set `MLX_QWEN_FUSED_ADDNORM=0` to restore the stock two-op junctions.
+    /// Both paths emit the identical bit stream (the fused kernel replicates
+    /// the stock add and the rms_looped reduction order exactly).
+    static let fusedAddNormEnabled =
+        ProcessInfo.processInfo.environment["MLX_QWEN_FUSED_ADDNORM"] != "0"
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -1896,25 +2077,63 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
-        for (i, layer) in layers.enumerated() {
-            let mask = layer.isLinear ? ssmMask : nil
-            let attnMask =
-                layer.isLinear
-                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
-                        asyncEval(hiddenStates)
+        // Fused add+RMSNorm junctions (default ON; "0" restores the stock
+        // two-op junctions). The loop threads the un-added MLP output as
+        // `carry` so both junction adds ride inside the fused norm kernels;
+        // one final add after the loop re-forms the returned stream. Local
+        // ablation switch only — the emitted stream is bit-identical either
+        // way.
+        if Qwen35TextModelInner.fusedAddNormEnabled {
+            var carry: MLXArray? = nil
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                let (stream, nextCarry) = layer.callFused(
+                    hiddenStates, carry: carry, attentionMask: attnMask,
+                    ssmMask: mask, cache: cacheArray?[i], nConfirmed: nConfirmed)
+                hiddenStates = stream
+                carry = nextCarry
+                if ladderActive {
+                    if prefillLadder {
+                        if i == 0 || i % 3 == 2 {
+                            asyncEval(hiddenStates, nextCarry)
+                        }
+                    } else {
+                        switch i {
+                        case 0, 1, 9, 19, 29, 39, 49, 57:
+                            asyncEval(hiddenStates, nextCarry)
+                        default:
+                            break
+                        }
                     }
-                } else {
-                    switch i {
-                    case 0, 1, 9, 19, 29, 39, 49, 57:
-                        asyncEval(hiddenStates)
-                    default:
-                        break
+                }
+            }
+            if let carry {
+                hiddenStates = hiddenStates + carry
+            }
+        } else {
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                hiddenStates = layer(
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if ladderActive {
+                    if prefillLadder {
+                        if i == 0 || i % 3 == 2 {
+                            asyncEval(hiddenStates)
+                        }
+                    } else {
+                        switch i {
+                        case 0, 1, 9, 19, 29, 39, 49, 57:
+                            asyncEval(hiddenStates)
+                        default:
+                            break
+                        }
                     }
                 }
             }
