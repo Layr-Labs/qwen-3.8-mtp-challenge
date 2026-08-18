@@ -493,8 +493,18 @@ public final class Qwen36MTPBlockSession {
     /// truth within ~10 rounds regardless; what protects the hard prompts
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
     /// uncapped transfer, not the prior).
+    ///
+    /// C4-ERA COLD SEED (this archive): 0.85*0.98^d -> 0.90*0.99^d.
+    /// On the live tip the coarse affine-2 step is cheaper (newjordan C4
+    /// M=1 singlerow), but the cost-model still prices it at h=0.18 and
+    /// still seeds the first-round product at 0.85*0.98^d. That product
+    /// dies at depth 4 against the h=0.18 threshold (~0.362 vs ~0.473)
+    /// even though the width wall already allows 5. The seed is the only
+    /// thing that can buy the leftover cold draft; h, the streak gate, and
+    /// the 0.95 transfer cap stay exactly as promoted. Not jonathan's
+    /// 0.92*0.995^d + gate-1 stack.
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
+        .map { 0.90 * pow(0.99, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
