@@ -1218,12 +1218,10 @@ public final class Qwen36MTPBlockSession {
         // them. The rare generic-repair path ran its own second eval.
         // `pendingHidden` is likewise device-only until the next round.
 
-        // Truncate after the first committed stop token, keeping the stop token
-        // itself — the same rule the serial reference applies.
-        if let stopIndex = committed.firstIndex(where: { stopTokens.contains($0) }) {
-            let dropped = committed.count - (stopIndex + 1)
-            committed = Array(committed.prefix(stopIndex + 1))
-            committedTokenCount -= dropped
+        // Primary stops return above and accepted drafts stop at the first stop,
+        // so a committed stop can only be the final token; avoid rescanning and
+        // reallocating the committed prefix on every round.
+        if let last = committed.last, stopTokens.contains(last) {
             reachedStopToken = true
         }
 
