@@ -232,6 +232,126 @@ private let qwen35CompiledGatedDeltaPostNorm:
     return body
 }()
 
+/// Candidate-only fusion of the GatedDelta output RMSNorm and its precise
+/// fp32 SiLU gate/product. The RMS result is explicitly rounded to BF16 before
+/// widening again for the gate product, matching the boundary between
+/// `MLXFast.rmsNorm` and `qwen35CompiledGatedDeltaPostNorm`.
+///
+/// The reduction is the exact `rms_single_row` geometry used by the stock
+/// primitive for Dv=128: 32 threads, four adjacent values per thread, one
+/// `simd_sum`, and `metal::precise::rsqrt`. Inputs are addressed by their live
+/// strides so the sliced `z` carrier does not acquire a hidden contiguous copy.
+private let qwen35FusedGatedDeltaPostNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_gated_delta_post_norm_bf16_v1",
+    inputNames: ["x", "gate", "weight", "eps"],
+    outputNames: ["fused"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        const uint row = threadgroup_position_in_grid.x;
+        const uint thread_id = thread_position_in_threadgroup.x;
+        const uint simd_thread = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const uint sequence_length = uint(x_shape[1]);
+        const uint value_heads = uint(x_shape[2]);
+        const uint axis_size = uint(x_shape[3]);
+        const uint batch = row / (sequence_length * value_heads);
+        const uint sequence_head = row % (sequence_length * value_heads);
+        const uint sequence = sequence_head / value_heads;
+        const uint head = sequence_head % value_heads;
+
+        const ulong x_base = ulong(batch) * ulong(x_strides[0])
+            + ulong(sequence) * ulong(x_strides[1])
+            + ulong(head) * ulong(x_strides[2]);
+        const ulong gate_base = ulong(batch) * ulong(gate_strides[0])
+            + ulong(sequence) * ulong(gate_strides[1])
+            + ulong(head) * ulong(gate_strides[2]);
+        const ulong output_base = ulong(row) * ulong(axis_size);
+        const ulong x_axis_stride = ulong(x_strides[3]);
+        const ulong gate_axis_stride = ulong(gate_strides[3]);
+        const ulong weight_stride = ulong(weight_strides[0]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        const uint first = thread_id * n_reads;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < n_reads; ++i) {
+            const uint element = first + i;
+            if (element < axis_size) {
+                const float value = float(
+                    x[x_base + ulong(element) * x_axis_stride]);
+                acc += value * value;
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float inv_mean = local_inv_mean[0];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < n_reads; ++i) {
+            const uint element = first + i;
+            if (element < axis_size) {
+                const bfloat input_value =
+                    x[x_base + ulong(element) * x_axis_stride];
+                const bfloat normalized = bfloat(
+                    float(input_value) * inv_mean);
+                // Preserve the stock RMSNorm's learned-weight multiply and its
+                // BF16 output rounding before the precise gate path widens it.
+                const bfloat rms_value =
+                    weight[ulong(element) * weight_stride] * normalized;
+
+                const float gate_value = float(
+                    gate[gate_base + ulong(element) * gate_axis_stride]);
+                const float sigmoid_base =
+                    1.0f / (1.0f + metal::exp(metal::abs(gate_value)));
+                const float sigmoid_value = gate_value < 0.0f
+                    ? sigmoid_base
+                    : 1.0f - sigmoid_base;
+                const float activated = gate_value * sigmoid_value;
+                fused[output_base + ulong(element)] = bfloat(
+                    activated * float(rms_value));
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+private func qwen35FusedGatedDeltaPostNorm(
+    x: MLXArray,
+    gate: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    let rows = x.size / x.dim(-1)
+    return qwen35FusedGatedDeltaPostNormKernel(
+        [x, gate, weight, eps],
+        grid: (rows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Fuse the full-attention output gate `x * sigmoid(gate)` into one compiled
 /// elementwise pass, replacing the separate sigmoid and multiply launches (and
 /// their intermediate materialization) in every full-attention layer call.
@@ -273,9 +393,26 @@ private let qwen35CompiledSigmoidMultiply:
 // carrier's live row stride (16480, not 10240) is consumed via the provided
 // stride arrays — ensureRowContiguous stays FALSE; forcing contiguity here
 // would silently insert a full-carrier copy and give back the launch saving.
-private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
+// Give every supported width its own fixed kernel name and constexpr geometry,
+// avoiding per-call Metal template construction while retaining the identical
+// source body. The call site checks the complete fixed-shape envelope first.
+private func qwen35PackedGDNPreworkKernelName(width: Int) -> String {
+    "qwen35_packed_gdn_prework_s\(width)_bf16_hk16_hv48_d128_v1"
+}
+
+private func qwen35MakePackedGDNPreworkKernel(
+    width: Int
+) -> MLXFast.MLXFastKernel {
+    precondition((3 ... 9).contains(width))
     let header = """
         typedef bfloat16_t InT;
+        static constant constexpr const int Hk = 16;
+        static constant constexpr const int Dk = 128;
+        static constant constexpr const int Hv = 48;
+        static constant constexpr const int Dv = 128;
+        static constant constexpr const int NKeep = 3;
+        static constant constexpr const int C = 10240;
+        static constant constexpr const int T = \(width);
 
         inline InT qwen35_prework_sigmoid(InT x) {
           auto y = 1 / (1 + metal::exp(metal::abs(x)));
@@ -416,7 +553,7 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         }
         """
     return MLXFast.metalKernel(
-        name: "qwen35_packed_gdn_prework",
+        name: qwen35PackedGDNPreworkKernelName(width: width),
         inputNames: [
             "qkv", "a", "b", "conv_state", "conv_weight", "a_log",
             "dt_bias", "q_scale", "k_scale",
@@ -427,7 +564,41 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         source: source,
         header: header,
         ensureRowContiguous: false)
-}()
+}
+
+private let qwen35PackedGDNPreworkKernels: [MLXFast.MLXFastKernel] =
+    (3 ... 9).map { qwen35MakePackedGDNPreworkKernel(width: $0) }
+
+private func qwen35PackedGDNPreworkEligible(
+    hardwareSupported: Bool,
+    batch: Int,
+    width: Int,
+    nKeep: Int,
+    numKHeads: Int,
+    numVHeads: Int,
+    headKDim: Int,
+    headVDim: Int,
+    qkv: MLXArray,
+    convState: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    convWeight: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray
+) -> Bool {
+    hardwareSupported
+        && batch == 1 && width >= 3 && width <= 9 && nKeep == 3
+        && numKHeads == 16 && numVHeads == 48
+        && headKDim == 128 && headVDim == 128
+        && qkv.shape == [1, width, 10_240]
+        && convState.shape == [1, 3, 10_240]
+        && a.shape == [1, width, 48] && b.shape == [1, width, 48]
+        && convWeight.shape == [10_240, 4, 1]
+        && aLog.shape == [48] && dtBias.shape == [48]
+        && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+        && a.dtype == .bfloat16 && b.dtype == .bfloat16
+        && convWeight.dtype == .bfloat16
+}
 
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
@@ -439,9 +610,22 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
 /// x48 layers). Bit-exact vs two T=1 launches: the state lives in fp32
 /// registers across the in-kernel t-loop and the eliminated round-trip was a
 /// lossless f32 store/reload. Body is textually the vendored kernel plus the
-/// `m_state` pointer and the `t == 0` store; no new template parameters and
-/// no unused constexpr (M5 gen-17 JIT builds are strict about that).
+/// `m_state` pointer and the `t == 0` store. The fixed BF16/fp32 Qwen geometry
+/// lives in the header, and the caller fails closed before this
+/// template-argument-free kernel when any dtype or dimension is outside that
+/// envelope. The width-2 scalar remains a runtime input as in the proven path.
+private let qwen35GatedDeltaMidKernelName =
+    "qwen35_gated_delta_step_mid_s2_bf16_f32_hk16_hv48_d128_v1"
+
 private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
+    let header = """
+        typedef bfloat16_t InT;
+        typedef float StT;
+        static constant constexpr const int Dk = 128;
+        static constant constexpr const int Dv = 128;
+        static constant constexpr const int Hk = 16;
+        static constant constexpr const int Hv = 48;
+        """
     let source = """
             auto n = thread_position_in_grid.z;
             auto b_idx = n / Hv;
@@ -521,12 +705,43 @@ private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
             }
         """
     return MLXFast.metalKernel(
-        name: "qwen35_gated_delta_step_mid",
+        name: qwen35GatedDeltaMidKernelName,
         inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
         outputNames: ["y", "state_out", "state_mid"],
-        source: source
+        source: source,
+        header: header
     )
 }()
+
+private func qwen35GatedDeltaMidEligible(
+    hardwareSupported: Bool,
+    batch: Int,
+    width: Int,
+    nConfirmed: Int,
+    maskIsNil: Bool,
+    convKernelSize: Int,
+    numKHeads: Int,
+    numVHeads: Int,
+    headKDim: Int,
+    headVDim: Int,
+    qkv: MLXArray,
+    convState: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    convWeight: MLXArray
+) -> Bool {
+    nConfirmed == 1 && width == 2 && maskIsNil
+        && hardwareSupported
+        && batch == 1 && convKernelSize == 4
+        && numKHeads == 16 && numVHeads == 48
+        && headKDim == 128 && headVDim == 128
+        && qkv.shape == [1, 2, 10_240]
+        && convState.shape == [1, 3, 10_240]
+        && a.shape == [1, 2, 48] && b.shape == [1, 2, 48]
+        && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
+        && a.dtype == .bfloat16 && b.dtype == .bfloat16
+        && convWeight.dtype == .bfloat16
+}
 
 // MARK: - GatedDeltaNet
 
@@ -794,13 +1009,22 @@ final class Qwen35GatedDeltaNet: Module {
         // shape, geometry, or dtype outside the byte-receipt envelope. The
         // S >= 3 lower bound is hard (the kernel's conv-state copy reads only
         // qkv rows, which is wrong at S < nKeep); above 9 no verify exists.
-        let mixerHit = MLXHardwareInfo.isCompiledDecodeSupported
-            && B == 1 && S >= 3 && S <= 9 && nKeep == 3
-            && numKHeads == 16 && numVHeads == 48
-            && headKDim == 128 && headVDim == 128
-            && qkv.dim(2) == 16 * 128 * 2 + 48 * 128
-            && qkv.dtype == .bfloat16 && convState.dtype == .bfloat16
-            && a.dtype == .bfloat16 && b.dtype == .bfloat16
+        let mixerHit = qwen35PackedGDNPreworkEligible(
+            hardwareSupported: MLXHardwareInfo.isCompiledDecodeSupported,
+            batch: B,
+            width: S,
+            nKeep: nKeep,
+            numKHeads: numKHeads,
+            numVHeads: numVHeads,
+            headKDim: headKDim,
+            headVDim: headVDim,
+            qkv: qkv,
+            convState: convState,
+            a: a,
+            b: b,
+            convWeight: conv1d.weight,
+            aLog: aLog,
+            dtBias: dtBias)
         let qNormed: MLXArray
         let kNormed: MLXArray
         let v: MLXArray
@@ -809,15 +1033,11 @@ final class Qwen35GatedDeltaNet: Module {
         let newConvState: MLXArray
         if mixerHit {
             let invScale = pow(Float(headKDim), -0.5)
-            let outs = qwen35PackedGDNPreworkKernel(
+            let mixerKernel = qwen35PackedGDNPreworkKernels[S - 3]
+            let outs = mixerKernel(
                 [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
                  MLXArray(pow(invScale, 2)).asType(.bfloat16),
                  MLXArray(invScale).asType(.bfloat16)],
-                template: [
-                    ("Hk", numKHeads), ("Dk", headKDim),
-                    ("Hv", numVHeads), ("Dv", headVDim),
-                    ("NKeep", nKeep), ("C", qkv.dim(2)), ("T", S),
-                ],
                 grid: (32, S, 2 * numKHeads + numVHeads),
                 threadGroup: (32, 1, 1),
                 outputShapes: [
@@ -1018,7 +1238,22 @@ final class Qwen35GatedDeltaNet: Module {
             finalConvState = c
             finalSsmState = s
             pendingPrefixTape = tape
-        } else if nConfirmed == 1 && S == 2 && mask == nil,
+        } else if qwen35GatedDeltaMidEligible(
+            hardwareSupported: MLXHardwareInfo.isCompiledDecodeSupported,
+            batch: B,
+            width: S,
+            nConfirmed: nConfirmed,
+            maskIsNil: mask == nil,
+            convKernelSize: convKernelSize,
+            numKHeads: numKHeads,
+            numVHeads: numVHeads,
+            headKDim: headKDim,
+            headVDim: headVDim,
+            qkv: qkv,
+            convState: convState,
+            a: a,
+            b: b,
+            convWeight: conv1d.weight),
            let midKernel = qwen35GatedDeltaMidKernel
         {
             // Width-2 MTP verify, single-launch form. The old split path ran
@@ -1059,14 +1294,6 @@ final class Qwen35GatedDeltaNet: Module {
 
             let outputs = midKernel(
                 [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
-                template: [
-                    ("InT", dtype),
-                    ("StT", DType.float32),
-                    ("Dk", headKDim),
-                    ("Dv", headVDim),
-                    ("Hk", numKHeads),
-                    ("Hv", numVHeads),
-                ],
                 grid: (32, headVDim, B * numVHeads),
                 threadGroup: (32, 4, 1),
                 outputShapes: [
@@ -1149,7 +1376,20 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let normedOut: MLXArray
-        if S >= 2 {
+        let fusedPostNormEligible =
+            MLXHardwareInfo.isCompiledDecodeSupported
+            && nConfirmed == 1 && mask == nil
+            && B == 1 && S >= 2 && S <= 9
+            && numVHeads == 48 && headVDim == 128
+            && out.ndim == 4 && out.shape == [B, S, numVHeads, headVDim]
+            && z.ndim == 4 && z.shape == out.shape
+            && out.dtype == .bfloat16 && z.dtype == .bfloat16
+            && norm.weight.ndim == 1 && norm.weight.shape == [headVDim]
+            && norm.weight.dtype == .bfloat16
+        if fusedPostNormEligible {
+            normedOut = qwen35FusedGatedDeltaPostNorm(
+                x: out, gate: z, weight: norm.weight, eps: norm.eps)
+        } else if S >= 2 {
             let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
         } else {
@@ -2119,8 +2359,42 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
 // incumbent affine-4 compact readout evaluates those rows, and this single
 // SIMDgroup applies the incumbent value/id total order to select the proposal.
 // The target lm_head, verify values, cache state, and row ledger are untouched.
+private let qwen35DraftRerankKernelName =
+    "qwen_mtp_draft_rerank_k32_prefix98304_offset149740_v1"
+
+private func qwen35DraftRerankInputEligible(
+    coarseWeight: MLXArray,
+    coarseScales: MLXArray,
+    coarseBiases: MLXArray,
+    x: MLXArray,
+    hiddenSize: Int,
+    paddedCount: Int,
+    candidateCount: Int,
+    prefixCount: Int,
+    controlOffset: Int
+) -> Bool {
+    coarseWeight.dim(0) == paddedCount
+        && coarseWeight.dim(1) == 320
+        && coarseScales.shape == [paddedCount, 80]
+        && coarseBiases.shape == [paddedCount, 80]
+        && x.shape == [1, 1, hiddenSize]
+        && x.dtype == .bfloat16
+        && candidateCount == 32
+        && prefixCount == 98_304
+        && controlOffset == 149_740
+}
+
+private func qwen35DraftRerankOutputEligible(
+    candidateIDs: MLXArray,
+    exactLogits: MLXArray
+) -> Bool {
+    candidateIDs.shape == [32] && candidateIDs.dtype == .uint32
+        && exactLogits.shape == [1, 1, 32]
+        && exactLogits.dtype == .bfloat16
+}
+
 private let qwen35DraftRerankKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_rerank",
+    name: qwen35DraftRerankKernelName,
     inputNames: ["logits", "candidate_ids"],
     outputNames: ["token_id"],
     source: """
@@ -2146,6 +2420,9 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
         }
     """,
     header: """
+        static constant constexpr const int PREFIX_COUNT = 98304;
+        static constant constexpr const int CONTROL_OFFSET = 149740;
+
         inline bool qwen_draft_rerank_better(
             float candidate_value,
             uint candidate_id,
@@ -2885,11 +3162,18 @@ extension Qwen35TextModel: MTPCapable {
         guard let coarseWeight = _draftHeadW,
               let coarseScales = _draftHeadS,
               let coarseBiases = _draftHeadZ,
-              coarseWeight.dim(0) == Self.compactDraftPaddedCount,
-              coarseWeight.dim(1) == 320,
-              coarseScales.shape == [Self.compactDraftPaddedCount, 80],
-              coarseBiases.shape == [Self.compactDraftPaddedCount, 80],
-              x.shape == [1, 1, configuration.hiddenSize]
+              qwen35DraftRerankInputEligible(
+                  coarseWeight: coarseWeight,
+                  coarseScales: coarseScales,
+                  coarseBiases: coarseBiases,
+                  x: x,
+                  hiddenSize: configuration.hiddenSize,
+                  paddedCount: Self.compactDraftPaddedCount,
+                  candidateCount: Self.draftRerankCandidateCount,
+                  prefixCount: Self.compactDraftPrefixCount,
+                  controlOffset:
+                      Self.compactDraftControlStart
+                      - Self.compactDraftPrefixCount)
         else { return nil }
 
         if _compactDraftHead == nil {
@@ -2933,13 +3217,13 @@ extension Qwen35TextModel: MTPCapable {
             x, exactWeight, scales: exactScales, biases: exactZeroPoints,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
 
+        guard qwen35DraftRerankOutputEligible(
+            candidateIDs: candidateIDs,
+            exactLogits: exactLogits)
+        else { return nil }
+
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
-            template: [
-                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                ("CONTROL_OFFSET",
-                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
-            ],
             grid: (candidateCount, 1, 1),
             threadGroup: (candidateCount, 1, 1),
             outputShapes: [[1, 1]],
