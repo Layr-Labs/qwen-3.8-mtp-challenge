@@ -1080,6 +1080,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 // 2-bit matmul (all its projections are affine-4), and out_vec_size ==
 // 98_336 exists only in the compact draft readout, so the dispatch gate
 // below cannot touch the serial numerator or the denominator band.
+//
+// Occupancy: the host still owns an 8-row threadgroup tile (2 simdgroups
+// x 4 rows). Each simdgroup now finishes a 2-row pair through all K
+// before opening the next pair, so only two weight/scale/bias streams
+// sit next to the 32-value activation tile. Isolated 2-row/32-value
+// geometry beat 4-row/32-value on this same shape; the write map is
+// unchanged. Reloading x per pair is ~10 KB against 158 MB of weights.
 template <typename T>
 METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     const device uint32_t* w,
@@ -1093,60 +1100,64 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     uint simd_gid,
     uint simd_lid) {
   constexpr int rows_per_simd = 4;
+  constexpr int live_rows = 2;
   constexpr int values_per_thread = 32;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_lane = 8;  // 32 values x 2 bits = 8 bytes
   const int in_vec_size_w = in_vec_size / 4;   // weight bytes per output row
   const int in_vec_size_g = in_vec_size / 64;  // scale groups per output row
 
-  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int out_base = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
 
-  thread float result[rows_per_simd];
-  for (int r = 0; r < rows_per_simd; r++) {
-    result[r] = 0.0f;
-  }
-
-  for (int k = 0; k < in_vec_size; k += block_size) {
-    thread ulong packed[rows_per_simd];
-    thread float scale_local[rows_per_simd];
-    thread float bias_local[rows_per_simd];
-    for (int r = 0; r < rows_per_simd; r++) {
-      const int row = out_row + r;
-      const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
-          row * in_vec_size_w + k / 4 + simd_lid * bytes_per_lane;
-      packed[r] = *reinterpret_cast<const device ulong*>(ws);
-      // 32 values per lane = half of one 64-value group.
-      const int group_index =
-          row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
-      scale_local[r] = scales[group_index];
-      bias_local[r] = biases[group_index];
+  for (int pair = 0; pair < rows_per_simd; pair += live_rows) {
+    const int out_row = out_base + pair;
+    thread float result[live_rows];
+    for (int r = 0; r < live_rows; r++) {
+      result[r] = 0.0f;
     }
 
-    thread float x0[values_per_thread];
-    const device T* xm = x + k + simd_lid * values_per_thread;
-    float sum = 0.0f;
-    for (int i = 0; i < values_per_thread; i += 4) {
-      x0[i] = static_cast<float>(xm[i]);
-      x0[i + 1] = static_cast<float>(xm[i + 1]);
-      x0[i + 2] = static_cast<float>(xm[i + 2]);
-      x0[i + 3] = static_cast<float>(xm[i + 3]);
-      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
-    }
-
-    for (int r = 0; r < rows_per_simd; r++) {
-      float accum = 0.0f;
-      #pragma unroll
-      for (int j = 0; j < 32; j++) {
-        accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+    for (int k = 0; k < in_vec_size; k += block_size) {
+      thread ulong packed[live_rows];
+      thread float scale_local[live_rows];
+      thread float bias_local[live_rows];
+      for (int r = 0; r < live_rows; r++) {
+        const int row = out_row + r;
+        const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
+            row * in_vec_size_w + k / 4 + simd_lid * bytes_per_lane;
+        packed[r] = *reinterpret_cast<const device ulong*>(ws);
+        // 32 values per lane = half of one 64-value group.
+        const int group_index =
+            row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
+        scale_local[r] = scales[group_index];
+        bias_local[r] = biases[group_index];
       }
-      result[r] += scale_local[r] * accum + sum * bias_local[r];
-    }
-  }
 
-  for (int r = 0; r < rows_per_simd; r++) {
-    const float reduced = simd_sum(result[r]);
-    if (simd_lid == 0) {
-      y[out_row + r] = static_cast<T>(reduced);
+      thread float x0[values_per_thread];
+      const device T* xm = x + k + simd_lid * values_per_thread;
+      float sum = 0.0f;
+      for (int i = 0; i < values_per_thread; i += 4) {
+        x0[i] = static_cast<float>(xm[i]);
+        x0[i + 1] = static_cast<float>(xm[i + 1]);
+        x0[i + 2] = static_cast<float>(xm[i + 2]);
+        x0[i + 3] = static_cast<float>(xm[i + 3]);
+        sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+      }
+
+      for (int r = 0; r < live_rows; r++) {
+        float accum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) {
+          accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+        }
+        result[r] += scale_local[r] * accum + sum * bias_local[r];
+      }
+    }
+
+    for (int r = 0; r < live_rows; r++) {
+      const float reduced = simd_sum(result[r]);
+      if (simd_lid == 0) {
+        y[out_row + r] = static_cast<T>(reduced);
+      }
     }
   }
 }
