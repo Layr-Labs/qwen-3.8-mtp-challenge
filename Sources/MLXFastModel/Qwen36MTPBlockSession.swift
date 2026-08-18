@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import MLXFastCore
@@ -202,95 +203,12 @@ public final class Qwen36MTPBlockSession {
 
     // MARK: - warm
 
-    /// Keep the ranked M5-Max model allocations in Metal's residency set
-    /// after the input-independent warm. MLX attaches a residency set to every
-    /// command queue, but its capacity is zero until a wired limit is applied;
-    /// without this one-time resize the driver must re-establish residency for
-    /// the whole tower on later command buffers.
-    ///
-    /// Capacity is deliberately the live post-warm footprint plus only a small
-    /// page-rounding allowance. After cached warm temporaries are cleared,
-    /// persistent weights fit in the one resize while later scratch fails the
-    /// fit test and stays on the commit-free unwired path. The ticket is never
-    /// ended because shrinking the limit would evict the resident weights.
-    private static let wiredZHDefaultFraction = 1.0
-    private static let wiredZHDefaultSlackMB = 64
-    private static let wiredTicketLock = NSLock()
-    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
-
-    private final class QwenMTPWiredLimitBox: @unchecked Sendable {
-        var value: Int = 0
-    }
-
-    private static func wireResidentWeightsIfEnabled() {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["DARKBLOOM_QWEN_MTP_WIRED_ZH"] != "0" else { return }
-        guard ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
-        else { return }
-
-        wiredTicketLock.lock()
-        defer { wiredTicketLock.unlock() }
-        guard wiredTicketRetainer == nil else { return }
-
-        // Shape-warm locals have left scope before this method is called.
-        // Remove their cached storage so the active count describes the live
-        // backbone, head, and persistent runtime tensors rather than scratch.
-        Memory.clearCache()
-        let active = Memory.activeMemory
-        guard active > 0 else { return }
-
-        let fraction = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_FRACTION"]
-            .flatMap(Double.init) ?? wiredZHDefaultFraction
-        let slackMB = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_SLACK_MB"]
-            .flatMap(Int.init) ?? wiredZHDefaultSlackMB
-        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
-        target += max(0, slackMB) << 20
-
-        // The MLX backend rejects a wired limit above the recommended working
-        // set. Keep a 256 MiB margin for system bookkeeping and fail closed on
-        // nonsensical geometry.
-        if let recommended = GPU.maxRecommendedWorkingSetBytes() {
-            target = min(target, max(0, recommended - (256 << 20)))
-        }
-        guard target > 0 else { return }
-
-        let ticket = WiredMemoryTicket(
-            size: target,
-            policy: MLXLMCommon.WiredSumPolicy(cap: target),
-            manager: .shared,
-            kind: .active
-        )
-        let appliedBox = QwenMTPWiredLimitBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached(priority: .userInitiated) {
-            appliedBox.value = await ticket.start()
-            semaphore.signal()
-        }
-        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
-        wiredTicketRetainer = ticket
-
-        let applied = outcome == .success ? appliedBox.value : -1
-        let recommended = GPU.maxRecommendedWorkingSetBytes() ?? -1
-        var line = "mlxfast: qwen-mtp wired-zh request=\(target)"
-        line += " applied=\(applied) active=\(active)"
-        line += " slack_mb=\(max(0, slackMB)) fraction=\(fraction)"
-        line += " maxrec=\(recommended)\n"
-        FileHandle.standardError.write(Data(line.utf8))
-    }
-
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
     /// Warms the two forward shapes a round dispatches — the batched verify at
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
-        // Keep the large shape-warm object graph in a separate call frame so
-        // every throwaway cache and tensor is released before residency sizing.
-        try warmAllDepthShapes(maxDepth: maxDepth)
-        Self.wireResidentWeightsIfEnabled()
-    }
-
-    private func warmAllDepthShapes(maxDepth: Int) throws {
         // Warms every legal verify width from 1 (the serial control's
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
@@ -374,14 +292,31 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
-            // Compile the two top-2 reduction kernels outside the scored window
-            // at every row count a round can dispatch.
+            // tape. Warm the SAME expression scored rounds dispatch:
+            // `callWithHiddenAndNormed` (E). Warming only `callWithHidden`
+            // leaves the published post-norm output to cold-JIT inside
+            // the first timed verify — the 7b33621 failure mode.
+            let verifyLogits: MLXArray
+            let verifyNormed: MLXArray?
+            if width >= 2 {
+                let triple = model.callWithHiddenAndNormed(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 1)
+                verifyLogits = triple.0
+                verifyNormed = triple.2
+            } else {
+                let pair = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0)
+                verifyLogits = pair.0
+                verifyNormed = nil
+            }
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
+            if let verifyNormed { warmBundle.append(verifyNormed) }
+            eval(warmBundle)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -402,10 +337,13 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
-            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-            cache: oneRowReplayCache, nConfirmed: 1)
-        eval(oneRowReplayLogits)
+        let (oneRowReplayLogits, _, oneRowReplayNormed) =
+            model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+                cache: oneRowReplayCache, nConfirmed: 1)
+        var oneRowBundle = [oneRowReplayLogits]
+        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
+        eval(oneRowBundle)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -439,6 +377,72 @@ public final class Qwen36MTPBlockSession {
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
             + [seedWarmIDs, seedWarmValues, seedWarmNorm])
+        Self.applyQwenMTPWiredResidencyTicket()
+    }
+
+    // MARK: - wired residency
+
+    /// Largest wired-limit ticket applied so far; the ticket only ever RAISES
+    /// the limit. The allocator clear at phase start shrinks the live
+    /// footprint, but shrinking the residency set would evict wired weights
+    /// and re-introduce per-command-buffer residency commits inside the
+    /// scored window. The worker is single-threaded (protocol loop on one
+    /// thread), so this mutable global is only ever touched there.
+    private static nonisolated(unsafe) var qwenMTPWiredResidencyLimit = Int.min
+
+    /// Zero-headroom wired residency (Laguna mechanism 2, +2.03% official on
+    /// M5; the same mechanism composed into the 3.2322 crown, SSHdotCodes
+    /// 3a995c2b). The vendored MLX Device attaches an MTLResidencySet to
+    /// every command queue but `capacity_` defaults to 0, so the driver
+    /// re-establishes residency for the whole RAM-resident tower on every
+    /// command buffer (driver-busy 167ms vs GPU-busy 124ms on the Laguna
+    /// board). One `set_wired_limit` ticket at the end of session warm sizes
+    /// the set to the LIVE footprint (active + cached allocator bytes) with
+    /// only 64 MiB slack, clamped below the device's recommended working set
+    /// with a 256 MiB margin; later transient allocations (round KV,
+    /// activations) fail the ResidencySet fit test and take the commit-free
+    /// branch, so scored windows stay free of per-allocation residency
+    /// commits. Pure driver-side; no numerics change.
+    ///
+    /// Guards: 96 GiB physical-memory floor (ranked box is 128 GB),
+    /// DARKBLOOM_WIRED_ZH=0 kill switch, DARKBLOOM_WIRED_ZH_FRACTION /
+    /// _SLACK_MB / _MIN_PHYS_GB overrides. Idempotent: re-measures and only
+    /// applies when the new limit is strictly larger than the previous
+    /// ticket.
+    private static func applyQwenMTPWiredResidencyTicket() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["DARKBLOOM_WIRED_ZH"] != "0" else { return }
+
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let minPhysGB = UInt64(env["DARKBLOOM_WIRED_ZH_MIN_PHYS_GB"] ?? "96") ?? 96
+        guard physical >= minPhysGB * 1_073_741_824 else { return }
+
+        let snapshot = Memory.snapshot()
+        let live = snapshot.activeMemory + snapshot.cacheMemory
+        let fraction = Double(env["DARKBLOOM_WIRED_ZH_FRACTION"] ?? "1.0") ?? 1.0
+        let slackMB = Int(env["DARKBLOOM_WIRED_ZH_SLACK_MB"] ?? "64") ?? 64
+        var limit = max(0, Int(Double(live) * fraction) + slackMB * 1_048_576)
+        if let workingSet = GPU.maxRecommendedWorkingSetBytes() {
+            limit = Swift.min(limit, workingSet - 256 * 1_048_576)
+        }
+        guard limit > qwenMTPWiredResidencyLimit else { return }
+
+        var previous: size_t = 0
+        let result = mlx_set_wired_limit(&previous, size_t(limit))
+        if result != 0 {
+            fputs(
+                "mlxfast-worker: wired-residency ticket failed (rc=\(result))\n",
+                stderr
+            )
+            return
+        }
+        qwenMTPWiredResidencyLimit = limit
+        fputs(
+            "mlxfast-worker: wired-residency ticket applied: limit=\(limit) "
+                + "bytes (live \(live) = active \(snapshot.activeMemory) "
+                + "cache \(snapshot.cacheMemory))\n",
+            stderr
+        )
     }
 
     // MARK: - begin
@@ -577,7 +581,7 @@ public final class Qwen36MTPBlockSession {
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
+        .map { 0.92 * pow(0.995, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
@@ -676,7 +680,7 @@ public final class Qwen36MTPBlockSession {
     /// touch a cold or hard prompt at all — it only shortens the
     /// re-qualification ramp on stretches the head is already proving. Gate 1 is
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
-    private static let segmentedStreakGate = 2
+    private static let segmentedStreakGate = 1
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -692,26 +696,47 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
+        // A single draft is ALWAYS worth more than none: the batched verify
+        // prices the extra row at a tiny marginal cost (the primary row's
+        // forward is already launched), so drafting 1 is strictly better than
+        // the adaptive skip even when the head is cold. Only the MARGINAL
+        // rule may trade depth away; the first draft is floored at 1. This
+        // removes the white-out failure mode measured on hard hidden prompts
+        // (official prompt 5 collapsed to 0.166 mean drafts, 1.25x, dragging
+        // the median down to the 4th of 8 sorted ratios).
+        var depth = 1
         let h = Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
-        var depth = 0
-        while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+        if cap > 1 {
+            // First marginal step: from depth 0 to 1. The floored first draft
+            // is not free — its acceptance is the EMA at position 0 (or the
+            // margin confidence when available) — so the second draft is
+            // priced against that same product.
+            var p0 = positionAcceptEMA[0]
+            if let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
+                p0 = Swift.min(p0, conf)
             }
-            reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
-            guard reach > threshold else { break }
-            expected += reach
-            depth += 1
+            reach = p0
+            expected = p0
+            var d = 1
+            while d < cap {
+                var p = positionAcceptEMA[d]
+                if d == 1, let tail = pendingTop2, tail.1.count >= 2 {
+                    let margin = tail.1[0] - tail.1[1]
+                    let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
+                    p = Swift.min(p, conf2)
+                }
+                reach *= p
+                let threshold = h * (1.0 + expected)
+                    / (1.0 + Double(d) * h)
+                guard reach > threshold else { break }
+                expected += reach
+                d += 1
+            }
+            depth = d
         }
         return depth
     }

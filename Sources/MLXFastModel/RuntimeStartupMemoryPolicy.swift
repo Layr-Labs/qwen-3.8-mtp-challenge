@@ -1,5 +1,4 @@
 import Darwin
-import Foundation
 import MLX
 
 /// Selects a model-startup profile from the machine's physical-memory budget.
@@ -45,41 +44,10 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     public let clearAllocatorCacheAfterWarmup: Bool
     public let environmentOverrides: [String: String]
 
-    /// Install the full-memory Qwen-MTP command-buffer geometry before the
-    /// worker's first MLX device access. The MTP worker calls `resolve` before
-    /// loading either the backbone or head, but deliberately returns early
-    /// from the low-memory policy application on the ranked 128 GiB machine.
-    /// MLX caches both limits on first use, so this is the last editable hook
-    /// early enough to supply a full-profile default without touching trusted
-    /// worker code.
-    ///
-    /// The 512 MiB referenced-byte budget is the independently promoted
-    /// post-residency setting from the Laguna M5-Max track. It admits a whole
-    /// model layer per command buffer after the persistent weights have been
-    /// wired, while the stock 50-operation cap remains the outer safety wall.
-    /// Explicit user values win and a benchmark-forwarded kill switch supports
-    /// same-binary controls.
-    private static func installQwenMTPFullProfileCommandBufferDefaults(
-        physicalMemoryBytes: UInt64,
-        requestedProfile: String?
-    ) {
-        guard physicalMemoryBytes >= (UInt64(96) << 30) else { return }
-        guard requestedProfile?.lowercased() != "low" else { return }
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"] != "0"
-        else { return }
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
-    }
-
     public static func resolve(
         physicalMemoryBytes: UInt64,
         requestedProfile: String? = nil
     ) -> RuntimeStartupMemoryPolicy {
-        installQwenMTPFullProfileCommandBufferDefaults(
-            physicalMemoryBytes: physicalMemoryBytes,
-            requestedProfile: requestedProfile
-        )
         let lowMemory: Bool
         let selectionReason: String
         switch requestedProfile?.lowercased() ?? "" {
@@ -138,12 +106,16 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             cacheLimitBytes: 32 << 30,
             // The MLX M5 Max default commits a command buffer after
             // referencing 50 MiB. Many 4-bit projections individually exceed
-            // that, so 320 MiB groups adjacent kernels without long command
-            // buffers; decode's explicit async-eval groups remain the outer
-            // command-buffer boundary, and this referenced-buffer budget
-            // governs within them.
-            maxMegabytesPerCommandBuffer: 320,
-            maxOperationsPerCommandBuffer: 128,
+            // that, so 512 MiB groups a full decode layer into one command
+            // buffer once the tower is wired (the zero-headroom residency
+            // ticket's premise: post-residency, splitting buys nothing).
+            // This is the promoted post-wire configuration from the 3.2322
+            // crown (SSHdotCodes 3a995c2b: MLX_MAX_MB_PER_BUFFER=512, stock
+            // 50-operation cap); decode's explicit async-eval groups remain
+            // the outer command-buffer boundary, and this referenced-buffer
+            // budget governs within them.
+            maxMegabytesPerCommandBuffer: 512,
+            maxOperationsPerCommandBuffer: 50,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )

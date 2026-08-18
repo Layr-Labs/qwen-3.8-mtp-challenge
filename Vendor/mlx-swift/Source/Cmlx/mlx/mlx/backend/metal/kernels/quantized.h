@@ -1065,6 +1065,41 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
+// IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
+// with the remainder spread evenly so no group runs a one-row tail.
+template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M >= 3 && M <= 9, "wide multi-row QMV dispatch covers M in [3, 9]");
+  static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
+  constexpr int TAIL = M % IPG;
+  const int first_m = int(tid.x) * IPG;
+  if (first_m >= M) {
+    return;
+  }
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+  if (TAIL == 0 || M - first_m >= IPG) {
+    qmv_fast_crossrow_affine4_g64_wide<T, IPG, DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  } else {
+    qmv_fast_crossrow_affine4_g64_wide<
+        T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  }
+}
+
+
 // Single-row (M == 1) affine2/g64 fast QMV for the coarse compact draft
 // readout (out_vec_size == 98_336, bits == 2) of the promoted draft-rerank
 // scheme, at 32 values per lane: each lane loads ONE uint64 (32 packed
@@ -1148,40 +1183,6 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     if (simd_lid == 0) {
       y[out_row + r] = static_cast<T>(reduced);
     }
-  }
-}
-
-// IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
-// with the remainder spread evenly so no group runs a one-row tail.
-template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
-METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
-    uint3 tid,
-    uint simd_gid,
-    uint simd_lid) {
-  static_assert(M >= 3 && M <= 9, "wide multi-row QMV dispatch covers M in [3, 9]");
-  static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
-  constexpr int TAIL = M % IPG;
-  const int first_m = int(tid.x) * IPG;
-  if (first_m >= M) {
-    return;
-  }
-  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
-  if (TAIL == 0 || M - first_m >= IPG) {
-    qmv_fast_crossrow_affine4_g64_wide<T, IPG, DIRECT_NIBBLES>(
-        w, scales, biases, x, y, in_vec_size, out_vec_size,
-        first_m, out_row, simd_lid);
-  } else {
-    qmv_fast_crossrow_affine4_g64_wide<
-        T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
-        w, scales, biases, x, y, in_vec_size, out_vec_size,
-        first_m, out_row, simd_lid);
   }
 }
 
@@ -1905,15 +1906,19 @@ template <typename T, int group_size, int bits, bool batched>
         b_strides,
         tid);
   }
-  if (!batched && group_size == 64 && bits == 2 && out_vec_size == 98336 &&
-      ntg.x == 1) {
-    // M == 1 coarse draft readout (draft-rerank scheme): the ONE 2-bit shape
-    // in the scored path; proposal-only by construction (see kernel header).
-    qmv_fast_singlerow_affine2_g64<T>(
-        w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid,
-        simd_lid);
-    return;
+
+  if (!batched && group_size == 64 && bits == 2 && out_vec_size == 98336) {
+    // M == 1 2-bit coarse draft readout (draft-rerank scheme): the ONE 2-bit
+    // shape in the scored path. Serial-leg matmuls are all affine4, so this
+    // branch cannot touch the serial numerator or the denominator band.
+    if (ntg.x == 1) {
+      qmv_fast_singlerow_affine2_g64<T>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return;
+    }
   }
+
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
