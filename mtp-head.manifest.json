@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:morgan/qwen38-27b-mtp-r20k-lr3-q4-g64-q2-rerank@fd4a99c590dd6e468c0e2a28168c235e32151a4b",
+  "sha256": "2f6805e1c8b7ea5e5c6cf19acc968426c5b1c3fb2e5442eb1000df96550bf174",
+  "bytes": 427742680,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "The immutable public 40-tensor LR3 proposal artifact keeps the current frontier ABI, affine-2 draft-readout triple, and Q/K/V precision-island index arrays byte-for-byte. Its affine-4/group-64 core and gathered BF16 island values come from the LR3 refinement checkpoint. A fresh anonymous readback of the pinned revision reproduced the declared 427742680 bytes, raw file SHA-256, configuration identity, 40-tensor inventory, and single-file tree digest. The frontier runtime uses the coarse readout only to form a 32-token shortlist, then exactly reranks those rows with the affine-4 compact target lm_head. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay remain unchanged; no remote code is executed."
 }
