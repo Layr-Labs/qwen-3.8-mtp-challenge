@@ -526,7 +526,16 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    private static let headStepCostRatioCold = 0.18
+    private static let headStepCostRatioHot = 0.12
+
+    /// streak 0-1 -> cold; streak 2 -> 0.16; streak 3 -> 0.14; streak 4+ -> hot.
+    private static func adaptiveHeadStepCostRatio(streak: Int) -> Double {
+        let steps = Swift.min(Swift.max(streak - 1, 0), 3)
+        return headStepCostRatioCold
+            - (headStepCostRatioCold - headStepCostRatioHot) * Double(steps)
+                / 3.0
+    }
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -565,7 +574,13 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    /// CAP-7 ARM (exp/cap7): 8 -> 7. Cool-session block receipts measure the
+    /// per-token efficiency peak at depth 7 (9.66 ms/token) and a degrade at
+    /// depth 8 (9.79; the 8th draft's marginal row ≈ 11.5 ms — the segmented
+    /// sdpa second chunk grows 3 -> 4 rows there). Stopping one depth short
+    /// keeps every deep round on the efficient side of the peak; hard prompts
+    /// never reach this cap, so only easy-prompt mixes change.
+    private static let segmentedVerifyDepthCap = 7
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -609,7 +624,7 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        let h = Self.adaptiveHeadStepCostRatio(streak: fullAcceptStreak)
         var reach = 1.0
         var expected = 0.0
         var depth = 0
