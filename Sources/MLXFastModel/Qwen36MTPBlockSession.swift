@@ -155,6 +155,31 @@ public final class Qwen36MTPBlockSession {
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
+    /// E047: rolling window of the most recent committed token ids (seed
+    /// tail at begin), feeding the draft-vocabulary width hint. Host-side
+    /// integers the session already owns; per-request state only.
+    private static let draftScriptWindowSize = 16
+    private var draftScriptWindow: [Int] = []
+
+    private func publishDraftVocabularyHint() {
+        guard let hintable = model as? Qwen36DraftVocabularyHintReceiver
+        else { return }
+        hintable.draftVocabularyWideHint = draftScriptWindow.contains {
+            $0 >= 98_304 && $0 < 248_044
+        }
+    }
+
+    private func noteCommittedForScriptHint(_ tokens: [Int]) {
+        guard !tokens.isEmpty else { return }
+        draftScriptWindow.append(contentsOf: tokens)
+        if draftScriptWindow.count > Self.draftScriptWindowSize {
+            draftScriptWindow.removeFirst(
+                draftScriptWindow.count - Self.draftScriptWindowSize)
+        }
+        publishDraftVocabularyHint()
+    }
+
+
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
     public private(set) var roundCount = 0
@@ -472,6 +497,21 @@ public final class Qwen36MTPBlockSession {
         // eval below materialises it so no seed graph is kept alive.
         seedHiddenForPriming = hidden
         seedTokensForPriming = seedTokens
+
+        // E047: dynamic script hint for the extended draft vocabulary. The
+        // window tracks the most recent committed ids (initialized from the
+        // seed's tail), so an ASCII prompt whose CONTINUATION leaves the
+        // core band gains the wide scan mid-request, and a mostly-ASCII
+        // request with one incidental out-of-core token releases it a few
+        // rounds later instead of paying the wide tax for the whole window.
+        draftScriptWindow = Array(seedTokens.suffix(Self.draftScriptWindowSize))
+        publishDraftVocabularyHint()
+        // E048: compile the wide kernels and touch the band pages NOW, in
+        // warmup, so a mid-request trigger flip has no one-time cost inside
+        // the scored window (the official stall guardrail excludes only the
+        // first block).
+        (model as? Qwen36DraftVocabularyHintReceiver)?
+            .warmDraftVocabularyWidePath()
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
@@ -838,6 +878,7 @@ public final class Qwen36MTPBlockSession {
             pendingPrimary = nil
             pendingTop2 = nil
             pendingHidden = nil
+            noteCommittedForScriptHint(committed)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -904,6 +945,7 @@ public final class Qwen36MTPBlockSession {
             Self.traceRow(
                 pos: seedTokenCount + committedTokenCount,
                 ids: tailTokens, values: tailLogits)
+            noteCommittedForScriptHint(committed)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -1227,6 +1269,7 @@ public final class Qwen36MTPBlockSession {
             reachedStopToken = true
         }
 
+        noteCommittedForScriptHint(committed)
         return Qwen36MTPRoundResult(
             tokens: committed,
             declaredRows: draftCount + 1,
