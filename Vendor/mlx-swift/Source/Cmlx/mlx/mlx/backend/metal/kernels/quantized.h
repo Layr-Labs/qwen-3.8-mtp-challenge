@@ -868,7 +868,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(M >= 1 && M <= 9, "multi-row QMV supports M in [1, 9]");
+  static_assert(M >= 2 && M <= 9, "multi-row QMV supports M in [2, 9]");
   constexpr int inputs_per_group = 2;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -1096,94 +1096,6 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
         T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
         w, scales, biases, x, y, in_vec_size, out_vec_size,
         first_m, out_row, simd_lid);
-  }
-}
-
-// Single-row (M == 1) affine2/g64 fast QMV for the coarse compact draft
-// readout (out_vec_size == 98_336, bits == 2) introduced by the promoted
-// draft-rerank scheme. The generic fast dispatch gate requires bits == 4,
-// so this 2-bit M == 1 op previously fell through to qmv_fast_impl. The
-// serial leg runs NO 2-bit matmuls at all — fused qkv 8192, o_proj 5120,
-// mlp 17408/20480, lm_head 248_320 are all affine4 — so a bits == 2 gate
-// is MTP-only by construction; out_vec_size == 98_336 pins it to the ONE
-// 2-bit shape in the scored path. The per-element expression is the same
-// load_vector + qdot tree as qmv_fast_impl for bits == 2 — raw-x sum,
-// x/4-x/16-x/64 pre-divisions, 0x03/0x0c/0x30/0xc0 byte masks, per-block
-// scale/bias, simd_sum — zero numerics drift vs the fallback.
-template <typename T>
-METAL_FUNC void qmv_fast_singlerow_affine2_g64(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
-    uint3 tid,
-    uint simd_gid,
-    uint simd_lid) {
-  constexpr int rows_per_simd = 4;
-  constexpr int values_per_thread = 16;
-  constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int bytes_per_lane = 4;
-  const int in_vec_size_w = in_vec_size / 4;
-  const int in_vec_size_g = in_vec_size / 64;
-
-  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
-
-  thread float result[rows_per_simd];
-  for (int r = 0; r < rows_per_simd; r++) {
-    result[r] = 0.0f;
-  }
-
-  for (int k = 0; k < in_vec_size; k += block_size) {
-    thread uint32_t packed[rows_per_simd];
-    thread float scale_local[rows_per_simd];
-    thread float bias_local[rows_per_simd];
-    for (int r = 0; r < rows_per_simd; r++) {
-      const int row = out_row + r;
-      const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
-          row * in_vec_size_w + k / 4 + simd_lid * bytes_per_lane;
-      packed[r] = *reinterpret_cast<const device uint32_t*>(ws);
-      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
-      scale_local[r] = scales[group_index];
-      bias_local[r] = biases[group_index];
-    }
-
-    thread float x0[values_per_thread];
-    const device T* xm = x + k + simd_lid * values_per_thread;
-    float sum = 0.0f;
-    for (int i = 0; i < values_per_thread; i += 4) {
-      x0[i] = static_cast<float>(xm[i]);
-      x0[i + 1] = static_cast<float>(xm[i + 1]);
-      x0[i + 2] = static_cast<float>(xm[i + 2]);
-      x0[i + 3] = static_cast<float>(xm[i + 3]);
-      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
-    }
-
-    for (int r = 0; r < rows_per_simd; r++) {
-      const uint32_t p = packed[r];
-      float accum = 0.0f;
-      // Direct 2-bit extraction — x/4^k times (w & (3<<2k)) equals
-      // x times ((w>>2k) & 3) bit-exactly, since power-of-two scaling is
-      // exact and the products round identically to the fallback's masked
-      // form.
-      for (int i = 0; i < 4; i++) {
-        const uint8_t byte = (p >> (8 * i)) & 0xff;
-        accum += (x0[4 * i] * ((byte >> 0) & 0x03) +
-                  x0[4 * i + 1] * ((byte >> 2) & 0x03) +
-                  x0[4 * i + 2] * ((byte >> 4) & 0x03) +
-                  x0[4 * i + 3] * ((byte >> 6) & 0x03));
-      }
-      result[r] += scale_local[r] * accum + sum * bias_local[r];
-    }
-  }
-
-  for (int r = 0; r < rows_per_simd; r++) {
-    const float reduced = simd_sum(result[r]);
-    if (simd_lid == 0) {
-      y[out_row + r] = static_cast<T>(reduced);
-    }
   }
 }
 
@@ -1907,17 +1819,6 @@ template <typename T, int group_size, int bits, bool batched>
         b_strides,
         tid);
   }
-  if (!batched && group_size == 64 && bits == 2 && out_vec_size == 98336) {
-    // M == 1 2-bit coarse draft readout (draft-rerank scheme): the ONE 2-bit
-    // shape in the scored path. Serial-leg matmuls are all affine4, so this
-    // branch cannot touch the serial numerator or the denominator band.
-    if (ntg.x == 1) {
-      qmv_fast_singlerow_affine2_g64<T>(
-          w, scales, biases, x, y, in_vec_size, out_vec_size,
-          tid, simd_gid, simd_lid);
-      return;
-    }
-  }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
@@ -1955,20 +1856,17 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
+          // 4+4, not 3+3+2. The older three-lane choice was measured before
+          // direct-nibble affine-4 reduced the inner loop's register pressure.
+          // With direct nibbles, two four-row groups stream each weight tile
+          // twice instead of the three streams paid by 3+3+2. The isolated
+          // M=8 change ranked at 3.1676568 on the 3.1464259 frontier.
           // Exact: these lanes carry INDEPENDENT input rows and are never reduced
-          // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
+          // across (simd_sum reduces along K WITHIN a row), so moving rows
+          // between groups cannot reorder any row's scalar chain. Template
+          // admits the even split: M in [3,9], 8 % 4 == 0, IPG 4 inside the
+          // wide helper's [2,4].
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1982,22 +1880,6 @@ template <typename T, int group_size, int bits, bool batched>
       }
     } else {
       switch (ntg.x) {
-        case 1:
-          // M == 1 below 4096 outputs: the MTP head's per-position narrow
-          // matmuls (head qkv 3*1024 = 3072, the per-committed-token K/V
-          // pack at 2048) previously fell through to qmv_fast_impl. The
-          // serial leg is 512 plain forwards whose quantized matmuls are
-          // ALL >= 4096 outputs (fused qkv 8192, o_proj 5120, mlp
-          // 17408/20480, lm_head 248_320), so this branch is MTP-only by
-          // construction and cannot touch the serial numerator or the
-          // 5% denominator band. With M == 1 the kernel's has_pair guard
-          // idles the second-lane load; the single lane is the same
-          // qdot_affine4_loaded expression tree as the promoted narrow
-          // rows, so no arithmetic drift vs the fallback.
-          qmv_fast_crossrow_affine4_g64<T, 1>(
-              w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
-          return;
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
