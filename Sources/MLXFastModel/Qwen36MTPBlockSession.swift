@@ -276,17 +276,27 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
-        let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
-        let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
-        let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: foldHidden, nextTokenIds: foldTokens,
-            cache: historyWarmCache)
-            ?? model.mtpHeadHiddenForward(
+        // A fully accepted depth-d round queues d hidden/token pairs. The next
+        // round appends its current transition, so every fold width from 2
+        // through maxDepth + 1 is legal. Exercise those exact live expressions
+        // before timing instead of compiling a new fold shape in round two.
+        for foldWidth in 2 ... (maxDepth + 1) {
+            let foldHidden = MLXArray.zeros(
+                [1, foldWidth, hDim], dtype: row.dtype)
+            let foldTokens = MLXArray(
+                Array(repeating: Int32(0), count: foldWidth)
+            ).reshaped([1, foldWidth])
+            let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: foldHidden, nextTokenIds: foldTokens,
                 cache: historyWarmCache)
-        eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
-        eval(historyWarmCache.flatMap { $0.state })
+                ?? model.mtpHeadHiddenForward(
+                    hidden: foldHidden, nextTokenIds: foldTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                folded[
+                    0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+            eval(historyWarmCache.flatMap { $0.state })
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses

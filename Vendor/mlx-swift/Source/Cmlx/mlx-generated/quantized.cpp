@@ -1112,6 +1112,193 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+// Balanced deep-width specialization. The first two host x-groups split the
+// eight output rows and apply a proven float3 bank followed by a two- or
+// three-input bank. The third group applies the remaining three inputs to all
+// rows. Sequential bank temporaries keep the live register set below the
+// frontier while each output weight row is streamed twice instead of three
+// times.
+template <typename T, int SECOND_BANK>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_two_banks_rows2_direct(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    int out_row,
+    uint simd_lid) {
+  static_assert(
+      SECOND_BANK == 2 || SECOND_BANK == 3,
+      "second direct-nibble bank must contain two or three inputs");
+  typedef vec<float, SECOND_BANK> VB;
+  constexpr int rows_per_simd = 2;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float3 acc0[rows_per_simd];
+  VB acc1[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    acc0[r] = float3(0.0f);
+    acc1[r] = VB(0.0f);
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    {
+      float3 sums = float3(0.0f);
+      float3 partial[rows_per_simd];
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial[r] = float3(0.0f);
+      }
+      for (int i = 0; i < 4; i++) {
+        float3 a0, a1, a2, a3;
+        for (int m = 0; m < 3; m++) {
+          const device T* xm = x + m * in_vec_size + k +
+              simd_lid * values_per_thread + 4 * i;
+          a0[m] = static_cast<float>(xm[0]);
+          a1[m] = static_cast<float>(xm[1]);
+          a2[m] = static_cast<float>(xm[2]);
+          a3[m] = static_cast<float>(xm[3]);
+          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+        }
+        for (int r = 0; r < rows_per_simd; r++) {
+          const uint16_t word = packed[r][i];
+          const float q0 = float(word & 0x000f);
+          const float q1 = float((word >> 4) & 0x000f);
+          const float q2 = float((word >> 8) & 0x000f);
+          const float q3 = float((word >> 12) & 0x000f);
+          partial[r] += a0 * q0 + a1 * q1 + a2 * q2 + a3 * q3;
+        }
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        acc0[r] += scale_local[r] * partial[r] + sums * bias_local[r];
+      }
+    }
+
+    {
+      VB sums = VB(0.0f);
+      VB partial[rows_per_simd];
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial[r] = VB(0.0f);
+      }
+      for (int i = 0; i < 4; i++) {
+        VB a0, a1, a2, a3;
+        for (int m = 0; m < SECOND_BANK; m++) {
+          const device T* xm = x + (m + 3) * in_vec_size + k +
+              simd_lid * values_per_thread + 4 * i;
+          a0[m] = static_cast<float>(xm[0]);
+          a1[m] = static_cast<float>(xm[1]);
+          a2[m] = static_cast<float>(xm[2]);
+          a3[m] = static_cast<float>(xm[3]);
+          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+        }
+        for (int r = 0; r < rows_per_simd; r++) {
+          const uint16_t word = packed[r][i];
+          const float q0 = float(word & 0x000f);
+          const float q1 = float((word >> 4) & 0x000f);
+          const float q2 = float((word >> 8) & 0x000f);
+          const float q3 = float((word >> 12) & 0x000f);
+          partial[r] += a0 * q0 + a1 * q1 + a2 * q2 + a3 * q3;
+        }
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        acc1[r] += scale_local[r] * partial[r] + sums * bias_local[r];
+      }
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < 3; m++) {
+      const float reduced = simd_sum(acc0[r][m]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+    for (int m = 0; m < SECOND_BANK; m++) {
+      const float reduced = simd_sum(acc1[r][m]);
+      if (simd_lid == 0) {
+        y[(m + 3) * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m8_fivethree_direct(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  if (tid.x > 2) {
+    return;
+  }
+  if (tid.x < 2) {
+    const int out_row =
+        int(tid.y) * 8 + int(tid.x) * 4 + int(simd_gid) * 2;
+    qmv_fast_crossrow_affine4_g64_two_banks_rows2_direct<T, 2>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        out_row, simd_lid);
+  } else {
+    qmv_fast_crossrow_affine4_g64_wide<T, 3, true>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        5, int(tid.y) * 8 + int(simd_gid) * 4, simd_lid);
+  }
+}
+
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m9_sixthree_direct(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  if (tid.x > 2) {
+    return;
+  }
+  if (tid.x < 2) {
+    const int out_row =
+        int(tid.y) * 8 + int(tid.x) * 4 + int(simd_gid) * 2;
+    qmv_fast_crossrow_affine4_g64_two_banks_rows2_direct<T, 3>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        out_row, simd_lid);
+  } else {
+    qmv_fast_crossrow_affine4_g64_wide<T, 3, true>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        6, int(tid.y) * 8 + int(simd_gid) * 4, simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1869,15 +2056,14 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4 -- see quantized.h for the register-cliff rationale,
-          // the row-independence exactness argument, and the streak-gate synergy.
-          // This JIT twin is the runtime-effective source.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
+          // Balanced 5+3: sequential float3/float2 banks stay below the 4+4
+          // register cliff while reducing each output row to two weight reads.
+          qmv_fast_crossrow_affine4_g64_m8_fivethree_direct<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 9:
-          qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
+          qmv_fast_crossrow_affine4_g64_m9_sixthree_direct<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
