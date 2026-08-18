@@ -2187,6 +2187,16 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     // for draft proposals when no declared draft_lm_head is present. It is not
     // ModuleInfo because it is derived during warmup, not checkpoint state.
     private var _compactDraftHead: Linear?
+
+    /// One fixed-shape compile of the live declared-head readout:
+    /// affine-2 scan, argPartition top-32, gather, affine-4 rerank, MLX
+    /// total-order select, compact-to-tokenizer map.
+    /// Input `[1, 1, hidden]` → `[1, 1]` int32.
+    /// Installed only after the untimed warm proves the compiled token equals
+    /// the eager Metal-selector token on that same row. A mismatch leaves
+    /// the eager path installed for the rest of the process.
+    private var _compiledDraftTokenID: ((MLXArray) -> MLXArray)?
+    private var _draftTokenCompileResolved = false
     // Prefix 98_304, the promoted trim. A 49_152 halving was measured on the
     // public longcopy gate and REGRESSED: three of its committed argmax ids
     // live in [49_152, 248_044), the head could no longer propose them, and
@@ -2603,25 +2613,68 @@ extension Qwen35TextModel: MTPCapable {
               exactBiases.shape == [Self.compactDraftPaddedCount, 80]
         else { return nil }
 
-        let coarse = quantizedMM(
-            x, coarseWeight, scales: coarseScales, biases: coarseBiases,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine
-        )[0..., 0..., 0 ..< Self.compactDraftRealCount]
+        if let compiled = _compiledDraftTokenID {
+            return compiled(x)
+        }
+
+        let eager = eagerDeclaredRerankTokenID(
+            x,
+            coarseWeight: coarseWeight,
+            coarseScales: coarseScales,
+            coarseBiases: coarseBiases,
+            exactWeight: exact.weight,
+            exactScales: exact.scales,
+            exactBiases: exactBiases)
+        if _draftTokenCompileResolved {
+            return eager
+        }
+        _draftTokenCompileResolved = true
+        guard MLXHardwareInfo.isCompiledDecodeSupported else {
+            return eager
+        }
+
+        let compiled = compile(
+            declaredRerankBody(
+                coarseWeight: coarseWeight,
+                coarseScales: coarseScales,
+                coarseBiases: coarseBiases,
+                exactWeight: exact.weight,
+                exactScales: exact.scales,
+                exactBiases: exactBiases))
+        let compiledToken = compiled(x)
+        eval([eager, compiledToken])
+        // Fail closed: one untimed warm row must produce the same proposal
+        // as the incumbent Metal selector. A compile that disagrees on
+        // argPartition ties or the total order never ships into the clock.
+        if all(eager .== compiledToken).item(Bool.self) {
+            _compiledDraftTokenID = compiled
+            return compiledToken
+        }
+        return eager
+    }
+
+    /// Incumbent eager path: same shortlist arithmetic, then the one-SIMDgroup
+    /// Metal selector that `b1e2591` shipped.
+    private func eagerDeclaredRerankTokenID(
+        _ x: MLXArray,
+        coarseWeight: MLXArray,
+        coarseScales: MLXArray,
+        coarseBiases: MLXArray,
+        exactWeight: MLXArray,
+        exactScales: MLXArray,
+        exactBiases: MLXArray
+    ) -> MLXArray {
         let candidateCount = Self.draftRerankCandidateCount
-        let kth = Self.compactDraftRealCount - candidateCount
-        let candidateIDs = MLX.argPartition(
-            coarse, kth: kth, axis: -1
-        )[.ellipsis, (kth)...].reshaped([candidateCount])
-
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
-        let exactLogits = quantizedMM(
-            x, exactWeight, scales: exactScales, biases: exactZeroPoints,
-            transpose: true, groupSize: 64, bits: 4, mode: .affine)
-
+        let (exactLogits, candidateIDs) = declaredRerankShortlist(
+            x,
+            coarseWeight: coarseWeight,
+            coarseScales: coarseScales,
+            coarseBiases: coarseBiases,
+            exactWeight: exactWeight,
+            exactScales: exactScales,
+            exactBiases: exactBiases)
         return qwen35DraftRerankKernel(
-            [exactLogits.reshaped([candidateCount]), candidateIDs],
+            [exactLogits, candidateIDs],
             template: [
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
@@ -2632,6 +2685,87 @@ extension Qwen35TextModel: MTPCapable {
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]
+    }
+
+    /// Affine-2 shortlist + affine-4 rerank logits. Eager only; feeds the
+    /// incumbent Metal selector.
+    private func declaredRerankShortlist(
+        _ x: MLXArray,
+        coarseWeight: MLXArray,
+        coarseScales: MLXArray,
+        coarseBiases: MLXArray,
+        exactWeight: MLXArray,
+        exactScales: MLXArray,
+        exactBiases: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let realCount = Self.compactDraftRealCount
+        let candidateCount = Self.draftRerankCandidateCount
+        let kth = realCount - candidateCount
+        let coarse = quantizedMM(
+            x, coarseWeight, scales: coarseScales, biases: coarseBiases,
+            transpose: true, groupSize: 64, bits: 2, mode: .affine
+        )[0..., 0..., 0 ..< realCount]
+        let candidateIDs = MLX.argPartition(
+            coarse, kth: kth, axis: -1
+        )[.ellipsis, (kth)...].reshaped([candidateCount])
+        let gatheredWeight = MLX.take(exactWeight, candidateIDs, axis: 0)
+        let gatheredScales = MLX.take(exactScales, candidateIDs, axis: 0)
+        let gatheredZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
+        let exactLogits = quantizedMM(
+            x, gatheredWeight, scales: gatheredScales,
+            biases: gatheredZeroPoints, transpose: true,
+            groupSize: 64, bits: 4, mode: .affine)
+        return (exactLogits.reshaped([candidateCount]), candidateIDs)
+    }
+
+    /// Shared graph: shortlist + affine-4 logits + MLX total-order select.
+    /// The Metal selector is *not* in this closure so `compile` never wraps
+    /// a custom `metalKernel`. Finite-value total order matches the kernel:
+    /// larger logit wins, lower compact id wins ties. NaNs lose to finite
+    /// values on the Metal side; the self-check refuses the compile if that
+    /// ever matters on the warm row.
+    private func declaredRerankBody(
+        coarseWeight: MLXArray,
+        coarseScales: MLXArray,
+        coarseBiases: MLXArray,
+        exactWeight: MLXArray,
+        exactScales: MLXArray,
+        exactBiases: MLXArray
+    ) -> (MLXArray) -> MLXArray {
+        let realCount = Self.compactDraftRealCount
+        let candidateCount = Self.draftRerankCandidateCount
+        let kth = realCount - candidateCount
+        let prefixCount = Self.compactDraftPrefixCount
+        let controlOffset =
+            Self.compactDraftControlStart - Self.compactDraftPrefixCount
+        return { hidden in
+            let coarse = quantizedMM(
+                hidden, coarseWeight, scales: coarseScales, biases: coarseBiases,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine
+            )[0..., 0..., 0 ..< realCount]
+            let candidateIDs = MLX.argPartition(
+                coarse, kth: kth, axis: -1
+            )[.ellipsis, (kth)...].reshaped([candidateCount])
+            let gatheredWeight = MLX.take(exactWeight, candidateIDs, axis: 0)
+            let gatheredScales = MLX.take(exactScales, candidateIDs, axis: 0)
+            let gatheredZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
+            let exactLogits = quantizedMM(
+                hidden, gatheredWeight, scales: gatheredScales,
+                biases: gatheredZeroPoints, transpose: true,
+                groupSize: 64, bits: 4, mode: .affine
+            ).reshaped([candidateCount])
+            let values = exactLogits.asType(.float32)
+            let maxValue = values.max()
+            let isMax = values .== maxValue
+            let ids = candidateIDs.asType(.int32)
+            let maskedIds = which(isMax, ids, MLXArray(Int32.max))
+            let bestId = maskedIds.min()
+            return which(
+                bestId .< Int32(prefixCount),
+                bestId,
+                bestId + Int32(controlOffset)
+            ).reshaped([1, 1]).asType(.int32)
+        }
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
