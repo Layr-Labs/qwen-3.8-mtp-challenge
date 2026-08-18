@@ -251,6 +251,50 @@ private let qwen35CompiledSigmoidMultiply:
     return body
 }()
 
+/// Fuse the full-attention output gate into the affine-4 `o_proj` QMM for
+/// decode / verify widths (`L <= 16`). Algebra is the two-launch path:
+///
+/// ```
+/// o_proj(x ⊙ σ(g)) = quantizedMM((x * sigmoid(g)).reshaped(B, L, K), W)
+/// ```
+///
+/// Same primitives as `qwen35CompiledSigmoidMultiply` then `QuantizedLinear`
+/// (`sigmoid`, multiply, `quantizedMM` affine-4 / g64 / transpose). Compile
+/// records them as one graph so the gated activation is not a separate
+/// host-visible kernel boundary on the 16 full-attention layers. The
+/// elementwise still reads the strided 4-D `(output, gate)` pair — flattening
+/// the packed q/gate split first is a real Copy, which is why the multiply
+/// stays 4-D. Reshape of the compiled multiply's contiguous result is a view.
+///
+/// `quantizedMM` is the same primitive `QuantizedLinear.callAsFunction` uses,
+/// with the same packed `W`, scales, and affine biases. Compile does not
+/// rewrite the QMM; it records the existing op, so the ranked M5 still
+/// selects the promoted qmv / qmm specializations. Prefill (`L > 16`) keeps
+/// the two-launch path so the long-prompt split-k reduction order is
+/// untouched. Group size 64 / 4-bit / affine is the backbone `o_proj`
+/// contract; any other `o_proj` falls back to the two-launch form.
+///
+/// Not shapeless: `reshaped(dim0, dim1, -1)` has the same Slice-style
+/// shape-inference failure mode the fused SwiGLU compile already measured
+/// (`[Primitive::output_shapes] Slice cannot infer output shapes`). Per-width
+/// traces (L = 1…16) are the price of the fused form.
+private let qwen35CompiledGatedAffine4OProj:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+{
+    let body:
+        @Sendable (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+        { x, gate, weight, scales, biases in
+            let gated = (x * sigmoid(gate)).reshaped(x.dim(0), x.dim(1), -1)
+            return quantizedMM(
+                gated, weight, scales: scales, biases: biases, transpose: true,
+                groupSize: 64, bits: 4, mode: .affine)
+        }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(body)
+    }
+    return body
+}()
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
@@ -1925,6 +1969,14 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
+        if L <= 16,
+           let q = oProj as? QuantizedLinear,
+           q.groupSize == 64, q.bits == 4, q.mode == .affine,
+           q.bias == nil, let z = q.biases
+        {
+            return qwen35CompiledGatedAffine4OProj(
+                output, gate, q.weight, q.scales, z)
+        }
         return oProj(
             qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
     }
