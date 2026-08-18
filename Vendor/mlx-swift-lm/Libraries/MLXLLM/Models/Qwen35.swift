@@ -2163,6 +2163,136 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. Replaces `argPartition` on the 98,330 legal coarse
+// logits. One SIMD group keeps an exact 32-row bag per lane, then lane 0
+// merges the 32 bags with the same value/id/NaN order the rerank kernel
+// uses. Padding rows past REAL_COUNT stay unreachable. The affine-4
+// rerank, target lm_head, verify values, and ledger are untouched.
+private let qwen35DraftTopKKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_topk",
+    inputNames: ["logits"],
+    outputNames: ["candidate_ids"],
+    source: """
+        uint lane = thread_index_in_simdgroup;
+        float values[K];
+        uint ids[K];
+        int filled = 0;
+        float worst_value = 0.0f;
+        uint worst_id = 0xFFFFFFFFu;
+        int worst_index = 0;
+
+        for (uint index = lane; index < REAL_COUNT; index += 32) {
+            float value = float(logits[index]);
+            if (filled < K) {
+                values[filled] = value;
+                ids[filled] = index;
+                if (filled == 0
+                    || qwen_draft_rerank_better(
+                        worst_value, worst_id, value, index)) {
+                    worst_value = value;
+                    worst_id = index;
+                    worst_index = filled;
+                }
+                filled += 1;
+                continue;
+            }
+            if (!qwen_draft_rerank_better(
+                    value, index, worst_value, worst_id)) {
+                continue;
+            }
+            values[worst_index] = value;
+            ids[worst_index] = index;
+            worst_value = values[0];
+            worst_id = ids[0];
+            worst_index = 0;
+            for (int slot = 1; slot < K; slot++) {
+                if (qwen_draft_rerank_better(
+                        worst_value, worst_id, values[slot], ids[slot])) {
+                    worst_value = values[slot];
+                    worst_id = ids[slot];
+                    worst_index = slot;
+                }
+            }
+        }
+
+        threadgroup float bag_value[32 * K];
+        threadgroup uint bag_id[32 * K];
+        for (int slot = 0; slot < K; slot++) {
+            bool live = slot < filled;
+            bag_value[lane * K + slot] = live ? values[slot] : NAN;
+            bag_id[lane * K + slot] = live ? ids[slot] : 0xFFFFFFFFu;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane == 0) {
+            float keep_value[K];
+            uint keep_id[K];
+            int keep_filled = 0;
+            float keep_worst_value = 0.0f;
+            uint keep_worst_id = 0xFFFFFFFFu;
+            int keep_worst_index = 0;
+            for (uint item = 0; item < 32 * K; item++) {
+                uint id = bag_id[item];
+                if (id == 0xFFFFFFFFu) { continue; }
+                float value = bag_value[item];
+                if (keep_filled < K) {
+                    keep_value[keep_filled] = value;
+                    keep_id[keep_filled] = id;
+                    if (keep_filled == 0
+                        || qwen_draft_rerank_better(
+                            keep_worst_value, keep_worst_id, value, id)) {
+                        keep_worst_value = value;
+                        keep_worst_id = id;
+                        keep_worst_index = keep_filled;
+                    }
+                    keep_filled += 1;
+                    continue;
+                }
+                if (!qwen_draft_rerank_better(
+                        value, id, keep_worst_value, keep_worst_id)) {
+                    continue;
+                }
+                keep_value[keep_worst_index] = value;
+                keep_id[keep_worst_index] = id;
+                keep_worst_value = keep_value[0];
+                keep_worst_id = keep_id[0];
+                keep_worst_index = 0;
+                for (int slot = 1; slot < K; slot++) {
+                    if (qwen_draft_rerank_better(
+                            keep_worst_value, keep_worst_id,
+                            keep_value[slot], keep_id[slot])) {
+                        keep_worst_value = keep_value[slot];
+                        keep_worst_id = keep_id[slot];
+                        keep_worst_index = slot;
+                    }
+                }
+            }
+            for (int slot = 0; slot < K; slot++) {
+                candidate_ids[slot] = int(
+                    slot < keep_filled ? keep_id[slot] : 0);
+            }
+        }
+    """,
+    header: """
+        inline bool qwen_draft_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2605,13 +2735,19 @@ extension Qwen35TextModel: MTPCapable {
 
         let coarse = quantizedMM(
             x, coarseWeight, scales: coarseScales, biases: coarseBiases,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine
-        )[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            transpose: true, groupSize: 64, bits: 2, mode: .affine)
         let candidateCount = Self.draftRerankCandidateCount
-        let kth = Self.compactDraftRealCount - candidateCount
-        let candidateIDs = MLX.argPartition(
-            coarse, kth: kth, axis: -1
-        )[.ellipsis, (kth)...].reshaped([candidateCount])
+        let candidateIDs = qwen35DraftTopKKernel(
+            [coarse.reshaped([Self.compactDraftPaddedCount])],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("K", candidateCount),
+            ],
+            grid: (candidateCount, 1, 1),
+            threadGroup: (candidateCount, 1, 1),
+            outputShapes: [[candidateCount]],
+            outputDTypes: [.int32]
+        )[0]
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
