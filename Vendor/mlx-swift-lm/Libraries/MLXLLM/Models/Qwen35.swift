@@ -429,6 +429,178 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         ensureRowContiguous: false)
 }()
 
+// MARK: - Fused GDN postwork kernel (RMSNorm + fp32 SiLU gate)
+
+/// Fuses the GatedDeltaNet output block — `MLXFast.rmsNorm(out, ...)` followed
+/// by the compiled fp32 SiLU-gate elementwise
+/// (`qwen35CompiledGatedDeltaPostNorm(rmsOut, z)`) — into ONE dispatch.
+///
+/// BIT-EXACTNESS CONTRACT, same bar as `qwen35FusedAddRMSNormKernel`:
+///
+/// 1. The norm reduces over the last dim of `out` ([B, S, Hv, Dv] rows of
+///    Dv = 128), so the vendored dispatch is `rms_single_row` (128 <=
+///    RMS_LOOPED_LIMIT = 4096), NOT `rms_looped`: normalization.cpp computes
+///    threadgroup = 32 * ceil(ceil(128 / 4) / 32) = 32 — one simdgroup per
+///    row, deterministic, hardware-independent — and grid = n_rows * 32. The
+///    reduction body below is a verbatim copy of `rms_single_row`
+///    (backend/metal/kernels/rms_norm.metal): 4-element fp32 chunks,
+///    `simd_sum`, the (degenerate, single-simdgroup) `local_sums` tree, and
+///    `metal::precise::rsqrt(acc / axis_size + eps)` in fp32.
+/// 2. `rmsOut` is rounded to bf16 at exactly the vendored output point
+///    (`w[i] * static_cast<bfloat16_t>(x[i] * inv)`) and held in registers;
+///    the eager graph materializes it, but its only consumer is the gate, so
+///    the fused kernel needs only the one gated output.
+/// 3. The gate replicates the compiled `qwen35CompiledGatedDeltaPostNorm`
+///    tape op for op: `g32 = static_cast<float>(z[i])`,
+///    `act = g32 * Sigmoid()(g32)`, `out = static_cast<bfloat16_t>(act *
+///    static_cast<float>(rmsOut[i]))`. The compiled Metal backend emits the
+///    vendored `Sigmoid` functor (backend/metal/compiled.cpp prints
+///    `primitive().name()` — `Sigmoid` — and prepends unary_ops.h), here
+///    instantiated at T = float:
+///    `y = 1 / (1 + metal::exp(metal::abs(g))); (g < 0) ? y : 1 - y`.
+///    Everything runs in fp32 and rounds ONCE at the final bf16 cast, so the
+///    0xC0DB bf16-sigmoid fixup carried by the prework kernel does NOT apply
+///    (that fixup covers a bf16-rounded sigmoid; this sigmoid never is).
+/// 4. Both the eager compiled kernel and this JIT string compile with fast
+///    math disabled, so no contraction moves any rounding.
+///
+/// Validated against the eager two-kernel sequence (verbatim rms_single_row
+/// replica + compiled-tape gate replica): EXHAUSTIVE over all 65,536 bf16
+/// gate values crossed with two x distributions (realistic and heavy-tail /
+/// denormal / near-overflow) plus random-z rows — zero mismatches.
+///
+/// Internal (not private) so `Tests/MLXFastTests/Model/
+/// Qwen35FusedAddRMSNormTests.swift` can dispatch it via `@testable`.
+let qwen35FusedGatedDeltaPostworkKernel: MLXFast.MLXFastKernel = {
+    let header = """
+        typedef bfloat16_t InT;
+        """
+    let source = """
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        constexpr int SIMD_SIZE = 32;
+        constexpr int N_READS = 4;
+        constexpr uint axis_size = uint(Dv);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const device InT* x_row = x + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* z_row = z + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* w_row = w + lid * N_READS;
+
+        // rms_single_row reduction, verbatim.
+        float acc = 0;
+        InT rms_local[N_READS];
+        if (lid * N_READS + N_READS <= axis_size) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            const InT xv = x_row[i];
+            rms_local[i] = xv;
+            float xi = xv;
+            acc += xi * xi;
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            if ((lid * N_READS + i) < axis_size) {
+              const InT xv = x_row[i];
+              rms_local[i] = xv;
+              float xi = xv;
+              acc += xi * xi;
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        //  Initialize shared memory
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write simd accumulations into shared memory
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate over simd groups
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write the gated output: rmsOut rounded to bf16 at exactly the
+        // vendored rms_norm output point, then the fp32 SiLU gate and final
+        // product exactly as the compiled qwen35CompiledGatedDeltaPostNorm
+        // tape (vendored Sigmoid functor at T = float).
+        device InT* out_row = out + gid * size_t(axis_size) + lid * N_READS;
+        if (lid * N_READS + N_READS <= axis_size) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            const InT rmsv = w_row[i] *
+                static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+            const float g = static_cast<float>(z_row[i]);
+            const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+            const float sg = (g < 0) ? ys : 1 - ys;
+            const float act = g * sg;
+            out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            if ((lid * N_READS + i) < axis_size) {
+              const InT rmsv = w_row[i] *
+                  static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+              const float g = static_cast<float>(z_row[i]);
+              const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+              const float sg = (g < 0) ? ys : 1 - ys;
+              const float act = g * sg;
+              out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+            }
+          }
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_fused_gdn_postwork",
+        inputNames: ["x", "z", "w", "eps"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: true)
+}()
+
+/// Dispatches the fused GDN postwork kernel, returning
+/// `silu(z) * rmsNorm(x) * w` bit-identical to the eager two-step
+/// (`MLXFast.rmsNorm` + `qwen35CompiledGatedDeltaPostNorm`), or `nil` when the
+/// operands are outside the kernel's validated envelope ([.., Dv = 128] bf16
+/// rows, matching z shape, 1-D contiguous bf16 weight) and the caller must
+/// use the exact eager expression instead.
+private func qwen35FusedGatedDeltaPostwork(
+    _ x: MLXArray, _ z: MLXArray, _ norm: Qwen3NextRMSNormGated
+) -> MLXArray? {
+    let w = norm.weight
+    guard x.dtype == .bfloat16, z.dtype == .bfloat16, w.dtype == .bfloat16,
+        x.ndim >= 1, x.dim(x.ndim - 1) == 128, x.shape == z.shape,
+        w.ndim == 1, w.dim(0) == 128, w.strides == [1]
+    else { return nil }
+    let nRows = x.size / 128
+    return qwen35FusedGatedDeltaPostworkKernel(
+        [x, z, w, MLXArray(norm.eps)],
+        template: [("Dv", 128)],
+        grid: (nRows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16])[0]
+}
+
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -729,6 +901,30 @@ final class Qwen35GatedDeltaNet: Module {
     ///   - ssmState: Initial SSM state (nil on first token)
     ///   - mask: SSM mask for `gatedDeltaUpdate` (optional)
     /// - Returns: `(out, newConvState, newSsmState)`
+    // Memoized q/k norm scale constants. Geometry-derived and input-
+    // independent, but the previous inline `MLXArray(...).asType(...)` form
+    // rebuilt them as two fresh graph nodes (two encoder dispatches) per
+    // layer per round. Bytes are identical: same scalar, same cast, same
+    // consumers — only the rebuild disappears. Stored as plain optionals
+    // (the `_qkvW` pattern above) so Module parameter reflection never sees
+    // them at load time.
+    private var _qScaleConst: MLXArray?
+    private var _kScaleConst: MLXArray?
+
+    fileprivate func normScaleConstants(_ dtype: DType) -> (MLXArray, MLXArray) {
+        if dtype == .bfloat16, let q = _qScaleConst, let k = _kScaleConst {
+            return (q, k)
+        }
+        let invScale = pow(Float(headKDim), -0.5)
+        let q = MLXArray(pow(invScale, 2)).asType(dtype)
+        let k = MLXArray(invScale).asType(dtype)
+        if dtype == .bfloat16 {
+            _qScaleConst = q
+            _kScaleConst = k
+        }
+        return (q, k)
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -751,12 +947,12 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
+        let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
         let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
+            qScaleConst
             * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
         let kNormed =
-            MLXArray(invScale).asType(dtype)
+            kScaleConst
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newSsmState) = gatedDeltaUpdateMemoG(
@@ -808,11 +1004,11 @@ final class Qwen35GatedDeltaNet: Module {
         let beta: MLXArray
         let newConvState: MLXArray
         if mixerHit {
-            let invScale = pow(Float(headKDim), -0.5)
+            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
             let outs = qwen35PackedGDNPreworkKernel(
                 [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
-                 MLXArray(pow(invScale, 2)).asType(.bfloat16),
-                 MLXArray(invScale).asType(.bfloat16)],
+                 qScaleConst,
+                 kScaleConst],
                 template: [
                     ("Hk", numKHeads), ("Dk", headKDim),
                     ("Hv", numVHeads), ("Dv", headVDim),
@@ -850,12 +1046,12 @@ final class Qwen35GatedDeltaNet: Module {
             v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
+            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
             qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
+                qScaleConst
                 * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
             kNormed =
-                MLXArray(invScale).asType(dtype)
+                kScaleConst
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             // Keep the recurrence and conv prologue wide. The promoted
@@ -1040,12 +1236,12 @@ final class Qwen35GatedDeltaNet: Module {
             let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
+            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
             let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
+                qScaleConst
                 * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
             let kNormed =
-                MLXArray(invScale).asType(dtype)
+                kScaleConst
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
@@ -1150,8 +1346,16 @@ final class Qwen35GatedDeltaNet: Module {
 
         let normedOut: MLXArray
         if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            // Fused postwork: rmsNorm + fp32 SiLU gate in ONE dispatch,
+            // bit-identical to the eager two-step it replaces (see
+            // qwen35FusedGatedDeltaPostworkKernel). On any envelope mismatch,
+            // fall back to the exact eager expression.
+            if let fusedPost = qwen35FusedGatedDeltaPostwork(out, z, norm) {
+                normedOut = fusedPost
+            } else {
+                let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+                normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            }
         } else {
             normedOut = norm(out, gate: z)
         }
@@ -1198,6 +1402,10 @@ private let qwen35CompiledFusedSwiGLU:
         return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
+        // NOT shapeless: the half-split Slice cannot re-infer output shapes
+        // under a shapeless replay (measured: worker fatal
+        // "[Primitive::output_shapes] Slice cannot infer output shapes").
+        // The per-shape traces are the price of the fused form.
         return compile(body)
     }
     return body
@@ -1436,6 +1644,134 @@ func qwen35AttentionQKRMSRoPE(
         grid: (totalRows * 64, 1, 1),
         threadGroup: (64, 1, 1),
         outputShapes: [[B, queryHeads, L, D], [B, keyHeads, L, D]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
+// MARK: - Fused residual + RMS norm (PR #250 mechanism, receipt 2.9083)
+
+/// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
+///
+/// Bit-exact with the eager `h = x + r; postAttentionLayerNorm(h)` sequence
+/// because the add is rounded to BF16 BEFORE squaring (matching the write-back
+/// and re-read of `h` in the eager path) and the accumulation / reduction tree
+/// mirrors `rms_norm.metal` exactly.
+private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
+/// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
+/// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
+func qwen35FusedResidualRMSNorm(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray) {
+    let nRows = x.size / x.dim(-1)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormKernel(
+        [x, r, weight, MLXArray(eps)],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape],
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
@@ -1709,7 +2045,11 @@ final class Qwen35Attention: Module {
         let (qProjOutput, keysIn, valuesIn) = qkv(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
-        let gate = qSplit[1].reshaped(B, L, -1)
+        // Keep the gate 4-D: flattening here merged a head axis across the
+        // packed q/gate interleave, which is a REAL Copy kernel per call. The
+        // compiled elementwise below takes strided inputs without copies; the
+        // element pairing (h, d) <-> flat h*D+d is identical either way.
+        let gate = qSplit[1]
 
         var keys = keysIn
         var values = valuesIn
@@ -1751,6 +2091,10 @@ final class Qwen35Attention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
+        // Transpose is a view; the old post-transpose flatten was the second
+        // REAL Copy of this function. Multiply 4-D (strided inputs are
+        // copy-free in the compiled elementwise), then flatten the compiled
+        // kernel's CONTIGUOUS output, which is a free view.
         let output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
@@ -1760,9 +2104,9 @@ final class Qwen35Attention: Module {
             mask: mask
         )
         .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
 
-        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
+        return oProj(
+            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
     }
 }
 
@@ -1882,8 +2226,64 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Fused residual+RMSNorm when shapes and dtype match the common
+        // decode path (hidden 5120, BF16).  Bit-exact with the eager
+        // h = x + r; postAttentionLayerNorm(h) sequence.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
+    }
+
+    /// Boundary-fused variant for the BF16/5120 decode path: the incoming
+    /// residual boundary arrives as an UNMERGED pair with
+    /// `h_in = base + delta`, and this layer's entry performs that merge and
+    /// its own input RMSNorm in ONE fused launch — collapsing the previous
+    /// layer's exit add and this layer's entry norm. The exit returns
+    /// `(h, mlpOut)` unmerged for the next layer (or the caller's single
+    /// final merge). Same kernel, same bf16-round-before-square argument as
+    /// the post-attention pair above, so the values are bit-identical to the
+    /// sequential `x = prevH + prevMLP; inputLayerNorm(x)` chain.
+    func boundaryFused(
+        base: MLXArray,
+        delta: MLXArray?,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int = 0
+    ) -> (base: MLXArray, delta: MLXArray) {
+        let hIn: MLXArray
+        let normedIn: MLXArray
+        if let delta {
+            (hIn, normedIn) = qwen35FusedResidualRMSNorm(
+                x: base, r: delta,
+                weight: inputLayerNorm.weight,
+                eps: inputLayerNorm.eps)
+        } else {
+            hIn = base
+            normedIn = inputLayerNorm(base)
+        }
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(
+                normedIn, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
+        } else {
+            r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
+        }
+        let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+            x: hIn, r: r,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+        return (h, (mlp as! UnaryLayer)(postAttnNorm))
     }
 }
 
@@ -1952,25 +2352,63 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
-        for (i, layer) in layers.enumerated() {
-            let mask = layer.isLinear ? ssmMask : nil
-            let attnMask =
-                layer.isLinear
-                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
-                        asyncEval(hiddenStates)
+        if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
+            // Boundary-fused chain: the residual boundary flows as an
+            // UNMERGED (base, delta) pair, so each interior layer pays one
+            // fused add+norm at entry instead of a standalone exit add plus
+            // a standalone entry RMSNorm — 63 launches removed per forward.
+            // Ladder rungs force both halves of the pair: same graph
+            // frontier, same overlap, no arithmetic change.
+            var base = hiddenStates
+            var delta: MLXArray? = nil
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                let out = layer.boundaryFused(
+                    base: base, delta: delta,
+                    attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                base = out.base
+                delta = out.delta
+                if ladderActive {
+                    if prefillLadder {
+                        if i == 0 || i % 3 == 2 {
+                            asyncEval(base, out.delta)
+                        }
+                    } else {
+                        switch i {
+                        case 0, 1, 9, 19, 29, 39, 49, 57:
+                            asyncEval(base, out.delta)
+                        default:
+                            break
+                        }
                     }
-                } else {
-                    switch i {
-                    case 0, 1, 9, 19, 29, 39, 49, 57:
-                        asyncEval(hiddenStates)
-                    default:
-                        break
+                }
+            }
+            hiddenStates = delta.map { base + $0 } ?? base
+        } else {
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                hiddenStates = layer(
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if ladderActive {
+                    if prefillLadder {
+                        if i == 0 || i % 3 == 2 {
+                            asyncEval(hiddenStates)
+                        }
+                    } else {
+                        switch i {
+                        case 0, 1, 9, 19, 29, 39, 49, 57:
+                            asyncEval(hiddenStates)
+                        default:
+                            break
+                        }
                     }
                 }
             }
@@ -2163,306 +2601,302 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// ---------------------------------------------------------------------------
-// PROPOSAL-SIDE TOP-32 SHORTLIST
-//
-// Replaces `MLX.argPartition(coarse, kth: 98_298, axis: -1)[98_298...]`.
-//
-// `ArgPartition::eval_gpu` in this vendored MLX is a stub -- its own comment
-// reads "We direct arg partition to sort for now" -- so it calls
-// `gpu_merge_sort(..., argsort=true)`. For a 98,330-wide bf16 row that
-// resolves to `multi_block_sort` (bn=512, tn=4, n_blocks=49): one block sort
-// + six merge levels x two kernels + one output copy = 14 dependent
-// dispatches and five device temporaries, to FULLY ARGSORT 98,330 elements
-// from which exactly 32 are ever read. This pair answers the same question
-// in two dispatches.
-//
-// EXACTNESS. MLX's merge sort is STABLE ASCENDING under `LessThan<T>`:
-// ThreadSort swaps only on strict less, merge_step takes from B only on
-// strict less, merge_partition advances into A on ties, and block_sort seeds
-// ascending global indices with an `idx < size_sorted_axis` write guard so
-// the padding slots never reach the output. Its tail-32 is therefore the
-// unique 32-element set maximal under (value asc, index asc) -- ties broken
-// toward the HIGHER index, NaN ranking ABOVE every number because LessThan
-// returns (!an) & bn. `qwen_top32_ordinal` is a monotone map from float into
-// uint32 inducing exactly that order, including both corners: -0.0 folds
-// into +0.0 so the pair ties and breaks by index, and every NaN payload
-// collapses to one ordinal so all NaNs tie and break by index.
-//
-// Bounding the scan at REAL_COUNT inside the kernel is exactly what the
-// removed `[0 ..< 98_330]` pre-slice did, so the six duplicated padding rows
-// stay unreachable even on a tie.
-//
-// Downstream, `qwen35DraftRerankKernel` reduces the 32 candidates under a
-// strict total order on (value, id), which is order-independent -- so set
-// identity would suffice. Element-wise identity is a strictly stronger
-// property and makes the offline gate a plain array equality.
-private let qwen35Top32RealCount    = 98_330
-private let qwen35Top32K            = 32
-private let qwen35Top32TG           = 256
-private let qwen35Top32Tiles        = 64
-private let qwen35Top32Stride       = qwen35Top32Tiles * qwen35Top32TG
-private let qwen35Top32PerThread    =
-    (qwen35Top32RealCount + qwen35Top32Stride - 1) / qwen35Top32Stride
-private let qwen35Top32Cands        = qwen35Top32Tiles * qwen35Top32K
-private let qwen35Top32FinPerThread = qwen35Top32Cands / qwen35Top32TG
-
-private let qwen35Top32Header = """
-    inline uint qwen_top32_ordinal(float v) {
-        if (isnan(v))  { return 0xFFFFFFFFu; }
-        if (v == 0.0f) { return 0x80000000u; }
-        uint u = as_type<uint>(v);
-        return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
-    }
-    """
-
-// Stage 1: 64 threadgroups partition [0, REAL_COUNT); each emits its top 32
-// as (ordinal, index) pairs. 64 * 32 = 2,048 candidates.
-private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_partial",
-    inputNames: ["logits"],
-    outputNames: ["cand_ord", "cand_idx"],
+// PROPOSAL SIDE, FUSED TAIL (7 host ops -> 2 per draft step). Replaces
+// [argPartition + gatherQuantizedMM + rerankKernel] with ONE dispatch:
+// stage 1 selects the top-64 coarse rows under the strict (value desc,
+// id asc, NaN-worst) total order used everywhere else, via a two-pass
+// threadgroup selection (per-thread top-32 of the full set, then of the
+// complement), overfetching every row tied with the 64th value; stage 2
+// dequantizes the 4-bit compact rows (mlx affine group-64 arithmetic,
+// power-of-two-scaled nibble products) and evaluates the exact logits;
+// stage 3 reduces with the same value/id total order and maps the winner
+// back to the full token ID space. The candidate superset can only add
+// rows the coarse partition's arbitrary tie cut could have excluded, so
+// the proposal is at least as good as the partitioned one. The wider
+// shortlist raises draft acceptance without touching emitted tokens.
+private let qwen35DraftSelectRerankKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_select_rerank",
+    inputNames: ["coarse", "x", "w", "scales", "biases"],
+    outputNames: ["token_id"],
     source: """
-        constexpr uint REAL_COUNT = \(qwen35Top32RealCount);
-        constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint STRIDE     = \(qwen35Top32Stride);
-        constexpr uint PER_THREAD = \(qwen35Top32PerThread);
-        constexpr uint TOPK       = \(qwen35Top32K);
-        constexpr uint SIMD_SIZE  = 32;
-        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
-        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-        // `taken` / `tk2` are 32-bit bitmasks indexed by slot, so a slot count
-        // above 32 would shift out of range and silently corrupt the result.
-        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
-        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
-
-        uint tile = threadgroup_position_in_grid.x;
-        uint tid  = thread_position_in_threadgroup.x;
-        uint lane = thread_index_in_simdgroup;
-        uint sg   = simdgroup_index_in_threadgroup;
-
-        uint ord[PER_THREAD];
-        uint idx[PER_THREAD];
-        for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
-        uint n = 0;
-        for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
-            ord[n] = qwen_top32_ordinal(float(logits[i]));
-            idx[n] = i;
-            n++;
-        }
-
-        threadgroup uint sc_ord[NSIMD * TOPK];
-        threadgroup uint sc_idx[NSIMD * TOPK];
-
-        uint taken = 0u;
-        for (uint r = 0; r < TOPK; ++r) {
-            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-            for (uint t = 0; t < PER_THREAD; ++t) {
-                if ((taken & (1u << t)) != 0u) { continue; }
-                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
-                    bo = ord[t]; bi = idx[t]; bs = t;
+        // Exact 4-bit affine logit for one compact row (mlx group-64
+        // arithmetic, 4-at-a-time grouping, left-associative raw-x sum).
+        inline float qwen_draft_exact_logit(
+            const device uint* wrow,
+            const device float* x,
+            const device float* scales,
+            const device float* biases,
+            uint row
+        ) {
+            float logit = 0.0f;
+            for (uint k = 0; k < K; k += 64u) {
+                for (uint j = 0; j < 64u; j += 8u) {
+                    float acc8 = 0.0f;
+                    float s8 = 0.0f;
+                    for (uint q = 0; q < 8u; q += 4u) {
+                        const uint idx0 = k + j + q;
+                        const float x0 = x[idx0];
+                        const float x1 = x[idx0 + 1];
+                        const float x2 = x[idx0 + 2];
+                        const float x3 = x[idx0 + 3];
+                        const uint w0 = wrow[idx0 / 8u];
+                        const uint w1 = wrow[(idx0 + 1) / 8u];
+                        const uint w2 = wrow[(idx0 + 2) / 8u];
+                        const uint w3 = wrow[(idx0 + 3) / 8u];
+                        const float n0 = (float)((w0 >> (4u * (idx0 % 8u))) & 0xfu);
+                        const float n1 = (float)((w1 >> (4u * ((idx0 + 1) % 8u))) & 0xfu);
+                        const float n2 = (float)((w2 >> (4u * ((idx0 + 2) % 8u))) & 0xfu);
+                        const float n3 = (float)((w3 >> (4u * ((idx0 + 3) % 8u))) & 0xfu);
+                        acc8 += ((x0 * n0 + x1 * n1) + x2 * n2) + x3 * n3;
+                        // load_vector's raw-x sum is left-associative; match it bit-for-bit.
+                        s8 += ((x0 + x1) + x2) + x3;
+                    }
+                    const uint g = (k + j) / 64u;
+                    logit += scales[row * GROUP_COUNT + g] * acc8
+                        + s8 * biases[row * GROUP_COUNT + g];
                 }
             }
-            uint mo = simd_max(bo);
-            uint mi = simd_max((bo == mo) ? bi : 0u);
-            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                taken |= (1u << bs);
+            return logit;
+        }
+
+        // SELECT WIDTH 64 (two-pass): threadgroup memory stays at the old
+        // 16 KB. Pass 1 keeps per-thread top-32 and merges to the global
+        // top-32; pass 2 re-scans, excluding those 32 ids, and keeps the
+        // per-thread top-32 of the complement — merging yields global rows
+        // 33..64. The exact 4-bit rerank then scores up to 64 candidates
+        // plus every row tied with the 64th-best coarse value (deduped,
+        // capped at 128). Wider shortlist = higher draft acceptance rate;
+        // proposal-side only, so emitted tokens stay verify-driven.
+        constexpr uint kThreads = 64u;
+        constexpr uint kHalf = 32u;
+        const uint tid = thread_index_in_threadgroup;
+
+        threadgroup uint tg_boundary;
+        threadgroup uint64_t tg_all[2048];
+        threadgroup uint tg_top32[32];
+        threadgroup uint tg_cand_ids[128];
+        threadgroup float tg_cand_logits[128];
+        threadgroup atomic_uint tg_cand_count;
+
+        // Pass 1: per-thread local top-32 (ascending), written to tg_all.
+        uint64_t local_keys[kHalf];
+        uint local_fill = 0;
+        for (uint i = tid; i < REAL_COUNT; i += kThreads) {
+            const uint64_t k = qwen_select_key(coarse[i], i);
+            if (local_fill < kHalf) {
+                uint pos = local_fill;
+                while (pos > 0 && local_keys[pos - 1] > k) {
+                    local_keys[pos] = local_keys[pos - 1];
+                    pos--;
+                }
+                local_keys[pos] = k;
+                local_fill++;
+            } else if (k > local_keys[0]) {
+                uint pos = 1u;
+                while (pos < kHalf && local_keys[pos] < k) {
+                    local_keys[pos - 1] = local_keys[pos];
+                    pos++;
+                }
+                local_keys[pos - 1] = k;
             }
-            if (lane == 0) {
-                sc_ord[sg * TOPK + r] = mo;
-                sc_idx[sg * TOPK + r] = mi;
+        }
+        for (uint j = 0; j < kHalf; j++) {
+            tg_all[tid * kHalf + j] = (j < local_fill) ? local_keys[j] : 0ull;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Merge 1: thread 0 reduces the 2048 candidates to the global top-32
+        // and records their row ids (low 32 key bits are id-inverted) as the
+        // pass-2 exclusion set.
+        if (tid == 0) {
+            uint64_t top_keys[kHalf];
+            uint top_fill = 0;
+            for (uint t = 0; t < kThreads; t++) {
+                for (uint j = 0; j < kHalf; j++) {
+                    const uint64_t k = tg_all[t * kHalf + j];
+                    if (k == 0ull) { continue; }
+                    if (top_fill < kHalf) {
+                        uint pos = top_fill;
+                        while (pos > 0 && top_keys[pos - 1] > k) {
+                            top_keys[pos] = top_keys[pos - 1];
+                            pos--;
+                        }
+                        top_keys[pos] = k;
+                        top_fill++;
+                    } else if (k > top_keys[0]) {
+                        uint pos = 1u;
+                        while (pos < kHalf && top_keys[pos] < k) {
+                            top_keys[pos - 1] = top_keys[pos];
+                            pos++;
+                        }
+                        top_keys[pos - 1] = k;
+                    }
+                }
+            }
+            for (uint j = 0; j < kHalf; j++) {
+                tg_top32[j] = 0xffffffffu - uint(top_keys[j] & 0xffffffffu);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sg == 0) {
-            uint o2[PB];
-            uint i2[PB];
-            for (uint t = 0; t < PB; ++t) {
-                uint p = t * SIMD_SIZE + lane;
-                o2[t] = sc_ord[p];
-                i2[t] = sc_idx[p];
+        // Pass 2: per-thread top-32 of the complement rows, reusing tg_all.
+        uint64_t local2[kHalf];
+        uint fill2 = 0;
+        for (uint i = tid; i < REAL_COUNT; i += kThreads) {
+            bool excluded = false;
+            for (uint j = 0; j < kHalf; j++) {
+                if (tg_top32[j] == i) { excluded = true; break; }
             }
-            uint tk2 = 0u;
-            for (uint r = 0; r < TOPK; ++r) {
-                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-                for (uint t = 0; t < PB; ++t) {
-                    if ((tk2 & (1u << t)) != 0u) { continue; }
-                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
-                        bo = o2[t]; bi = i2[t]; bs = t;
+            if (excluded) { continue; }
+            const uint64_t k = qwen_select_key(coarse[i], i);
+            if (fill2 < kHalf) {
+                uint pos = fill2;
+                while (pos > 0 && local2[pos - 1] > k) {
+                    local2[pos] = local2[pos - 1];
+                    pos--;
+                }
+                local2[pos] = k;
+                fill2++;
+            } else if (k > local2[0]) {
+                uint pos = 1u;
+                while (pos < kHalf && local2[pos] < k) {
+                    local2[pos - 1] = local2[pos];
+                    pos++;
+                }
+                local2[pos - 1] = k;
+            }
+        }
+        for (uint j = 0; j < kHalf; j++) {
+            tg_all[tid * kHalf + j] = (j < fill2) ? local2[j] : 0ull;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Merge 2: thread 0 reduces the complement's top-32s to global rows
+        // 33..64, records the 64th-best boundary value, and seeds the 64
+        // base candidates (top-32 ids + complement top-32 ids).
+        if (tid == 0) {
+            uint64_t top2[kHalf];
+            uint top2_fill = 0;
+            for (uint t = 0; t < kThreads; t++) {
+                for (uint j = 0; j < kHalf; j++) {
+                    const uint64_t k = tg_all[t * kHalf + j];
+                    if (k == 0ull) { continue; }
+                    if (top2_fill < kHalf) {
+                        uint pos = top2_fill;
+                        while (pos > 0 && top2[pos - 1] > k) {
+                            top2[pos] = top2[pos - 1];
+                            pos--;
+                        }
+                        top2[pos] = k;
+                        top2_fill++;
+                    } else if (k > top2[0]) {
+                        uint pos = 1u;
+                        while (pos < kHalf && top2[pos] < k) {
+                            top2[pos - 1] = top2[pos];
+                            pos++;
+                        }
+                        top2[pos - 1] = k;
                     }
                 }
-                uint mo = simd_max(bo);
-                uint mi = simd_max((bo == mo) ? bi : 0u);
-                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                    tk2 |= (1u << bs);
-                }
-                if (lane == 0) {
-                    cand_ord[tile * TOPK + r] = mo;
-                    cand_idx[tile * TOPK + r] = mi;
-                }
             }
+            tg_boundary = uint(top2[0] >> 32u);
+            for (uint j = 0; j < kHalf; j++) {
+                tg_cand_ids[j] = tg_top32[j];
+                tg_cand_ids[kHalf + j] =
+                    0xffffffffu - uint(top2[j] & 0xffffffffu);
+            }
+            atomic_store_explicit(&tg_cand_count, 64u, memory_order_relaxed);
         }
-        """,
-    header: qwen35Top32Header,
-    ensureRowContiguous: false
-)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-// Stage 2: one threadgroup reduces the 2,048 candidates to the final 32,
-// written ASCENDING so the result is element-wise identical to
-// `argPartition(...)[kth...]`.
-private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_finalize",
-    inputNames: ["cand_ord", "cand_idx"],
-    outputNames: ["token_ids"],
-    source: """
-        constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
-        constexpr uint TOPK       = \(qwen35Top32K);
-        constexpr uint SIMD_SIZE  = 32;
-        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
-        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
-        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
-
-        uint tid  = thread_position_in_threadgroup.x;
-        uint lane = thread_index_in_simdgroup;
-        uint sg   = simdgroup_index_in_threadgroup;
-
-        uint ord[PER_THREAD];
-        uint idx[PER_THREAD];
-        for (uint t = 0; t < PER_THREAD; ++t) {
-            uint p = t * TG_SIZE + tid;
-            ord[t] = cand_ord[p];
-            idx[t] = cand_idx[p];
-        }
-
-        threadgroup uint sc_ord[NSIMD * TOPK];
-        threadgroup uint sc_idx[NSIMD * TOPK];
-
-        uint taken = 0u;
-        for (uint r = 0; r < TOPK; ++r) {
-            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-            for (uint t = 0; t < PER_THREAD; ++t) {
-                if ((taken & (1u << t)) != 0u) { continue; }
-                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
-                    bo = ord[t]; bi = idx[t]; bs = t;
+        // Overfetch: every row tied with the 64th-best value that is not
+        // already a base candidate (dedupe keeps the 128-slot budget for
+        // genuine ties; duplicates cannot change the winner).
+        for (uint i = tid; i < REAL_COUNT; i += kThreads) {
+            const uint64_t k = qwen_select_key(coarse[i], i);
+            if (uint(k >> 32u) == tg_boundary) {
+                bool dup = false;
+                for (uint j = 0; j < 64u; j++) {
+                    if (tg_cand_ids[j] == i) { dup = true; break; }
                 }
-            }
-            uint mo = simd_max(bo);
-            uint mi = simd_max((bo == mo) ? bi : 0u);
-            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                taken |= (1u << bs);
-            }
-            if (lane == 0) {
-                sc_ord[sg * TOPK + r] = mo;
-                sc_idx[sg * TOPK + r] = mi;
+                if (!dup) {
+                    const uint old = atomic_fetch_add_explicit(
+                        &tg_cand_count, 1u, memory_order_relaxed);
+                    if (old < 128u) {
+                        tg_cand_ids[old] = i;
+                    }
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sg == 0) {
-            uint o2[PB];
-            uint i2[PB];
-            for (uint t = 0; t < PB; ++t) {
-                uint p = t * SIMD_SIZE + lane;
-                o2[t] = sc_ord[p];
-                i2[t] = sc_idx[p];
-            }
-            uint tk2 = 0u;
-            for (uint r = 0; r < TOPK; ++r) {
-                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-                for (uint t = 0; t < PB; ++t) {
-                    if ((tk2 & (1u << t)) != 0u) { continue; }
-                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
-                        bo = o2[t]; bi = i2[t]; bs = t;
-                    }
-                }
-                uint mo = simd_max(bo);
-                uint mi = simd_max((bo == mo) ? bi : 0u);
-                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                    tk2 |= (1u << bs);
-                }
-                if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
-            }
+        // Exact 4-bit logits for the candidate rows — up to 128 rows, two per
+        // thread (mlx affine group-64 arithmetic, 4-at-a-time grouping).
+        const uint ccount =
+            min(atomic_load_explicit(&tg_cand_count, memory_order_relaxed), 128u);
+        if (tid < ccount) {
+            tg_cand_logits[tid] = qwen_draft_exact_logit(
+                w + (uint64_t)tg_cand_ids[tid] * PACKED_WORDS,
+                x, scales, biases, tg_cand_ids[tid]);
         }
-        """,
-    header: "",
-    ensureRowContiguous: false
+        if (tid + 64u < ccount) {
+            tg_cand_logits[tid + 64u] = qwen_draft_exact_logit(
+                w + (uint64_t)tg_cand_ids[tid + 64u] * PACKED_WORDS,
+                x, scales, biases, tg_cand_ids[tid + 64u]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Winner by the value/id total order, mapped to full IDs.
+        if (tid == 0) {
+            float best_v = tg_cand_logits[0];
+            uint best_id = tg_cand_ids[0];
+            for (uint c = 1; c < ccount; c++) {
+                const float v = tg_cand_logits[c];
+                const uint id = tg_cand_ids[c];
+                if (qwen_draft_rerank_better(v, id, best_v, best_id)) {
+                    best_v = v;
+                    best_id = id;
+                }
+            }
+            token_id[0] = int(
+                best_id < PREFIX_COUNT
+                    ? best_id
+                    : best_id + CONTROL_OFFSET);
+        }
+    """,
+
+    header: """
+        inline uint64_t qwen_select_key(float value, uint id) {
+            uint b = as_type<uint>(value);
+            if ((b & 0x7f800000u) == 0x7f800000u && (b & 0x007fffffu) != 0u) {
+                b = 0u;
+            } else if (b == 0x80000000u) {
+                b = 0u;
+            }
+            if ((b & 0x80000000u) != 0u) {
+                b = ~b & 0x7fffffffu;
+            } else {
+                b |= 0x80000000u;
+            }
+            return (((uint64_t)b) << 32) | (0xffffffffu - id);
+        }
+
+        inline bool qwen_draft_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: true
 )
-
-// `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
-private let qwen35Top32Enabled: Bool =
-    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
-
-/// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
-private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
-    // Mirrors the kernel static_asserts; see the bitmask note there.
-    precondition(qwen35Top32PerThread <= 32 && qwen35Top32FinPerThread <= 32,
-                 "top-32 slot count exceeds the 32-bit selection bitmask")
-    let partial = qwen35DraftTop32PartialKernel(
-        [row],
-        grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
-        threadGroup: (qwen35Top32TG, 1, 1),
-        outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
-        outputDTypes: [.uint32, .uint32]
-    )
-    return qwen35DraftTop32FinalizeKernel(
-        [partial[0], partial[1]],
-        grid: (qwen35Top32TG, 1, 1),
-        threadGroup: (qwen35Top32TG, 1, 1),
-        outputShapes: [[qwen35Top32K]],
-        outputDTypes: [.uint32]
-    )[0]
-}
-
-/// Offline equivalence gate. Needs no checkpoint and no MTP head: it exercises
-/// the two selection kernels against `MLX.argPartition` on synthetic bf16 rows
-/// of the live width. Returns (checked, mismatches, firstBadTrial).
-/// Never called on a scored path.
-/// Isolated micro-benchmark: times the two-dispatch top-32 against
-/// `MLX.argPartition` on a real-width bf16 row. Never called on a scored path.
-public func qwen35BenchDraftTop32(iters: Int = 200) -> (Double, Double, Int, Int) {
-    MLXRandom.seed(3)
-    let row = MLXRandom.normal([qwen35Top32RealCount]).asType(.bfloat16)
-    let kth = qwen35Top32RealCount - qwen35Top32K
-    // warm both paths (JIT + allocator)
-    for _ in 0 ..< 10 {
-        eval(qwen35DraftTop32(row))
-        eval(MLX.argPartition(row, kth: kth, axis: -1)[(kth)...])
-    }
-    var t0 = Date()
-    for _ in 0 ..< iters { eval(MLX.argPartition(row, kth: kth, axis: -1)[(kth)...]) }
-    let baseUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    t0 = Date()
-    for _ in 0 ..< iters { eval(qwen35DraftTop32(row)) }
-    let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    return (baseUs, mineUs, qwen35Top32Tiles, qwen35Top32PerThread)
-}
-
-public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, Int, Int) {
-    MLXRandom.seed(seed)
-    var bad = 0
-    var firstBad = -1
-    let kth = qwen35Top32RealCount - qwen35Top32K
-    for trial in 0 ..< trials {
-        var row = MLXRandom.normal([qwen35Top32RealCount]).asType(.bfloat16)
-        if trial % 4 == 1 {
-            // force heavy ties: quantise hard so many values collide
-            row = (MLXRandom.normal([qwen35Top32RealCount]) * 4).round().asType(.bfloat16)
-        }
-        let mine = qwen35DraftTop32(row)
-        let theirs = MLX.argPartition(row, kth: kth, axis: -1)[(kth)...]
-            .asType(.uint32)
-        eval(mine, theirs)
-        let same = MLX.all(MLX.equal(mine, theirs)).item(Bool.self)
-        if !same {
-            bad += 1
-            if firstBad < 0 { firstBad = trial }
-        }
-    }
-    return (trials, bad, firstBad)
-}
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
@@ -2501,7 +2935,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 64
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2907,41 +3341,25 @@ extension Qwen35TextModel: MTPCapable {
         let coarse = quantizedMM(
             x, coarseWeight, scales: coarseScales, biases: coarseBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
-        )
-        let candidateCount = Self.draftRerankCandidateCount
-        // Drift guard: the kernels bake these shapes in as constexpr.
-        guard qwen35Top32RealCount == Self.compactDraftRealCount,
-              qwen35Top32K == candidateCount
-        else { return nil }
-        let candidateIDs: MLXArray
-        if qwen35Top32Enabled {
-            candidateIDs = qwen35DraftTop32(
-                coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
-                    .reshaped([Self.compactDraftRealCount]))
-        } else {
-            let kth = Self.compactDraftRealCount - candidateCount
-            candidateIDs = MLX.argPartition(
-                coarse[0..., 0..., 0 ..< Self.compactDraftRealCount],
-                kth: kth, axis: -1
-            )[.ellipsis, (kth)...].reshaped([candidateCount])
-        }
-
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
-        let exactLogits = quantizedMM(
-            x, exactWeight, scales: exactScales, biases: exactZeroPoints,
-            transpose: true, groupSize: 64, bits: 4, mode: .affine)
-
-        return qwen35DraftRerankKernel(
-            [exactLogits.reshaped([candidateCount]), candidateIDs],
+        )[0..., 0..., 0 ..< Self.compactDraftRealCount]
+        // FUSED TAIL: one dispatch replaces [argPartition + gatherQuantizedMM
+        // + rerankKernel]. Selection uses the strict (value, id) total order
+        // with boundary-tie overfetch; the exact 4-bit logits and the rerank
+        // reduction run inside the same kernel. Host graph ops per draft step
+        // drop from 4 to 2 (quantizedMM + this kernel).
+        return qwen35DraftSelectRerankKernel(
+            [coarse, x, exact.weight, exact.scales, exactBiases],
             template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ("K", exact.weight.dim(1) * 8),
+                ("GROUP_COUNT", exact.scales.dim(1)),
+                ("PACKED_WORDS", exact.weight.dim(1)),
             ],
-            grid: (candidateCount, 1, 1),
-            threadGroup: (candidateCount, 1, 1),
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]
