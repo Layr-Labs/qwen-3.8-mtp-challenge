@@ -1178,6 +1178,21 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
+
+// IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
+// with the remainder spread evenly so no group runs a one-row tail.
+template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
   static_assert(M >= 3 && M <= 9, "wide multi-row QMV dispatch covers M in [3, 9]");
   static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
   constexpr int TAIL = M % IPG;
@@ -1964,9 +1979,9 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
+          // 4+4, not 3+3+2 -- see quantized.h for the direct-nibble traffic
+          // rationale, the ranked affine-2-head receipt, and exactness argument.
+          // This JIT twin is the runtime-effective source.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
