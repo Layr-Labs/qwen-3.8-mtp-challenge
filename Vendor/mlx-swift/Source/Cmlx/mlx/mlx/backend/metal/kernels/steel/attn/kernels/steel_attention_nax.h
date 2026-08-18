@@ -207,7 +207,7 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
-        STEEL_PRAGMA_UNROLL
+        _Pragma("clang loop unroll_count(8)")
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
@@ -416,7 +416,7 @@ template <
     // Do O = P @ V
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
-      STEEL_PRAGMA_UNROLL
+      _Pragma("clang loop unroll_count(8)")
       for (short id = 0; id < TD; id += 2) {
         if constexpr (BD == 128) {
           if (id == 4) {
