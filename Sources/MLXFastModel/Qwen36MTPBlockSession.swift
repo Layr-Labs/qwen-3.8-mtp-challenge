@@ -276,29 +276,55 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
-        let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
-        let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
-        let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: foldHidden, nextTokenIds: foldTokens,
-            cache: historyWarmCache)
-            ?? model.mtpHeadHiddenForward(
+        // A fully accepted depth-d round queues d hidden/token pairs. The next
+        // round appends its current transition, so the live committed-history
+        // fold width is d+1: every value in 2...maxDepth+1 is legal. Exercise
+        // the exact live expression at every legal width while this cache is
+        // still untimed.
+        for foldWidth in 2 ... (maxDepth + 1) {
+            let foldHidden = MLXArray.zeros(
+                [1, foldWidth, hDim], dtype: row.dtype)
+            let foldTokens = MLXArray(
+                Array(repeating: Int32(0), count: foldWidth)
+            ).reshaped([1, foldWidth])
+            let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: foldHidden, nextTokenIds: foldTokens,
                 cache: historyWarmCache)
-        eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
-        eval(historyWarmCache.flatMap { $0.state })
+                ?? model.mtpHeadHiddenForward(
+                    hidden: foldHidden, nextTokenIds: foldTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                folded[
+                    0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+            eval(historyWarmCache.flatMap { $0.state })
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
-            // Compile the two top-2 reduction kernels outside the scored window
-            // at every row count a round can dispatch.
+            // tape. Warm the exact normed-hidden expression scored rounds
+            // dispatch so its JIT also stays outside the timed window.
+            let verifyLogits: MLXArray
+            let verifyNormed: MLXArray?
+            if width >= 2 {
+                let triple = model.callWithHiddenAndNormed(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 1)
+                verifyLogits = triple.0
+                verifyNormed = triple.2
+            } else {
+                let pair = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0)
+                verifyLogits = pair.0
+                verifyNormed = nil
+            }
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
+            if let verifyNormed { warmBundle.append(verifyNormed) }
+            eval(warmBundle)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -319,10 +345,13 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
-            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-            cache: oneRowReplayCache, nConfirmed: 1)
-        eval(oneRowReplayLogits)
+        let (oneRowReplayLogits, _, oneRowReplayNormed) =
+            model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+                cache: oneRowReplayCache, nConfirmed: 1)
+        var oneRowBundle = [oneRowReplayLogits]
+        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
+        eval(oneRowBundle)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
