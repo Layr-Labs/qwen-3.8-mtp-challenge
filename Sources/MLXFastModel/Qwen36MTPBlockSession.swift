@@ -155,6 +155,12 @@ public final class Qwen36MTPBlockSession {
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
+    /// Cache of MLX-compiled verify graphs per width (2...maxDepth+1).
+    /// The first round of each width traces and compiles the graph; subsequent
+    /// rounds reuse the cached compilation, avoiding the ~46 ms host-side
+    /// graph-build overhead measured in PRE-005.
+    private var compiledVerifyCache: [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
     public private(set) var roundCount = 0
@@ -359,25 +365,6 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
-        // VERIFY-CONCAT JIT WARM. Scored rounds assemble verifyTokens as
-        // concatenated([host primary] + device draftIds) over int32 [1, 1]
-        // arrays. The width loop below feeds callWithHidden a single host
-        // [1, width] tensor, so it never compiles that multi-input concat.
-        // MLX JIT-specializes copy/concat by dtype and input count
-        // (ml-explore/mlx metal JIT; first launch pays Metal library
-        // compile — see Kernel Management / JIT Compilation). Those
-        // copyint32int32 kernels otherwise land inside scored round 1.
-        // Values are zeros / already-eval'd draft IDs and the result is
-        // discarded: shape + dtype + host/device mix select the kernels.
-        // Warm every legal extra-count 0...maxDepth so an adaptive
-        // draftPolicy that returns 0..8 does not hit a cold width later.
-        for extra in 0 ... maxDepth {
-            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
-            for _ in 0 ..< extra {
-                parts.append(primedDraftID)
-            }
-            eval(concatenated(parts, axis: 1))
-        }
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -771,6 +758,40 @@ public final class Qwen36MTPBlockSession {
         }
     }
 
+    /// Returns an MLX-compiled verify function for the given width (draftCount + 1).
+    /// The first call traces and compiles the graph; subsequent calls reuse the
+    /// cached compilation. The cache (self.cache) is tracked as mutable state.
+    /// nConfirmed is hardcoded to 1 for all drafting widths (>= 2).
+    private func compiledVerify(
+        width: Int, tokens: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        if let compiled = compiledVerifyCache[width] {
+            let results = compiled([tokens])
+            let normed = results.count > 2 && results[2].size > 0 ? results[2] : nil
+            return (results[0], results[1], normed)
+        }
+
+        // Create the compiled function. The cache is tracked as state via
+        // inputs/outputs so its mutations (offset, keys, values) are preserved.
+        let model = self.model
+        let cache = self.cache
+        let compiled = MLX.compile(inputs: cache, outputs: cache, shapeless: false) { arrays in
+            let tokens = arrays[0]
+            let input = LMInput.Text(tokens: tokens)
+            // nConfirmed = 1 for all drafting widths (width >= 2)
+            let (logits, hidden, normed) = model.callWithHiddenAndNormed(
+                input: input, cache: cache, nConfirmed: 1)
+            // Return normed as an array (empty if nil) so compile can track it
+            let normedArray = normed ?? MLXArray(0)
+            return [logits, hidden, normedArray]
+        }
+        compiledVerifyCache[width] = compiled
+
+        let results = compiled([tokens])
+        let normed = results.count > 2 && results[2].size > 0 ? results[2] : nil
+        return (results[0], results[1], normed)
+    }
+
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
 
@@ -1049,10 +1070,9 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: verifyTokens),
-                cache: cache, nConfirmed: 1)
+        let verifyWidth = 1 + draftCount
+        let (verifyLogits, verifyHidden, verifyNormed) = compiledVerify(
+            width: verifyWidth, tokens: verifyTokens)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
