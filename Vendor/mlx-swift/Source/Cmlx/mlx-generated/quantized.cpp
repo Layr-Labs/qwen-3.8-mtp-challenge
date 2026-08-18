@@ -1078,6 +1078,89 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
+// Single-row (M == 1) affine2/g64 fast QMV with direct-duo arithmetic.
+// Serves ONLY the declared coarse compact readout (bits == 2, group 64,
+// out_vec_size == 98_336): each lane loads ONE u32 (16 packed 2-bit values)
+// per row per k-block instead of the generic path's four byte loads, and
+// duo values are extracted by shift and multiplied by the UNSCALED
+// activation, removing the /4, /16, /64 pre-scale divides of load_vector.
+// The per-output-element real value, K accumulation order, per-block
+// scale/bias application, and simd_sum reduction match qmv_fast_impl<T, 64,
+// 2>: (x / 2^(2j)) * (w & (0x03 << 2j)) and x * ((w >> 2j) & 0x03) are the
+// same product for every lane j (power-of-two scaling is exact in FP32), so
+// the coarse shortlist this kernel feeds is unchanged row-for-row. The
+// exact affine-4 rerank and target verification decide every emitted token.
+template <typename T>
+METAL_FUNC void qmv_fast_singlerow_affine2_g64(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 4;  // 16 values x 2 bits = 4 bytes
+  const int in_vec_size_w = in_vec_size / 8;   // weight bytes per output row
+  const int in_vec_size_g = in_vec_size / 64;  // scale groups per output row
+
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+
+  thread float result[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    result[r] = 0.0f;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint32_t packed[rows_per_simd];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint8_t* base =
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 8 + simd_lid * bytes_per_lane;
+      packed[r] = *reinterpret_cast<const device uint32_t*>(base);
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    thread float x0[values_per_thread];
+    const device T* xm = x + tid.x * in_vec_size + k +
+        simd_lid * values_per_thread;
+    float sum = 0.0f;
+    for (int i = 0; i < values_per_thread; i += 4) {
+      x0[i] = static_cast<float>(xm[i]);
+      x0[i + 1] = static_cast<float>(xm[i + 1]);
+      x0[i + 2] = static_cast<float>(xm[i + 2]);
+      x0[i + 3] = static_cast<float>(xm[i + 3]);
+      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+    }
+
+    for (int r = 0; r < rows_per_simd; r++) {
+      float accum = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < 16; j++) {
+        accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03u);
+      }
+      result[r] += scale_local[r] * accum + sum * bias_local[r];
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    const float reduced = simd_sum(result[r]);
+    if (simd_lid == 0) {
+      y[tid.x * out_vec_size + out_row + r] = static_cast<T>(reduced);
+    }
+  }
+}
+
 // IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
 // with the remainder spread evenly so no group runs a one-row tail.
 template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
@@ -1831,6 +1914,18 @@ template <typename T, int group_size, int bits, bool batched>
         s_strides,
         b_strides,
         tid);
+  }
+  if (!batched && group_size == 64 && bits == 2 && out_vec_size == 98336 &&
+      ntg.x == 1) {
+    // The declared coarse compact readout only. bits == 2 is invisible to
+    // every affine-4 dispatch below, and out_vec_size == 98_336 appears
+    // nowhere in the serial control leg, so this gate is proposal-only by
+    // construction. Arithmetic is bit-equivalent to the generic
+    // qmv_fast_impl<T, 64, 2> route it replaces (see the helper's header).
+    qmv_fast_singlerow_affine2_g64<T>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+        simd_lid);
+    return;
   }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
