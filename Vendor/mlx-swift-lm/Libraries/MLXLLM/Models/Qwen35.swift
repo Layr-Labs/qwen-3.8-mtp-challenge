@@ -2373,6 +2373,84 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. This is a one-SIMDgroup, one-output-row spelling of the
+// vendored `qmv_fast_impl<T, 64, 4>` arithmetic (with U=float). It gathers the row number
+// from `candidate_ids`, but otherwise reads the original packed tensors. The
+// constants are intentionally frozen to the Qwen 3.8 compact exact head shape.
+// `load_vector`, `qdot`, the ten K-blocks, and `simd_sum` mirror qmv_fast_impl;
+// lane 0 performs the same final cast to the activation/output dtype.
+private let qwen35FusedCandidateRowsK = 5120
+private let qwen35FusedCandidateRowsKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_fused_candidate_rows_affine4_g64",
+    inputNames: ["x", "weights", "scales", "biases", "candidate_ids"],
+    outputNames: ["logits"],
+    source: """
+        constexpr uint K = \(qwen35FusedCandidateRowsK);
+        constexpr uint VALUES_PER_THREAD = 16;
+        constexpr uint BLOCK_SIZE = 512;
+        constexpr uint WEIGHT_HALFWORDS_PER_ROW = 1280;
+        constexpr uint GROUPS_PER_ROW = 80;
+
+        uint slot = threadgroup_position_in_grid.x;
+        uint lane = thread_index_in_simdgroup;
+        uint row = candidate_ids[slot];
+
+        const device uint16_t* row_weights =
+            (const device uint16_t*)weights
+            + row * WEIGHT_HALFWORDS_PER_ROW;
+        float result = 0.0f;
+
+        for (uint k = 0; k < K; k += BLOCK_SIZE) {
+            float x_thread[VALUES_PER_THREAD];
+            float sum = 0.0f;
+
+            // Textually follows load_vector<T, float, 16, 4>.
+            for (uint i = 0; i < VALUES_PER_THREAD; i += 4) {
+                sum +=
+                    x[k + lane * VALUES_PER_THREAD + i]
+                    + x[k + lane * VALUES_PER_THREAD + i + 1]
+                    + x[k + lane * VALUES_PER_THREAD + i + 2]
+                    + x[k + lane * VALUES_PER_THREAD + i + 3];
+                x_thread[i] = x[k + lane * VALUES_PER_THREAD + i];
+                x_thread[i + 1] =
+                    x[k + lane * VALUES_PER_THREAD + i + 1] / 16.0f;
+                x_thread[i + 2] =
+                    x[k + lane * VALUES_PER_THREAD + i + 2] / 256.0f;
+                x_thread[i + 3] =
+                    x[k + lane * VALUES_PER_THREAD + i + 3] / 4096.0f;
+            }
+
+            const device uint16_t* ws =
+                row_weights + k / 4 + lane * 4;
+            float accum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                accum +=
+                    (x_thread[4 * i] * (ws[i] & 0x000f)
+                     + x_thread[4 * i + 1] * (ws[i] & 0x00f0)
+                     + x_thread[4 * i + 2] * (ws[i] & 0x0f00)
+                     + x_thread[4 * i + 3] * (ws[i] & 0xf000));
+            }
+
+            uint group = k / 64 + lane / 4;
+            result += float(scales[row * GROUPS_PER_ROW + group]) * accum
+                + sum * float(biases[row * GROUPS_PER_ROW + group]);
+        }
+
+        // All lanes participate in the SIMD reduction, as in qmv_fast_impl.
+        float reduced = simd_sum(result);
+        if (lane == 0) {
+            logits[slot] = static_cast<T>(reduced);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+// `MLXFAST_QWEN_MTP_FUSED_CANDIDATE_ROWS=0` restores the incumbent
+// MLX.take + quantizedMM path. The fused read is default-on only for the exact
+// guarded Qwen 3.8 shape below; every other shape or dtype still falls back.
+private let qwen35FusedCandidateRowsEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_FUSED_CANDIDATE_ROWS"] != "0"
+
 // PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
 // incumbent affine-4 compact readout evaluates those rows, and this single
 // SIMDgroup applies the incumbent value/id total order to select the proposal.
@@ -3184,12 +3262,46 @@ extension Qwen35TextModel: MTPCapable {
             )[.ellipsis, (kth)...].reshaped([candidateCount])
         }
 
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
-        let exactLogits = quantizedMM(
-            x, exactWeight, scales: exactScales, biases: exactZeroPoints,
-            transpose: true, groupSize: 64, bits: 4, mode: .affine)
+        let exactLogits: MLXArray
+        let fusedDType =
+            x.dtype == .bfloat16 || x.dtype == .float16 || x.dtype == .float32
+        let useFusedCandidateRows =
+            qwen35FusedCandidateRowsEnabled
+            && qwen35FusedCandidateRowsK == 5120
+            && candidateCount == 32
+            && x.shape == [1, 1, qwen35FusedCandidateRowsK]
+            && candidateIDs.shape == [candidateCount]
+            && candidateIDs.dtype == .uint32
+            && fusedDType
+            && exact.weight.dtype == .uint32
+            && exact.scales.dtype == x.dtype
+            && exactBiases.dtype == x.dtype
+            && exact.weight.shape == [Self.compactDraftPaddedCount, 640]
+            && exact.scales.shape == [Self.compactDraftPaddedCount, 80]
+            && exactBiases.shape == [Self.compactDraftPaddedCount, 80]
+
+        if useFusedCandidateRows {
+            // `candidateIDs` is uint32 and is produced by either the bounded
+            // top-32 kernel or argPartition over the same 98,330 rows. Thus
+            // each slot is a valid row of the full exact tensors, in order.
+            exactLogits = qwen35FusedCandidateRowsKernel(
+                [x, exact.weight, exact.scales, exactBiases, candidateIDs],
+                template: [("T", x.dtype)],
+                grid: (candidateCount * 32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[candidateCount]],
+                outputDTypes: [x.dtype]
+            )[0]
+        } else {
+            // Incumbent path: keep these operations textually unchanged so the
+            // fused proposal can always be disabled without changing logits.
+            let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
+            let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
+            let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
+            exactLogits = quantizedMM(
+                x, exactWeight, scales: exactScales, biases: exactZeroPoints,
+                transpose: true, groupSize: 64, bits: 4, mode: .affine)
+        }
 
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
