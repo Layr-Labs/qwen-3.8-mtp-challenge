@@ -1856,20 +1856,19 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
+          // 4+4, not 3+3+2. The earlier three-lane choice was measured before
+          // direct-nibble affine-4 reduced the inner loop's register pressure.
+          // With direct nibbles, two four-row groups stream each weight tile
+          // twice instead of the three streams paid by 3+3+2. The exact
+          // composition on the affine-2 shortlist frontier ranked at
+          // 3.19580475139646, +0.23% over its 3.19351254799833 parent
+          // (submission 578535f).
           // Exact: these lanes carry INDEPENDENT input rows and are never reduced
-          // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
+          // across (simd_sum reduces along K WITHIN a row), so moving rows
+          // between groups cannot reorder any row's scalar chain. Template
+          // admits the even split: M in [3,9], 8 % 4 == 0, IPG 4 inside the
+          // wide helper's [2,4].
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;

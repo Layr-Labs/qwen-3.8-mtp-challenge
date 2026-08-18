@@ -1456,6 +1456,105 @@ public final class Qwen36MTPBlockSession {
         ensureRowContiguous: false
     )
 
+    /// Candidate-only wide-row variant of ``linearTopTwoPartialKernel``.
+    ///
+    /// The incumbent reduction stores 256 five-field states in threadgroup
+    /// memory and crosses eight whole-threadgroup barriers for every one of
+    /// the 32 vocabulary stripes.  A speculative verify has 2...9 rows, so
+    /// that synchronization is multiplied by the verify width.  Reduce each
+    /// 32-lane SIMD group with register shuffles first, publish only its eight
+    /// top-two pairs, then let SIMD group zero merge those eight pairs.  The
+    /// selected set is identical because `qwen_top2_better` defines a total
+    /// order (value descending, id ascending, NaN last) and top-two merge is
+    /// associative under that order.
+    ///
+    /// `linearTopTwoRows` deliberately keeps rows == 1 on the incumbent
+    /// kernel.  The paired serial control therefore stays byte-for-byte on its
+    /// promoted path; only multi-row candidate verifies receive the lower
+    /// synchronization count.  Every legal width is warmed before timing.
+    private static let linearTopTwoWidePartialKernel = MLXFast.metalKernel(
+        name: "qwen_mtp_linear_top2_wide_partial",
+        inputNames: ["logits"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: """
+            uint lane = thread_position_in_threadgroup.x;
+            uint simd_lane = thread_index_in_simdgroup;
+            uint simd_group = simdgroup_index_in_threadgroup;
+            uint group_index = threadgroup_position_in_grid.x;
+            uint row = group_index / 32;
+            uint group = group_index % 32;
+            uint vocab = uint(logits_shape[2]);
+            qwen_top2_state local = qwen_top2_empty();
+
+            for (uint index = group * 256 + lane;
+                 index < vocab;
+                 index += 32 * 256) {
+                ulong offset = ulong(row) * ulong(logits_strides[1])
+                    + ulong(index) * ulong(logits_strides[2]);
+                qwen_top2_insert(local, float(logits[offset]), index);
+            }
+
+            // A total-order top-two merge is associative, so first collapse
+            // each SIMD group in registers.  All lanes participate in every
+            // shuffle; only the lower half mutates at each tree level.
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+                qwen_top2_state other;
+                other.first_value = simd_shuffle_down(local.first_value, stride);
+                other.second_value = simd_shuffle_down(local.second_value, stride);
+                other.first_id = simd_shuffle_down(local.first_id, stride);
+                other.second_id = simd_shuffle_down(local.second_id, stride);
+                other.count = simd_shuffle_down(local.count, stride);
+                if (simd_lane < stride) {
+                    if (other.count > 0) {
+                        qwen_top2_insert(local, other.first_value, other.first_id);
+                    }
+                    if (other.count > 1) {
+                        qwen_top2_insert(local, other.second_value, other.second_id);
+                    }
+                }
+            }
+
+            // Eight SIMD winners replace the incumbent 256-state scratchpad.
+            threadgroup qwen_top2_state scratch[8];
+            if (simd_lane == 0) {
+                scratch[simd_group] = local;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_group == 0) {
+                local = simd_lane < 8 ? scratch[simd_lane] : qwen_top2_empty();
+                for (uint stride = 16; stride > 0; stride >>= 1) {
+                    qwen_top2_state other;
+                    other.first_value = simd_shuffle_down(local.first_value, stride);
+                    other.second_value = simd_shuffle_down(local.second_value, stride);
+                    other.first_id = simd_shuffle_down(local.first_id, stride);
+                    other.second_id = simd_shuffle_down(local.second_id, stride);
+                    other.count = simd_shuffle_down(local.count, stride);
+                    if (simd_lane < stride) {
+                        if (other.count > 0) {
+                            qwen_top2_insert(
+                                local, other.first_value, other.first_id);
+                        }
+                        if (other.count > 1) {
+                            qwen_top2_insert(
+                                local, other.second_value, other.second_id);
+                        }
+                    }
+                }
+
+                if (simd_lane == 0) {
+                    uint base = (row * 32 + group) * 2;
+                    partial_ids[base] = int(local.first_id);
+                    partial_ids[base + 1] = int(local.second_id);
+                    partial_values[base] = local.first_value;
+                    partial_values[base + 1] = local.second_value;
+                }
+            }
+        """,
+        header: linearTopTwoHeader,
+        ensureRowContiguous: false
+    )
+
     /// Stage two: one small threadgroup per row merges the 32 partial pairs.
     private static let linearTopTwoFinalizeKernel = MLXFast.metalKernel(
         name: "qwen_mtp_linear_top2_finalize",
@@ -1502,7 +1601,10 @@ public final class Qwen36MTPBlockSession {
     static func linearTopTwoRows(_ logits: MLXArray) -> (MLXArray, MLXArray) {
         precondition(logits.ndim == 3 && logits.dim(0) == 1)
         let rows = logits.dim(1)
-        let partials = linearTopTwoPartialKernel(
+        let partialKernel = rows > 1
+            ? linearTopTwoWidePartialKernel
+            : linearTopTwoPartialKernel
+        let partials = partialKernel(
             [logits],
             grid: (rows * 32 * 256, 1, 1),
             threadGroup: (256, 1, 1),
