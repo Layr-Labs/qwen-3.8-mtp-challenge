@@ -1461,7 +1461,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
-    const int BM = 32,
+    const int BM = 64,
     const int BK = 32,
     const int BN = 32>
 METAL_FUNC void qmm_t_impl(
@@ -1484,6 +1484,7 @@ METAL_FUNC void qmm_t_impl(
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
   (void)lid;
+  (void)aligned_N;
 
   constexpr int WM = 2;
   constexpr int WN = 2;
@@ -1510,8 +1511,21 @@ METAL_FUNC void qmm_t_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
+  // Host qmm() is not on the editable surface and always launches a 32x32
+  // threadgroup grid. Remap that grid onto BM x BN tiles so a kernel-default
+  // tile change is ranked-legal. Extra TGs return immediately. When
+  // BM=BN=32 this is identical to tid.y * BM / tid.x * BN. Defaults here
+  // are BM=64, BN=32, BK=32: N pitch matches the host, so only the M
+  // dimension remaps (~50% extra TGs at T=512 rather than ~75%).
+  const int host_nx = (N + 31) / 32;
+  const int linear = int(tid.y) * host_nx + int(tid.x);
+  const int want_nx = (N + BN - 1) / BN;
+  const int want_ny = (M + BM - 1) / BM;
+  if (linear >= want_nx * want_ny) {
+    return;
+  }
+  const int y_col = (linear % want_nx) * BN;
+  const int y_row = (linear / want_nx) * BM;
 
   auto wl = (const device uint8_t*)w;
 
@@ -1529,7 +1543,7 @@ METAL_FUNC void qmm_t_impl(
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
-    if (!aligned_N && num_outs < BN) {
+    if (num_outs < BN) {
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_safe(short2(BK, num_els));
@@ -1551,7 +1565,7 @@ METAL_FUNC void qmm_t_impl(
       }
     }
   } else {
-    if (!aligned_N && num_outs < BN) {
+    if (num_outs < BN) {
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_unsafe();
@@ -2207,7 +2221,7 @@ template <
     const int bits,
     const bool aligned_N,
     const bool batched,
-    const int BM = 32,
+    const int BM = 64,
     const int BK = 32,
     const int BN = 32>
 [[kernel]] void affine_qmm_t(
@@ -2279,7 +2293,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
-    const int BM = 32,
+    const int BM = 64,
     const int BK = 32,
     const int BN = 32>
 [[kernel]] void affine_qmm_t_splitk(
@@ -2585,7 +2599,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
-    const int BM = 32,
+    const int BM = 64,
     const int BK = 32,
     const int BN = 32>
 [[kernel]] void affine_gather_qmm_t(
