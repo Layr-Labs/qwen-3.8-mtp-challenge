@@ -580,6 +580,39 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
+    /// LATCH RELEASE. `costModelDepth` returns 0 whenever
+    /// `positionAcceptEMA[0] <= headStepCostRatio`, and a non-drafting round
+    /// returns before `recordAcceptOutcome` is ever reached (the sole call
+    /// site is on the drafting path). The EMA is therefore frozen at the
+    /// value that caused the skip, so `EMA[0] <= h` is an ABSORBING state:
+    /// once entered, the session cannot draft again for the rest of the
+    /// window and can never observe the evidence that would release it.
+    /// The ranked report shows this directly -- a pool prompt scored raw
+    /// 1.2489 with effective_mean_draft_len 0.154 and 449 non-drafting
+    /// rounds, against 3.31-3.42 for prompts that kept drafting.
+    ///
+    /// Fix: after `latchProbeInterval` consecutive skips, take one depth-1
+    /// probe. The probe runs the ordinary drafting path, so it reaches
+    /// `recordAcceptOutcome` and the EMA becomes live again -- succeed and
+    /// the prompt climbs back out, fail and it simply resumes skipping.
+    /// Cost is bounded and paid only by prompts that are already skipping:
+    /// one depth-1 draft costs `h` of a verify, so the ceiling is
+    /// h / latchProbeInterval ~ 1.1% of round time on a latched prompt and
+    /// exactly zero on a healthy one. Skipping when acceptance is genuinely
+    /// low stays correct; it just stops being permanent.
+    /// 4, not 16. The skip branch appends to `headHistoryBacklogHidden` every
+    /// non-drafting round (:921) and the next drafting round flushes the whole
+    /// backlog at once (:990), so the probe's block cost grows with the gap.
+    /// Measured on the ranked box at interval 16: max_block 0.2512s against a
+    /// 0.0360s p50, ratio 6.98, twice, which the stall guardrail rejects at 4x.
+    /// That prices the flush at about 0.0134s per queued entry, so block time
+    /// runs about 0.036 + 0.0134 * interval and the interval must stay under 8.
+    /// 4 gives roughly 0.090s, a ratio near 2.5, and releases the latch sooner.
+    private static let latchProbeInterval = 4
+    private var consecutiveSkippedRounds = 0
+    private static let latchProbeEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_LATCH_PROBE"] != "0"
+
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
@@ -713,7 +746,22 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
-        return depth
+        if depth > 0 {
+            consecutiveSkippedRounds = 0
+            return depth
+        }
+        // depth == 0: the skip path, which never records an outcome. Probe
+        // periodically so the EMA cannot stay frozen. `cap > 0` is already
+        // established above, so a depth-1 probe is always within the offered
+        // width; the serial-control leg exits at the `guard cap > 0` and is
+        // never reached here.
+        guard Self.latchProbeEnabled else { return 0 }
+        consecutiveSkippedRounds += 1
+        if consecutiveSkippedRounds >= Self.latchProbeInterval {
+            consecutiveSkippedRounds = 0
+            return 1
+        }
+        return 0
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
