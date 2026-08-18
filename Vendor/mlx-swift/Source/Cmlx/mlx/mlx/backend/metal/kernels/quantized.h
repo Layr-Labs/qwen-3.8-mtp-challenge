@@ -1822,8 +1822,10 @@ template <typename T, int group_size, int bits, bool batched>
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
-      // below 4096 outputs the reduced x-group count thins the grid, so the
-      // promoted pair kernel is kept there byte-for-byte.
+      // below 4096 outputs the pair kernel stays at M = 2. M = 3..9 reuse
+      // the already-compiled _m/DIRECT_NIBBLES helpers (same bodies as the
+      // N>=4096 cases) so mid-width K/V (N=1024) and other 1024<=N<4096
+      // projections share one weight tile across NA rows.
       switch (ntg.x) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
@@ -1884,42 +1886,45 @@ template <typename T, int group_size, int bits, bool batched>
     } else {
       switch (ntg.x) {
         case 2:
+          // Occupancy hedge: keep the pair kernel at M=2. #450 measured
+          // pair-kernel nibbles +21% on down; routing M=2 through _m
+          // would also instantiate a new NA=2 wide body.
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 3:
-          qmv_fast_crossrow_affine4_g64<T, 3>(
+          qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 4:
-          qmv_fast_crossrow_affine4_g64<T, 4>(
+          qmv_fast_crossrow_affine4_g64_m<T, 4, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64<T, 5>(
+          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64<T, 6>(
+          qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 7:
-          qmv_fast_crossrow_affine4_g64<T, 7>(
+          qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          qmv_fast_crossrow_affine4_g64<T, 8>(
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 9:
-          qmv_fast_crossrow_affine4_g64<T, 9>(
+          qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
