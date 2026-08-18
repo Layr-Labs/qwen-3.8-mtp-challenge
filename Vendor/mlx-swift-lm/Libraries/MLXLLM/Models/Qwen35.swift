@@ -1295,6 +1295,29 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 
+    /// PROPOSAL-HEAD-ONLY single-row tail: stock fused gate/up QMV, then ONE
+    /// launch for SwiGLU + down_proj QMV + residual add, bit-identical to
+    /// the stock three-dispatch tail. Returns nil (caller uses the stock
+    /// chain) unless this is the q4/g64 head MLP at the head geometry.
+    func fusedDownProposal(_ x: MLXArray, residual: MLXArray) -> MLXArray? {
+        guard x.dim(0) == 1, x.dim(-2) == 1, x.dtype == .bfloat16,
+              residual.dtype == .bfloat16, residual.dim(2) == 5120,
+              let d = downProj as? QuantizedLinear,
+              d.groupSize == 64, d.bits == 4, d.mode == .affine,
+              let dBiases = d.biases,
+              d.weight.dim(0) == 5120, d.weight.dim(1) == 17408 * 4 / 32,
+              let y = fusedGateUp(x),
+              _gateOut == 17408, _gateOut * 2 == y.dim(-1),
+              y.dtype == .bfloat16
+        else { return nil }
+        // Stock SwiGLU kernel materializes the down input ONCE (folding it
+        // into the QMV recomputes sigmoid per weight tile and lost 6%), then
+        // one launch does down_proj + residual.
+        return qwenMTPQmvResid(
+            x: qwen35CompiledFusedSwiGLU(y), projection: d, biases: dBiases,
+            residual: residual, inVec: 17408)
+    }
+
 }
 
 // MARK: - Full-attention Q/K preparation
@@ -1927,6 +1950,79 @@ final class Qwen35Attention: Module {
 
         return oProj(
             qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+    }
+
+    /// PROPOSAL-HEAD-ONLY single-row tail: identical attention front
+    /// (qkv pack, fused QK RMS+RoPE, sdpa with cache update), then ONE
+    /// launch for sigmoid-gate + o_proj QMV + residual add, bit-identical
+    /// to the stock three-dispatch tail. Returns nil BEFORE any compute or
+    /// cache mutation when the configuration is not the q4/g64 head shape,
+    /// so the caller can fall back safely. The target tower never calls this.
+    func forwardFusedProposalTail(
+        _ x: MLXArray, residual: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray? {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        guard B == 1, L == 1,
+              usesFusedQKPreparation,
+              attentionHeads == 24, kvHeads == 4, headDim == 256,
+              x.dtype == .bfloat16, residual.dtype == .bfloat16,
+              residual.dim(2) == 5120,
+              let o = oProj as? QuantizedLinear,
+              o.groupSize == 64, o.bits == 4, o.mode == .affine,
+              let oBiases = o.biases,
+              o.weight.dim(0) == 5120, o.weight.dim(1) == 6144 * 4 / 32,
+              qNorm.weight.dtype == .bfloat16, kNorm.weight.dtype == .bfloat16,
+              qNorm.weight.shape == [256], kNorm.weight.shape == [256],
+              qNorm.eps == kNorm.eps,
+              !(cache is CompilableRotatingKVCache),
+              !(cache is CompilableKVCache),
+              !(cache is BatchPositionedKVCache)
+        else { return nil }
+
+        let (qProjOutput, keysIn, valuesIn) = qkv(x)
+        guard qProjOutput.dtype == .bfloat16 else { return nil }
+        let qSplit = qProjOutput
+            .reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qSplit[0]
+        let gate = qSplit[1]
+
+        var keys = keysIn.reshaped(B, L, kvHeads, -1)
+        let values = valuesIn.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+        guard queries.shape == [B, L, attentionHeads, headDim],
+              keys.shape == [B, L, kvHeads, headDim]
+        else { return nil }
+
+        let prepared = qwen35AttentionQKRMSRoPE(
+            queries: queries,
+            keys: keys,
+            qWeight: qNorm.weight,
+            kWeight: kNorm.weight,
+            eps: qNorm.eps,
+            offset: cache?.offset ?? 0,
+            log2Base: ropeLog2Base
+        )
+        queries = prepared.queries
+        keys = prepared.keys
+
+        let attnOut = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        // Stock sigmoid-gate kernel materializes the o input ONCE (folding it
+        // into the QMV recomputes the sigmoid per weight tile and lost 6%),
+        // then one launch does o_proj + residual.
+        let gated = qwen35CompiledSigmoidMultiply(attnOut, gate)
+            .reshaped(B, L, -1)
+        return qwenMTPQmvResid(
+            x: gated, projection: o, biases: oBiases,
+            residual: residual, inVec: 6144)
     }
 }
 

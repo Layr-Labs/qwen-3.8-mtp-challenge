@@ -330,6 +330,40 @@ public final class Qwen36MTPBlockSession {
             eval(draftLogits, row)
         }
 
+        // FUSED HEAD-STEP WARM. When the fused single-row step can run
+        // (MLX_QWEN_MTP_HEADFUSE set), compile its three custom kernels
+        // outside the scored window: two fused steps on a throwaway cache,
+        // int32 ids like the live rounds (the fused path gates on int32).
+        if Self.headFuseMode != nil {
+            let previousFuse = _qwen35MTPHeadFuseEnabled
+            _qwen35MTPHeadFuseEnabled = true
+            let fusedWarmCache = model.makeMTPCache()
+            var fusedRow = row
+            for _ in 0 ..< 2 {
+                let (draftLogits, draftHidden) = model.mtpForwardWithHidden(
+                    hidden: fusedRow,
+                    nextTokenIds: MLXArray([Int32(0)]).reshaped([1, 1]),
+                    cache: fusedWarmCache)
+                fusedRow = draftHidden[
+                    0..., (draftHidden.dim(1) - 1) ..< draftHidden.dim(1), 0...]
+                eval(draftLogits, fusedRow)
+            }
+            _qwen35MTPHeadFuseEnabled = previousFuse
+        }
+
+        // VERIFY-CONCAT JIT WARM. Every round builds its verify block as
+        // concatenated([host primary] + device draft ids) over int32 [1, 1]
+        // arrays; the int32 copy kernels that concat JIT-compiles otherwise
+        // land inside scored round 1 (a ranked phase trace caught
+        // copyint32int32 compiling in-window). Zero-value inputs, throwaway
+        // output, one eval: shape and dtype select the kernels, nothing else.
+        var warmConcatParts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+        for _ in 0 ..< maxDepth {
+            warmConcatParts.append(
+                MLXArray.zeros([1, 1], dtype: .int32))
+        }
+        eval(concatenated(warmConcatParts, axis: 1))
+
         // Committed-history head shapes: compile both the K/V-only leading-row
         // path and final full row for the full seed and a 2-row accept fold.
         let hDim = row.dim(-1)
@@ -543,6 +577,21 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
+    /// Fused single-row head-step mode, read once. DEFAULT ON: the fused
+    /// kernels are bit-identical to the stock chain (verified: acceptance
+    /// equality at two window lengths on the declared q4 head) and the path
+    /// self-gates to the q4/g64 proposal head, so the pinned bf16 head and
+    /// every target-tower forward are untouched. The `MLX_`-prefixed env
+    /// override exists for local measurement only ("0" = stock, "parity" =
+    /// fused on odd rounds for within-run A/B); the ranked sandbox strips
+    /// env, so rank always runs the default.
+    private static let headFuseMode: String? = {
+        let value = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_HEADFUSE"]
+        if value == "0" { return nil }
+        if value == "1" || value == "parity" { return value }
+        return "1"
+    }()
     private static func traceWrite(_ line: String) {
         // stderr: the worker sandbox denies file-write*, and the parent's
         // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
@@ -788,6 +837,15 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
+        // MEASUREMENT INSTRUMENT (env-gated, inert unless MLX_QWEN_MTP_HEADFUSE
+        // is set; the ranked sandbox strips env): "1" runs the fused single-row
+        // head step every round, "parity" on odd rounds only for within-run
+        // A/B. The fused kernels are bit-identical to the stock chain, so the
+        // drafts and the ledger are unchanged in either mode.
+        if let mode = Self.headFuseMode {
+            _qwen35MTPHeadFuseEnabled =
+                mode == "1" || (mode == "parity" && roundCount % 2 == 1)
+        }
         // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
         // split a round into head-chain graph build, verify graph build, and
         // the single blocking eval's GPU wall. Never on in a ranked run.
