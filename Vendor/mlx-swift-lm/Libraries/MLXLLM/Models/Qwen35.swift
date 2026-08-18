@@ -1441,6 +1441,134 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Fused residual + RMS norm (PR #250 mechanism, receipt 2.9083)
+
+/// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
+///
+/// Bit-exact with the eager `h = x + r; postAttentionLayerNorm(h)` sequence
+/// because the add is rounded to BF16 BEFORE squaring (matching the write-back
+/// and re-read of `h` in the eager path) and the accumulation / reduction tree
+/// mirrors `rms_norm.metal` exactly.
+private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
+/// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
+/// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
+func qwen35FusedResidualRMSNorm(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray) {
+    let nRows = x.size / x.dim(-1)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormKernel(
+        [x, r, weight, MLXArray(eps)],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -1882,8 +2010,64 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Fused residual+RMSNorm when shapes and dtype match the common
+        // decode path (hidden 5120, BF16).  Bit-exact with the eager
+        // h = x + r; postAttentionLayerNorm(h) sequence.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
+    }
+
+    /// Boundary-fused variant for the BF16/5120 decode path: the incoming
+    /// residual boundary arrives as an UNMERGED pair with
+    /// `h_in = base + delta`, and this layer's entry performs that merge and
+    /// its own input RMSNorm in ONE fused launch — collapsing the previous
+    /// layer's exit add and this layer's entry norm. The exit returns
+    /// `(h, mlpOut)` unmerged for the next layer (or the caller's single
+    /// final merge). Same kernel, same bf16-round-before-square argument as
+    /// the post-attention pair above, so the values are bit-identical to the
+    /// sequential `x = prevH + prevMLP; inputLayerNorm(x)` chain.
+    func boundaryFused(
+        base: MLXArray,
+        delta: MLXArray?,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int = 0
+    ) -> (base: MLXArray, delta: MLXArray) {
+        let hIn: MLXArray
+        let normedIn: MLXArray
+        if let delta {
+            (hIn, normedIn) = qwen35FusedResidualRMSNorm(
+                x: base, r: delta,
+                weight: inputLayerNorm.weight,
+                eps: inputLayerNorm.eps)
+        } else {
+            hIn = base
+            normedIn = inputLayerNorm(base)
+        }
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(
+                normedIn, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
+        } else {
+            r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
+        }
+        let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+            x: hIn, r: r,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+        return (h, (mlp as! UnaryLayer)(postAttnNorm))
     }
 }
 
@@ -1932,6 +2116,21 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
+        forwardHiddenAndFusedNorm(inputs, cache: cache, nConfirmed: nConfirmed).hidden
+    }
+
+    /// Backbone forward that can also publish a fused final RMSNorm.
+    ///
+    /// On the BF16/5120 decode path the last residual merge and `model.norm`
+    /// share one `qwen35FusedResidualRMSNorm` launch. `fusedNormed` is then
+    /// the published post-norm (same bf16-round-before-square contract as
+    /// the layer kernels). Callers that still need a standalone
+    /// `model.norm(hidden)` fall back when `fusedNormed` is nil.
+    func forwardHiddenAndFusedNorm(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0
+    ) -> (hidden: MLXArray, fusedNormed: MLXArray?) {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -1952,32 +2151,77 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
-        for (i, layer) in layers.enumerated() {
-            let mask = layer.isLinear ? ssmMask : nil
-            let attnMask =
-                layer.isLinear
-                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
-            if ladderActive {
-                if prefillLadder {
-                    if i == 0 || i % 3 == 2 {
-                        asyncEval(hiddenStates)
-                    }
-                } else {
-                    switch i {
-                    case 0, 1, 9, 19, 29, 39, 49, 57:
-                        asyncEval(hiddenStates)
-                    default:
-                        break
+        if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
+            // Boundary-fused chain: the residual boundary flows as an
+            // UNMERGED (base, delta) pair, so each interior layer pays one
+            // fused add+norm at entry instead of a standalone exit add plus
+            // a standalone entry RMSNorm — 63 launches removed per forward.
+            // Ladder rungs force both halves of the pair: same graph
+            // frontier, same overlap, no arithmetic change.
+            var base = hiddenStates
+            var delta: MLXArray? = nil
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                let out = layer.boundaryFused(
+                    base: base, delta: delta,
+                    attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                base = out.base
+                delta = out.delta
+                if ladderActive {
+                    if prefillLadder {
+                        if i == 0 || i % 3 == 2 {
+                            asyncEval(base, out.delta)
+                        }
+                    } else {
+                        switch i {
+                        case 0, 1, 9, 19, 29, 39, 49, 57:
+                            asyncEval(base, out.delta)
+                        default:
+                            break
+                        }
                     }
                 }
             }
+            // Unique vs a naive Claudio restack: fold the LAST merge and
+            // the final RMSNorm into the same kernel instead of
+            // `hidden = base + delta` then a standalone `model.norm`.
+            if let delta {
+                return qwen35FusedResidualRMSNorm(
+                    x: base, r: delta,
+                    weight: norm.weight,
+                    eps: norm.eps)
+            }
+            return (base, nil)
+        } else {
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.isLinear ? ssmMask : nil
+                let attnMask =
+                    layer.isLinear
+                    ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                hiddenStates = layer(
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if ladderActive {
+                    if prefillLadder {
+                        if i == 0 || i % 3 == 2 {
+                            asyncEval(hiddenStates)
+                        }
+                    } else {
+                        switch i {
+                        case 0, 1, 9, 19, 29, 39, 49, 57:
+                            asyncEval(hiddenStates)
+                        default:
+                            break
+                        }
+                    }
+                }
+            }
+            return (hiddenStates, nil)
         }
-
-        // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
-        return hiddenStates
     }
 
     /// Atomically rebuild every linear-attention layer at the same committed
@@ -2528,8 +2772,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
-        let hidden = model(inputs, cache: cache)
-        var out = model.norm(hidden)
+        let (hidden, fusedNormed) = model.forwardHiddenAndFusedNorm(inputs, cache: cache)
+        var out = fusedNormed ?? model.norm(hidden)
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -2670,8 +2914,9 @@ extension Qwen35TextModel: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let (hidden, fusedNormed) = model.forwardHiddenAndFusedNorm(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = fusedNormed ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(normed)
@@ -2690,8 +2935,9 @@ extension Qwen35TextModel: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
-        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
-        let normed = model.norm(hidden)
+        let (hidden, fusedNormed) = model.forwardHiddenAndFusedNorm(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = fusedNormed ?? model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(normed)
