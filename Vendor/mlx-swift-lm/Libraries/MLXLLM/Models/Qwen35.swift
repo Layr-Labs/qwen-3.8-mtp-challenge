@@ -2421,6 +2421,121 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. Fuse the three `take` materializations, affine-4 QMV,
+// and final 32-way rerank into one dispatch. One SIMDgroup owns each candidate
+// row and reproduces qmv_fast_impl's 16-values-per-lane arithmetic and K-loop
+// order. SIMDgroup 0 then applies the same value/id total order as the
+// incumbent rerank kernel. The target verify remains the sole authority for
+// emitted tokens, while preserving the incumbent proposal exactly avoids an
+// acceptance-rate trade for the dispatch savings.
+private let qwen35DraftDirectRerankKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_direct_rerank",
+    inputNames: ["x", "weight", "scales", "biases", "candidate_ids"],
+    outputNames: ["token_id"],
+    source: """
+        constexpr uint HIDDEN_SIZE = 5120;
+        constexpr uint WORDS_PER_ROW = 640;
+        constexpr uint GROUPS_PER_ROW = 80;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint BLOCK_SIZE = 512;
+        constexpr uint TOPK = 32;
+
+        uint lane = thread_index_in_simdgroup;
+        uint sg = simdgroup_index_in_threadgroup;
+        uint candidate = uint(candidate_ids[sg]);
+
+        // The affine-4 weight row is 640 uint32 words = 1,280 uint16 packs.
+        const device ushort* row_weight =
+            reinterpret_cast<const device ushort*>(weight)
+            + candidate * WORDS_PER_ROW * 2;
+        float result = 0.0f;
+
+        for (uint k = 0; k < HIDDEN_SIZE; k += BLOCK_SIZE) {
+            uint first = k + lane * VALUES_PER_LANE;
+            float xv[VALUES_PER_LANE];
+            float sum = 0.0f;
+            for (uint i = 0; i < VALUES_PER_LANE; i += 4) {
+                xv[i] = float(x[first + i]);
+                xv[i + 1] = float(x[first + i + 1]);
+                xv[i + 2] = float(x[first + i + 2]);
+                xv[i + 3] = float(x[first + i + 3]);
+                // Match load_vector<T,float,16,4>'s bias-correction tree.
+                sum += x[first + i] + x[first + i + 1]
+                    + x[first + i + 2] + x[first + i + 3];
+            }
+
+            float partial = 0.0f;
+            uint pack_base = first / 4;
+            for (uint i = 0; i < 4; ++i) {
+                uint packed = uint(row_weight[pack_base + i]);
+                partial +=
+                    xv[4 * i] * float(packed & 0x000fu)
+                    + (xv[4 * i + 1] / 16.0f)
+                        * float(packed & 0x00f0u)
+                    + (xv[4 * i + 2] / 256.0f)
+                        * float(packed & 0x0f00u)
+                    + (xv[4 * i + 3] / 4096.0f)
+                        * float(packed & 0xf000u);
+            }
+
+            uint group_index = candidate * GROUPS_PER_ROW
+                + k / 64 + lane / 4;
+            float scale = float(scales[group_index]);
+            float bias = float(biases[group_index]);
+            result += scale * partial + sum * bias;
+        }
+
+        result = simd_sum(result);
+        threadgroup float candidate_value[TOPK];
+        threadgroup uint candidate_id[TOPK];
+        if (lane == 0) {
+            candidate_value[sg] = result;
+            candidate_id[sg] = candidate;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            float best_value = candidate_value[lane];
+            uint best_id = candidate_id[lane];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (lane < offset && qwen_draft_rerank_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
+        }
+    """,
+    header: """
+        inline bool qwen_draft_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+// Kill switch for exact A/B and emergency rollback without another archive.
+private let qwen35DirectRerankEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_DIRECT_RERANK"] != "0"
+
 // ---------------------------------------------------------------------------
 // PROPOSAL-SIDE TOP-32 SHORTLIST
 //
@@ -3182,6 +3297,22 @@ extension Qwen35TextModel: MTPCapable {
                 coarse[0..., 0..., 0 ..< Self.compactDraftRealCount],
                 kth: kth, axis: -1
             )[.ellipsis, (kth)...].reshaped([candidateCount])
+        }
+
+        if qwen35DirectRerankEnabled {
+            return qwen35DraftDirectRerankKernel(
+                [x.reshaped([configuration.hiddenSize]), exact.weight,
+                 exact.scales, exactBiases, candidateIDs],
+                template: [
+                    ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                    ("CONTROL_OFFSET",
+                     Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ],
+                grid: (1024, 1, 1),
+                threadGroup: (1024, 1, 1),
+                outputShapes: [[1, 1]],
+                outputDTypes: [.int32]
+            )[0]
         }
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
