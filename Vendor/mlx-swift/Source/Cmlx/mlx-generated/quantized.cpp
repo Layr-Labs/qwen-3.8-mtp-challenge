@@ -1981,6 +1981,16 @@ template <typename T, int group_size, int bits, bool batched>
       }
     } else {
       switch (ntg.x) {
+        case 1:
+          // M == 1 below 4096 outputs: K/V projections (output 1024 = 8 KV
+          // heads x 128 head_dim) and other narrow MTP-side matmuls. Serial
+          // forwards are all >= 4096 outputs, so this case is MTP-only and
+          // cannot touch the serial numerator. has_pair guard idles the
+          // second-lane load; arithmetic is identical to qmv_fast_impl.
+          qmv_fast_crossrow_affine4_g64<T, 1>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
