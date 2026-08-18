@@ -1065,6 +1065,90 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
+// Single-row (M == 1) affine4/g64 fast QMV with the promoted direct-nibble
+// arithmetic. The wide row-sharing kernels cannot serve a one-input-row call
+// (their static_asserts demand M >= 2 / NA >= 2), so every M == 1 affine4/g64
+// quantizedMM with >= 4096 outputs -- the compact draft lm_head (98_336 rows)
+// and the serial-control lm_head (248_320 rows) -- used to fall through to
+// qmv_fast_impl. This is the NA == 1 specialization of
+// qmv_fast_crossrow_affine4_g64_wide with DIRECT_NIBBLES == true: identical
+// per-output-element expression (u16 packed loads, shift-extracted nibbles,
+// per-block scale/bias application, simd_sum reduction) to the promoted
+// M = 3..9 wide rows.
+template <typename T>
+METAL_FUNC void qmv_fast_singlerow_affine4_g64(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+
+  thread float result[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    result[r] = 0.0f;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    thread float x0[values_per_thread];
+    const device T* xm = x + k + simd_lid * values_per_thread;
+    float sum = 0.0f;
+    for (int i = 0; i < values_per_thread; i += 4) {
+      x0[i] = static_cast<float>(xm[i]);
+      x0[i + 1] = static_cast<float>(xm[i + 1]);
+      x0[i + 2] = static_cast<float>(xm[i + 2]);
+      x0[i + 3] = static_cast<float>(xm[i + 3]);
+      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+    }
+
+    for (int r = 0; r < rows_per_simd; r++) {
+      float accum = 0.0f;
+      for (int i = 0; i < 4; i++) {
+        accum += (x0[4 * i] * (packed[r][i] & 0x000f) +
+                  x0[4 * i + 1] * ((packed[r][i] >> 4) & 0x000f) +
+                  x0[4 * i + 2] * ((packed[r][i] >> 8) & 0x000f) +
+                  x0[4 * i + 3] * ((packed[r][i] >> 12) & 0x000f));
+      }
+      result[r] += scale_local[r] * accum + sum * bias_local[r];
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    const float reduced = simd_sum(result[r]);
+    if (simd_lid == 0) {
+      y[out_row + r] = static_cast<T>(reduced);
+    }
+  }
+}
+
 // IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
 // with the remainder spread evenly so no group runs a one-row tail.
 template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
@@ -1825,6 +1909,25 @@ template <typename T, int group_size, int bits, bool batched>
       // below 4096 outputs the reduced x-group count thins the grid, so the
       // promoted pair kernel is kept there byte-for-byte.
       switch (ntg.x) {
+        case 1:
+          // M == 1 with >= 4096 outputs. GATED to the ONE shape the serial
+          // leg never runs: the compact draft lm_head (out_vec_size ==
+          // 98_336). raw_p = mean(serial depth-0 seconds/token) /
+          // mean(MTP seconds/token) is measured on the SAME binary in the
+          // same session, and the serial leg is 512 plain forwards whose
+          // matmuls are all M == 1 with >= 4096 outputs (fused qkv 8192,
+          // o_proj 5120, mlp 17408/20480, lm_head 248_320). An ungated
+          // singlerow case would accelerate the serial NUMERATOR as much as
+          // the MTP denominator -- diluting the score and risking the serial
+          // denominator band (0.03799 s/token +- 5%). 98_336 never appears
+          // in the serial leg, so this gate is MTP-only by construction.
+          if (out_vec_size == 98336) {
+            qmv_fast_singlerow_affine4_g64<T>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+            return;
+          }
+          break;
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
