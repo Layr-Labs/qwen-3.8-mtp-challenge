@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:xkm/qwen3.8-27b-mtp-head-retrained@b261da092e836c1d2990c82f3746c707cc884b7a",
+  "sha256": "a124736ad5bb116c4f0779d720ed6680c2a7293849d783eb84c2e2e82d7bcab0",
+  "bytes": 849400336,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "Retrained MTP head (weights change, architecture unchanged): chain-faithful distillation of the pinned target's own top-K over ~17.5M mixed-corpus positions, 50/50 soup of two finetunes. bf16, 15 tensors, loads through the stock bf16 path with zero code changes. Matched-protocol accept@1-4 .773/.695/.639/.615 vs pinned .740/.648/.578/.553; 167 vs 180 rounds on the public fixtures at ed4dfd6. sha256 is the TREE digest per mtp-head/README.md: sha256 over '<file sha256>  model.safetensors\\n' where the fetched file's own sha256 is ca37addfbadf03f19c7c198b2c9d27ad860caeeac9fbd15d88ea4bc0a5bb3e05; bytes is the file size. Resubmission of PR #453, which failed only this digest-format check (declared the raw file hash). Full recipe, trainer, and corpus builders published in the HF repo."
 }
