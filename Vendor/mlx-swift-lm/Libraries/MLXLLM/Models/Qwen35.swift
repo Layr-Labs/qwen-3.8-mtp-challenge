@@ -2115,30 +2115,36 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
-// incumbent affine-4 compact readout evaluates those rows, and this single
-// SIMDgroup applies the incumbent value/id total order to select the proposal.
+// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses K rows; the
+// incumbent affine-4 compact readout evaluates those rows, and this threadgroup
+// applies the incumbent value/id total order to select the proposal.
 // The target lm_head, verify values, cache state, and row ledger are untouched.
+// K=64 needs a threadgroup tree (two SIMD groups); the 32-wide shuffle loop
+// cannot cover that bag.
 private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_rerank",
     inputNames: ["logits", "candidate_ids"],
     outputNames: ["token_id"],
     source: """
-        uint lane = thread_index_in_simdgroup;
-        float best_value = float(logits[lane]);
-        uint best_id = uint(candidate_ids[lane]);
+        uint tid = thread_position_in_threadgroup.x;
+        threadgroup float tval[CANDIDATE_COUNT];
+        threadgroup uint tidid[CANDIDATE_COUNT];
+        tval[tid] = float(logits[tid]);
+        tidid[tid] = uint(candidate_ids[tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint offset = 16; offset > 0; offset >>= 1) {
-            float other_value = simd_shuffle_down(best_value, offset);
-            uint other_id = simd_shuffle_down(best_id, offset);
-            if (lane < offset && qwen_draft_rerank_better(
-                    other_value, other_id, best_value, best_id)) {
-                best_value = other_value;
-                best_id = other_id;
+        for (uint stride = CANDIDATE_COUNT / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && qwen_draft_rerank_better(
+                    tval[tid + stride], tidid[tid + stride],
+                    tval[tid], tidid[tid])) {
+                tval[tid] = tval[tid + stride];
+                tidid[tid] = tidid[tid + stride];
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        if (lane == 0) {
+        if (tid == 0) {
+            uint best_id = tidid[0];
             token_id[0] = int(
                 best_id < PREFIX_COUNT
                     ? best_id
@@ -2200,7 +2206,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 64
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2623,6 +2629,7 @@ extension Qwen35TextModel: MTPCapable {
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
             template: [
+                ("CANDIDATE_COUNT", candidateCount),
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
