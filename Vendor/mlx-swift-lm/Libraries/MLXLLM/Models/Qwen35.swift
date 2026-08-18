@@ -2115,45 +2115,115 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
-// incumbent affine-4 compact readout evaluates those rows, and this single
-// SIMDgroup applies the incumbent value/id total order to select the proposal.
-// The target lm_head, verify values, cache state, and row ledger are untouched.
-private let qwen35DraftRerankKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_rerank",
-    inputNames: ["logits", "candidate_ids"],
+// PROPOSAL SIDE ONLY. The exact affine-4 rerank consumes the shortlist IDs
+// directly instead of materializing three 32-row tensors with MLX.take,
+// launching a separate quantizedMM, and then launching the selector. Eight
+// SIMDgroups reproduce qmv_fast_impl's four-output-row arithmetic for the 32
+// indexed rows, round each logit through bf16 exactly where quantizedMM does,
+// and reduce the same value/id total order inside this single dispatch.
+private let qwen35IndexedDraftRerankKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_indexed_draft_rerank",
+    inputNames: ["weight", "scales", "biases", "x", "candidate_ids"],
     outputNames: ["token_id"],
     source: """
-        uint lane = thread_index_in_simdgroup;
-        float best_value = float(logits[lane]);
-        uint best_id = uint(candidate_ids[lane]);
+        constexpr uint values_per_thread = 16;
+        constexpr uint rows_per_simd = 4;
+        constexpr uint block_size = values_per_thread * 32;
+        constexpr uint groups_per_row = HIDDEN_SIZE / GROUP_SIZE;
+        constexpr uint bytes_per_row = HIDDEN_SIZE / 2;
 
-        for (uint offset = 16; offset > 0; offset >>= 1) {
-            float other_value = simd_shuffle_down(best_value, offset);
-            uint other_id = simd_shuffle_down(best_id, offset);
-            if (lane < offset && qwen_draft_rerank_better(
-                    other_value, other_id, best_value, best_id)) {
-                best_value = other_value;
-                best_id = other_id;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint candidate_base = simd_group * rows_per_simd;
+
+        float result[rows_per_simd] = {0.0f};
+        for (uint k = 0; k < HIDDEN_SIZE; k += block_size) {
+            float xv[values_per_thread];
+            float sum = 0.0f;
+            const uint x_base = k + lane * values_per_thread;
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < values_per_thread; i += 4) {
+                const float x0 = float(x[x_base + i]);
+                const float x1 = float(x[x_base + i + 1]);
+                const float x2 = float(x[x_base + i + 2]);
+                const float x3 = float(x[x_base + i + 3]);
+                sum += x0 + x1 + x2 + x3;
+                xv[i] = x0;
+                xv[i + 1] = x1 / 16.0f;
+                xv[i + 2] = x2 / 256.0f;
+                xv[i + 3] = x3 / 4096.0f;
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < rows_per_simd; ++r) {
+                const uint candidate = candidate_base + r;
+                const uint row = uint(candidate_ids[candidate]);
+                const device uint16_t* packed =
+                    reinterpret_cast<const device uint16_t*>(
+                        reinterpret_cast<const device uint8_t*>(weight)
+                        + ulong(row) * bytes_per_row
+                        + ulong(k / 2 + lane * 8));
+                const uint group_index =
+                    row * groups_per_row + k / GROUP_SIZE + lane / 4;
+                const float scale = float(scales[group_index]);
+                const float bias = float(biases[group_index]);
+                float accum = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < values_per_thread / 4; ++i) {
+                    const uint16_t word = packed[i];
+                    accum +=
+                        (xv[4 * i] * (word & 0x000f) +
+                         xv[4 * i + 1] * (word & 0x00f0) +
+                         xv[4 * i + 2] * (word & 0x0f00) +
+                         xv[4 * i + 3] * (word & 0xf000));
+                }
+                result[r] += scale * accum + sum * bias;
             }
         }
 
+        threadgroup float scratch_value[CANDIDATE_COUNT];
+        threadgroup uint scratch_id[CANDIDATE_COUNT];
         if (lane == 0) {
-            token_id[0] = int(
-                best_id < PREFIX_COUNT
-                    ? best_id
-                    : best_id + CONTROL_OFFSET);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < rows_per_simd; ++r) {
+                const uint candidate = candidate_base + r;
+                scratch_value[candidate] = float(InT(result[r]));
+                scratch_id[candidate] = uint(candidate_ids[candidate]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            float best_value = scratch_value[lane];
+            uint best_id = scratch_id[lane];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                const float other_value = simd_shuffle_down(best_value, offset);
+                const uint other_id = simd_shuffle_down(best_id, offset);
+                if (lane < offset && qwen_indexed_rerank_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
         }
     """,
     header: """
-        inline bool qwen_draft_rerank_better(
+        typedef bfloat16_t InT;
+
+        inline bool qwen_indexed_rerank_better(
             float candidate_value,
             uint candidate_id,
             float current_value,
             uint current_id
         ) {
-            bool candidate_nan = isnan(candidate_value);
-            bool current_nan = isnan(current_value);
+            const bool candidate_nan = isnan(candidate_value);
+            const bool current_nan = isnan(current_value);
             if (candidate_nan != current_nan) { return !candidate_nan; }
             if (candidate_value > current_value) { return true; }
             if (candidate_value < current_value) { return false; }
@@ -2613,22 +2683,18 @@ extension Qwen35TextModel: MTPCapable {
             coarse, kth: kth, axis: -1
         )[.ellipsis, (kth)...].reshaped([candidateCount])
 
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
-        let exactLogits = quantizedMM(
-            x, exactWeight, scales: exactScales, biases: exactZeroPoints,
-            transpose: true, groupSize: 64, bits: 4, mode: .affine)
-
-        return qwen35DraftRerankKernel(
-            [exactLogits.reshaped([candidateCount]), candidateIDs],
+        return qwen35IndexedDraftRerankKernel(
+            [exact.weight, exact.scales, exactBiases, x, candidateIDs],
             template: [
+                ("HIDDEN_SIZE", configuration.hiddenSize),
+                ("GROUP_SIZE", exact.groupSize),
+                ("CANDIDATE_COUNT", candidateCount),
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
             ],
-            grid: (candidateCount, 1, 1),
-            threadGroup: (candidateCount, 1, 1),
+            grid: (candidateCount * 8, 1, 1),
+            threadGroup: (candidateCount * 8, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]
