@@ -1441,6 +1441,117 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Fused residual + RMSNorm
+
+/// Fused `h = x + r` plus `RMSNorm(h)` for the candidate verify path.
+///
+/// The add is rounded to BF16 before squaring, matching the eager store of
+/// `h = x + r`. The reduction tree matches `rms_norm.metal` `rms_looped`:
+/// simd_sum, threadgroup sums, precise rsqrt. The output multiply is
+/// `w * T(h * inv_mean)`. Serial S=1 never calls this helper.
+private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm_bf16_v1",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float hi = float(bfloat(
+                        float(x[offset + elem + i]) + float(r[offset + elem + i])));
+                    acc += hi * hi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float hi = float(bfloat(
+                            float(x[offset + elem + i]) + float(r[offset + elem + i])));
+                        acc += hi * hi;
+                    }
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    bfloat hi = bfloat(
+                        float(x[offset + elem + i]) + float(r[offset + elem + i]));
+                    h[offset + elem + i] = hi;
+                    normed[offset + elem + i] =
+                        weight[elem + i] * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        bfloat hi = bfloat(
+                            float(x[offset + elem + i]) + float(r[offset + elem + i]));
+                        h[offset + elem + i] = hi;
+                        normed[offset + elem + i] =
+                            weight[elem + i] * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+func qwen35FusedResidualRMSNorm(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray) {
+    let nRows = x.size / x.dim(-1)
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormKernel(
+        [x, r, weight, eps],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -1885,6 +1996,47 @@ final class Qwen35DecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
+
+    /// Candidate-only layer body. `normalizedInput` is the already-computed
+    /// next-layer RMSNorm from the previous fused residual, or nil to run
+    /// `inputLayerNorm` as usual.
+    func residualAndMLP(
+        _ x: MLXArray,
+        normalizedInput: MLXArray?,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int,
+        fuseResidualNorm: Bool
+    ) -> (residual: MLXArray, mlpOutput: MLXArray) {
+        let layerInput = normalizedInput ?? inputLayerNorm(x)
+        let r: MLXArray
+        if isLinear {
+            r = linearAttn!(
+                layerInput, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
+        } else {
+            r = selfAttn!(layerInput, mask: attentionMask, cache: cache)
+        }
+
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if fuseResidualNorm,
+           x.dtype == .bfloat16,
+           r.dtype == .bfloat16,
+           x.dim(-1) == 5120,
+           postAttentionLayerNorm.weight.dtype == .bfloat16
+        {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return (h, (mlp as! UnaryLayer)(postAttnNorm))
+    }
 }
 
 // MARK: - Text Model
@@ -1952,14 +2104,43 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        // Verify widths 2...9 only. Serial S=1 keeps the original two-op
+        // residual + RMSNorm path so the paired denominator does not move.
+        let fuseResidualNorm = inputs.dim(1) >= 2 && inputs.dim(1) <= 9
+        var normalizedInput: MLXArray?
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
+            if fuseResidualNorm {
+                let outputs = layer.residualAndMLP(
+                    hiddenStates, normalizedInput: normalizedInput,
+                    attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed,
+                    fuseResidualNorm: true)
+                if i + 1 < layers.count,
+                   outputs.residual.dtype == .bfloat16,
+                   outputs.mlpOutput.dtype == .bfloat16,
+                   outputs.residual.dim(-1) == 5120,
+                   layers[i + 1].inputLayerNorm.weight.dtype == .bfloat16
+                {
+                    let fused = qwen35FusedResidualRMSNorm(
+                        x: outputs.residual, r: outputs.mlpOutput,
+                        weight: layers[i + 1].inputLayerNorm.weight,
+                        eps: layers[i + 1].inputLayerNorm.eps)
+                    hiddenStates = fused.residual
+                    normalizedInput = fused.normed
+                } else {
+                    hiddenStates = outputs.residual + outputs.mlpOutput
+                    normalizedInput = nil
+                }
+            } else {
+                hiddenStates = layer(
+                    hiddenStates, attentionMask: attnMask, ssmMask: mask,
+                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                normalizedInput = nil
+            }
             if ladderActive {
                 if prefillLadder {
                     if i == 0 || i % 3 == 2 {
