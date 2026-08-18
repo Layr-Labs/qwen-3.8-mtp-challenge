@@ -1497,6 +1497,11 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    // Canonical [K; V] columns for a sidecar that covers every K/V output.
+    // Island rows are stored in importance order, so direct projection must
+    // sort them by their output indices before it can replace putAlong.
+    private var _fullExactKVWeightT: MLXArray?
+    private var _fullExactKRowCount = 0
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1551,6 +1556,20 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if let kvWeightT = _fullExactKVWeightT,
+           let q = qProj as? QuantizedLinear,
+           let qz = q.biases
+        {
+            var qy = quantizedMM(
+                x, q.weight, scales: q.scales, biases: qz, transpose: true,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            qy = replaceExactQRows(qy, input: x)
+            let kv = matmul(x, kvWeightT)
+            return (
+                qy,
+                kv[.ellipsis, ..<_fullExactKRowCount],
+                kv[.ellipsis, _fullExactKRowCount...])
+        }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1601,6 +1620,12 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let kvWeightT = _fullExactKVWeightT {
+            let y = matmul(x, kvWeightT)
+            return (
+                y[.ellipsis, ..<_fullExactKRowCount],
+                y[.ellipsis, _fullExactKRowCount...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1660,6 +1685,23 @@ final class Qwen35Attention: Module {
             base, indices.reshaped(indexShape), values: exact, axis: -1)
     }
 
+    /// Restore only the selected query rows when full-cover K/V is projected
+    /// directly from its canonicalized BF16 sidecar.
+    private func replaceExactQRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard _exactQRowCount > 0,
+              let weight = _exactQKVWeight,
+              let indices = _exactQKVIndices
+        else { return base }
+        let exact = matmul(
+            input, weight[..<_exactQRowCount].transposed(1, 0))
+        let qIndices = indices[..<_exactQRowCount]
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, qIndices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
@@ -1678,12 +1720,31 @@ final class Qwen35Attention: Module {
         let kvIndices = concatenated(
             [kIndices, vIndices + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
-        eval(weight, qkvIndices, kvIndices)
+        var fullExactKVWeightT: MLXArray?
+        if kWeight.dim(0) == kOutputCount,
+           vWeight.dim(0) == kOutputCount
+        {
+            // Full-cover island rows are a permutation of output channels,
+            // not canonical channel order. Sorting the indices once at install
+            // makes direct [K; V] projection identical to matmul + putAlong.
+            let canonicalK = kWeight[argSort(kIndices, axis: 0)]
+            let canonicalV = vWeight[argSort(vIndices, axis: 0)]
+            fullExactKVWeightT = concatenated(
+                [canonicalK, canonicalV], axis: 0
+            ).transposed(1, 0).contiguous()
+        }
+        if let fullExactKVWeightT {
+            eval(weight, qkvIndices, kvIndices, fullExactKVWeightT)
+        } else {
+            eval(weight, qkvIndices, kvIndices)
+        }
 
         _exactQKVWeight = weight
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+        _fullExactKVWeightT = fullExactKVWeightT
+        _fullExactKRowCount = fullExactKVWeightT == nil ? 0 : kOutputCount
     }
 
     /// Append rows to an attention cache without producing query outputs.
