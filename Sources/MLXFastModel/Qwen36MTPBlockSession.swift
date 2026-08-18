@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import MLXFastCore
 import MLXLLM
@@ -200,7 +201,91 @@ public final class Qwen36MTPBlockSession {
         }
     }
 
+    /// Finalizer of last resort for the local GPU capture: whatever path
+    /// tears this session down (normal end, stop token, poisoned worker),
+    /// an armed capture gets its stopCapture so the .gputrace bundle is
+    /// written out loadable. No-op when the gate never armed.
+    deinit {
+        gpuFrameCaptureStopIfActive()
+    }
+
     // MARK: - warm
+
+    /// Keep the ranked M5-Max model allocations in Metal's residency set
+    /// after the input-independent warm. MLX attaches a residency set to every
+    /// command queue, but its capacity is zero until a wired limit is applied;
+    /// without this one-time resize the driver must re-establish residency for
+    /// the whole tower on later command buffers.
+    ///
+    /// Capacity is deliberately the live post-warm footprint plus only a small
+    /// page-rounding allowance. After cached warm temporaries are cleared,
+    /// persistent weights fit in the one resize while later scratch fails the
+    /// fit test and stays on the commit-free unwired path. The ticket is never
+    /// ended because shrinking the limit would evict the resident weights.
+    private static let wiredZHDefaultFraction = 1.0
+    private static let wiredZHDefaultSlackMB = 64
+    private static let wiredTicketLock = NSLock()
+    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
+
+    private final class QwenMTPWiredLimitBox: @unchecked Sendable {
+        var value: Int = 0
+    }
+
+    private static func wireResidentWeightsIfEnabled() {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["DARKBLOOM_QWEN_MTP_WIRED_ZH"] != "0" else { return }
+        guard ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
+        else { return }
+
+        wiredTicketLock.lock()
+        defer { wiredTicketLock.unlock() }
+        guard wiredTicketRetainer == nil else { return }
+
+        // Shape-warm locals have left scope before this method is called.
+        // Remove their cached storage so the active count describes the live
+        // backbone, head, and persistent runtime tensors rather than scratch.
+        Memory.clearCache()
+        let active = Memory.activeMemory
+        guard active > 0 else { return }
+
+        let fraction = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_FRACTION"]
+            .flatMap(Double.init) ?? wiredZHDefaultFraction
+        let slackMB = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_SLACK_MB"]
+            .flatMap(Int.init) ?? wiredZHDefaultSlackMB
+        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
+        target += max(0, slackMB) << 20
+
+        // The MLX backend rejects a wired limit above the recommended working
+        // set. Keep a 256 MiB margin for system bookkeeping and fail closed on
+        // nonsensical geometry.
+        if let recommended = GPU.maxRecommendedWorkingSetBytes() {
+            target = min(target, max(0, recommended - (256 << 20)))
+        }
+        guard target > 0 else { return }
+
+        let ticket = WiredMemoryTicket(
+            size: target,
+            policy: MLXLMCommon.WiredSumPolicy(cap: target),
+            manager: .shared,
+            kind: .active
+        )
+        let appliedBox = QwenMTPWiredLimitBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            appliedBox.value = await ticket.start()
+            semaphore.signal()
+        }
+        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
+        wiredTicketRetainer = ticket
+
+        let applied = outcome == .success ? appliedBox.value : -1
+        let recommended = GPU.maxRecommendedWorkingSetBytes() ?? -1
+        var line = "mlxfast: qwen-mtp wired-zh request=\(target)"
+        line += " applied=\(applied) active=\(active)"
+        line += " slack_mb=\(max(0, slackMB)) fraction=\(fraction)"
+        line += " maxrec=\(recommended)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
 
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
@@ -208,6 +293,13 @@ public final class Qwen36MTPBlockSession {
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
+        // Keep the large shape-warm object graph in a separate call frame so
+        // every throwaway cache and tensor is released before residency sizing.
+        try warmAllDepthShapes(maxDepth: maxDepth)
+        Self.wireResidentWeightsIfEnabled()
+    }
+
+    private func warmAllDepthShapes(maxDepth: Int) throws {
         // Warms every legal verify width from 1 (the serial control's
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
@@ -465,6 +557,106 @@ public final class Qwen36MTPBlockSession {
         // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
         // `forwardsWorkerStderr` on the local mtp-timed verb.
         FileHandle.standardError.write(Data(line.utf8))
+        // File fallback (local-only, same env gate): the parent's drain can
+        // drop worker stderr entirely on some verbs; a local operator arming
+        // the trace needs the lines regardless. Appends only when the trace
+        // gate is on and the run is unsandboxed (MLXFAST_NO_SANDBOX=1),
+        // mirroring the Qwen35Trace fallback the timing work validated.
+        if traceRounds {
+            let path = "/tmp/qwen36-phase-trace.txt"
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(atPath: path, contents: nil)
+            }
+            if let fh = FileHandle(forWritingAtPath: path) {
+                fh.seekToEndOfFile()
+                fh.write(Data(line.utf8))
+                try? fh.close()
+            }
+        }
+    }
+
+    // MARK: - local GPU frame capture (MLX_QWEN_GPU_TRACE=1)
+
+    /// Local-only GPU frame-capture gate, read ONCE — the same shape as
+    /// `traceRounds` above, and legal for the same reason: the trusted
+    /// harness strips `MLXFAST_*` from the sandboxed worker's env but lets
+    /// the `MLX_*` prefix through, so at rank nothing can arm this and the
+    /// only per-round cost is one dead-branch boolean test. Off by default.
+    ///
+    /// A second gate applies below: Metal refuses the `.gpuTraceDocument`
+    /// destination unless `MTL_CAPTURE_ENABLED=1` was in the env AT PROCESS
+    /// LAUNCH. `supportsDestination` reports exactly that; an unarmed
+    /// process gets one stderr note and the hook then skips silently. The
+    /// hook NEVER throws and never writes to /tmp unless the local operator
+    /// armed BOTH gates deliberately.
+    private static let gpuTraceEnabled =
+        ProcessInfo.processInfo.environment["MLX_QWEN_GPU_TRACE"] == "1"
+
+    /// Capture window in session rounds (1-based, like `roundCount`): arm at
+    /// the top of round 6 — safely past warm-up, seed prefill and first-touch
+    /// JIT — and stop at the top of round 9, so the bundle holds exactly the
+    /// steady-state decode work of rounds 6-8. Bounded on purpose: a
+    /// whole-run .gputrace of a 128-token decode is gigabytes of recording
+    /// overhead and adds nothing over three representative rounds.
+    private static let gpuTraceStartRound = 6
+    private static let gpuTraceStopRound = 9
+
+    /// Per-session truth about the capture this session armed. Instance, not
+    /// static: the run drives one session at a time, and instance state keeps
+    /// the deinit backstop exact (whoever armed it stops it).
+    private var gpuCaptureActive = false
+
+    /// Round-top tick: arm or stop the bounded whole-device capture.
+    ///
+    /// The WHOLE default device is the capture object (not one command
+    /// queue) because MLX submits on its own queues of that device — this
+    /// records every draft chain, verify forward and top-2 reduction the
+    /// window dispatches, which is what Xcode's per-dispatch occupancy and
+    /// limiter views need.
+    private func gpuFrameCaptureTick() {
+        guard Self.gpuTraceEnabled else { return }
+        if roundCount == Self.gpuTraceStartRound, !gpuCaptureActive {
+            let manager = MTLCaptureManager.shared()
+            guard manager.supportsDestination(.gpuTraceDocument) else {
+                Self.traceWrite("qwen-gpu-trace: .gpuTraceDocument destination"
+                    + " unsupported — relaunch with MTL_CAPTURE_ENABLED=1;"
+                    + " skipping GPU capture\n")
+                return
+            }
+            guard let device = MTLCreateSystemDefaultDevice() else {
+                Self.traceWrite("qwen-gpu-trace: no default Metal device;"
+                    + " skipping GPU capture\n")
+                return
+            }
+            let descriptor = MTLCaptureDescriptor()
+            descriptor.captureObject = device
+            descriptor.destination = .gpuTraceDocument
+            descriptor.outputURL = URL(
+                fileURLWithPath: "/tmp/qwen-rounds.gputrace")
+            do {
+                try manager.startCapture(with: descriptor)
+                gpuCaptureActive = true
+                Self.traceWrite("qwen-gpu-trace: capture armed at round "
+                    + "\(roundCount) -> /tmp/qwen-rounds.gputrace\n")
+            } catch {
+                // A local diagnostic must never poison the run it observes.
+                Self.traceWrite("qwen-gpu-trace: startCapture failed, "
+                    + "skipping: \(error)\n")
+            }
+        } else if roundCount == Self.gpuTraceStopRound, gpuCaptureActive {
+            gpuFrameCaptureStopIfActive()
+        }
+    }
+
+    /// Stop an armed capture wherever the run ends — the round-9 top, a stop
+    /// token inside the window, or session teardown. Metal only writes the
+    /// .gputrace bundle out on stopCapture, so an unpaired start would leave
+    /// nothing loadable behind.
+    private func gpuFrameCaptureStopIfActive() {
+        guard gpuCaptureActive else { return }
+        MTLCaptureManager.shared().stopCapture()
+        gpuCaptureActive = false
+        Self.traceWrite("qwen-gpu-trace: capture stopped, trace finalized\n")
     }
 
     /// Exact-value row dump for the LOCAL width-wall gate: hexfloat (`%a`)
@@ -705,6 +897,10 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
+        // Local-only GPU frame capture (MLX_QWEN_GPU_TRACE=1): arm/stop the
+        // bounded whole-device capture around steady-state rounds 6-8. One
+        // dead-branch boolean test per round when the gate is off.
+        gpuFrameCaptureTick()
         // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
         // split a round into head-chain graph build, verify graph build, and
         // the single blocking eval's GPU wall. Never on in a ranked run.
@@ -749,6 +945,9 @@ public final class Qwen36MTPBlockSession {
         // candidate is the one already spent), so the ledger stays closed.
         if stopTokens.contains(primary) {
             reachedStopToken = true
+            // Run ends inside the capture window: finalize the trace now
+            // instead of leaving an unpaired start (deinit is the backstop).
+            gpuFrameCaptureStopIfActive()
             // The tail row to declare is the row that produced this primary —
             // its top-2 was read out of the previous round's batched eval.
             let (tailTokens, tailLogits) = tailPending

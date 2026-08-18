@@ -1984,6 +1984,99 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+// MARK: - Env-gated per-site enqueue timing (MLX_QWEN_MTP_TRACE=1)
+//
+// Observation-only wall-clock brackets around the boundary decode path's
+// sub-calls, for local attribution of a verify round. Same env var name as
+// the session's `traceRounds` gate so ONE env arms both trace sources.
+//
+// HONESTY NOTE ON THE NUMBERS: MLX is lazy. A bracket around a sub-call
+// measures HOST time (graph build + enqueue) plus any allocator/stream
+// stall that happens to land inside it — NOT the isolated GPU time of that
+// sublayer's kernels. GPU work only materializes at an eval boundary, and
+// the round's final blocking eval lives in the caller, outside these
+// brackets (the asyncEval ladder rungs inside the loop DO drain the GPU
+// pipeline partially and their stall time lands wherever the host was at
+// the time). That is why every bucket is named `*_enqueue_us` and the
+// counts are reported alongside: treat them as enqueue brackets, not
+// per-kernel GPU timings.
+//
+// Off by default (ranked env never sets MLX_QWEN_MTP_TRACE). When off the
+// hot path pays one Bool branch per hook site and allocates nothing; when
+// on the cost is a few DispatchTime.now() reads per layer (~64/round).
+// Decode forwards never overlap in this harness (one thread drives the
+// model; begin/end pair on that same thread), so plain mutable statics are
+// sufficient — no atomics, no queue.
+private enum Qwen35Trace {
+    static let on =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+
+    nonisolated(unsafe) static var beginAt: UInt64 = 0
+    nonisolated(unsafe) static var layerUs: UInt64 = 0
+    nonisolated(unsafe) static var attnUs: UInt64 = 0
+    nonisolated(unsafe) static var mlpUs: UInt64 = 0
+    nonisolated(unsafe) static var junctionUs: UInt64 = 0
+    nonisolated(unsafe) static var layerCount = 0
+    nonisolated(unsafe) static var faCount = 0
+    nonisolated(unsafe) static var gdnCount = 0
+    nonisolated(unsafe) static var roundIndex = 0
+
+    static func beginRound() {
+        beginAt = DispatchTime.now().uptimeNanoseconds
+        layerUs = 0
+        attnUs = 0
+        mlpUs = 0
+        junctionUs = 0
+        layerCount = 0
+        faCount = 0
+        gdnCount = 0
+    }
+
+    static func recordLayer(_ elapsedNs: UInt64) {
+        layerUs += elapsedNs / 1_000
+        layerCount += 1
+    }
+
+    static func recordSublayers(
+        junctionNs: UInt64, attnNs: UInt64, mlpNs: UInt64, linear: Bool
+    ) {
+        junctionUs += junctionNs / 1_000
+        attnUs += attnNs / 1_000
+        mlpUs += mlpNs / 1_000
+        if linear { gdnCount += 1 } else { faCount += 1 }
+    }
+
+    /// ONE summary line per model forward (one verify round = one forward).
+    /// stderr follows the session's `traceWrite` pattern; the /tmp file is a
+    /// belt-and-braces copy because the local worker spawn path may not
+    /// forward stderr (runs that arm this gate set MLXFAST_NO_SANDBOX=1,
+    /// so the file write is permitted).
+    static func endRound(width: Int, nConfirmed: Int) {
+        let wallUs = (DispatchTime.now().uptimeNanoseconds - beginAt) / 1_000
+        // Everything inside the round but outside the per-layer brackets:
+        // embedding, mask construction, loop control, asyncEval rung
+        // dispatch, and the final residual merge.
+        let otherUs = wallUs > layerUs ? wallUs - layerUs : 0
+        roundIndex += 1
+        let line = "qwen35-trace: round=\(roundIndex) width=\(width) "
+            + "conf=\(nConfirmed) wall_us=\(wallUs) "
+            + "layer_us=\(layerUs) "
+            + "attn_enqueue_us=\(attnUs) mlp_enqueue_us=\(mlpUs) "
+            + "junction_enqueue_us=\(junctionUs) other_us=\(otherUs) "
+            + "counts(layer=\(layerCount),fa=\(faCount),gdn=\(gdnCount))\n"
+        FileHandle.standardError.write(Data(line.utf8))
+        let path = "/tmp/qwen35-trace.txt"
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(Data(line.utf8))
+            try? fh.close()
+        }
+    }
+}
+
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
@@ -2072,6 +2165,12 @@ final class Qwen35DecoderLayer: Module {
     /// final merge). Same kernel, same bf16-round-before-square argument as
     /// the post-attention pair above, so the values are bit-identical to the
     /// sequential `x = prevH + prevMLP; inputLayerNorm(x)` chain.
+    ///
+    /// The DispatchTime brackets (env-gated, see `Qwen35Trace`) are pure
+    /// observation: no arithmetic, op order, or dispatch changes. The three
+    /// buckets are entry+post-attn residual/RMSNorm junctions (`junction`),
+    /// the attention sublayer (`attn`), and the MLP (`mlp`) — all ENQUEUE
+    /// wall time, not isolated GPU time (see `Qwen35Trace`'s honesty note).
     func boundaryFused(
         base: MLXArray,
         delta: MLXArray?,
@@ -2080,6 +2179,8 @@ final class Qwen35DecoderLayer: Module {
         cache: KVCache?,
         nConfirmed: Int = 0
     ) -> (base: MLXArray, delta: MLXArray) {
+        let traceOn = Qwen35Trace.on
+        let t0 = traceOn ? DispatchTime.now().uptimeNanoseconds : 0
         let hIn: MLXArray
         let normedIn: MLXArray
         if let delta {
@@ -2091,6 +2192,7 @@ final class Qwen35DecoderLayer: Module {
             hIn = base
             normedIn = inputLayerNorm(base)
         }
+        let tEntry = traceOn ? DispatchTime.now().uptimeNanoseconds : 0
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
@@ -2099,11 +2201,21 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
         }
+        let tAttn = traceOn ? DispatchTime.now().uptimeNanoseconds : 0
         let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
             x: hIn, r: r,
             weight: postAttentionLayerNorm.weight,
             eps: postAttentionLayerNorm.eps)
-        return (h, (mlp as! UnaryLayer)(postAttnNorm))
+        let tJunction = traceOn ? DispatchTime.now().uptimeNanoseconds : 0
+        let mlpOut = (mlp as! UnaryLayer)(postAttnNorm)
+        if traceOn {
+            Qwen35Trace.recordSublayers(
+                junctionNs: (tEntry - t0) + (tJunction - tAttn),
+                attnNs: tAttn - tEntry,
+                mlpNs: DispatchTime.now().uptimeNanoseconds - tJunction,
+                linear: isLinear)
+        }
+        return (h, mlpOut)
     }
 }
 
@@ -2152,6 +2264,13 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
+        // Env-gated round bracket (see `Qwen35Trace`): the wall spans the
+        // whole forward — embedding, mask construction, the layer loop
+        // (including asyncEval rung dispatch), and the final residual merge
+        // — while the per-layer brackets below attribute the layer loop
+        // itself. Pure observation; nothing below changes when the gate is
+        // off.
+        if Qwen35Trace.on { Qwen35Trace.beginRound() }
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -2186,10 +2305,16 @@ public class Qwen35TextModelInner: Module {
                 let attnMask =
                     layer.isLinear
                     ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+                let layerT0 = Qwen35Trace.on
+                    ? DispatchTime.now().uptimeNanoseconds : 0
                 let out = layer.boundaryFused(
                     base: base, delta: delta,
                     attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if Qwen35Trace.on {
+                    Qwen35Trace.recordLayer(
+                        DispatchTime.now().uptimeNanoseconds - layerT0)
+                }
                 base = out.base
                 delta = out.delta
                 if ladderActive {
@@ -2235,6 +2360,9 @@ public class Qwen35TextModelInner: Module {
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
+        if Qwen35Trace.on {
+            Qwen35Trace.endRound(width: inputs.dim(1), nConfirmed: nConfirmed)
+        }
         return hiddenStates
     }
 
