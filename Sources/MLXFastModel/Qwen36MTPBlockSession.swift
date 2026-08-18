@@ -276,17 +276,40 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
-        let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
-        let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
-        let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: foldHidden, nextTokenIds: foldTokens,
-            cache: historyWarmCache)
-            ?? model.mtpHeadHiddenForward(
+        // Committed-history flush lengths 1...maxDepth+1, not just 2: a live
+        // round's flush carries 1 + acceptedCount rows from the previous
+        // round, and only the 512-row prime and a 2-row fold were warmed, so
+        // every other legal length cold-JIT-compiled inside a scored round.
+        // Each width gets its OWN cache primed to the same 512-row prefix as
+        // the live path, because the attention kernels also specialize on the
+        // live KV length -- folding several widths through one cache would
+        // compile them at cache lengths 513/515/... that decode never sees.
+        for foldWidth in 1 ... (maxDepth + 1) {
+            let foldCache = model.makeMTPCache()
+            // Force-evaluate the 512-row prime (output AND cache state) before
+            // the fold so the fold shape, not the prime graph, is what compiles
+            // on the fold's own dispatch.
+            let foldPrimed = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: primeHidden, nextTokenIds: primeTokens,
+                cache: foldCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: primeHidden, nextTokenIds: primeTokens,
+                    cache: foldCache)
+            eval(foldPrimed)
+            eval(foldCache.flatMap { $0.state })
+            let foldHidden = MLXArray.zeros([1, foldWidth, hDim], dtype: row.dtype)
+            let foldTokens = MLXArray(
+                Array(repeating: Int32(0), count: foldWidth)).reshaped([1, foldWidth])
+            let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: foldHidden, nextTokenIds: foldTokens,
-                cache: historyWarmCache)
-        eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
-        eval(historyWarmCache.flatMap { $0.state })
+                cache: foldCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: foldHidden, nextTokenIds: foldTokens,
+                    cache: foldCache)
+            eval(model.draftTokenID(
+                folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+            eval(foldCache.flatMap { $0.state })
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
