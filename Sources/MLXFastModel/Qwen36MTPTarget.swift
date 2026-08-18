@@ -138,4 +138,14 @@ extension Qwen36MTPTarget {
 // the protocol rather than at the shadowing, which is why this note exists.
 // `QwenMTPBackboneLayoutTests` pins that the qualified spelling stays.
 extension Qwen35TextModel: Qwen36MTPTarget {}
+
+/// E045: receiver for the per-request seed-script draft-vocabulary hint.
+/// The session sets it from the request's own seed tokens before decode;
+/// it is draft-side scheduling state (the sanctioned adaptive surface) and
+/// never influences a ledger or verify value.
+public protocol Qwen36DraftVocabularyHintReceiver: AnyObject {
+    var draftVocabularyWideHint: Bool { get set }
+}
+
+extension Qwen35TextModel: Qwen36DraftVocabularyHintReceiver {}
 extension MLXLLM.Qwen35Model: Qwen36MTPTarget {}

@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:amal-david/qwen38-mtp-head-extvocab-a2-v1@81cca64f1396babbd67f05ccc57bfb7e238017db",
+  "sha256": "1f81937e02e4842cba8044762239b1a5708dc7e8ee72c855a7c88f986569b8b1",
+  "bytes": 558814187,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "The promoted precision-island proposal head and its affine-2 shortlist readout are preserved tensor-for-tensor; the shortlist tensors are extended with an appended affine-2/group-64 band covering full token ids [98304, 180224), derived by dequantizing the public target checkpoint's Q4/group-64 lm_head rows and requantizing with the same MLX runtime the worker links. Rows [0, 98336) are byte-identical to the promoted artifact, so ASCII-core requests take the promoted scan path unchanged; the band participates only when the session's own seed contains out-of-core ids. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
 }

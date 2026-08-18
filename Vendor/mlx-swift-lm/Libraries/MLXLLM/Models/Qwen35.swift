@@ -2674,6 +2674,188 @@ private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
     )[0]
 }
 
+// E045 wide-shortlist variants. The extended declared artifact appends an
+// affine-2 band (full ids 98_304 ..< 180_224) after the padded core block.
+// The wide partial scans the whole padded extended row and skips the
+// mid-tensor pad hole so the six duplicated pad rows stay unreachable; the
+// finalize stage is candidate-count-shaped and is reused as-is. Constants
+// are baked and the names are fixed; the core kernels stay byte-identical.
+private let qwen35Top32WideScanEnd   = 180_256
+private let qwen35Top32WidePadStart  = 98_330
+private let qwen35Top32WidePadEnd    = 98_336
+private let qwen35Top32WidePerThread =
+    (qwen35Top32WideScanEnd + qwen35Top32Stride - 1) / qwen35Top32Stride
+
+private let qwen35DraftTop32PartialWideKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_top32_partial_wide_pad98330_v1",
+    inputNames: ["logits"],
+    outputNames: ["cand_ord", "cand_idx"],
+    source: """
+        constexpr uint SCAN_END   = \(qwen35Top32WideScanEnd);
+        constexpr uint PAD_START  = \(qwen35Top32WidePadStart);
+        constexpr uint PAD_END    = \(qwen35Top32WidePadEnd);
+        constexpr uint TG_SIZE    = \(qwen35Top32TG);
+        constexpr uint STRIDE     = \(qwen35Top32Stride);
+        constexpr uint PER_THREAD = \(qwen35Top32WidePerThread);
+        constexpr uint TOPK       = \(qwen35Top32K);
+        constexpr uint SIMD_SIZE  = 32;
+        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint tid  = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg   = simdgroup_index_in_threadgroup;
+
+        uint ord[PER_THREAD];
+        uint idx[PER_THREAD];
+        for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
+        uint n = 0;
+        for (uint i = tile * TG_SIZE + tid; i < SCAN_END; i += STRIDE) {
+            if (i >= PAD_START && i < PAD_END) { continue; }
+            ord[n] = qwen_top32_ordinal(float(logits[i]));
+            idx[n] = i;
+            n++;
+        }
+
+        threadgroup uint sc_ord[NSIMD * TOPK];
+        threadgroup uint sc_idx[NSIMD * TOPK];
+
+        uint taken = 0u;
+        for (uint r = 0; r < TOPK; ++r) {
+            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+            for (uint t = 0; t < PER_THREAD; ++t) {
+                if ((taken & (1u << t)) != 0u) { continue; }
+                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+                    bo = ord[t]; bi = idx[t]; bs = t;
+                }
+            }
+            uint mo = simd_max(bo);
+            uint mi = simd_max((bo == mo) ? bi : 0u);
+            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                taken |= (1u << bs);
+            }
+            if (lane == 0) {
+                sc_ord[sg * TOPK + r] = mo;
+                sc_idx[sg * TOPK + r] = mi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            uint o2[PB];
+            uint i2[PB];
+            for (uint t = 0; t < PB; ++t) {
+                uint p = t * SIMD_SIZE + lane;
+                o2[t] = sc_ord[p];
+                i2[t] = sc_idx[p];
+            }
+            uint tk2 = 0u;
+            for (uint r = 0; r < TOPK; ++r) {
+                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                for (uint t = 0; t < PB; ++t) {
+                    if ((tk2 & (1u << t)) != 0u) { continue; }
+                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+                        bo = o2[t]; bi = i2[t]; bs = t;
+                    }
+                }
+                uint mo = simd_max(bo);
+                uint mi = simd_max((bo == mo) ? bi : 0u);
+                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                    tk2 |= (1u << bs);
+                }
+                if (lane == 0) {
+                    cand_ord[tile * TOPK + r] = mo;
+                    cand_idx[tile * TOPK + r] = mi;
+                }
+            }
+        }
+        """,
+    header: qwen35Top32Header,
+    ensureRowContiguous: false
+)
+
+/// Exact top-32 of the full padded EXTENDED coarse row (shape [180_256],
+/// bf16), pad hole excluded inside the kernel. Reuses the core finalize
+/// stage (candidate-count-shaped, layout-independent).
+private func qwen35DraftTop32Wide(_ row: MLXArray) -> MLXArray {
+    precondition(qwen35Top32WidePerThread <= 32 && qwen35Top32FinPerThread <= 32,
+                 "top-32 slot count exceeds the 32-bit selection bitmask")
+    let partial = qwen35DraftTop32PartialWideKernel(
+        [row],
+        grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
+        threadGroup: (qwen35Top32TG, 1, 1),
+        outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
+        outputDTypes: [.uint32, .uint32]
+    )
+    return qwen35DraftTop32FinalizeKernel(
+        [partial[0], partial[1]],
+        grid: (qwen35Top32TG, 1, 1),
+        threadGroup: (qwen35Top32TG, 1, 1),
+        outputShapes: [[qwen35Top32K]],
+        outputDTypes: [.uint32]
+    )[0]
+}
+
+// E045 wide rerank: identical SIMD reduction and (value, lower-id) total
+// order as the core kernel; only the final compact-row -> full-token-id map
+// differs, covering the three extended-layout regions. Baked constants,
+// fixed name.
+private let qwen35DraftRerankWideKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_rerank_wide_k32_prefix98304_band98336_v1",
+    inputNames: ["logits", "candidate_ids"],
+    outputNames: ["token_id"],
+    source: """
+        uint lane = thread_index_in_simdgroup;
+        float best_value = float(logits[lane]);
+        uint best_id = uint(candidate_ids[lane]);
+
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_value = simd_shuffle_down(best_value, offset);
+            uint other_id = simd_shuffle_down(best_id, offset);
+            if (lane < offset && qwen_draft_rerank_better(
+                    other_value, other_id, best_value, best_id)) {
+                best_value = other_value;
+                best_id = other_id;
+            }
+        }
+
+        if (lane == 0) {
+            uint mapped;
+            if (best_id < PREFIX_COUNT) {
+                mapped = best_id;
+            } else if (best_id < BAND_ROW_START) {
+                mapped = best_id + CONTROL_OFFSET;
+            } else {
+                mapped = best_id - (BAND_ROW_START - PREFIX_COUNT);
+            }
+            token_id[0] = int(mapped);
+        }
+    """,
+    header: """
+        constant constexpr const uint PREFIX_COUNT   = 98304;
+        constant constexpr const uint BAND_ROW_START = 98336;
+        constant constexpr const uint CONTROL_OFFSET = 149740;
+
+        inline bool qwen_draft_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 /// Offline equivalence gate. Needs no checkpoint and no MTP head: it exercises
 /// the two selection kernels against `MLX.argPartition` on synthetic bf16 rows
 /// of the live width. Returns (checked, mismatches, firstBadTrial).
@@ -2742,6 +2924,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftHeadS: MLXArray?
     private var _draftHeadZ: MLXArray?
 
+    /// E045: set by the session from THIS request's own seed tokens (host
+    /// side, before decode): true when the seed contains ids outside the
+    /// ASCII-core compact band, i.e. the request's script needs the declared
+    /// wide band to draft at all. Draft-side scheduling state only — every
+    /// emitted token is still decided by the exact target verifier.
+    public var draftVocabularyWideHint = false
+
     // Input-independent compact copy of the loaded exact lm_head, used only
     // for draft proposals when no declared draft_lm_head is present. It is not
     // ModuleInfo because it is derived during warmup, not checkpoint state.
@@ -2759,6 +2948,20 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
+    // E045 script-adaptive extended draft vocabulary. A declared artifact may
+    // append an affine-2 band covering full ids [98_304, 180_224) AFTER the
+    // padded core block, so rows [0, 98_336) stay byte-identical to the
+    // promoted layout and the core scan path is unchanged. The wide scan is
+    // taken only when the session's seed contains a token outside the core
+    // band; covered (ASCII-core) requests never pay for the band.
+    private static let extendedDraftBandFullStart = 98_304
+    private static let extendedDraftBandFullEnd = 180_224
+    private static let extendedDraftBandRowStart = 98_336
+    private static let extendedDraftPaddedCount = 180_256
+    // Real rows in the extended layout: core 98,330 + band 81,920. The pad
+    // hole [98_330, 98_336) sits mid-tensor and is skipped inside the wide
+    // shortlist kernel.
+    private static let extendedDraftRealCount = 180_250
     private static let draftRerankCandidateCount = 32
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
@@ -3087,6 +3290,11 @@ extension Qwen35TextModel: MTPCapable {
             if w.dim(0) == Self.compactDraftPaddedCount {
                 return logits[0..., 0..., 0 ..< Self.compactDraftRealCount]
             }
+            if w.dim(0) == Self.extendedDraftPaddedCount {
+                // Fallback path stays on the core block; the wide band is
+                // reachable only through the shortlist/rerank pipeline.
+                return logits[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            }
             return logits
         }
         guard usesCompactDraftVocabulary else { return applyLMHead(x) }
@@ -3140,26 +3348,42 @@ extension Qwen35TextModel: MTPCapable {
     }
 
     private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
-        guard let coarseWeight = _draftHeadW,
-              let coarseScales = _draftHeadS,
-              let coarseBiases = _draftHeadZ,
-              coarseWeight.dim(0) == Self.compactDraftPaddedCount,
-              coarseWeight.dim(1) == 320,
-              coarseScales.shape == [Self.compactDraftPaddedCount, 80],
-              coarseBiases.shape == [Self.compactDraftPaddedCount, 80],
+        guard let declaredW = _draftHeadW,
+              let declaredS = _draftHeadS,
+              let declaredZ = _draftHeadZ,
+              declaredW.dim(0) == Self.compactDraftPaddedCount
+                  || declaredW.dim(0) == Self.extendedDraftPaddedCount,
+              declaredW.dim(1) == 320,
+              declaredS.shape == [declaredW.dim(0), 80],
+              declaredZ.shape == [declaredW.dim(0), 80],
               x.shape == [1, 1, configuration.hiddenSize]
         else { return nil }
+        let isExtendedArtifact =
+            declaredW.dim(0) == Self.extendedDraftPaddedCount
+        // Wide only when the artifact carries the band AND this request's
+        // seed needs it; otherwise slice the core block (zero-copy leading-
+        // dim view) so covered requests run today's exact path and kernels.
+        let wide = isExtendedArtifact && draftVocabularyWideHint
+            && qwen35Top32Enabled
+        let coarseWeight = wide || !isExtendedArtifact
+            ? declaredW : declaredW[0 ..< Self.compactDraftPaddedCount]
+        let coarseScales = wide || !isExtendedArtifact
+            ? declaredS : declaredS[0 ..< Self.compactDraftPaddedCount]
+        let coarseBiases = wide || !isExtendedArtifact
+            ? declaredZ : declaredZ[0 ..< Self.compactDraftPaddedCount]
 
         if _compactDraftHead == nil {
             _compactDraftHead = makeCompactDraftHead()
         }
+        let exactRows = isExtendedArtifact
+            ? Self.extendedDraftPaddedCount : Self.compactDraftPaddedCount
         guard let exact = _compactDraftHead as? QuantizedLinear,
               exact.groupSize == 64,
               exact.bits == 4,
-              exact.weight.shape == [Self.compactDraftPaddedCount, 640],
-              exact.scales.shape == [Self.compactDraftPaddedCount, 80],
+              exact.weight.shape == [exactRows, 640],
+              exact.scales.shape == [exactRows, 80],
               let exactBiases = exact.biases,
-              exactBiases.shape == [Self.compactDraftPaddedCount, 80]
+              exactBiases.shape == [exactRows, 80]
         else { return nil }
 
         let coarse = quantizedMM(
@@ -3172,7 +3396,10 @@ extension Qwen35TextModel: MTPCapable {
               qwen35Top32K == candidateCount
         else { return nil }
         let candidateIDs: MLXArray
-        if qwen35Top32Enabled {
+        if wide {
+            candidateIDs = qwen35DraftTop32Wide(
+                coarse.reshaped([Self.extendedDraftPaddedCount]))
+        } else if qwen35Top32Enabled {
             candidateIDs = qwen35DraftTop32(
                 coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
                     .reshaped([Self.compactDraftRealCount]))
@@ -3191,6 +3418,15 @@ extension Qwen35TextModel: MTPCapable {
             x, exactWeight, scales: exactScales, biases: exactZeroPoints,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
 
+        if wide {
+            return qwen35DraftRerankWideKernel(
+                [exactLogits.reshaped([candidateCount]), candidateIDs],
+                grid: (candidateCount, 1, 1),
+                threadGroup: (candidateCount, 1, 1),
+                outputShapes: [[1, 1]],
+                outputDTypes: [.int32]
+            )[0]
+        }
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
             template: [
@@ -3230,6 +3466,12 @@ extension Qwen35TextModel: MTPCapable {
             fatalError("compact draft vocabulary requires an untied lm_head")
         }
 
+        // E045: when the declared coarse artifact carries the extended band,
+        // the exact rerank copy mirrors its layout so compact row indices
+        // stay consistent between shortlist and rerank.
+        let extendedExact =
+            (_draftHeadW?.dim(0) ?? 0) == Self.extendedDraftPaddedCount
+
         func compactRows(_ array: MLXArray) -> MLXArray {
             let prefix = array[0 ..< Self.compactDraftPrefixCount]
             let controls = array[
@@ -3237,6 +3479,12 @@ extension Qwen35TextModel: MTPCapable {
             let paddingCount =
                 Self.compactDraftPaddedCount - Self.compactDraftRealCount
             let padding = array[0 ..< paddingCount]
+            if extendedExact {
+                let band = array[
+                    Self.extendedDraftBandFullStart
+                        ..< Self.extendedDraftBandFullEnd]
+                return concatenated([prefix, controls, padding, band], axis: 0)
+            }
             return concatenated([prefix, controls, padding], axis: 0)
         }
 
