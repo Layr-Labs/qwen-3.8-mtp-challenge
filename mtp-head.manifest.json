@@ -1,9 +1,10 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:ivanfioravanti/qwen38-mtp-head-trunk-islands-v1@6a33bf7b0f640a18698b59d9592a97e414e0cdb3",
+  "sha256": "930b2fe347b0ffa83c88958fb6f7c028e6f5a169830ea9e8e78c8796f25543cb",
+  "bytes": 532633172,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+
+  "note": "The promoted q2-coarse + affine-4 trunk + QKV-island proposal head is preserved tensor-for-tensor and extended with BF16 exact-row islands for the remaining trunk projections, selected by reconstruction SSE-per-byte against the pinned organizer BF16 head under a ~100 MB island-byte budget: o_proj 5,118 of 5,120 rows, q_proj extended to 3,195 rows, up 850, gate 775, down 80, fc 15. Candidate code applies the islands only on the MTP head's module instances (proposal side; MLXFAST_QWEN_MTP_TRUNK_ISLANDS=0 disables). The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. sha256 is the documented single-file tree digest over the fetched model.safetensors; bytes is the fetched file size. The artifact was verified tensor-for-tensor against the pinned BF16 reference before any timed run."
 }

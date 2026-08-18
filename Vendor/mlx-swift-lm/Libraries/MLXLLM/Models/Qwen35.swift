@@ -1203,10 +1203,44 @@ private let qwen35CompiledFusedSwiGLU:
     return body
 }()
 
+/// Exact-row island for one head-side projection output. Same contract as
+/// the QKV islands: the quantized GEMV result stands for every row, and the
+/// installed BF16 rows overwrite their outputs with an exact matmul.
+/// Installed only on the MTP head's module instances from a declared
+/// artifact — the target model never carries these.
+struct Qwen35RowIslands {
+    let weight: MLXArray   // [N, K] bf16
+    let indices: MLXArray  // [N] int32
+
+    init?(weight: MLXArray, indices: MLXArray) {
+        guard weight.dim(0) == indices.dim(0), weight.dim(0) > 0 else {
+            return nil
+        }
+        self.weight = weight.contiguous()
+        self.indices = indices.asType(.int32).contiguous()
+    }
+
+    /// Overwrite the island rows of `base` (a projection of `input`) with
+    /// exact BF16 matmul rows. `indexOffset` supports concatenated outputs
+    /// (e.g. the fused [gate | up] GEMV shifts up-row indices by the gate
+    /// row count).
+    func applied(_ base: MLXArray, input: MLXArray, indexOffset: Int = 0) -> MLXArray {
+        let idx = indexOffset == 0 ? indices : (indices + indexOffset).contiguous()
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(base, idx.reshaped(indexShape), values: exact, axis: -1)
+    }
+}
+
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
+
+    /// Head-side trunk islands (proposal-only; nil on target instances).
+    var gateRowIslands: Qwen35RowIslands?
+    var upRowIslands: Qwen35RowIslands?
+    var downRowIslands: Qwen35RowIslands?
 
     private var _fqW: MLXArray?
     private var _fqS: MLXArray?
@@ -1262,9 +1296,35 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+            // Head-side trunk islands (proposal-only; nil on the target).
+            // The fused output is [gate | up], so up-row indices shift by
+            // the gate row count; the split path below uses raw indices.
+            var fused = y
+            if let islands = gateRowIslands {
+                fused = islands.applied(fused, input: x)
+            }
+            if let islands = upRowIslands {
+                fused = islands.applied(fused, input: x, indexOffset: _gateOut)
+            }
+            let activated = qwen35CompiledFusedSwiGLU(fused)
+            if let islands = downRowIslands {
+                return islands.applied(downProj(activated), input: activated)
+            }
+            return downProj(activated)
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
+        var g = gateProj(x)
+        if let islands = gateRowIslands {
+            g = islands.applied(g, input: x)
+        }
+        var u = upProj(x)
+        if let islands = upRowIslands {
+            u = islands.applied(u, input: x)
+        }
+        let activated = silu(g) * u
+        if let islands = downRowIslands {
+            return islands.applied(downProj(activated), input: activated)
+        }
+        return downProj(activated)
     }
 
 }
@@ -1498,6 +1558,11 @@ final class Qwen35Attention: Module {
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
 
+    /// Head-side exact-row islands for the attention output projection.
+    /// Nil on every target-model instance; only the MTP head's attention
+    /// installs one from a declared artifact.
+    var oRowIslands: Qwen35RowIslands?
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -1664,8 +1729,7 @@ final class Qwen35Attention: Module {
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
         vWeight: MLXArray, vIndices: MLXArray
-    ) {
-        precondition(
+    ) {        precondition(
             qWeight.dim(0) == qIndices.dim(0)
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
@@ -1762,7 +1826,11 @@ final class Qwen35Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
+        let oInput = qwen35CompiledSigmoidMultiply(output, gate)
+        if let islands = oRowIslands {
+            return islands.applied(oProj(oInput), input: oInput)
+        }
+        return oProj(oInput)
     }
 }
 
@@ -2163,307 +2231,6 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// ---------------------------------------------------------------------------
-// PROPOSAL-SIDE TOP-32 SHORTLIST
-//
-// Replaces `MLX.argPartition(coarse, kth: 98_298, axis: -1)[98_298...]`.
-//
-// `ArgPartition::eval_gpu` in this vendored MLX is a stub -- its own comment
-// reads "We direct arg partition to sort for now" -- so it calls
-// `gpu_merge_sort(..., argsort=true)`. For a 98,330-wide bf16 row that
-// resolves to `multi_block_sort` (bn=512, tn=4, n_blocks=49): one block sort
-// + six merge levels x two kernels + one output copy = 14 dependent
-// dispatches and five device temporaries, to FULLY ARGSORT 98,330 elements
-// from which exactly 32 are ever read. This pair answers the same question
-// in two dispatches.
-//
-// EXACTNESS. MLX's merge sort is STABLE ASCENDING under `LessThan<T>`:
-// ThreadSort swaps only on strict less, merge_step takes from B only on
-// strict less, merge_partition advances into A on ties, and block_sort seeds
-// ascending global indices with an `idx < size_sorted_axis` write guard so
-// the padding slots never reach the output. Its tail-32 is therefore the
-// unique 32-element set maximal under (value asc, index asc) -- ties broken
-// toward the HIGHER index, NaN ranking ABOVE every number because LessThan
-// returns (!an) & bn. `qwen_top32_ordinal` is a monotone map from float into
-// uint32 inducing exactly that order, including both corners: -0.0 folds
-// into +0.0 so the pair ties and breaks by index, and every NaN payload
-// collapses to one ordinal so all NaNs tie and break by index.
-//
-// Bounding the scan at REAL_COUNT inside the kernel is exactly what the
-// removed `[0 ..< 98_330]` pre-slice did, so the six duplicated padding rows
-// stay unreachable even on a tie.
-//
-// Downstream, `qwen35DraftRerankKernel` reduces the 32 candidates under a
-// strict total order on (value, id), which is order-independent -- so set
-// identity would suffice. Element-wise identity is a strictly stronger
-// property and makes the offline gate a plain array equality.
-private let qwen35Top32RealCount    = 98_330
-private let qwen35Top32K            = 32
-private let qwen35Top32TG           = 256
-private let qwen35Top32Tiles        = 64
-private let qwen35Top32Stride       = qwen35Top32Tiles * qwen35Top32TG
-private let qwen35Top32PerThread    =
-    (qwen35Top32RealCount + qwen35Top32Stride - 1) / qwen35Top32Stride
-private let qwen35Top32Cands        = qwen35Top32Tiles * qwen35Top32K
-private let qwen35Top32FinPerThread = qwen35Top32Cands / qwen35Top32TG
-
-private let qwen35Top32Header = """
-    inline uint qwen_top32_ordinal(float v) {
-        if (isnan(v))  { return 0xFFFFFFFFu; }
-        if (v == 0.0f) { return 0x80000000u; }
-        uint u = as_type<uint>(v);
-        return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
-    }
-    """
-
-// Stage 1: 64 threadgroups partition [0, REAL_COUNT); each emits its top 32
-// as (ordinal, index) pairs. 64 * 32 = 2,048 candidates.
-private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_partial",
-    inputNames: ["logits"],
-    outputNames: ["cand_ord", "cand_idx"],
-    source: """
-        constexpr uint REAL_COUNT = \(qwen35Top32RealCount);
-        constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint STRIDE     = \(qwen35Top32Stride);
-        constexpr uint PER_THREAD = \(qwen35Top32PerThread);
-        constexpr uint TOPK       = \(qwen35Top32K);
-        constexpr uint SIMD_SIZE  = 32;
-        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
-        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-        // `taken` / `tk2` are 32-bit bitmasks indexed by slot, so a slot count
-        // above 32 would shift out of range and silently corrupt the result.
-        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
-        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
-
-        uint tile = threadgroup_position_in_grid.x;
-        uint tid  = thread_position_in_threadgroup.x;
-        uint lane = thread_index_in_simdgroup;
-        uint sg   = simdgroup_index_in_threadgroup;
-
-        uint ord[PER_THREAD];
-        uint idx[PER_THREAD];
-        for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
-        uint n = 0;
-        for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
-            ord[n] = qwen_top32_ordinal(float(logits[i]));
-            idx[n] = i;
-            n++;
-        }
-
-        threadgroup uint sc_ord[NSIMD * TOPK];
-        threadgroup uint sc_idx[NSIMD * TOPK];
-
-        uint taken = 0u;
-        for (uint r = 0; r < TOPK; ++r) {
-            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-            for (uint t = 0; t < PER_THREAD; ++t) {
-                if ((taken & (1u << t)) != 0u) { continue; }
-                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
-                    bo = ord[t]; bi = idx[t]; bs = t;
-                }
-            }
-            uint mo = simd_max(bo);
-            uint mi = simd_max((bo == mo) ? bi : 0u);
-            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                taken |= (1u << bs);
-            }
-            if (lane == 0) {
-                sc_ord[sg * TOPK + r] = mo;
-                sc_idx[sg * TOPK + r] = mi;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sg == 0) {
-            uint o2[PB];
-            uint i2[PB];
-            for (uint t = 0; t < PB; ++t) {
-                uint p = t * SIMD_SIZE + lane;
-                o2[t] = sc_ord[p];
-                i2[t] = sc_idx[p];
-            }
-            uint tk2 = 0u;
-            for (uint r = 0; r < TOPK; ++r) {
-                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-                for (uint t = 0; t < PB; ++t) {
-                    if ((tk2 & (1u << t)) != 0u) { continue; }
-                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
-                        bo = o2[t]; bi = i2[t]; bs = t;
-                    }
-                }
-                uint mo = simd_max(bo);
-                uint mi = simd_max((bo == mo) ? bi : 0u);
-                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                    tk2 |= (1u << bs);
-                }
-                if (lane == 0) {
-                    cand_ord[tile * TOPK + r] = mo;
-                    cand_idx[tile * TOPK + r] = mi;
-                }
-            }
-        }
-        """,
-    header: qwen35Top32Header,
-    ensureRowContiguous: false
-)
-
-// Stage 2: one threadgroup reduces the 2,048 candidates to the final 32,
-// written ASCENDING so the result is element-wise identical to
-// `argPartition(...)[kth...]`.
-private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_finalize",
-    inputNames: ["cand_ord", "cand_idx"],
-    outputNames: ["token_ids"],
-    source: """
-        constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
-        constexpr uint TOPK       = \(qwen35Top32K);
-        constexpr uint SIMD_SIZE  = 32;
-        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
-        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
-        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
-
-        uint tid  = thread_position_in_threadgroup.x;
-        uint lane = thread_index_in_simdgroup;
-        uint sg   = simdgroup_index_in_threadgroup;
-
-        uint ord[PER_THREAD];
-        uint idx[PER_THREAD];
-        for (uint t = 0; t < PER_THREAD; ++t) {
-            uint p = t * TG_SIZE + tid;
-            ord[t] = cand_ord[p];
-            idx[t] = cand_idx[p];
-        }
-
-        threadgroup uint sc_ord[NSIMD * TOPK];
-        threadgroup uint sc_idx[NSIMD * TOPK];
-
-        uint taken = 0u;
-        for (uint r = 0; r < TOPK; ++r) {
-            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-            for (uint t = 0; t < PER_THREAD; ++t) {
-                if ((taken & (1u << t)) != 0u) { continue; }
-                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
-                    bo = ord[t]; bi = idx[t]; bs = t;
-                }
-            }
-            uint mo = simd_max(bo);
-            uint mi = simd_max((bo == mo) ? bi : 0u);
-            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                taken |= (1u << bs);
-            }
-            if (lane == 0) {
-                sc_ord[sg * TOPK + r] = mo;
-                sc_idx[sg * TOPK + r] = mi;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sg == 0) {
-            uint o2[PB];
-            uint i2[PB];
-            for (uint t = 0; t < PB; ++t) {
-                uint p = t * SIMD_SIZE + lane;
-                o2[t] = sc_ord[p];
-                i2[t] = sc_idx[p];
-            }
-            uint tk2 = 0u;
-            for (uint r = 0; r < TOPK; ++r) {
-                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-                for (uint t = 0; t < PB; ++t) {
-                    if ((tk2 & (1u << t)) != 0u) { continue; }
-                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
-                        bo = o2[t]; bi = i2[t]; bs = t;
-                    }
-                }
-                uint mo = simd_max(bo);
-                uint mi = simd_max((bo == mo) ? bi : 0u);
-                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                    tk2 |= (1u << bs);
-                }
-                if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
-            }
-        }
-        """,
-    header: "",
-    ensureRowContiguous: false
-)
-
-// `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
-private let qwen35Top32Enabled: Bool =
-    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
-
-/// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
-private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
-    // Mirrors the kernel static_asserts; see the bitmask note there.
-    precondition(qwen35Top32PerThread <= 32 && qwen35Top32FinPerThread <= 32,
-                 "top-32 slot count exceeds the 32-bit selection bitmask")
-    let partial = qwen35DraftTop32PartialKernel(
-        [row],
-        grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
-        threadGroup: (qwen35Top32TG, 1, 1),
-        outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
-        outputDTypes: [.uint32, .uint32]
-    )
-    return qwen35DraftTop32FinalizeKernel(
-        [partial[0], partial[1]],
-        grid: (qwen35Top32TG, 1, 1),
-        threadGroup: (qwen35Top32TG, 1, 1),
-        outputShapes: [[qwen35Top32K]],
-        outputDTypes: [.uint32]
-    )[0]
-}
-
-/// Offline equivalence gate. Needs no checkpoint and no MTP head: it exercises
-/// the two selection kernels against `MLX.argPartition` on synthetic bf16 rows
-/// of the live width. Returns (checked, mismatches, firstBadTrial).
-/// Never called on a scored path.
-/// Isolated micro-benchmark: times the two-dispatch top-32 against
-/// `MLX.argPartition` on a real-width bf16 row. Never called on a scored path.
-public func qwen35BenchDraftTop32(iters: Int = 200) -> (Double, Double, Int, Int) {
-    MLXRandom.seed(3)
-    let row = MLXRandom.normal([qwen35Top32RealCount]).asType(.bfloat16)
-    let kth = qwen35Top32RealCount - qwen35Top32K
-    // warm both paths (JIT + allocator)
-    for _ in 0 ..< 10 {
-        eval(qwen35DraftTop32(row))
-        eval(MLX.argPartition(row, kth: kth, axis: -1)[(kth)...])
-    }
-    var t0 = Date()
-    for _ in 0 ..< iters { eval(MLX.argPartition(row, kth: kth, axis: -1)[(kth)...]) }
-    let baseUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    t0 = Date()
-    for _ in 0 ..< iters { eval(qwen35DraftTop32(row)) }
-    let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    return (baseUs, mineUs, qwen35Top32Tiles, qwen35Top32PerThread)
-}
-
-public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, Int, Int) {
-    MLXRandom.seed(seed)
-    var bad = 0
-    var firstBad = -1
-    let kth = qwen35Top32RealCount - qwen35Top32K
-    for trial in 0 ..< trials {
-        var row = MLXRandom.normal([qwen35Top32RealCount]).asType(.bfloat16)
-        if trial % 4 == 1 {
-            // force heavy ties: quantise hard so many values collide
-            row = (MLXRandom.normal([qwen35Top32RealCount]) * 4).round().asType(.bfloat16)
-        }
-        let mine = qwen35DraftTop32(row)
-        let theirs = MLX.argPartition(row, kth: kth, axis: -1)[(kth)...]
-            .asType(.uint32)
-        eval(mine, theirs)
-        let same = MLX.all(MLX.equal(mine, theirs)).item(Bool.self)
-        if !same {
-            bad += 1
-            if firstBad < 0 { firstBad = trial }
-        }
-    }
-    return (trials, bad, firstBad)
-}
-
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2615,6 +2382,28 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
                     kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
                     vWeight: vWeight, vIndices: vIndices)
+            }
+            // Trunk islands: fc / o / gate / up / down exact BF16 rows for the
+            // head's remaining projections. All optional; installed only from
+            // a declared artifact and only on the head's module instances.
+            if ProcessInfo.processInfo.environment[
+                "MLXFAST_QWEN_MTP_TRUNK_ISLANDS"] != "0"
+            {
+                func trunkIslands(_ name: String) -> Qwen35RowIslands? {
+                    guard let w = weights.removeValue(
+                            forKey: islandPrefix + "\(name).weight"),
+                          let i = weights.removeValue(
+                            forKey: islandPrefix + "\(name).indices")
+                    else { return nil }
+                    return Qwen35RowIslands(weight: w, indices: i)
+                }
+                mtp?.fcRowIslands = trunkIslands("fc")
+                layer.selfAttn.oRowIslands = trunkIslands("o")
+                if let mlp = layer.mlp as? Qwen35FusedMLP {
+                    mlp.gateRowIslands = trunkIslands("gate")
+                    mlp.upRowIslands = trunkIslands("up")
+                    mlp.downRowIslands = trunkIslands("down")
+                }
             }
         }
 
@@ -2907,24 +2696,12 @@ extension Qwen35TextModel: MTPCapable {
         let coarse = quantizedMM(
             x, coarseWeight, scales: coarseScales, biases: coarseBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
-        )
+        )[0..., 0..., 0 ..< Self.compactDraftRealCount]
         let candidateCount = Self.draftRerankCandidateCount
-        // Drift guard: the kernels bake these shapes in as constexpr.
-        guard qwen35Top32RealCount == Self.compactDraftRealCount,
-              qwen35Top32K == candidateCount
-        else { return nil }
-        let candidateIDs: MLXArray
-        if qwen35Top32Enabled {
-            candidateIDs = qwen35DraftTop32(
-                coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
-                    .reshaped([Self.compactDraftRealCount]))
-        } else {
-            let kth = Self.compactDraftRealCount - candidateCount
-            candidateIDs = MLX.argPartition(
-                coarse[0..., 0..., 0 ..< Self.compactDraftRealCount],
-                kth: kth, axis: -1
-            )[.ellipsis, (kth)...].reshaped([candidateCount])
-        }
+        let kth = Self.compactDraftRealCount - candidateCount
+        let candidateIDs = MLX.argPartition(
+            coarse, kth: kth, axis: -1
+        )[.ellipsis, (kth)...].reshaped([candidateCount])
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)

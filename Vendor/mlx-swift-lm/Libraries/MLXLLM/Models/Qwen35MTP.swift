@@ -87,6 +87,9 @@ final class Qwen35MTPModule: Module {
     @ModuleInfo(key: "pre_fc_norm_hidden") var preFcNormHidden: RMSNorm
     @ModuleInfo(key: "pre_fc_norm_embedding") var preFcNormEmbedding: RMSNorm
     @ModuleInfo(key: "fc") var fc: Linear
+
+    /// Head-side trunk islands for the fusion projection (proposal-only).
+    var fcRowIslands: Qwen35RowIslands?
     // `layers` uses the default ModuleInfo key derived from the property name.
     let layers: [Qwen35MTPDecoderLayer]
     let norm: RMSNorm
@@ -115,7 +118,11 @@ final class Qwen35MTPModule: Module {
         let embeds = embedTokens(nextTokenIds)
         let e = preFcNormEmbedding(embeds)
         let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        let fusedInput = concatenated([e, h], axis: -1)
+        var fused = fc(fusedInput)
+        if let islands = fcRowIslands {
+            fused = islands.applied(fused, input: fusedInput)
+        }
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -149,7 +156,11 @@ final class Qwen35MTPModule: Module {
         let embeds = embedTokens(nextTokenIds)
         let e = preFcNormEmbedding(embeds)
         let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fusedInput = concatenated([e, h], axis: -1)
+        var fused = fc(fusedInput)
+        if let islands = fcRowIslands {
+            fused = islands.applied(fused, input: fusedInput)
+        }
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
