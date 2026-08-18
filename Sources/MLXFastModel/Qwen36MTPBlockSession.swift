@@ -202,12 +202,95 @@ public final class Qwen36MTPBlockSession {
 
     // MARK: - warm
 
+    /// Keep the ranked M5-Max model allocations in Metal's residency set
+    /// after the input-independent warm. MLX attaches a residency set to every
+    /// command queue, but its capacity is zero until a wired limit is applied;
+    /// without this one-time resize the driver must re-establish residency for
+    /// the whole tower on later command buffers.
+    ///
+    /// Capacity is deliberately the live post-warm footprint plus only a small
+    /// page-rounding allowance. After cached warm temporaries are cleared,
+    /// persistent weights fit in the one resize while later scratch fails the
+    /// fit test and stays on the commit-free unwired path. The ticket is never
+    /// ended because shrinking the limit would evict the resident weights.
+    private static let wiredZHDefaultFraction = 1.0
+    private static let wiredZHDefaultSlackMB = 64
+    private static let wiredTicketLock = NSLock()
+    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
+
+    private final class QwenMTPWiredLimitBox: @unchecked Sendable {
+        var value: Int = 0
+    }
+
+    private static func wireResidentWeightsIfEnabled() {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["DARKBLOOM_QWEN_MTP_WIRED_ZH"] != "0" else { return }
+        guard ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
+        else { return }
+
+        wiredTicketLock.lock()
+        defer { wiredTicketLock.unlock() }
+        guard wiredTicketRetainer == nil else { return }
+
+        // Shape-warm locals have left scope before this method is called.
+        // Remove their cached storage so the active count describes the live
+        // backbone, head, and persistent runtime tensors rather than scratch.
+        Memory.clearCache()
+        let active = Memory.activeMemory
+        guard active > 0 else { return }
+
+        let fraction = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_FRACTION"]
+            .flatMap(Double.init) ?? wiredZHDefaultFraction
+        let slackMB = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_SLACK_MB"]
+            .flatMap(Int.init) ?? wiredZHDefaultSlackMB
+        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
+        target += max(0, slackMB) << 20
+
+        // The MLX backend rejects a wired limit above the recommended working
+        // set. Keep a 256 MiB margin for system bookkeeping and fail closed on
+        // nonsensical geometry.
+        if let recommended = GPU.maxRecommendedWorkingSetBytes() {
+            target = min(target, max(0, recommended - (256 << 20)))
+        }
+        guard target > 0 else { return }
+
+        let ticket = WiredMemoryTicket(
+            size: target,
+            policy: MLXLMCommon.WiredSumPolicy(cap: target),
+            manager: .shared,
+            kind: .active
+        )
+        let appliedBox = QwenMTPWiredLimitBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            appliedBox.value = await ticket.start()
+            semaphore.signal()
+        }
+        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
+        wiredTicketRetainer = ticket
+
+        let applied = outcome == .success ? appliedBox.value : -1
+        let recommended = GPU.maxRecommendedWorkingSetBytes() ?? -1
+        var line = "mlxfast: qwen-mtp wired-zh request=\(target)"
+        line += " applied=\(applied) active=\(active)"
+        line += " slack_mb=\(max(0, slackMB)) fraction=\(fraction)"
+        line += " maxrec=\(recommended)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
     /// Warms the two forward shapes a round dispatches — the batched verify at
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
+        // Keep the large shape-warm object graph in a separate call frame so
+        // every throwaway cache and tensor is released before residency sizing.
+        try warmAllDepthShapes(maxDepth: maxDepth)
+        Self.wireResidentWeightsIfEnabled()
+    }
+
+    private func warmAllDepthShapes(maxDepth: Int) throws {
         // Warms every legal verify width from 1 (the serial control's
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
@@ -497,6 +580,31 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
+    /// LATCH RELEASE. `costModelDepth` returns 0 whenever
+    /// `positionAcceptEMA[0] <= headStepCostRatio`, and a non-drafting round
+    /// returns before `recordAcceptOutcome` is ever reached (the sole call
+    /// site is on the drafting path). The EMA is therefore frozen at the
+    /// value that caused the skip, so `EMA[0] <= h` is an ABSORBING state:
+    /// once entered, the session cannot draft again for the rest of the
+    /// window and can never observe the evidence that would release it.
+    /// The ranked report shows this directly -- a pool prompt scored raw
+    /// 1.2489 with effective_mean_draft_len 0.154 and 449 non-drafting
+    /// rounds, against 3.31-3.42 for prompts that kept drafting.
+    ///
+    /// Fix: after `latchProbeInterval` consecutive skips, take one depth-1
+    /// probe. The probe runs the ordinary drafting path, so it reaches
+    /// `recordAcceptOutcome` and the EMA becomes live again -- succeed and
+    /// the prompt climbs back out, fail and it simply resumes skipping.
+    /// Cost is bounded and paid only by prompts that are already skipping:
+    /// one depth-1 draft costs `h` of a verify, so the ceiling is
+    /// h / latchProbeInterval ~ 1.1% of round time on a latched prompt and
+    /// exactly zero on a healthy one. Skipping when acceptance is genuinely
+    /// low stays correct; it just stops being permanent.
+    private static let latchProbeInterval = 16
+    private var consecutiveSkippedRounds = 0
+    private static let latchProbeEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_LATCH_PROBE"] != "0"
+
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
@@ -630,7 +738,22 @@ public final class Qwen36MTPBlockSession {
             expected += reach
             depth += 1
         }
-        return depth
+        if depth > 0 {
+            consecutiveSkippedRounds = 0
+            return depth
+        }
+        // depth == 0: the skip path, which never records an outcome. Probe
+        // periodically so the EMA cannot stay frozen. `cap > 0` is already
+        // established above, so a depth-1 probe is always within the offered
+        // width; the serial-control leg exits at the `guard cap > 0` and is
+        // never reached here.
+        guard Self.latchProbeEnabled else { return 0 }
+        consecutiveSkippedRounds += 1
+        if consecutiveSkippedRounds >= Self.latchProbeInterval {
+            consecutiveSkippedRounds = 0
+            return 1
+        }
+        return 0
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.

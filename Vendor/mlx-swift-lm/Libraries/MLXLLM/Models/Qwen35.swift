@@ -2698,6 +2698,28 @@ public func qwen35BenchDraftTop32(iters: Int = 200) -> (Double, Double, Int, Int
     return (baseUs, mineUs, qwen35Top32Tiles, qwen35Top32PerThread)
 }
 
+/// Isolated timing of the coarse affine-2/group-64 compact draft readout at
+/// its exact live shape. Used to A/B the singlerow specialisation against the
+/// generic qmv_fast_impl path. Never called on a scored path.
+public func qwen35BenchCoarseReadout(iters: Int = 400) -> Double {
+    MLXRandom.seed(5)
+    let rows = 98_336
+    let x = MLXRandom.normal([1, 1, 5120]).asType(.bfloat16)
+    let w = (MLXRandom.uniform(low: 0, high: 4_000_000, [rows, 320])).asType(.uint32)
+    let sc = MLXRandom.normal([rows, 80]).asType(.bfloat16)
+    let bi = MLXRandom.normal([rows, 80]).asType(.bfloat16)
+    for _ in 0 ..< 20 {
+        eval(quantizedMM(x, w, scales: sc, biases: bi,
+                         transpose: true, groupSize: 64, bits: 2, mode: .affine))
+    }
+    let t0 = Date()
+    for _ in 0 ..< iters {
+        eval(quantizedMM(x, w, scales: sc, biases: bi,
+                         transpose: true, groupSize: 64, bits: 2, mode: .affine))
+    }
+    return Date().timeIntervalSince(t0) / Double(iters) * 1e6
+}
+
 public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, Int, Int) {
     MLXRandom.seed(seed)
     var bad = 0
