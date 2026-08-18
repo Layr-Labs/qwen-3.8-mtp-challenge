@@ -49,6 +49,9 @@ template <typename T, int D, int V = D>
 
   typedef float U;
 
+  const int q_batch_head_idx = tid.x;
+  const int q_seq_idx = tid.y;
+
   thread U q[qk_per_thread];
   thread U k[qk_per_thread];
   thread U o[v_per_thread];
@@ -57,9 +60,149 @@ template <typename T, int D, int V = D>
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
+  // Pair adjacent query heads only for the one-token, unmasked 128D GQA
+  // shapes where each pair shares one KV head. All other shapes retain the
+  // original one-head-per-threadgroup path below.
+  if constexpr (D == 128 && V == 128) {
+    const bool paired_gqa =
+        tpg.y == 1 && !query_transposed && !has_mask && !do_causal &&
+        !has_sinks && (gqa_factor == 6 || gqa_factor == 8);
+    if (paired_gqa) {
+      // The host grid is unchanged for ABI/dispatch compatibility. Odd
+      // groups are idle; each even group owns two adjacent query heads.
+      if (q_batch_head_idx & 1)
+        return;
+      if (q_batch_head_idx + 1 < int(tpg.x)) {
+        const int q0_offset = q_batch_head_idx * tpg.y + q_seq_idx;
+        const int q1_offset = (q_batch_head_idx + 1) * tpg.y + q_seq_idx;
+        const int kv_head_idx = q_batch_head_idx / gqa_factor;
+
+        const device T* q0 =
+            queries + q0_offset * D + simd_lid * qk_per_thread;
+        const device T* q1 =
+            queries + q1_offset * D + simd_lid * qk_per_thread;
+        const device T* pair_keys =
+            keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+            simd_lid * qk_per_thread;
+        const device T* pair_values =
+            values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+            simd_lid * v_per_thread;
+        device T* out0 =
+            out + q0_offset * V + simd_gid * v_per_thread;
+        device T* out1 =
+            out + q1_offset * V + simd_gid * v_per_thread;
+
+        thread U q0_values[qk_per_thread];
+        thread U q1_values[qk_per_thread];
+        thread U o0[v_per_thread];
+        thread U o1[v_per_thread];
+        thread U pair_v[v_per_thread];
+        for (int i = 0; i < qk_per_thread; i++) {
+          q0_values[i] = static_cast<U>(scale) * q0[i];
+          q1_values[i] = static_cast<U>(scale) * q1[i];
+        }
+        for (int i = 0; i < v_per_thread; i++) {
+          o0[i] = 0;
+          o1[i] = 0;
+          pair_v[i] = 0;
+        }
+
+        U max_score0 = Limits<U>::finite_min;
+        U max_score1 = Limits<U>::finite_min;
+        U sum_exp_score0 = 0;
+        U sum_exp_score1 = 0;
+
+        // One K/V load feeds both query-head score/output accumulators.
+        for (int i = simd_gid; i < N; i += BN) {
+          for (int j = 0; j < qk_per_thread; j++) {
+            k[j] = pair_keys[j];
+          }
+          for (int j = 0; j < v_per_thread; j++) {
+            pair_v[j] = pair_values[j];
+          }
+
+          U score0 = 0;
+          U score1 = 0;
+          for (int j = 0; j < qk_per_thread; j++) {
+            score0 += q0_values[j] * k[j];
+            score1 += q1_values[j] * k[j];
+          }
+          score0 = simd_sum(score0);
+          score1 = simd_sum(score1);
+
+          U new_max0 = max(max_score0, score0);
+          U factor0 = fast::exp(max_score0 - new_max0);
+          U exp_score0 = fast::exp(score0 - new_max0);
+          max_score0 = new_max0;
+          sum_exp_score0 = sum_exp_score0 * factor0 + exp_score0;
+          for (int j = 0; j < v_per_thread; j++) {
+            o0[j] = o0[j] * factor0 + exp_score0 * pair_v[j];
+          }
+
+          U new_max1 = max(max_score1, score1);
+          U factor1 = fast::exp(max_score1 - new_max1);
+          U exp_score1 = fast::exp(score1 - new_max1);
+          max_score1 = new_max1;
+          sum_exp_score1 = sum_exp_score1 * factor1 + exp_score1;
+          for (int j = 0; j < v_per_thread; j++) {
+            o1[j] = o1[j] * factor1 + exp_score1 * pair_v[j];
+          }
+
+          pair_keys += inner_k_stride;
+          pair_values += inner_v_stride;
+        }
+
+        // Reduce and store head 0, then reuse the same threadgroup scratch for
+        // head 1. The online softmax state remains independent per head.
+        if (simd_lid == 0) {
+          max_scores[simd_gid] = max_score0;
+          sum_exp_scores[simd_gid] = sum_exp_score0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_score0 = max_scores[simd_lid];
+        U new_max0 = simd_max(max_score0);
+        U factor0 = fast::exp(max_score0 - new_max0);
+        sum_exp_score0 = simd_sum(sum_exp_scores[simd_lid] * factor0);
+        for (int i = 0; i < v_per_thread; i++) {
+          outputs[simd_lid * BD + simd_gid] = o0[i];
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          o0[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor0);
+          o0[i] = sum_exp_score0 == 0 ? o0[i] : (o0[i] / sum_exp_score0);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (simd_lid == 0) {
+          for (int i = 0; i < v_per_thread; i++) {
+            out0[i] = static_cast<T>(o0[i]);
+          }
+        }
+
+        if (simd_lid == 0) {
+          max_scores[simd_gid] = max_score1;
+          sum_exp_scores[simd_gid] = sum_exp_score1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_score1 = max_scores[simd_lid];
+        U new_max1 = simd_max(max_score1);
+        U factor1 = fast::exp(max_score1 - new_max1);
+        sum_exp_score1 = simd_sum(sum_exp_scores[simd_lid] * factor1);
+        for (int i = 0; i < v_per_thread; i++) {
+          outputs[simd_lid * BD + simd_gid] = o1[i];
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          o1[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor1);
+          o1[i] = sum_exp_score1 == 0 ? o1[i] : (o1[i] / sum_exp_score1);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (simd_lid == 0) {
+          for (int i = 0; i < v_per_thread; i++) {
+            out1[i] = static_cast<T>(o1[i]);
+          }
+        }
+        return;
+      }
+    }
+  }
+
   // Adjust positions
-  const int q_batch_head_idx = tid.x;
-  const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
   const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
   const int q_offset =

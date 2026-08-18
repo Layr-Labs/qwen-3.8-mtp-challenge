@@ -609,7 +609,21 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        // A full-accept streak is direct evidence that deeper proposals are
+        // likely to amortize the next verify. Lower the marginal draft price
+        // only after that evidence accumulates; any rejection resets the
+        // streak and immediately restores the conservative frontier price.
+        let h: Double
+        switch fullAcceptStreak {
+        case 4...:
+            h = 0.12
+        case 3:
+            h = 0.14
+        case 2:
+            h = 0.16
+        default:
+            h = Self.headStepCostRatio
+        }
         var reach = 1.0
         var expected = 0.0
         var depth = 0
