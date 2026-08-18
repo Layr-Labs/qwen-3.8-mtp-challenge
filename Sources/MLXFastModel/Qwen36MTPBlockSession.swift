@@ -194,8 +194,18 @@ public final class Qwen36MTPBlockSession {
         // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
+        // LOCAL ABLATION HOOK (inert at rank): a fixed-depth schedule driven
+        // by the environment so an ablation series (V(width) vs H(head step)
+        // vs prefill) can run on ONE build. Unset in every ranked run; the
+        // worker never carries ranked env overrides.
+        let fixedDepth = ProcessInfo.processInfo.environment[
+            "MLX_QWEN_MTP_POLICY_FIXED_DEPTH"
+        ].flatMap(Int.init)
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
+            if let fixed = fixedDepth {
+                return Swift.min(Swift.min(offeredDepth, fixed), Qwen36MTPLimits.maxDepth)
+            }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
     }
@@ -526,7 +536,23 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    ///
+    /// FIFTH FIT — re-fit for the declared q2/q4-rerank head (2026-08-18).
+    /// Direct skip-head attribution on M5 Max (fixed-depth arms, steady
+    /// second blocks) measures V2 ≈ 35 ms, V9+rollback ≈ 72 ms and a
+    /// marginal head step of ≈ 2.2 ms — the 4-bit precision-island head
+    /// plus the 2-bit compact readout is far cheaper than the bf16 pinned
+    /// head the 0.18 fit was derived against. At the same time the verify
+    /// width growth (≈ 4 ms/row above width 2) is NOT priced by the rule,
+    /// which keeps a floor under how low h can go. Local A/B on the public
+    /// longcopy window (3 samples per arm, direct mtp-timed): h=0.12
+    /// finishes 64 tokens in 9 rounds (mean 6.22, one reject) vs h=0.18's
+    /// 10 rounds (mean 5.4, no rejects), saving the last width-2 round
+    /// (~36 ms) at a cost of one rollback; rounds-only -0.6% and the gap
+    /// scales with the 512-token ranked window (≈ 9 fewer rounds). h=0.10
+    /// produced the identical local schedule, so 0.12 is the conservative
+    /// point of that plateau.
+    private static let headStepCostRatio = 0.12
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
