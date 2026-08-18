@@ -1174,13 +1174,192 @@ final class Qwen35GatedDeltaNet: Module {
 
         let normedOut: MLXArray
         if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            // Fused postwork: rmsNorm + fp32 SiLU gate in ONE dispatch,
+            // bit-identical to the eager two-step it replaces (see
+            // qwen35FusedGatedDeltaPostworkKernel). On any envelope mismatch,
+            // fall back to the exact eager expression.
+            if let fusedPost = qwen35FusedGatedDeltaPostwork(out, z, norm) {
+                normedOut = fusedPost
+            } else {
+                let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+                normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            }
         } else {
             normedOut = norm(out, gate: z)
         }
         return outProj(normedOut.reshaped(B, S, -1))
     }
+}
+
+// MARK: - Fused GDN postwork kernel (RMSNorm + fp32 SiLU gate)
+
+/// Fuses the GatedDeltaNet output block — `MLXFast.rmsNorm(out, ...)` followed
+/// by the compiled fp32 SiLU-gate elementwise
+/// (`qwen35CompiledGatedDeltaPostNorm(rmsOut, z)`) — into ONE dispatch.
+///
+/// BIT-EXACTNESS CONTRACT, same bar as `qwen35FusedAddRMSNormKernel`:
+///
+/// 1. The norm reduces over the last dim of `out` ([B, S, Hv, Dv] rows of
+///    Dv = 128), so the vendored dispatch is `rms_single_row` (128 <=
+///    RMS_LOOPED_LIMIT = 4096), NOT `rms_looped`: normalization.cpp computes
+///    threadgroup = 32 * ceil(ceil(128 / 4) / 32) = 32 — one simdgroup per
+///    row, deterministic, hardware-independent — and grid = n_rows * 32. The
+///    reduction body below is a verbatim copy of `rms_single_row`
+///    (backend/metal/kernels/rms_norm.metal): 4-element fp32 chunks,
+///    `simd_sum`, the (degenerate, single-simdgroup) `local_sums` tree, and
+///    `metal::precise::rsqrt(acc / axis_size + eps)` in fp32.
+/// 2. `rmsOut` is rounded to bf16 at exactly the vendored output point
+///    (`w[i] * static_cast<bfloat16_t>(x[i] * inv)`) and held in registers;
+///    the eager graph materializes it, but its only consumer is the gate, so
+///    the fused kernel needs only the one gated output.
+/// 3. The gate replicates the compiled `qwen35CompiledGatedDeltaPostNorm`
+///    tape op for op: `g32 = static_cast<float>(z[i])`,
+///    `act = g32 * Sigmoid()(g32)`, `out = static_cast<bfloat16_t>(act *
+///    static_cast<float>(rmsOut[i]))`. The compiled Metal backend emits the
+///    vendored `Sigmoid` functor (backend/metal/compiled.cpp prints
+///    `primitive().name()` — `Sigmoid` — and prepends unary_ops.h), here
+///    instantiated at T = float:
+///    `y = 1 / (1 + metal::exp(metal::abs(g))); (g < 0) ? y : 1 - y`.
+///    Everything runs in fp32 and rounds ONCE at the final bf16 cast, so the
+///    0xC0DB bf16-sigmoid fixup carried by the prework kernel does NOT apply
+///    (that fixup covers a bf16-rounded sigmoid; this sigmoid never is).
+/// 4. Both the eager compiled kernel and this JIT string compile with fast
+///    math disabled, so no contraction moves any rounding.
+///
+/// Validated against the eager two-kernel sequence (verbatim rms_single_row
+/// replica + compiled-tape gate replica): EXHAUSTIVE over all 65,536 bf16
+/// gate values crossed with two x distributions (realistic and heavy-tail /
+/// denormal / near-overflow) plus random-z rows — zero mismatches.
+///
+/// Internal (not private) so `Tests/MLXFastTests/Model/
+/// Qwen35FusedAddRMSNormTests.swift` can dispatch it via `@testable`.
+let qwen35FusedGatedDeltaPostworkKernel: MLXFast.MLXFastKernel = {
+    let header = """
+        typedef bfloat16_t InT;
+        """
+    let source = """
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        constexpr int SIMD_SIZE = 32;
+        constexpr int N_READS = 4;
+        constexpr uint axis_size = uint(Dv);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const device InT* x_row = x + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* z_row = z + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* w_row = w + lid * N_READS;
+
+        // rms_single_row reduction, verbatim.
+        float acc = 0;
+        InT rms_local[N_READS];
+        if (lid * N_READS + N_READS <= axis_size) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            const InT xv = x_row[i];
+            rms_local[i] = xv;
+            float xi = xv;
+            acc += xi * xi;
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            if ((lid * N_READS + i) < axis_size) {
+              const InT xv = x_row[i];
+              rms_local[i] = xv;
+              float xi = xv;
+              acc += xi * xi;
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        //  Initialize shared memory
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write simd accumulations into shared memory
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate over simd groups
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write the gated output: rmsOut rounded to bf16 at exactly the
+        // vendored rms_norm output point, then the fp32 SiLU gate and final
+        // product exactly as the compiled qwen35CompiledGatedDeltaPostNorm
+        // tape (vendored Sigmoid functor at T = float).
+        device InT* out_row = out + gid * size_t(axis_size) + lid * N_READS;
+        if (lid * N_READS + N_READS <= axis_size) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            const InT rmsv = w_row[i] *
+                static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+            const float g = static_cast<float>(z_row[i]);
+            const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+            const float sg = (g < 0) ? ys : 1 - ys;
+            const float act = g * sg;
+            out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            if ((lid * N_READS + i) < axis_size) {
+              const InT rmsv = w_row[i] *
+                  static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+              const float g = static_cast<float>(z_row[i]);
+              const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+              const float sg = (g < 0) ? ys : 1 - ys;
+              const float act = g * sg;
+              out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+            }
+          }
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_fused_gdn_postwork",
+        inputNames: ["x", "z", "w", "eps"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: true)
+}()
+
+/// Dispatches the fused GDN postwork kernel, returning
+/// `silu(z) * rmsNorm(x) * w` bit-identical to the eager two-step
+/// (`MLXFast.rmsNorm` + `qwen35CompiledGatedDeltaPostNorm`), or `nil` when the
+/// operands are outside the kernel's validated envelope ([.., Dv = 128] bf16
+/// rows, matching z shape, 1-D contiguous bf16 weight) and the caller must
+/// use the exact eager expression instead.
+private func qwen35FusedGatedDeltaPostwork(
+    _ x: MLXArray, _ z: MLXArray, _ norm: Qwen3NextRMSNormGated
+) -> MLXArray? {
+    let w = norm.weight
+    guard x.dtype == .bfloat16, z.dtype == .bfloat16, w.dtype == .bfloat16,
+        x.ndim >= 1, x.dim(x.ndim - 1) == 128, x.shape == z.shape,
+        w.ndim == 1, w.dim(0) == 128, w.strides == [1]
+    else { return nil }
+    let nRows = x.size / 128
+    return qwen35FusedGatedDeltaPostworkKernel(
+        [x, z, w, MLXArray(norm.eps)],
+        template: [("Dv", 128)],
+        grid: (nRows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16])[0]
 }
 
 // MARK: - Fused MLP
