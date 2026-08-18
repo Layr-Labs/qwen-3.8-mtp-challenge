@@ -1490,13 +1490,22 @@ final class Qwen35Attention: Module {
     private var _kvOut = 0
     private var _kvDenseW: MLXArray?
 
-    // Proposal-head-only precision islands.  The declared artifact preserves
+    // Proposal-head-only precision islands. The declared artifact preserves
     // the promoted affine-4 head and additionally carries selected exact BF16
-    // output rows. Target-model attention never installs these arrays.
+    // output rows. Target-model attention never installs these arrays. When K
+    // and V cover their complete output ranges, `_directExactQKVWeight` stores
+    // those rows in output order: the hot path can then skip quantized K/V that
+    // the exact rows would overwrite. The original overlay fields remain the
+    // fail-closed path for any other artifact geometry.
     private var _exactQKVWeight: MLXArray?
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    private var _directExactQKVWeight: MLXArray?
+    private var _directExactQIndices: MLXArray?
+    private var _directExactQOutputCount = 0
+    private var _directExactKOutputCount = 0
+    private var _directExactVOutputCount = 0
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1551,6 +1560,38 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if let q = qProj as? QuantizedLinear,
+           let k = kProj as? QuantizedLinear,
+           let v = vProj as? QuantizedLinear,
+           q.groupSize == k.groupSize, k.groupSize == v.groupSize,
+           q.bits == k.bits, k.bits == v.bits,
+           q.mode == k.mode, k.mode == v.mode, q.mode == .affine,
+           q.biases != nil, k.biases != nil, v.biases != nil,
+           q.bias == nil, k.bias == nil, v.bias == nil,
+           q.shape.0 == _directExactQOutputCount,
+           k.shape.0 == _directExactKOutputCount,
+           v.shape.0 == _directExactVOutputCount,
+           let exactWeight = _directExactQKVWeight,
+           let qIndices = _directExactQIndices
+        {
+            // K/V are complete exact-row permutations, so their quantized
+            // projections are entirely dead. Q still needs its affine-4 base
+            // for the non-island rows; keeping Q at output offset zero retains
+            // the packed-QKV kernel's per-row reduction order.
+            let qBase = q(x)
+            let exact = matmul(x, exactWeight.transposed(1, 0))
+            let qExactEnd = _exactQRowCount
+            let kExactEnd = qExactEnd + _directExactKOutputCount
+            let indexShape =
+                Array(repeating: 1, count: max(0, qBase.ndim - 1)) + [-1]
+            let qOut = putAlong(
+                qBase, qIndices.reshaped(indexShape),
+                values: exact[.ellipsis, ..<qExactEnd], axis: -1)
+            return (
+                qOut,
+                exact[.ellipsis, qExactEnd ..< kExactEnd],
+                exact[.ellipsis, kExactEnd...])
+        }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1601,6 +1642,26 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let k = kProj as? QuantizedLinear,
+           let v = vProj as? QuantizedLinear,
+           k.groupSize == v.groupSize,
+           k.bits == v.bits,
+           k.mode == v.mode, k.mode == .affine,
+           k.biases != nil, v.biases != nil,
+           k.bias == nil, v.bias == nil,
+           k.shape.0 == _directExactKOutputCount,
+           v.shape.0 == _directExactVOutputCount,
+           let exactWeight = _directExactQKVWeight
+        {
+            // Every K/V row is exact, so the affine-4 projection and its later
+            // full overwrite are dead. The install-time permutation turns this
+            // slice into ordinary output order and removes the scatter too.
+            let weight = exactWeight[_exactQRowCount...]
+            let y = matmul(x, weight.transposed(1, 0))
+            return (
+                y[.ellipsis, ..<_directExactKOutputCount],
+                y[.ellipsis, _directExactKOutputCount...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1660,6 +1721,41 @@ final class Qwen35Attention: Module {
             base, indices.reshaped(indexShape), values: exact, axis: -1)
     }
 
+    /// Return the source-row order that places a complete index permutation in
+    /// natural output order. Any malformed, duplicate, missing, or out-of-range
+    /// index fails closed onto the pre-existing post-projection overlay.
+    private static func inverseCompletePermutation(
+        _ indices: MLXArray, count: Int
+    ) -> [Int32]? {
+        guard count > 0, indices.dtype == .int32, indices.shape == [count]
+        else { return nil }
+        let values = indices.asArray(Int32.self)
+        var inverse = [Int32](repeating: -1, count: count)
+        for (source, rawTarget) in values.enumerated() {
+            let target = Int(rawTarget)
+            guard target >= 0, target < count, inverse[target] == -1
+            else { return nil }
+            inverse[target] = Int32(source)
+        }
+        return inverse
+    }
+
+    private static func hasUniqueInRangeIndices(
+        _ indices: MLXArray, count: Int, upperBound: Int
+    ) -> Bool {
+        guard count > 0, upperBound > 0,
+              indices.dtype == .int32, indices.shape == [count]
+        else { return false }
+        var seen = [Bool](repeating: false, count: upperBound)
+        for rawValue in indices.asArray(Int32.self) {
+            let value = Int(rawValue)
+            guard value >= 0, value < upperBound, !seen[value]
+            else { return false }
+            seen[value] = true
+        }
+        return true
+    }
+
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
@@ -1670,20 +1766,79 @@ final class Qwen35Attention: Module {
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
             "Qwen MTP precision-island weights and indices must have equal row counts")
-        let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
-        let qkvIndices = concatenated(
+        let fallbackWeight = concatenated(
+            [qWeight, kWeight, vWeight], axis: 0).contiguous()
+        let fallbackQKVIndices = concatenated(
             [qIndices, kIndices + qOutputCount,
              vIndices + qOutputCount + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
-        let kvIndices = concatenated(
+        let fallbackKVIndices = concatenated(
             [kIndices, vIndices + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
-        eval(weight, qkvIndices, kvIndices)
 
-        _exactQKVWeight = weight
-        _exactQKVIndices = qkvIndices
-        _exactKVIndices = kvIndices
+        _directExactQKVWeight = nil
+        _directExactQIndices = nil
+        _directExactQOutputCount = 0
+        _directExactKOutputCount = 0
+        _directExactVOutputCount = 0
         _exactQRowCount = qWeight.dim(0)
+
+        let vOutputCount = vProj.weight.dim(0)
+        let directQIndices = qIndices.asType(.int32).contiguous()
+        let directKIndices = kIndices.asType(.int32).contiguous()
+        let directVIndices = vIndices.asType(.int32).contiguous()
+        eval(directQIndices, directKIndices, directVIndices)
+        guard qIndices.dtype == .int32,
+              kIndices.dtype == .int32,
+              vIndices.dtype == .int32,
+              Self.hasUniqueInRangeIndices(
+                  directQIndices, count: qWeight.dim(0),
+                  upperBound: qOutputCount),
+              kWeight.dim(0) == kOutputCount,
+              vWeight.dim(0) == vOutputCount,
+              let kOrder = Self.inverseCompletePermutation(
+                  directKIndices, count: kOutputCount),
+              let vOrder = Self.inverseCompletePermutation(
+                  directVIndices, count: vOutputCount)
+        else {
+            // Unknown/sparse K/V geometry: preserve the previous projection,
+            // exact matmul, and putAlong graph without alteration.
+            eval(fallbackWeight, fallbackQKVIndices, fallbackKVIndices)
+            _exactQKVWeight = fallbackWeight
+            _exactQKVIndices = fallbackQKVIndices
+            _exactKVIndices = fallbackKVIndices
+            return
+        }
+
+        // The artifact stores exact rows in importance/permutation order. Gather
+        // K and V once during untimed installation so their runtime matmul emits
+        // natural K|V output order directly. Q stays in artifact order because
+        // it remains a sparse correction into the affine-4 Q projection.
+        let orderedK = MLX.take(kWeight, MLXArray(kOrder), axis: 0)
+        let orderedV = MLX.take(vWeight, MLXArray(vOrder), axis: 0)
+        let directWeight = concatenated(
+            [qWeight, orderedK, orderedV], axis: 0).contiguous()
+        let naturalK = MLXArray((0 ..< kOutputCount).map(Int32.init))
+        let naturalV = MLXArray((0 ..< vOutputCount).map(Int32.init))
+        let directQKVIndices = concatenated(
+            [directQIndices, naturalK + qOutputCount,
+             naturalV + qOutputCount + kOutputCount], axis: 0)
+            .asType(.int32).contiguous()
+        let directKVIndices = concatenated(
+            [naturalK, naturalV + kOutputCount], axis: 0)
+            .asType(.int32).contiguous()
+        eval(directWeight, directQKVIndices, directKVIndices)
+
+        // These reordered fields also form an exact fallback overlay if a future
+        // runtime does not satisfy the direct quantized-path guards above.
+        _exactQKVWeight = directWeight
+        _exactQKVIndices = directQKVIndices
+        _exactKVIndices = directKVIndices
+        _directExactQKVWeight = directWeight
+        _directExactQIndices = directQIndices
+        _directExactQOutputCount = qOutputCount
+        _directExactKOutputCount = kOutputCount
+        _directExactVOutputCount = vOutputCount
     }
 
     /// Append rows to an attention cache without producing query outputs.
@@ -2163,6 +2318,117 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. MLX currently implements argPartition as a stable full
+// ascending sort. The incumbent shortlist takes its final 32 entries, so an
+// exact coarse-value tie at the cutoff admits the higher token id; the
+// downstream exact affine-4 rerank still resolves its ties toward the lower id.
+//
+// Pass one keeps that behavior while sorting 48 independent 2,048-row blocks
+// in one dispatch. Pass two merges their 1,536 winners with all 26 rows in
+// the partial 49th block (plus six invalid lanes) and returns the same global
+// suffix order as the incumbent vocabulary-wide sort: value ascending, then
+// id ascending. Invalid lanes compare below every real row, including -inf
+// and NaN, rather than relying on an in-band padding value.
+private let qwen35DraftShortlistMergeKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_shortlist_merge",
+    inputNames: ["coarse_logits", "local_ids"],
+    outputNames: ["candidate_ids"],
+    source: """
+        uint lane = thread_position_in_threadgroup.x;
+        threadgroup float scratch_values[MERGE_WIDTH];
+        threadgroup uint scratch_ids[MERGE_WIDTH];
+
+        for (uint slot = lane; slot < MERGE_WIDTH; slot += TG_SIZE) {
+            uint id = 0xFFFFFFFFu;
+            uint full_count = FULL_GROUP_COUNT * SHORTLIST_COUNT;
+            if (slot < full_count) {
+                uint group = slot / SHORTLIST_COUNT;
+                uint rank = slot - group * SHORTLIST_COUNT;
+                ulong offset = ulong(group) * ulong(local_ids_strides[0])
+                    + ulong(rank) * ulong(local_ids_strides[1]);
+                uint local_id = uint(local_ids[offset]);
+                if (local_id < LOCAL_WIDTH) {
+                    id = group * LOCAL_WIDTH + local_id;
+                }
+            } else {
+                uint tail_id = FULL_GROUP_COUNT * LOCAL_WIDTH
+                    + slot - full_count;
+                if (tail_id < REAL_COUNT) {
+                    id = tail_id;
+                }
+            }
+
+            scratch_ids[slot] = id;
+            scratch_values[slot] = id == 0xFFFFFFFFu
+                ? 0.0f
+                : float(coarse_logits[
+                    ulong(id) * ulong(coarse_logits_strides[0])]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Bitonic order is best-first under the incumbent shortlist order.
+        // Only this small 2,048-lane merge is sorted here; the 98k-wide work
+        // was already split into one-block sorts above.
+        for (uint width = 2; width <= MERGE_WIDTH; width <<= 1) {
+            for (uint stride = width >> 1; stride > 0; stride >>= 1) {
+                for (uint slot = lane; slot < MERGE_WIDTH; slot += TG_SIZE) {
+                    uint other = slot ^ stride;
+                    if (other > slot) {
+                        float left_value = scratch_values[slot];
+                        float right_value = scratch_values[other];
+                        uint left_id = scratch_ids[slot];
+                        uint right_id = scratch_ids[other];
+                        bool better_first = (slot & width) == 0;
+                        bool swap = better_first
+                            ? qwen_draft_shortlist_better(
+                                right_value, right_id, left_value, left_id)
+                            : qwen_draft_shortlist_better(
+                                left_value, left_id, right_value, right_id);
+                        if (swap) {
+                            scratch_values[slot] = right_value;
+                            scratch_values[other] = left_value;
+                            scratch_ids[slot] = right_id;
+                            scratch_ids[other] = left_id;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        if (lane < SHORTLIST_COUNT) {
+            // Reverse best-first into the stable ascending suffix order emitted
+            // by the incumbent full argPartition implementation.
+            candidate_ids[lane] = scratch_ids[SHORTLIST_COUNT - 1 - lane];
+        }
+    """,
+    header: """
+        inline bool qwen_draft_shortlist_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
+
+            // MLX LessThan sorts NaN after every non-NaN. Since the incumbent
+            // takes the ascending sort's suffix, NaN ranks first for shortlist
+            // membership. Exact rerank retains its separate NaN-last rule.
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+
+            // Stable ascending sort + suffix admits higher ids at a coarse
+            // boundary tie. Mirroring it is required for set identity.
+            return candidate_id > current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2201,6 +2467,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
     private static let draftRerankCandidateCount = 32
+    private static let draftShortlistLocalWidth = 2_048
+    private static let draftShortlistFullGroupCount = 48
+    private static let draftShortlistMergeWidth = 2_048
+    private static let draftShortlistThreadgroupSize = 256
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2608,10 +2878,17 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         )[0..., 0..., 0 ..< Self.compactDraftRealCount]
         let candidateCount = Self.draftRerankCandidateCount
-        let kth = Self.compactDraftRealCount - candidateCount
-        let candidateIDs = MLX.argPartition(
-            coarse, kth: kth, axis: -1
-        )[.ellipsis, (kth)...].reshaped([candidateCount])
+        let candidateIDs: MLXArray
+        if let hierarchical = hierarchicalDraftCandidateIDs(coarse) {
+            candidateIDs = hierarchical
+        } else {
+            // Fail closed: retain the incumbent vocabulary-wide argPartition
+            // graph for every geometry the hierarchy was not written for.
+            let kth = Self.compactDraftRealCount - candidateCount
+            candidateIDs = MLX.argPartition(
+                coarse, kth: kth, axis: -1
+            )[.ellipsis, (kth)...].reshaped([candidateCount])
+        }
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
@@ -2631,6 +2908,62 @@ extension Qwen35TextModel: MTPCapable {
             threadGroup: (candidateCount, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
+        )[0]
+    }
+
+    /// Exact decomposition of the incumbent 98,330-row stable sort into 49
+    /// local top-32 lists and one 1,568-slot merge. The first 48 blocks are
+    /// full and share one one-block argPartition dispatch; the final 26 rows
+    /// all qualify for their block's top 32, so the merge kernel admits them
+    /// directly and marks the remaining six lanes invalid out-of-band.
+    private func hierarchicalDraftCandidateIDs(
+        _ coarse: MLXArray
+    ) -> MLXArray? {
+        let candidateCount = Self.draftRerankCandidateCount
+        let localWidth = Self.draftShortlistLocalWidth
+        let fullGroupCount = Self.draftShortlistFullGroupCount
+        let prefixCount = fullGroupCount * localWidth
+        let tailCount = Self.compactDraftRealCount - prefixCount
+        let logicalGroupCount = fullGroupCount + 1
+        let mergeCandidateCount = logicalGroupCount * candidateCount
+        let mergeWidth = Self.draftShortlistMergeWidth
+        let tgSize = Self.draftShortlistThreadgroupSize
+
+        guard candidateCount == 32,
+              localWidth == 2_048,
+              fullGroupCount == 48,
+              prefixCount == 98_304,
+              tailCount == 26,
+              tailCount > 0, tailCount < candidateCount,
+              logicalGroupCount == 49,
+              mergeCandidateCount == 1_568,
+              mergeCandidateCount <= mergeWidth,
+              mergeWidth == 2_048,
+              tgSize == 256,
+              coarse.shape == [1, 1, Self.compactDraftRealCount]
+        else { return nil }
+
+        let localRows = coarse[.ellipsis, 0 ..< prefixCount]
+            .reshaped([fullGroupCount, localWidth])
+        let localKth = localWidth - candidateCount
+        let localIDs = MLX.argPartition(
+            localRows, kth: localKth, axis: -1
+        )[.ellipsis, localKth...]
+
+        return qwen35DraftShortlistMergeKernel(
+            [coarse.reshaped([Self.compactDraftRealCount]), localIDs],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("LOCAL_WIDTH", localWidth),
+                ("FULL_GROUP_COUNT", fullGroupCount),
+                ("SHORTLIST_COUNT", candidateCount),
+                ("MERGE_WIDTH", mergeWidth),
+                ("TG_SIZE", tgSize),
+            ],
+            grid: (tgSize, 1, 1),
+            threadGroup: (tgSize, 1, 1),
+            outputShapes: [[candidateCount]],
+            outputDTypes: [.uint32]
         )[0]
     }
 
