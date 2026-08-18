@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q4-qkv-islands-v1@8081fee431e304076b6f6296d6eb5dc7a3fc91af",
-  "sha256": "477ba7266c6f726fafca7f7646e894fd962fa1a93c7672e04282f6243163549a",
-  "bytes": 270404624,
+  "source_url": "hf:jeweled/qwen38-isl-aw1024@8afd4fa173d43bfa6138ccfce191299d01af201c",
+  "sha256": "4e48f2ae201674d73f8c4eff0f6ac08d0fb57532133d1165b42076f5dc971895",
+  "bytes": 270404616,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 proposal head is preserved tensor-for-tensor. Six additional bare tensors provide BF16 proposal-only precision islands: all 1,024 K rows, all 1,024 V rows, and the 1,024 Q rows with the largest FP32 reconstruction SSE versus the pinned organizer BF16 head. Candidate code replaces only those proposal Q/K/V projection outputs after the unchanged packed QMV. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
+  "note": "The promoted 4-bit/group-64 island head preserved tensor-for-tensor; only the 1,024 Q precision-island rows differ, selected by activation-weighted output error (dW^T H dW over 3,774 real trunk-activation rows, six domains) instead of weight-space reconstruction SSE. Same island count, same byte count, same runtime contract. K and V islands unchanged."
 }
