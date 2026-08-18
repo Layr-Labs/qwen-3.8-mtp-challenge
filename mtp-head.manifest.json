@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-v6@46846656b060d5efc160a8468116454fedcaa830",
+  "sha256": "46bac7bfe5ead72722a1679a9563a4f857b4a65b35743f9bc58737885aaba3d8",
+  "bytes": 528431512,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "v6 breakthrough head. Stacks three orthogonal proposal-side levers on the promoted 4-bit/group-64 head: (1) BF16 precision islands on EVERY head projection (fc 1,024 AW rows, Q 2,048 AW rows, K/V all 1,024 rows, o_proj 1,024 AW rows, gate/up 1,024 AW rows each, down_proj 1,024 AW rows) -- final-hidden MSE 44.7% of the un-islanded 4-bit error; (2) a coarse affine-2 compact draft readout that forms a 32-token shortlist, reranked exactly with the affine-4 compact lm_head by a one-SIMDgroup Metal selector (proposal readout ~1.37x faster per draft row); (3) an adaptive draft schedule with warmer per-position acceptance priors (0.92*0.995^d) and a streak gate of 1, drafting 7.1 deep on average at 0.991 acceptance vs 6.0 before. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
 }
