@@ -356,6 +356,90 @@ public final class Qwen36MTPBlockSession {
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
             + [seedWarmIDs, seedWarmValues, seedWarmNorm])
+        Self.wireResidentWeightsIfEnabled()
+    }
+
+    // MARK: - wired residency
+
+    /// Zero-headroom wired residency, ported from the Laguna board's promoted
+    /// mechanism (mlxfast-challenge PRs #206/#207/#211: the first 42 MiB dose
+    /// alone ranked +1.24%, and the full wire measured -28.3% prefill /
+    /// -4.2% decode composite loaded-local there). The vendored MLX Device
+    /// attaches an `MTLResidencySet` to every command queue, but
+    /// `ResidencySet::capacity_` defaults to 0 and nothing ever calls
+    /// `set_wired_limit`, so the set stays empty and the driver re-establishes
+    /// residency for the whole RAM-resident tower on every command buffer.
+    /// One wired-limit commit at the end of warm — after the lazily-built
+    /// fused banks exist, so they are wired too — sizes the set to the live
+    /// footprint with zero headroom: every later transient allocation fails
+    /// `ResidencySet::insert`'s fit test and takes the commit-free
+    /// `unwired_set_` branch, so scored windows stay free of per-allocation
+    /// residency commits. Pure driver-side residency: no kernel, op, or
+    /// numerics change.
+    ///
+    /// Guards: `DARKBLOOM_WIRED_ZH=0` kills it; machines under the physical
+    /// memory floor (default 96 GiB — the ranked box is an M5 Max 128 GB)
+    /// keep stock behavior. `DARKBLOOM_WIRED_ZH_MIN_PHYS_GB` lowers the
+    /// floor for local measurement on smaller boxes.
+    private static func wireResidentWeightsIfEnabled() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["DARKBLOOM_WIRED_ZH"] != "0" else { return }
+        let minPhysGB = env["DARKBLOOM_WIRED_ZH_MIN_PHYS_GB"].flatMap(Int.init) ?? 96
+        guard ProcessInfo.processInfo.physicalMemory >= UInt64(minPhysGB) << 30 else {
+            return
+        }
+
+        // Evict cached warm transients first so only live buffers (weights,
+        // fused banks, persistent runtime tensors) are tracked and the
+        // computed capacity leaves no headroom for scored-window scratch to
+        // fit into.
+        GPU.clearCache()
+
+        let active = GPU.activeMemory
+        guard active > 0 else { return }
+
+        let fraction = env["DARKBLOOM_WIRED_ZH_FRACTION"].flatMap(Double.init) ?? 1.0
+        let slackMB = env["DARKBLOOM_WIRED_ZH_SLACK_MB"].flatMap(Int.init) ?? 64
+        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
+        target += max(0, slackMB) << 20
+
+        // metal::set_wired_limit throws (uncaught in the Swift backend) on
+        // limits above recommendedMaxWorkingSetSize; clamp with margin.
+        if let maxRec = GPU.maxRecommendedWorkingSetBytes() {
+            target = min(target, maxRec - (256 << 20))
+        }
+        guard target > 0 else { return }
+
+        let ticket = WiredMemoryTicket(
+            size: target,
+            policy: WiredSumPolicy(cap: target),
+            manager: .shared,
+            kind: .active
+        )
+        let appliedBox = WiredLimitBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            let applied = await ticket.start()
+            appliedBox.value = applied
+            semaphore.signal()
+        }
+        // Bounded wait: a manager stall must not hang session warm.
+        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
+        Self.wiredTicketRetainer = ticket
+        let applied = outcome == .success ? appliedBox.value : -1
+        FileHandle.standardError.write(Data(
+            "qwen-mtp: wired-zh request=\(target) applied=\(applied) active=\(active)\n"
+                .utf8))
+    }
+
+    /// Never ended: ending would restore the 0 baseline and unwire the
+    /// weights (`resident.cpp` resize-shrink evicts every allocation).
+    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
+
+    /// Crosses the applied wired limit back from the async ticket task to the
+    /// synchronous warm path; the semaphore orders the accesses.
+    private final class WiredLimitBox: @unchecked Sendable {
+        var value: Int = 0
     }
 
     // MARK: - begin

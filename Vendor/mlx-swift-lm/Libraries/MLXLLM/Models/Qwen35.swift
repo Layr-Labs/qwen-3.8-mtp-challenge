@@ -3021,11 +3021,32 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
+        Self.installCommandBufferBudgetOnce
         let textModel = Qwen35TextModel(args.textConfig)
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
     }
+
+    /// Layer-sized Metal command buffers, ported from the Laguna board's
+    /// promoted mechanism (mlxfast-challenge PR #213, ranked +0.6% there):
+    /// MLX's stock 50 MiB referenced-byte commit threshold splits a decode
+    /// layer's work across several command buffers purely on weight-byte
+    /// accounting; once the session's wired-residency mechanism has made
+    /// those weights permanently resident, that splitting buys nothing. A
+    /// 512 MiB budget fits roughly two Qwen decode layers (~234 MiB of
+    /// affine-4 weights each) while retaining MLX's stock 50-operation cap.
+    /// The env vars are function-local statics in `mlx/utils.h`, cached on
+    /// first use, so this must run before the first GPU eval — model init
+    /// precedes weight-load evaluation. Explicit `MLX_*` values win
+    /// (`overwrite: 0`), and `DARKBLOOM_POST_WIRE_COMMAND_BUFFER=0` is the
+    /// same-binary kill switch.
+    private static let installCommandBufferBudgetOnce: Void = {
+        let env = ProcessInfo.processInfo.environment
+        guard env["DARKBLOOM_POST_WIRE_COMMAND_BUFFER"] != "0" else { return }
+        setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
+    }()
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
