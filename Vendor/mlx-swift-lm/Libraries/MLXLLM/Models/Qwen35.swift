@@ -1216,8 +1216,10 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fqMode = QuantizationMode.affine
     private var _fbfW: MLXArray?
     private var _gateOut = 0
+    private let fuseGateUp: Bool
 
-    init(dimensions: Int, hiddenDimensions: Int) {
+    init(dimensions: Int, hiddenDimensions: Int, fuseGateUp: Bool = true) {
+        self.fuseGateUp = fuseGateUp
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1261,7 +1263,9 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
-        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+        if fuseGateUp, x.dim(-2) <= 16,
+           let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1)
+        {
             return downProj(qwen35CompiledFusedSwiGLU(y))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
@@ -2564,6 +2568,66 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let shouldShiftNormWeights = hasUnsanitizedConv1d  // NOT hasMTPWeights
 
         var weights = weights
+
+        // The proposal MLP is memory-bandwidth bound at M == 1. Repack its
+        // affine4 tensors to affine2 once, before timing, while retaining the
+        // public declared artifact as the reproducible source. This is guarded
+        // by the exact affine4/group-64 layout, so BF16 pinned heads and heads
+        // that already provide another quantization remain unchanged.
+        if mtp != nil {
+            for path in [
+                "mtp.layers.0.mlp.gate_proj",
+                "mtp.layers.0.mlp.up_proj",
+                "mtp.layers.0.mlp.down_proj",
+            ] {
+                guard let packed = weights["\(path).weight"],
+                      let scales = weights["\(path).scales"],
+                      let biases = weights["\(path).biases"],
+                      packed.ndim == 2,
+                      scales.ndim == 2,
+                      scales.dim(1) > 0
+                else { continue }
+                let inputSize = scales.dim(1) * 64
+                guard packed.dim(1) * 32 == inputSize * 4 else { continue }
+
+                let dense = dequantized(
+                    packed, scales: scales, biases: biases,
+                    groupSize: 64, bits: 4, mode: .affine)
+                let q2 = quantized(dense, groupSize: 64, bits: 2, mode: .affine)
+                guard let q2Biases = q2.biases else { continue }
+                eval(q2.wq, q2.scales, q2Biases)
+                weights["\(path).weight"] = q2.wq
+                weights["\(path).scales"] = q2.scales
+                weights["\(path).biases"] = q2Biases
+            }
+        }
+
+        // A declared proposal head may quantize its own linear layers at a
+        // different affine width from the pinned 4-bit target configuration.
+        // Wire those modules from the supplied packed shapes before the
+        // loader's whole-model quantization pass; already-quantized modules
+        // are skipped by that later pass. The target tower is untouched.
+        if let mtp {
+            quantize(model: mtp) { path, module in
+                guard let linear = module as? Linear,
+                      let packed = weights["mtp.\(path).weight"],
+                      let scales = weights["mtp.\(path).scales"],
+                      packed.ndim == 2,
+                      scales.ndim == 2,
+                      linear.shape.1 > 0,
+                      scales.dim(1) > 0,
+                      linear.shape.1 % scales.dim(1) == 0
+                else { return nil }
+                let groupSize = linear.shape.1 / scales.dim(1)
+                let packedBits = packed.dim(1) * 32
+                guard packedBits % linear.shape.1 == 0 else { return nil }
+                let bits = packedBits / linear.shape.1
+                guard [32, 64, 128].contains(groupSize),
+                      [2, 3, 4, 5, 6, 8].contains(bits)
+                else { return nil }
+                return (groupSize, bits, QuantizationMode.affine)
+            }
+        }
 
         // Keep mtp.* keys if the head is attached; strip them otherwise.
         // omlx: `if not hasattr(self, "mtp"): weights = {k:v if "mtp." not in k}`

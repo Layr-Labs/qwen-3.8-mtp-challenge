@@ -34,12 +34,15 @@ final class Qwen35MTPDecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
-            // Same fused gate/up MLP as the backbone layers; here the linears
-            // stay bf16 and the fuse takes the plain-weight path. Head side —
-            // proposal-only, no exactness constraint.
+            // Keep the proposal gate/up projections separate. The declared
+            // head is repacked to affine2 at load time, and the two 17,408-row
+            // calls then reach the proposal-only single-row fast kernel;
+            // fusing them to 34,816 rows would fall through to generic QMV.
+            // The target layers retain the default fused path.
             _mlp.wrappedValue = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
-                hiddenDimensions: args.intermediateSize
+                hiddenDimensions: args.intermediateSize,
+                fuseGateUp: false
             )
         }
         _inputLayerNorm.wrappedValue = RMSNorm(
