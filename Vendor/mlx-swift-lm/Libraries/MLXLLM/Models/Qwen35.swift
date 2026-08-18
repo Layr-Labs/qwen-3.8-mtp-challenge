@@ -2182,6 +2182,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftHeadW: MLXArray?
     private var _draftHeadS: MLXArray?
     private var _draftHeadZ: MLXArray?
+    // Optional PCA basis [hidden, D] bf16 carried by the declared head tree
+    // as `draft_proj`. When present, the coarse readout runs in the projected
+    // D-dim space (the declared draft_lm_head rows are the exact compact
+    // rows already projected). Proposal-side only.
+    private var _draftProj: MLXArray?
 
     // Input-independent compact copy of the loaded exact lm_head, used only
     // for draft proposals when no declared draft_lm_head is present. It is not
@@ -2277,6 +2282,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             _draftHeadW = draftW
             _draftHeadS = weights.removeValue(forKey: "mtp.draft_lm_head.scales")
             _draftHeadZ = weights.removeValue(forKey: "mtp.draft_lm_head.biases")
+            _draftProj = weights.removeValue(forKey: "mtp.draft_proj")
         }
         if mtp != nil, !weights.keys.contains(where: { $0.contains("mtp.") }) {
             // MTP enabled but no mtp.* keys in checkpoint → needs re-conversion.
@@ -2585,11 +2591,27 @@ extension Qwen35TextModel: MTPCapable {
               let coarseScales = _draftHeadS,
               let coarseBiases = _draftHeadZ,
               coarseWeight.dim(0) == Self.compactDraftPaddedCount,
-              coarseWeight.dim(1) == 320,
-              coarseScales.shape == [Self.compactDraftPaddedCount, 80],
-              coarseBiases.shape == [Self.compactDraftPaddedCount, 80],
+              coarseWeight.dim(1) == 64 || coarseWeight.dim(1) == 320,
+              coarseScales.shape == [Self.compactDraftPaddedCount, 80]
+                  || coarseScales.shape == [Self.compactDraftPaddedCount, 16],
+              coarseBiases.shape == [Self.compactDraftPaddedCount, 80]
+                  || coarseBiases.shape == [Self.compactDraftPaddedCount, 16],
               x.shape == [1, 1, configuration.hiddenSize]
         else { return nil }
+        // Projected coarse: when the declared tree carries a [hidden, 1024]
+        // PCA basis, the coarse scan runs in the projected space. The rows
+        // of the declared coarse head are the exact compact rows already
+        // projected onto the same basis; the shortlist ids index the SAME
+        // compact row space, so the exact rerank below is unchanged.
+        var coarseInput = x
+        if let proj = _draftProj,
+           proj.shape == [configuration.hiddenSize, 1024],
+           coarseWeight.dim(1) == 64
+        {
+            coarseInput = matmul(x, proj)
+        } else if coarseWeight.dim(1) == 64 {
+            return nil
+        }
 
         if _compactDraftHead == nil {
             _compactDraftHead = makeCompactDraftHead()
@@ -2604,7 +2626,7 @@ extension Qwen35TextModel: MTPCapable {
         else { return nil }
 
         let coarse = quantizedMM(
-            x, coarseWeight, scales: coarseScales, biases: coarseBiases,
+            coarseInput, coarseWeight, scales: coarseScales, biases: coarseBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         )[0..., 0..., 0 ..< Self.compactDraftRealCount]
         let candidateCount = Self.draftRerankCandidateCount
