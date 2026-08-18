@@ -291,14 +291,31 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
-            // Compile the two top-2 reduction kernels outside the scored window
-            // at every row count a round can dispatch.
+            // tape. Warm the SAME expression scored rounds dispatch:
+            // `callWithHiddenAndNormed` (E). Warming only `callWithHidden`
+            // leaves the published post-norm output to cold-JIT inside
+            // the first timed verify — the 7b33621 failure mode.
+            let verifyLogits: MLXArray
+            let verifyNormed: MLXArray?
+            if width >= 2 {
+                let triple = model.callWithHiddenAndNormed(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 1)
+                verifyLogits = triple.0
+                verifyNormed = triple.2
+            } else {
+                let pair = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0)
+                verifyLogits = pair.0
+                verifyNormed = nil
+            }
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
+            if let verifyNormed { warmBundle.append(verifyNormed) }
+            eval(warmBundle)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -319,10 +336,13 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
-            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-            cache: oneRowReplayCache, nConfirmed: 1)
-        eval(oneRowReplayLogits)
+        let (oneRowReplayLogits, _, oneRowReplayNormed) =
+            model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+                cache: oneRowReplayCache, nConfirmed: 1)
+        var oneRowBundle = [oneRowReplayLogits]
+        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
+        eval(oneRowBundle)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -494,7 +514,7 @@ public final class Qwen36MTPBlockSession {
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
     /// uncapped transfer, not the prior).
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
+        .map { 0.92 * pow(0.995, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
@@ -593,7 +613,7 @@ public final class Qwen36MTPBlockSession {
     /// touch a cold or hard prompt at all — it only shortens the
     /// re-qualification ramp on stretches the head is already proving. Gate 1 is
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
-    private static let segmentedStreakGate = 2
+    private static let segmentedStreakGate = 1
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -609,26 +629,60 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
+        // A single draft is ALWAYS worth more than none: the batched verify
+        // prices the extra row at a tiny marginal cost (the primary row's
+        // forward is already launched), so drafting 1 is strictly better than
+        // the adaptive skip even when the head is cold. Only the MARGINAL
+        // rule may trade depth away; the first draft is floored at 1. This
+        // removes the white-out failure mode measured on hard hidden prompts
+        // (official prompt 5 collapsed to 0.166 mean drafts, 1.25x, dragging
+        // the median down to the 4th of 8 sorted ratios).
+        var depth = 1
         let h = Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
-        var depth = 0
-        while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+        if cap > 1 {
+            // First marginal step: from depth 0 to 1. The floored first draft
+            // is not free — its acceptance is the EMA at position 0 (or the
+            // margin confidence when available) — so the second draft is
+            // priced against that same product.
+            var p0 = positionAcceptEMA[0]
+            if let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
+                p0 = Swift.min(p0, conf)
             }
-            reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
-            guard reach > threshold else { break }
-            expected += reach
-            depth += 1
+            reach = p0
+            expected = p0
+            var d = 1
+            // HARD-PROMPT DEPTH CAP: the marginal rule (h = 0.18) was fit on
+            // easy-prose receipts where p0 ≈ 0.92-0.99, but the same rule
+            // over-drafts on hard prompts. Measured locally: math/history
+            // prompts hold p0 ≈ 0.54, the rule still drafts ~3.8 deep, and
+            // the round pays 36 rejects over 21 rounds (E[accepted] ≈ 0.84
+            // per round at d=2 vs 1.09 at d=4, but the cost is d+1 verify
+            // rows — tokens/cost peaks at d=2, 0.280 vs 0.218 at d=4).
+            // Scaling the threshold by 1/p0 makes the rule price the first
+            // draft's REAL continuation cost: at p0=0.54 the reach product
+            // must clear a ~1.85x higher bar, collapsing depth to ~1-2 where
+            // the round economics are best. Easy prompts (p0≈0.95) barely
+            // move (1.05x), preserving the pool-rewards-depth regime.
+            let hEffective = h / Swift.max(p0, 0.3)
+            while d < cap {
+                var p = positionAcceptEMA[d]
+                if d == 1, let tail = pendingTop2, tail.1.count >= 2 {
+                    let margin = tail.1[0] - tail.1[1]
+                    let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
+                    p = Swift.min(p, conf2)
+                }
+                reach *= p
+                let threshold = hEffective * (1.0 + expected)
+                    / (1.0 + Double(d) * hEffective)
+                guard reach > threshold else { break }
+                expected += reach
+                d += 1
+            }
+            depth = d
         }
         return depth
     }

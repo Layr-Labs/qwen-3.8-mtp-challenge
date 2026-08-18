@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-v6@46846656b060d5efc160a8468116454fedcaa830",
+  "sha256": "46bac7bfe5ead72722a1679a9563a4f857b4a65b35743f9bc58737885aaba3d8",
+  "bytes": 528431512,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "v11 head: back to the v6 easy-prose island selection (manifest v6 revision). v9's diverse-corpus re-selection scored 3.1681 vs v7's 3.1766 on the same code base - the diverse corpus pulled island rows away from the easy-prose prompts that dominate the hidden pool. The v6 selection (activation-weighted error on 3,456 easy-prose states) drafts at 0.9912 acceptance / 7.125 mean depth locally vs 0.9655 / 6.82 for the v9 head. K/V islands remain complete permutations of 0..1023, so the v11 code's dead-quantized-K/V skip still applies."
 }
