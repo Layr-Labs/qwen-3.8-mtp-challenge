@@ -1489,7 +1489,11 @@ template <
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
-        STEEL_PRAGMA_UNROLL
+        // Upstream MLX 3541c66b (PR #3843): at head_dim 128, unroll-by-4
+        // interleaves K-tile loads with the dependent MMA chain instead of
+        // hoisting the entire TD loop. Arithmetic and accumulation order stay
+        // identical; only instruction scheduling changes.
+#pragma clang loop unroll_count(4)
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;

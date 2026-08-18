@@ -113,6 +113,15 @@ public final class Qwen36MTPBlockSession {
     private let postNorm: Bool
 
     private var cache: [any KVCache] = []
+    /// Fixed-shape cache stack and width-specialized verify graphs prepared by
+    /// `warmAllDepths`. They stay detached from the ordinary seed/serial path:
+    /// the first round that actually drafts copies the live cache roots into
+    /// these already-allocated buffers, while a depth-0 control never pays for
+    /// or observes compiled verification.
+    private var preparedCompiledVerifyCache: [any KVCache]?
+    private var compiledVerifyByWidth:
+        [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private var compiledVerifyActive = false
     /// Next round's primary token, read out of the previous round's single
     /// batched eval (the row argmax the old code re-fetched with a fresh
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
@@ -356,6 +365,212 @@ public final class Qwen36MTPBlockSession {
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
             + [seedWarmIDs, seedWarmValues, seedWarmNorm])
+        if Self.shouldPrepareCompiledVerifyThisWarm() {
+            prepareCompiledVerifyIfEnabled(
+                seedWarmCache: seedWarmCache, maxDepth: maxDepth)
+        }
+        Self.wireResidentWeightsIfEnabled()
+    }
+
+    // MARK: - compiled speculative verify
+
+    /// Whole-forward compilation is deliberately opt-in while it is being
+    /// validated. The trusted worker forwards `DARKBLOOM_*`, so local and
+    /// ranked ablations can select it without changing the harness.
+    private static let compiledVerifyEnabled: Bool = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_MTP_COMPILED_VERIFY"]
+        {
+            return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        }
+        // The fixed buffers and eight compiled tower graphs are intended for
+        // the ranked 128 GiB class. Keep smaller development machines on the
+        // already-validated eager path unless an explicit local test opts in.
+        return ProcessInfo.processInfo.physicalMemory >= (96 << 30)
+    }()
+
+    /// The runtime worker intentionally constructs and warms a throwaway
+    /// session before the live protocol session. A compiled closure captures
+    /// cache object identity, so compiling for that first session is pure waste
+    /// and the closure is immediately destroyed. Prepare only on the second
+    /// warm invocation in this process.
+    nonisolated(unsafe) private static var compiledWarmInvocationCount = 0
+    private static func shouldPrepareCompiledVerifyThisWarm() -> Bool {
+        guard compiledVerifyEnabled else { return false }
+        compiledWarmInvocationCount += 1
+        return compiledWarmInvocationCount >= 2
+    }
+
+    /// Compile one fixed-shape verify graph per legal drafting width, outside
+    /// the scored window. Qwen's 48 recurrent layers already expose their two
+    /// array roots through `ArraysCache.innerState`; the 16 attention layers
+    /// are promoted to the fixed-buffer cache required by MLX compilation.
+    ///
+    /// `nConfirmed` is intentionally zero here. The cached graph cannot replay
+    /// Swift-side checkpoint/tape bookkeeping on later invocations, so a rare
+    /// rejection uses the session's generic snapshot + repair path. Full
+    /// acceptance (the measured hot path) keeps the compiled state directly.
+    private func prepareCompiledVerifyIfEnabled(
+        seedWarmCache: [any KVCache], maxDepth: Int
+    ) {
+        guard Self.compiledVerifyEnabled,
+              MLXHardwareInfo.isCompiledDecodeSupported,
+              preparedCompiledVerifyCache == nil
+        else { return }
+
+        var fixed = seedWarmCache
+        for index in fixed.indices {
+            if let simple = fixed[index] as? KVCacheSimple {
+                fixed[index] = CompilableKVCache.promote(
+                    from: simple,
+                    maxLength: MLXFastConstants
+                        .experimentalDFlashMaxConfiguredTotalTokens)
+            } else if !(fixed[index] is MambaCache) {
+                return
+            }
+        }
+        eval(fixed.flatMap { $0.state })
+
+        let capturedModel = model
+        let capturedCache = fixed
+        for width in 2 ... (maxDepth + 1) {
+            let forward = compile(
+                inputs: capturedCache, outputs: capturedCache
+            ) { (arguments: [MLXArray]) -> [MLXArray] in
+                let (logits, hidden, normed) =
+                    capturedModel.callWithHiddenAndNormed(
+                        input: LMInput.Text(tokens: arguments[0]),
+                        cache: capturedCache,
+                        nConfirmed: 0)
+                return [
+                    logits,
+                    hidden,
+                    normed ?? capturedModel.applyFinalNorm(hidden),
+                ]
+            }
+            compiledVerifyByWidth[width] = forward
+
+            // First invocation traces, compiles and materializes this exact
+            // width. The cache may advance here; live seed state replaces all
+            // roots before the first scored speculative round.
+            let warmTokens = MLXArray(
+                Array(repeating: Int32(0), count: width))
+                .reshaped([1, width])
+            setenv("DARKBLOOM_MTP_COMPILE_TRACE_ACTIVE", "1", 1)
+            let outputs = forward([warmTokens])
+            unsetenv("DARKBLOOM_MTP_COMPILE_TRACE_ACTIVE")
+            eval(capturedCache.flatMap { $0.state } + outputs)
+        }
+        preparedCompiledVerifyCache = capturedCache
+    }
+
+    /// Move the live pre-round state into the cache objects captured by the
+    /// compiled closures. Attention buffers are reused in place and only their
+    /// valid prefix is overwritten; masked tail contents are irrelevant.
+    /// Recurrent roots have fixed shape and can be rebound directly.
+    private func activateCompiledVerifyIfPrepared() -> Bool {
+        if compiledVerifyActive { return true }
+        guard let fixed = preparedCompiledVerifyCache,
+              fixed.count == cache.count
+        else { return false }
+
+        for (source, destination) in zip(cache, fixed) {
+            if let source = source as? MambaCache,
+               let destination = destination as? MambaCache
+            {
+                let sourceState = source.state
+                let destinationState = destination.innerState()
+                guard sourceState.count == destinationState.count else {
+                    return false
+                }
+                for (target, value) in zip(destinationState, sourceState) {
+                    target._updateInternal(value)
+                }
+                destination.offset = source.offset
+            } else if let source = source as? KVCacheSimple,
+                      let destination = destination as? CompilableKVCache
+            {
+                let sourceState = source.state
+                guard sourceState.count == 2,
+                      let destinationKeys = destination.keys,
+                      let destinationValues = destination.values
+                else { return false }
+                let length = sourceState[0].dim(2)
+                guard length <= destination.maxLength else { return false }
+                destinationKeys[.ellipsis, ..<length, 0...] = sourceState[0]
+                destinationValues[.ellipsis, ..<length, 0...] = sourceState[1]
+                destination.offsetArray._updateInternal(
+                    MLXArray([Int32(length)]))
+            } else {
+                return false
+            }
+        }
+
+        eval(fixed.flatMap { $0.state })
+        cache = fixed
+        compiledVerifyActive = true
+        return true
+    }
+
+    // MARK: - zero-headroom Metal residency
+
+    /// Wire the already-materialized live model once, after the complete
+    /// input-independent warm and before the worker protocol hello. MLX keeps
+    /// a residency set attached to every command queue but its default
+    /// capacity is zero, so the driver otherwise re-establishes residency for
+    /// the live tower on each command buffer. Clearing free buffers first and
+    /// setting capacity to active bytes plus a small page-rounding allowance
+    /// leaves no usable headroom: later scratch allocations take MLX's
+    /// commit-free unwired path, while live weights remain resident.
+    ///
+    /// The ≥96 GiB guard confines this to the ranked 128 GiB class. The local
+    /// 32 GiB machine stays stock. The retained ticket is never ended because
+    /// ending it would resize the residency set back to zero.
+    private static func wireResidentWeightsIfEnabled() {
+        guard wiredTicketRetainer == nil else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["DARKBLOOM_WIRED_ZH"] != "0" else { return }
+        guard ProcessInfo.processInfo.physicalMemory >= (96 << 30) else { return }
+
+        Memory.clearCache()
+        let active = Memory.activeMemory
+        guard active > 0 else { return }
+
+        let fraction = environment["DARKBLOOM_WIRED_ZH_FRACTION"]
+            .flatMap(Double.init) ?? 1.0
+        let slackMB = environment["DARKBLOOM_WIRED_ZH_SLACK_MB"]
+            .flatMap(Int.init) ?? 64
+        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
+        target += max(0, slackMB) << 20
+        if let recommended = GPU.maxRecommendedWorkingSetBytes() {
+            target = min(target, recommended - (256 << 20))
+        }
+        guard target > 0 else { return }
+
+        let ticket = WiredMemoryTicket(
+            size: target,
+            policy: WiredSumPolicy(cap: target),
+            manager: .shared,
+            kind: .active)
+        let result = QwenWiredLimitBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            result.value = await ticket.start()
+            semaphore.signal()
+        }
+        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
+        wiredTicketRetainer = ticket
+        let applied = outcome == .success ? result.value : -1
+        let line = "mlxfast: qwen wired-zh request=\(target) applied=\(applied) "
+            + "active=\(active) slack_mb=\(max(0, slackMB)) "
+            + "fraction=\(fraction)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
+    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
+
+    private final class QwenWiredLimitBox: @unchecked Sendable {
+        var value = 0
     }
 
     // MARK: - begin
@@ -922,6 +1137,18 @@ public final class Qwen36MTPBlockSession {
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
+        // Activate the precompiled cache only for a round that truly drafts.
+        // The serial control therefore retains its ordinary dynamic cache and
+        // remains the benchmark's unchanged denominator.
+        let verifyWidth = draftCount + 1
+        var compiledVerify:
+            (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+        if compiledVerifyByWidth[verifyWidth] != nil,
+           activateCompiledVerifyIfPrepared()
+        {
+            compiledVerify = compiledVerifyByWidth[verifyWidth]
+        }
+
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
         //    vendored post-primary rollback checkpoint for the hot K=1 path. A
         //    rejected single draft can then retain the primary's target work and
@@ -947,10 +1174,26 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: verifyTokens),
-                cache: cache, nConfirmed: 1)
+        let verifyLogits: MLXArray
+        let verifyHidden: MLXArray
+        let verifyNormed: MLXArray?
+        let usedCompiledVerify: Bool
+        if let compiledVerify {
+            let outputs = compiledVerify([verifyTokens])
+            precondition(
+                outputs.count == 3,
+                "compiled MTP verify must return logits, hidden and normed")
+            verifyLogits = outputs[0]
+            verifyHidden = outputs[1]
+            verifyNormed = outputs[2]
+            usedCompiledVerify = true
+        } else {
+            (verifyLogits, verifyHidden, verifyNormed) =
+                model.callWithHiddenAndNormed(
+                    input: LMInput.Text(tokens: verifyTokens),
+                    cache: cache, nConfirmed: 1)
+            usedCompiledVerify = false
+        }
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -1027,7 +1270,7 @@ public final class Qwen36MTPBlockSession {
             // the same post-primary distribution, so reuse its already-recorded
             // top-2 evidence rather than running the target again.
             let committedOffset = base + committed.count
-            if Self.restoreAfterPrefixReject(
+            if !usedCompiledVerify && Self.restoreAfterPrefixReject(
                 model, cache,
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)

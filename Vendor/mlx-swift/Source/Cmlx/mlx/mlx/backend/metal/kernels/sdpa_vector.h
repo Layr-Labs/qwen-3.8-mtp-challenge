@@ -4,6 +4,114 @@
 
 using namespace metal;
 
+// ---------------------------------------------------------------------------
+// DARKBLOOM AOT: sdpa_vector exchange-plane width
+//
+// This header is AOT-only. It has no `mlx-generated/*.cpp` twin and is served
+// from `mlx.metallib`, which `tools/build-mlx-metallib.sh` compiles. EVERY
+// change here needs that rebuild to take effect, and a stale `mlx.metallib`
+// silently serves the previous kernel -- a measurement taken without a rebuild
+// is a false null in EITHER direction.
+//
+// WHAT THE WIDTH DOES
+//
+// `sdpa_vector`'s combine loop transposes the per-simdgroup output partials
+// through one recycled threadgroup plane, so every element pays a RAW barrier
+// after its write and a WAR barrier before the next write. Both hazards are
+// artifacts of the reuse, not of the reduction. Give the elements separate
+// planes and the hazards disappear; the one surviving rendezvous then absorbs
+// the max/sum publish that already precedes the loop. At Laguna's D = V = 128
+// (v_per_thread = 4), per threadgroup:
+//
+//   PLANES  planes  outputs   kernel threadgroup mem   barriers
+//   1       1        4096 B   4352 B                   8   (upstream, OFF)
+//   2       2        8192 B   8448 B                   3
+//   4       4       16384 B   16640 B                  1
+//
+// Two live widths because the trade buys barriers with threadgroup memory and
+// the residency cost of that memory is a hardware constant we have not
+// measured. If the kernel is thread-limited (1024 threads per threadgroup is
+// the binding constraint) PLANES=4 is free and dominates. If a core can
+// co-reside two of these threadgroups against a 32 KiB threadgroup-memory
+// pool, 2 x 16640 B = 33280 B does not fit and PLANES=4 would pay for its
+// barriers with occupancy, while 2 x 8448 B = 16896 B always does. PLANES=2 is
+// therefore safe under every hypothesis. Measure all three.
+//
+// HOW AN ARM IS SELECTED
+//
+// Both mechanisms exist because they serve different masters:
+//
+//  * SHIPPED (packaged, authoritative): the `DARKBLOOM_AOT_SDPA_PLANES` macro
+//    below picks the width behind the unsuffixed kernel name the stock MLX
+//    dispatcher asks for. Whatever this is set to at `mlxfast submit` time IS
+//    WHAT SHIPS. Default 1 = upstream = OFF.
+//
+//  * MEASUREMENT (local only, NEVER packaged): every width is also
+//    instantiated under its own kernel name (`..._planes1/2/4`) by
+//    `scaled_dot_product_attention.metal`, and a one-hunk local patch to
+//    `backend/metal/scaled_dot_product_attention.cpp` appends that suffix from
+//    the `DARKBLOOM_AOT_SDPA_PLANES` environment variable. The point of the
+//    named variants is that all three arms live in ONE metallib and ONE
+//    binary, so an A/B/C series can interleave without a rebuild between runs
+//    and without crossing a build boundary.
+//
+//    THAT PATCH MUST BE REVERTED BY HAND BEFORE `mlxfast submit`.
+//    `scaled_dot_product_attention.cpp` is outside `benchmark.json`
+//    editablePaths, and AGENTS.md is explicit that submit "rejects ... source
+//    changes outside the editable surface" -- it REJECTS them, it does not
+//    silently drop them, so leaving the hunk in place FAILS THE UPLOAD.
+//    (An earlier revision of this comment claimed it was "dropped by submit".
+//    That was wrong, and a wrong assertion sitting next to the shipping
+//    switch is how the next person gets caught.)
+//
+//    The named `_planes*` instantiations are likewise measurement scaffolding
+//    and are compiled only under `-DDARKBLOOM_AOT_SDPA_MEASURE`; see the guard
+//    in `scaled_dot_product_attention.metal`. The shipped metallib therefore
+//    contains exactly the upstream kernel set, at the width set below.
+//
+// Set the macro to the width you intend to ship before packaging. An arm
+// measured only through the environment variable ships as a no-op otherwise.
+//
+// MEASURED, session 7, 3-arm Latin square, one binary, n=12 pairs, median
+// steady decode step over steps 8..128, "+" = faster:
+//     PLANES=1 -> 2   10.4045 -> 10.3673 ms   +0.24%  t=1.21   8/12  (decays)
+//     PLANES=1 -> 4   10.4045 -> 10.3323 ms   +0.60%  t=4.64  12/12
+// 95% CI for PLANES=4 is [+0.35%, +0.86%], halves +0.67%/+0.54% (0.14 pp
+// swing). PLANES=2 is the RUNBAR shape -- +0.58% 4/4 at n=4 collapsing to
+// +0.24% 8/12 at n=12 -- and is NOT shipped. The residency worry that once
+// argued for the narrower width is empirically dead: at 16640 B the pipeline
+// still reports maxTotalThreadsPerThreadgroup 1024, and sdpa_vector is
+// already residency-1, so there was no residency left to lose.
+#ifndef DARKBLOOM_AOT_SDPA_PLANES
+#define DARKBLOOM_AOT_SDPA_PLANES 4
+#endif
+
+// Same encoding for `sdpa_vector_2pass_2`. Compile-time only, with no named
+// variants: that kernel is off the scored decode path (the host routes to
+// 2-pass only at KV length >= 1024 and the frozen timed window peaks at
+// 512 + 128 = 640), so it does not earn a slot in the measurement protocol.
+#ifndef DARKBLOOM_AOT_SDPA_2PASS_PLANES
+#define DARKBLOOM_AOT_SDPA_2PASS_PLANES 1
+#endif
+
+// Laguna decode uses eight query heads per KV head on sliding layers and six
+// on full-attention layers. The stock vector kernel launches one 1024-thread
+// group per query head, so each resident K/V row is reread for every owned
+// query head. Pair adjacent query heads inside one threadgroup: they retain
+// independent online-softmax state and the exact stock 32-simdgroup reduction
+// tree, but share each K/V load. The host grid is unchanged; its upper half
+// returns uniformly before touching memory.
+//
+// Two heads are deliberately conservative. Their four two-plane exchange
+// banks consume the same 16 KiB as the promoted one-head/four-plane kernel,
+// while query/output register state only doubles. This path is restricted to
+// the scored D=V=128, even Laguna GQA (8 or 6), one-query, unmasked,
+// sink-free vector shape. Both factors are even, so no adjacent pair crosses
+// a KV-head ownership boundary.
+#ifndef DARKBLOOM_GQA_PAIR_HEADS
+#define DARKBLOOM_GQA_PAIR_HEADS 2
+#endif
+
 constant bool has_mask [[function_constant(20)]];
 constant bool query_transposed [[function_constant(21)]];
 constant bool do_causal [[function_constant(22)]];
@@ -12,7 +120,16 @@ constant bool float_mask [[function_constant(24)]];
 constant bool has_sinks [[function_constant(25)]];
 constant int blocks [[function_constant(26)]];
 
-template <typename T, int D, int V = D>
+// `PLANES` is the requested exchange width, clamped to `v_per_thread` below.
+// `DEFAULT_ENTRY` carries no code: it only keeps the unsuffixed default entry
+// point a distinct specialization from the equal-width named variant, so both
+// can be instantiated from one template without a redefinition.
+template <
+    typename T,
+    int D,
+    int V = D,
+    int PLANES = DARKBLOOM_AOT_SDPA_PLANES,
+    bool DEFAULT_ENTRY = true>
 [[kernel]] void sdpa_vector(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -49,13 +166,185 @@ template <typename T, int D, int V = D>
 
   typedef float U;
 
+  // Clamp: more planes than elements would allocate threadgroup memory nobody
+  // writes. The clamp is also the compile-safety net for D = V = 256, where
+  // v_per_thread = 8 and eight 4 KiB planes (32768 B, plus max_scores and
+  // sum_exp_scores) would exceed the 32 KiB per-threadgroup limit - a hard
+  // metallib compile error, not a slow kernel. PLANES never exceeds 4.
+  constexpr int v_planes = PLANES < v_per_thread ? PLANES : v_per_thread;
+  constexpr int exchange_planes =
+      (D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2)
+      ? 4
+      : v_planes;
+  threadgroup U outputs[exchange_planes * BN * BD];
+  threadgroup U max_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
+  threadgroup U sum_exp_scores[DARKBLOOM_GQA_PAIR_HEADS * BN];
+
+  // DARKBLOOM_GQA_PAIR_HEADS: preserve each head's exact key order and
+  // reduction tree while sharing the K/V device reads across adjacent heads.
+  const bool use_gqa_pair =
+      D == 128 && V == 128 && DARKBLOOM_GQA_PAIR_HEADS == 2 &&
+      (gqa_factor == 8 || gqa_factor == 6) &&
+      tpg.y == 1 && (tpg.x % 2) == 0 &&
+      !has_mask && !do_causal && !has_sinks;
+  if (use_gqa_pair) {
+    const int pair_idx = tid.x;
+    const int q_head0 = 2 * pair_idx;
+    if (q_head0 >= int(tpg.x)) {
+      return;
+    }
+    const int q_head1 = q_head0 + 1;
+    const int kv_head_idx = q_head0 / gqa_factor;
+
+    const device T* pair_query0 =
+        queries + q_head0 * D + simd_lid * qk_per_thread;
+    const device T* pair_query1 =
+        queries + q_head1 * D + simd_lid * qk_per_thread;
+    const device T* pair_keys =
+        keys + kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+        simd_lid * qk_per_thread;
+    const device T* pair_values =
+        values + kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+        simd_lid * v_per_thread;
+    device T* pair_out0 =
+        out + q_head0 * V + simd_gid * v_per_thread;
+    device T* pair_out1 =
+        out + q_head1 * V + simd_gid * v_per_thread;
+
+    thread U pair_q0[qk_per_thread];
+    thread U pair_q1[qk_per_thread];
+    thread U pair_k[qk_per_thread];
+    thread U pair_o0[v_per_thread];
+    thread U pair_o1[v_per_thread];
+
+    for (int j = 0; j < qk_per_thread; ++j) {
+      pair_q0[j] = static_cast<U>(scale) * pair_query0[j];
+      pair_q1[j] = static_cast<U>(scale) * pair_query1[j];
+    }
+    for (int j = 0; j < v_per_thread; ++j) {
+      pair_o0[j] = 0;
+      pair_o1[j] = 0;
+    }
+
+    U pair_max0 = Limits<U>::finite_min;
+    U pair_max1 = Limits<U>::finite_min;
+    U pair_sum0 = 0;
+    U pair_sum1 = 0;
+
+    for (int i = simd_gid; i < N; i += BN) {
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_k[j] = pair_keys[j];
+      }
+
+      U pair_score0 = 0;
+      U pair_score1 = 0;
+      for (int j = 0; j < qk_per_thread; ++j) {
+        pair_score0 += pair_q0[j] * pair_k[j];
+        pair_score1 += pair_q1[j] * pair_k[j];
+      }
+      pair_score0 = simd_sum(pair_score0);
+      pair_score1 = simd_sum(pair_score1);
+
+      U pair_new_max0 = max(pair_max0, pair_score0);
+      U pair_new_max1 = max(pair_max1, pair_score1);
+      U pair_factor0 = fast::exp(pair_max0 - pair_new_max0);
+      U pair_factor1 = fast::exp(pair_max1 - pair_new_max1);
+      U pair_exp0 = fast::exp(pair_score0 - pair_new_max0);
+      U pair_exp1 = fast::exp(pair_score1 - pair_new_max1);
+
+      pair_max0 = pair_new_max0;
+      pair_max1 = pair_new_max1;
+      pair_sum0 = pair_sum0 * pair_factor0 + pair_exp0;
+      pair_sum1 = pair_sum1 * pair_factor1 + pair_exp1;
+
+      for (int j = 0; j < v_per_thread; ++j) {
+        const T pair_value = pair_values[j];
+        pair_o0[j] = pair_o0[j] * pair_factor0 + pair_exp0 * pair_value;
+        pair_o1[j] = pair_o1[j] * pair_factor1 + pair_exp1 * pair_value;
+      }
+
+      pair_keys += inner_k_stride;
+      pair_values += inner_v_stride;
+    }
+
+    // Each head keeps the promoted two-plane combine shape. The additive
+    // head-bank offset changes no producer/consumer pairing or simd_sum tree.
+    constexpr int pair_planes = 2;
+    constexpr int pair_plane_size = BN * BD;
+    if (simd_lid == 0) {
+      max_scores[simd_gid] = pair_max0;
+      max_scores[BN + simd_gid] = pair_max1;
+      sum_exp_scores[simd_gid] = pair_sum0;
+      sum_exp_scores[BN + simd_gid] = pair_sum1;
+    }
+    for (int i = 0; i < pair_planes; ++i) {
+      outputs[i * pair_plane_size + simd_lid * BD + simd_gid] = pair_o0[i];
+      outputs[
+          (pair_planes + i) * pair_plane_size + simd_lid * BD + simd_gid] =
+          pair_o1[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    pair_max0 = max_scores[simd_lid];
+    pair_max1 = max_scores[BN + simd_lid];
+    U pair_global_max0 = simd_max(pair_max0);
+    U pair_global_max1 = simd_max(pair_max1);
+    U pair_global_factor0 = fast::exp(pair_max0 - pair_global_max0);
+    U pair_global_factor1 = fast::exp(pair_max1 - pair_global_max1);
+    pair_sum0 =
+        simd_sum(sum_exp_scores[simd_lid] * pair_global_factor0);
+    pair_sum1 =
+        simd_sum(sum_exp_scores[BN + simd_lid] * pair_global_factor1);
+
+    for (int i = 0; i < pair_planes; ++i) {
+      U acc0 = simd_sum(
+          outputs[i * pair_plane_size + simd_gid * BD + simd_lid] *
+          pair_global_factor0);
+      U acc1 = simd_sum(
+          outputs[
+              (pair_planes + i) * pair_plane_size +
+              simd_gid * BD + simd_lid] *
+          pair_global_factor1);
+      pair_o0[i] = pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+      pair_o1[i] = pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < pair_planes; ++i) {
+      outputs[i * pair_plane_size + simd_lid * BD + simd_gid] =
+          pair_o0[pair_planes + i];
+      outputs[
+          (pair_planes + i) * pair_plane_size + simd_lid * BD + simd_gid] =
+          pair_o1[pair_planes + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < pair_planes; ++i) {
+      U acc0 = simd_sum(
+          outputs[i * pair_plane_size + simd_gid * BD + simd_lid] *
+          pair_global_factor0);
+      U acc1 = simd_sum(
+          outputs[
+              (pair_planes + i) * pair_plane_size +
+              simd_gid * BD + simd_lid] *
+          pair_global_factor1);
+      pair_o0[pair_planes + i] =
+          pair_sum0 == 0 ? acc0 : (acc0 / pair_sum0);
+      pair_o1[pair_planes + i] =
+          pair_sum1 == 0 ? acc1 : (acc1 / pair_sum1);
+    }
+
+    if (simd_lid == 0) {
+      for (int i = 0; i < v_per_thread; ++i) {
+        pair_out0[i] = static_cast<T>(pair_o0[i]);
+        pair_out1[i] = static_cast<T>(pair_o1[i]);
+      }
+    }
+    return;
+  }
+
   thread U q[qk_per_thread];
   thread U k[qk_per_thread];
   thread U o[v_per_thread];
-
-  threadgroup U outputs[BN * BD];
-  threadgroup U max_scores[BN];
-  threadgroup U sum_exp_scores[BN];
 
   // Adjust positions
   const int q_batch_head_idx = tid.x;
@@ -148,24 +437,93 @@ template <typename T, int D, int V = D>
 
   // Each thread has a partial part of the output so we need to combine them.
 
-  // First let's communicate the max and sum_exp
-  if (simd_lid == 0) {
-    max_scores[simd_gid] = max_score;
-    sum_exp_scores[simd_gid] = sum_exp_score;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  max_score = max_scores[simd_lid];
-  U new_max = simd_max(max_score);
-  U factor = fast::exp(max_score - new_max);
-  sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  // `v_planes` is a compile-time constant, so this selector is folded and only
+  // one arm survives in each specialization; the barriers inside it are never
+  // reached divergently.
+  U factor;
+  if (v_planes > 1) {
+    // Widened exchange. Elements are combined in groups of `v_planes`; within
+    // a group every element owns its own plane, so neither the RAW hazard
+    // (write then read) nor the WAR hazard (read then rewrite) recurs inside
+    // the group. The group's single rendezvous also absorbs the max/sum
+    // publish, because the plane stores depend only on registers (`o[]` is
+    // final here) and target a threadgroup array disjoint from
+    // max_scores/sum_exp_scores, so hoisting them above that barrier
+    // introduces no dependency.
+    //
+    // At D = V = 128 (v_per_thread = 4): 8 barriers -> 3 at PLANES=2 (two
+    // groups of two), -> 1 at PLANES=4 (one group of four).
+    //
+    // Exactness, per lane. Baseline: lane l of simdgroup g writes o[i] to
+    // outputs[l * BD + g] and reads outputs[g * BD + l], so the simd_sum over
+    // the 32 lanes of simdgroup g reduces, in lane order l = 0..31, the o[i]
+    // produced by lane g of simdgroup l. Widened: the same lane writes
+    // o[base+p] to outputs[p * (BN * BD) + l * BD + g] and reads
+    // outputs[p * (BN * BD) + g * BD + l]. The plane base p * (BN * BD) is the
+    // same additive constant for the writer and the reader of a given element,
+    // so the producer/consumer pairing, the lane ordering and the reduction
+    // tree are identical; only the base address differs. `factor`, the divide
+    // and the `sum_exp_score == 0` guard are untouched. No reassociation, no
+    // rounding boundary moved.
+    if (simd_lid == 0) {
+      max_scores[simd_gid] = max_score;
+      sum_exp_scores[simd_gid] = sum_exp_score;
+    }
+    for (int i = 0; i < v_planes; i++) {
+      outputs[i * (BN * BD) + simd_lid * BD + simd_gid] = o[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Now we need to aggregate all the outputs
-  for (int i = 0; i < v_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
+    max_score = max_scores[simd_lid];
+    U new_max = simd_max(max_score);
+    factor = fast::exp(max_score - new_max);
+    sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    for (int i = 0; i < v_planes; i++) {
+      U acc =
+          simd_sum(outputs[i * (BN * BD) + simd_gid * BD + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? acc : (acc / sum_exp_score);
+    }
+    // Only entered when v_per_thread exceeds v_planes (PLANES=2 at D >= 96,
+    // PLANES=4 at D = 256). Each extra group costs one WAR plus one RAW.
+    for (int base = v_planes; base < v_per_thread; base += v_planes) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < v_planes && base + i < v_per_thread; i++) {
+        outputs[i * (BN * BD) + simd_lid * BD + simd_gid] = o[base + i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < v_planes && base + i < v_per_thread; i++) {
+        U acc = simd_sum(
+            outputs[i * (BN * BD) + simd_gid * BD + simd_lid] * factor);
+        o[base + i] = sum_exp_score == 0 ? acc : (acc / sum_exp_score);
+      }
+    }
+  } else {
+    // Upstream shape, preserved verbatim so PLANES=1 is a true control.
+    // First let's communicate the max and sum_exp
+    if (simd_lid == 0) {
+      max_scores[simd_gid] = max_score;
+      sum_exp_scores[simd_gid] = sum_exp_score;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    max_score = max_scores[simd_lid];
+    U new_max = simd_max(max_score);
+    factor = fast::exp(max_score - new_max);
+    sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    // Now we need to aggregate all the outputs. The trailing barrier only
+    // protects the exchange plane's reuse by the NEXT iteration, so the last
+    // iteration's trailing barrier guards nothing and is skipped; every
+    // exchanged value, slot, and reduction is unchanged.
+    for (int i = 0; i < v_per_thread; i++) {
+      outputs[simd_lid * BD + simd_gid] = o[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      if (i + 1 < v_per_thread) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
   }
 
   // And write the output
@@ -175,7 +533,6 @@ template <typename T, int D, int V = D>
     }
   }
 }
-
 template <typename T, int D, int V = D>
 [[kernel]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -317,7 +674,7 @@ template <typename T, int D, int V = D>
   }
 }
 
-template <typename T, int D>
+template <typename T, int D, int PLANES = DARKBLOOM_AOT_SDPA_2PASS_PLANES>
 [[kernel]] void sdpa_vector_2pass_2(
     const device T* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
@@ -335,7 +692,8 @@ template <typename T, int D>
   typedef float U;
 
   thread U o[elem_per_thread] = {0};
-  threadgroup U outputs[BN * BD];
+  constexpr int o_planes = PLANES < elem_per_thread ? PLANES : elem_per_thread;
+  threadgroup U outputs[o_planes * BN * BD];
 
   // Adjust positions
   const int head_idx = tid.x;
@@ -376,13 +734,50 @@ template <typename T, int D>
     partials += BN * D;
   }
 
-  // Use shared memory to transpose and reduce the final block
-  for (int i = 0; i < elem_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
+  if (o_planes > 1) {
+    // Same widening as `sdpa_vector`: one plane per element removes the
+    // RAW/WAR pair that only existed because a single plane was recycled.
+    // 7 barriers -> 1 at D = 128. Unlike `sdpa_vector` there is no earlier
+    // threadgroup publish to merge with, so one rendezvous remains.
+    //
+    // Exactness: lane l of simdgroup g still writes o[i] to slot (l * BD + g)
+    // of plane i and reads slot (g * BD + l) of plane i, so each simd_sum
+    // reduces the same 32 values from the same producers in the same order.
+    // Only the plane base address changes.
+    for (int i = 0; i < o_planes; i++) {
+      outputs[i * (BN * BD) + simd_lid * BD + simd_gid] = o[i];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = 0; i < o_planes; i++) {
+      U acc = simd_sum(outputs[i * (BN * BD) + simd_gid * BD + simd_lid]);
+      o[i] = sum_exp_score == 0 ? acc : (acc / sum_exp_score);
+    }
+    for (int base = o_planes; base < elem_per_thread; base += o_planes) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < o_planes && base + i < elem_per_thread; i++) {
+        outputs[i * (BN * BD) + simd_lid * BD + simd_gid] = o[base + i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < o_planes && base + i < elem_per_thread; i++) {
+        U acc = simd_sum(outputs[i * (BN * BD) + simd_gid * BD + simd_lid]);
+        o[base + i] = sum_exp_score == 0 ? acc : (acc / sum_exp_score);
+      }
+    }
+  } else {
+    // Use shared memory to transpose and reduce the final block. As in
+    // sdpa_vector above, the trailing barrier only protects the exchange
+    // plane's reuse by the NEXT iteration, so the last iteration's trailing
+    // barrier guards nothing and is skipped; no value, order, or write set
+    // changes.
+    for (int i = 0; i < elem_per_thread; i++) {
+      outputs[simd_lid * BD + simd_gid] = o[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+      o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      if (i + 1 < elem_per_thread) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
   }
 
   // And write the output
