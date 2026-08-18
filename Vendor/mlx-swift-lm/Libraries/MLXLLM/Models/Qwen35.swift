@@ -2115,6 +2115,168 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. MLX's Metal ArgPartition currently routes to a complete
+// argsort, even though the draft reranker consumes only the best 32 coarse
+// rows. These two kernels retain exactly those 32 rows without materialising
+// the 98,330-wide index permutation: independent 256-row blocks first emit
+// their local top 32, then one small reducer keeps the global top 32.
+//
+// The comparison is a total order: finite values beat NaNs, larger values
+// win, and exact ties choose the lower compact ID. Block outputs need not be
+// sorted because the second stage applies the same order. Padded compact rows
+// are excluded by REAL_COUNT before either stage sees them.
+private let qwen35DraftShortlistBlocksKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_shortlist_blocks",
+    inputNames: ["logits"],
+    outputNames: ["block_values", "block_ids"],
+    source: """
+        uint block = thread_position_in_grid.x;
+        uint begin = block * BLOCK_SIZE;
+        uint end = min(begin + BLOCK_SIZE, uint(REAL_COUNT));
+
+        float best_values[TOP_K];
+        uint best_ids[TOP_K];
+        uint filled = 0;
+        uint worst = 0;
+
+        for (uint index = begin; index < end; ++index) {
+            float value = float(logits[index]);
+            if (filled < TOP_K) {
+                best_values[filled] = value;
+                best_ids[filled] = index;
+                ++filled;
+                if (filled == TOP_K) {
+                    worst = qwen_shortlist_worst(
+                        best_values, best_ids, uint(TOP_K));
+                }
+            } else if (qwen_shortlist_better(
+                    value, index, best_values[worst], best_ids[worst])) {
+                best_values[worst] = value;
+                best_ids[worst] = index;
+                worst = qwen_shortlist_worst(
+                    best_values, best_ids, uint(TOP_K));
+            }
+        }
+
+        uint out = block * TOP_K;
+        for (uint rank = 0; rank < TOP_K; ++rank) {
+            if (rank < filled) {
+                block_values[out + rank] = best_values[rank];
+                block_ids[out + rank] = best_ids[rank];
+            } else {
+                block_values[out + rank] = 0.0f;
+                block_ids[out + rank] = 0xFFFFFFFFu;
+            }
+        }
+    """,
+    header: """
+        inline bool qwen_shortlist_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+
+        inline uint qwen_shortlist_worst(
+            thread float* values,
+            thread uint* ids,
+            uint count
+        ) {
+            uint worst = 0;
+            for (uint index = 1; index < count; ++index) {
+                if (qwen_shortlist_better(
+                        values[worst], ids[worst],
+                        values[index], ids[index])) {
+                    worst = index;
+                }
+            }
+            return worst;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+private let qwen35DraftShortlistReduceKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_shortlist_reduce",
+    inputNames: ["block_values", "block_ids"],
+    outputNames: ["candidate_ids"],
+    source: """
+        float best_values[TOP_K];
+        uint best_ids[TOP_K];
+        uint filled = 0;
+        uint worst = 0;
+
+        for (uint index = 0; index < CANDIDATE_COUNT; ++index) {
+            uint candidate_id = uint(block_ids[index]);
+            if (candidate_id == 0xFFFFFFFFu) { continue; }
+            float value = float(block_values[index]);
+            if (filled < TOP_K) {
+                best_values[filled] = value;
+                best_ids[filled] = candidate_id;
+                ++filled;
+                if (filled == TOP_K) {
+                    worst = qwen_shortlist_reduce_worst(
+                        best_values, best_ids, uint(TOP_K));
+                }
+            } else if (qwen_shortlist_reduce_better(
+                    value, candidate_id,
+                    best_values[worst], best_ids[worst])) {
+                best_values[worst] = value;
+                best_ids[worst] = candidate_id;
+                worst = qwen_shortlist_reduce_worst(
+                    best_values, best_ids, uint(TOP_K));
+            }
+        }
+
+        for (uint rank = 0; rank < TOP_K; ++rank) {
+            candidate_ids[rank] = best_ids[rank];
+        }
+    """,
+    header: """
+        inline bool qwen_shortlist_reduce_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+
+        inline uint qwen_shortlist_reduce_worst(
+            thread float* values,
+            thread uint* ids,
+            uint count
+        ) {
+            uint worst = 0;
+            for (uint index = 1; index < count; ++index) {
+                if (qwen_shortlist_reduce_better(
+                        values[worst], ids[worst],
+                        values[index], ids[index])) {
+                    worst = index;
+                }
+            }
+            return worst;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 // PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
 // incumbent affine-4 compact readout evaluates those rows, and this single
 // SIMDgroup applies the incumbent value/id total order to select the proposal.
@@ -2608,10 +2770,35 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         )[0..., 0..., 0 ..< Self.compactDraftRealCount]
         let candidateCount = Self.draftRerankCandidateCount
-        let kth = Self.compactDraftRealCount - candidateCount
-        let candidateIDs = MLX.argPartition(
-            coarse, kth: kth, axis: -1
-        )[.ellipsis, (kth)...].reshaped([candidateCount])
+        let blockSize = 256
+        let blockCount =
+            (Self.compactDraftRealCount + blockSize - 1) / blockSize
+        let blockCandidateCount = blockCount * candidateCount
+        let blockCandidates = qwen35DraftShortlistBlocksKernel(
+            [coarse.reshaped([Self.compactDraftRealCount])],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("BLOCK_SIZE", blockSize),
+                ("TOP_K", candidateCount),
+            ],
+            grid: (blockCount, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [
+                [blockCandidateCount], [blockCandidateCount],
+            ],
+            outputDTypes: [.float32, .uint32]
+        )
+        let candidateIDs = qwen35DraftShortlistReduceKernel(
+            blockCandidates,
+            template: [
+                ("CANDIDATE_COUNT", blockCandidateCount),
+                ("TOP_K", candidateCount),
+            ],
+            grid: (1, 1, 1),
+            threadGroup: (1, 1, 1),
+            outputShapes: [[candidateCount]],
+            outputDTypes: [.uint32]
+        )[0]
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
