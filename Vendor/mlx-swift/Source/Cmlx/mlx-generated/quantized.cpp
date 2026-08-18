@@ -869,7 +869,50 @@ inline float2 qdot_affine4_loaded_pair(
   return scale * accum + sum * bias;
 }
 
-template <typename T, int M>
+// DIRECT_NIBBLES twins of the loaded qdot helpers: raw activations against
+// shifted 0x000f nibbles. Term order and the affine-sum tree are unchanged,
+// so every fp32 product and addition matches the load_vector/wide-mask
+// expression bit for bit (a bf16 mantissa times a 4-bit nibble is exact in
+// fp32, and the prescale the wide masks rely on is a power of two). Same
+// transform the promoted wide-QMV DIRECT_NIBBLES specialization applies,
+// carried to the pair-kernel sites.
+template <typename U>
+inline U qdot_affine4_direct(
+    const thread uint16_t* ws,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  for (int i = 0; i < 4; i++) {
+    accum +=
+        (x_thread[4 * i] * (ws[i] & 0x000f) +
+         x_thread[4 * i + 1] * ((ws[i] >> 4) & 0x000f) +
+         x_thread[4 * i + 2] * ((ws[i] >> 8) & 0x000f) +
+         x_thread[4 * i + 3] * ((ws[i] >> 12) & 0x000f));
+  }
+  return scale * accum + sum * bias;
+}
+
+inline float2 qdot_affine4_direct_pair(
+    const thread uint16_t* ws,
+    const thread float* x0,
+    const thread float* x1,
+    float scale,
+    float bias,
+    float2 sum) {
+  float2 accum = 0;
+  for (int i = 0; i < 4; i++) {
+    accum +=
+        (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
+         float2(x0[4 * i + 1], x1[4 * i + 1]) * ((ws[i] >> 4) & 0x000f) +
+         float2(x0[4 * i + 2], x1[4 * i + 2]) * ((ws[i] >> 8) & 0x000f) +
+         float2(x0[4 * i + 3], x1[4 * i + 3]) * ((ws[i] >> 12) & 0x000f));
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename T, int M, bool DIRECT_NIBBLES = false>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     const device uint32_t* w,
     const device T* scales,
@@ -929,22 +972,57 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     thread float x0[values_per_thread];
     const device T* xm0 =
         x + first_m * in_vec_size + k + simd_lid * values_per_thread;
-    const float sum0 =
-        load_vector<T, float, values_per_thread, 4>(xm0, x0);
+    float sum0;
+    if (DIRECT_NIBBLES) {
+      // Raw activations; the affine-sum keeps load_vector's exact 4-group
+      // accumulation tree (bits == 4 branch), term for term.
+      sum0 = 0.0f;
+      for (int i = 0; i < values_per_thread; i += 4) {
+        sum0 += xm0[i] + xm0[i + 1] + xm0[i + 2] + xm0[i + 3];
+        x0[i] = xm0[i];
+        x0[i + 1] = xm0[i + 1];
+        x0[i + 2] = xm0[i + 2];
+        x0[i + 3] = xm0[i + 3];
+      }
+    } else {
+      sum0 = load_vector<T, float, values_per_thread, 4>(xm0, x0);
+    }
     if (has_pair) {
       thread float x1[values_per_thread];
       const device T* xm1 = xm0 + in_vec_size;
-      const float sum1 =
-          load_vector<T, float, values_per_thread, 4>(xm1, x1);
+      float sum1;
+      if (DIRECT_NIBBLES) {
+        sum1 = 0.0f;
+        for (int i = 0; i < values_per_thread; i += 4) {
+          sum1 += xm1[i] + xm1[i + 1] + xm1[i + 2] + xm1[i + 3];
+          x1[i] = xm1[i];
+          x1[i + 1] = xm1[i + 1];
+          x1[i + 2] = xm1[i + 2];
+          x1[i + 3] = xm1[i + 3];
+        }
+      } else {
+        sum1 = load_vector<T, float, values_per_thread, 4>(xm1, x1);
+      }
       for (int r = 0; r < rows_per_simd; r++) {
-        pair_result[r] += qdot_affine4_loaded_pair(
-            packed[r], x0, x1, scale_local[r], bias_local[r],
-            float2(sum0, sum1));
+        if (DIRECT_NIBBLES) {
+          pair_result[r] += qdot_affine4_direct_pair(
+              packed[r], x0, x1, scale_local[r], bias_local[r],
+              float2(sum0, sum1));
+        } else {
+          pair_result[r] += qdot_affine4_loaded_pair(
+              packed[r], x0, x1, scale_local[r], bias_local[r],
+              float2(sum0, sum1));
+        }
       }
     } else {
       for (int r = 0; r < rows_per_simd; r++) {
-        single_result[r] += qdot_affine4_loaded<float>(
-            packed[r], x0, scale_local[r], bias_local[r], sum0);
+        if (DIRECT_NIBBLES) {
+          single_result[r] += qdot_affine4_direct<float>(
+              packed[r], x0, scale_local[r], bias_local[r], sum0);
+        } else {
+          single_result[r] += qdot_affine4_loaded<float>(
+              packed[r], x0, scale_local[r], bias_local[r], sum0);
+        }
       }
     }
   }
@@ -1839,7 +1917,7 @@ template <typename T, int group_size, int bits, bool batched>
       // promoted pair kernel is kept there byte-for-byte.
       switch (ntg.x) {
         case 2:
-          qmv_fast_crossrow_affine4_g64<T, 2>(
+          qmv_fast_crossrow_affine4_g64<T, 2, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1887,42 +1965,42 @@ template <typename T, int group_size, int bits, bool batched>
     } else {
       switch (ntg.x) {
         case 2:
-          qmv_fast_crossrow_affine4_g64<T, 2>(
+          qmv_fast_crossrow_affine4_g64<T, 2, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 3:
-          qmv_fast_crossrow_affine4_g64<T, 3>(
+          qmv_fast_crossrow_affine4_g64<T, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 4:
-          qmv_fast_crossrow_affine4_g64<T, 4>(
+          qmv_fast_crossrow_affine4_g64<T, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64<T, 5>(
+          qmv_fast_crossrow_affine4_g64<T, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64<T, 6>(
+          qmv_fast_crossrow_affine4_g64<T, 6, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 7:
-          qmv_fast_crossrow_affine4_g64<T, 7>(
+          qmv_fast_crossrow_affine4_g64<T, 7, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          qmv_fast_crossrow_affine4_g64<T, 8>(
+          qmv_fast_crossrow_affine4_g64<T, 8, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 9:
-          qmv_fast_crossrow_affine4_g64<T, 9>(
+          qmv_fast_crossrow_affine4_g64<T, 9, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
