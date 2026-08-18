@@ -2163,6 +2163,46 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. The declared affine-2 head produces 32 compact row IDs
+// which the exact affine-4 rerank consumes.  Gather the packed weight, scale,
+// and zero-point rows in one dispatch instead of fanning the same IDs out to
+// three independent `take` kernels.  The output buffers and the subsequent
+// quantizedMM are unchanged, so this removes only two launches and two
+// candidate-ID dependency edges; it does not change rerank arithmetic.
+private let qwen35DraftExactRowGatherKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_exact_row_gather",
+    inputNames: ["weight", "scales", "biases", "candidate_ids"],
+    outputNames: ["weight_out", "scales_out", "biases_out"],
+    source: """
+        const uint index = thread_position_in_grid.x;
+
+        if (index < CANDIDATE_COUNT * WEIGHT_COLUMNS) {
+            const uint output_row = index / WEIGHT_COLUMNS;
+            const uint column = index - output_row * WEIGHT_COLUMNS;
+            const uint source_row = uint(candidate_ids[output_row]);
+            const ulong source_offset =
+                ulong(source_row) * ulong(weight_strides[0])
+                + ulong(column) * ulong(weight_strides[1]);
+            weight_out[index] = weight[source_offset];
+        }
+
+        if (index < CANDIDATE_COUNT * PARAM_COLUMNS) {
+            const uint output_row = index / PARAM_COLUMNS;
+            const uint column = index - output_row * PARAM_COLUMNS;
+            const uint source_row = uint(candidate_ids[output_row]);
+            const ulong scales_offset =
+                ulong(source_row) * ulong(scales_strides[0])
+                + ulong(column) * ulong(scales_strides[1]);
+            const ulong biases_offset =
+                ulong(source_row) * ulong(biases_strides[0])
+                + ulong(column) * ulong(biases_strides[1]);
+            scales_out[index] = scales[scales_offset];
+            biases_out[index] = biases[biases_offset];
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2613,9 +2653,25 @@ extension Qwen35TextModel: MTPCapable {
             coarse, kth: kth, axis: -1
         )[.ellipsis, (kth)...].reshaped([candidateCount])
 
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
+        let gatheredExactRows = qwen35DraftExactRowGatherKernel(
+            [exact.weight, exact.scales, exactBiases, candidateIDs],
+            template: [
+                ("CANDIDATE_COUNT", candidateCount),
+                ("WEIGHT_COLUMNS", exact.weight.dim(1)),
+                ("PARAM_COLUMNS", exact.scales.dim(1)),
+            ],
+            grid: (candidateCount * exact.weight.dim(1), 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [
+                [candidateCount, exact.weight.dim(1)],
+                [candidateCount, exact.scales.dim(1)],
+                [candidateCount, exactBiases.dim(1)],
+            ],
+            outputDTypes: [exact.weight.dtype, exact.scales.dtype, exactBiases.dtype]
+        )
+        let exactWeight = gatheredExactRows[0]
+        let exactScales = gatheredExactRows[1]
+        let exactZeroPoints = gatheredExactRows[2]
         let exactLogits = quantizedMM(
             x, exactWeight, scales: exactScales, biases: exactZeroPoints,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
