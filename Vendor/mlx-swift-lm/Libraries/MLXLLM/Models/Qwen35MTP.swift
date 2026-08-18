@@ -17,6 +17,23 @@ import MLXNN
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
+// MARK: - Fused residual + RMS norm (head-side transplant)
+
+/// True when the array's storage is dense row-major from its data pointer,
+/// ignoring size-1 dims — the layout `qwen35FusedResidualRMSNorm`'s kernel
+/// assumes for its linear `row * axis_size` indexing. Sliced views can break
+/// this (e.g. a multi-row `fused[a..., i..., 0...]` batch slice), so callers
+/// pair it with an eager fallback.
+private func qwen35MTPIsDenseRowMajor(_ a: MLXArray) -> Bool {
+    var expected = 1
+    for d in stride(from: a.ndim - 1, through: 0, by: -1) {
+        if a.dim(d) == 1 { continue }
+        if a.strides[d] != expected { return false }
+        expected *= a.dim(d)
+    }
+    return true
+}
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -56,8 +73,28 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Head-side transplant of the body's post-attention junction
+        // (Qwen35.swift ~2052): h = bf16(x + r) and postAttentionLayerNorm(h)
+        // in ONE fused launch instead of an eager add + separate RMSNorm.
+        // Same round-before-square arithmetic, so bit-exact with the eager
+        // pair by the argument proven on the body. The head is proposal-only
+        // (never on the serial leg), so each removed launch is pure
+        // differential score. Guard mirrors the body's — plus a row-density
+        // check because the flush path can feed a sliced view as `x`.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120,
+            qwen35MTPIsDenseRowMajor(x)
+        {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
 
     /// Populate this layer's K/V history without computing a dead layer
