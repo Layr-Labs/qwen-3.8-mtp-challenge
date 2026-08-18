@@ -2613,11 +2613,9 @@ extension Qwen35TextModel: MTPCapable {
             coarse, kth: kth, axis: -1
         )[.ellipsis, (kth)...].reshaped([candidateCount])
 
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
-        let exactLogits = quantizedMM(
-            x, exactWeight, scales: exactScales, biases: exactZeroPoints,
+        let exactLogits = MLX.gatherQuantizedMM(
+            x, exact.weight, scales: exact.scales, biases: exactBiases,
+            rhsIndices: candidateIDs,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
 
         return qwen35DraftRerankKernel(
