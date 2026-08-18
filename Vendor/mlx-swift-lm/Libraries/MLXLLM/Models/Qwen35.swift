@@ -2115,18 +2115,20 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
-// incumbent affine-4 compact readout evaluates those rows, and this single
-// SIMDgroup applies the incumbent value/id total order to select the proposal.
+// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 64 rows; the
+// incumbent affine-4 compact readout evaluates those rows, and these two
+// SIMDgroups apply the incumbent value/id total order to select the proposal.
 // The target lm_head, verify values, cache state, and row ledger are untouched.
 private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_rerank",
     inputNames: ["logits", "candidate_ids"],
     outputNames: ["token_id"],
     source: """
+        uint thread_id = thread_position_in_threadgroup.x;
         uint lane = thread_index_in_simdgroup;
-        float best_value = float(logits[lane]);
-        uint best_id = uint(candidate_ids[lane]);
+        uint simd_group = simdgroup_index_in_threadgroup;
+        float best_value = float(logits[thread_id]);
+        uint best_id = uint(candidate_ids[thread_id]);
 
         for (uint offset = 16; offset > 0; offset >>= 1) {
             float other_value = simd_shuffle_down(best_value, offset);
@@ -2138,11 +2140,33 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
             }
         }
 
+        threadgroup float scratch_value[CANDIDATE_COUNT / 32];
+        threadgroup uint scratch_id[CANDIDATE_COUNT / 32];
         if (lane == 0) {
-            token_id[0] = int(
-                best_id < PREFIX_COUNT
-                    ? best_id
-                    : best_id + CONTROL_OFFSET);
+            scratch_value[simd_group] = best_value;
+            scratch_id[simd_group] = best_id;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            uint simd_group_count = CANDIDATE_COUNT / 32;
+            best_value = lane < simd_group_count ? scratch_value[lane] : NAN;
+            best_id = lane < simd_group_count ? scratch_id[lane] : 0xFFFFFFFFu;
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (lane < offset && qwen_draft_rerank_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
         }
     """,
     header: """
@@ -2152,6 +2176,8 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
             float current_value,
             uint current_id
         ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
             bool candidate_nan = isnan(candidate_value);
             bool current_nan = isnan(current_value);
             if (candidate_nan != current_nan) { return !candidate_nan; }
@@ -2200,7 +2226,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 64
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2623,6 +2649,7 @@ extension Qwen35TextModel: MTPCapable {
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
             template: [
+                ("CANDIDATE_COUNT", candidateCount),
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
