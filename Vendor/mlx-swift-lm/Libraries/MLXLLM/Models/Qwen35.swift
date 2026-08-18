@@ -2163,6 +2163,116 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// PROPOSAL SIDE ONLY. Specialized top-K over the coarse affine-2 compact
+// logits. MLX `argPartition` materializes a generic 98k-wide partition;
+// this kernel keeps a per-thread local top-K and a one-thread merge, which
+// is the same total order as the incumbent rerank selector (greater value
+// wins, lower id wins a tie, NaN never beats a finite value). A miss can
+// change only the proposal, never an emitted token.
+private let qwen35DraftTopKKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_topk",
+    inputNames: ["logits"],
+    outputNames: ["candidate_ids"],
+    source: """
+        uint lane = thread_index_in_simdgroup;
+        const uint slice = (REAL_COUNT + 31u) / 32u;
+        const uint start = lane * slice;
+        const uint end = min(start + slice, uint(REAL_COUNT));
+
+        float local_v[K];
+        uint  local_i[K];
+        for (uint k = 0; k < K; ++k) {
+            local_v[k] = NAN;
+            local_i[k] = 0xFFFFFFFFu;
+        }
+        uint filled = 0;
+        for (uint index = start; index < end; ++index) {
+            float value = float(logits[index]);
+            if (filled < K) {
+                uint pos = filled;
+                while (pos > 0 && qwen_draft_topk_better(
+                        value, index, local_v[pos - 1], local_i[pos - 1])) {
+                    local_v[pos] = local_v[pos - 1];
+                    local_i[pos] = local_i[pos - 1];
+                    --pos;
+                }
+                local_v[pos] = value;
+                local_i[pos] = index;
+                ++filled;
+                continue;
+            }
+            if (!qwen_draft_topk_better(
+                    value, index, local_v[K - 1], local_i[K - 1])) {
+                continue;
+            }
+            uint pos = K - 1;
+            while (pos > 0 && qwen_draft_topk_better(
+                    value, index, local_v[pos - 1], local_i[pos - 1])) {
+                local_v[pos] = local_v[pos - 1];
+                local_i[pos] = local_i[pos - 1];
+                --pos;
+            }
+            local_v[pos] = value;
+            local_i[pos] = index;
+        }
+
+        threadgroup float tg_v[32 * K];
+        threadgroup uint  tg_i[32 * K];
+        for (uint k = 0; k < K; ++k) {
+            tg_v[lane * K + k] = local_v[k];
+            tg_i[lane * K + k] = local_i[k];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane == 0) {
+            float best_v[K];
+            uint  best_i[K];
+            for (uint k = 0; k < K; ++k) {
+                best_v[k] = tg_v[k];
+                best_i[k] = tg_i[k];
+            }
+            for (uint src = K; src < 32u * K; ++src) {
+                float value = tg_v[src];
+                uint index = tg_i[src];
+                if (!qwen_draft_topk_better(
+                        value, index, best_v[K - 1], best_i[K - 1])) {
+                    continue;
+                }
+                uint pos = K - 1;
+                while (pos > 0 && qwen_draft_topk_better(
+                        value, index, best_v[pos - 1], best_i[pos - 1])) {
+                    best_v[pos] = best_v[pos - 1];
+                    best_i[pos] = best_i[pos - 1];
+                    --pos;
+                }
+                best_v[pos] = value;
+                best_i[pos] = index;
+            }
+            for (uint k = 0; k < K; ++k) {
+                candidate_ids[k] = int(best_i[k]);
+            }
+        }
+    """,
+    header: """
+        inline bool qwen_draft_topk_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -2608,10 +2718,17 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         )[0..., 0..., 0 ..< Self.compactDraftRealCount]
         let candidateCount = Self.draftRerankCandidateCount
-        let kth = Self.compactDraftRealCount - candidateCount
-        let candidateIDs = MLX.argPartition(
-            coarse, kth: kth, axis: -1
-        )[.ellipsis, (kth)...].reshaped([candidateCount])
+        let candidateIDs = qwen35DraftTopKKernel(
+            [coarse.reshaped([Self.compactDraftRealCount])],
+            template: [
+                ("REAL_COUNT", Self.compactDraftRealCount),
+                ("K", candidateCount),
+            ],
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[candidateCount]],
+            outputDTypes: [.int32]
+        )[0]
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
