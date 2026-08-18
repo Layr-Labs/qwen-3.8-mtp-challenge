@@ -155,6 +155,31 @@ public final class Qwen36MTPBlockSession {
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
+    /// E047: rolling window of the most recent committed token ids (seed
+    /// tail at begin), feeding the draft-vocabulary width hint. Host-side
+    /// integers the session already owns; per-request state only.
+    private static let draftScriptWindowSize = 16
+    private var draftScriptWindow: [Int] = []
+
+    private func publishDraftVocabularyHint() {
+        guard let hintable = model as? Qwen36DraftVocabularyHintReceiver
+        else { return }
+        hintable.draftVocabularyWideHint = draftScriptWindow.contains {
+            $0 >= 98_304 && $0 < 248_044
+        }
+    }
+
+    private func noteCommittedForScriptHint(_ tokens: [Int]) {
+        guard !tokens.isEmpty else { return }
+        draftScriptWindow.append(contentsOf: tokens)
+        if draftScriptWindow.count > Self.draftScriptWindowSize {
+            draftScriptWindow.removeFirst(
+                draftScriptWindow.count - Self.draftScriptWindowSize)
+        }
+        publishDraftVocabularyHint()
+    }
+
+
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
     public private(set) var roundCount = 0
@@ -202,95 +227,12 @@ public final class Qwen36MTPBlockSession {
 
     // MARK: - warm
 
-    /// Keep the ranked M5-Max model allocations in Metal's residency set
-    /// after the input-independent warm. MLX attaches a residency set to every
-    /// command queue, but its capacity is zero until a wired limit is applied;
-    /// without this one-time resize the driver must re-establish residency for
-    /// the whole tower on later command buffers.
-    ///
-    /// Capacity is deliberately the live post-warm footprint plus only a small
-    /// page-rounding allowance. After cached warm temporaries are cleared,
-    /// persistent weights fit in the one resize while later scratch fails the
-    /// fit test and stays on the commit-free unwired path. The ticket is never
-    /// ended because shrinking the limit would evict the resident weights.
-    private static let wiredZHDefaultFraction = 1.0
-    private static let wiredZHDefaultSlackMB = 64
-    private static let wiredTicketLock = NSLock()
-    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
-
-    private final class QwenMTPWiredLimitBox: @unchecked Sendable {
-        var value: Int = 0
-    }
-
-    private static func wireResidentWeightsIfEnabled() {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["DARKBLOOM_QWEN_MTP_WIRED_ZH"] != "0" else { return }
-        guard ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
-        else { return }
-
-        wiredTicketLock.lock()
-        defer { wiredTicketLock.unlock() }
-        guard wiredTicketRetainer == nil else { return }
-
-        // Shape-warm locals have left scope before this method is called.
-        // Remove their cached storage so the active count describes the live
-        // backbone, head, and persistent runtime tensors rather than scratch.
-        Memory.clearCache()
-        let active = Memory.activeMemory
-        guard active > 0 else { return }
-
-        let fraction = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_FRACTION"]
-            .flatMap(Double.init) ?? wiredZHDefaultFraction
-        let slackMB = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_SLACK_MB"]
-            .flatMap(Int.init) ?? wiredZHDefaultSlackMB
-        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
-        target += max(0, slackMB) << 20
-
-        // The MLX backend rejects a wired limit above the recommended working
-        // set. Keep a 256 MiB margin for system bookkeeping and fail closed on
-        // nonsensical geometry.
-        if let recommended = GPU.maxRecommendedWorkingSetBytes() {
-            target = min(target, max(0, recommended - (256 << 20)))
-        }
-        guard target > 0 else { return }
-
-        let ticket = WiredMemoryTicket(
-            size: target,
-            policy: MLXLMCommon.WiredSumPolicy(cap: target),
-            manager: .shared,
-            kind: .active
-        )
-        let appliedBox = QwenMTPWiredLimitBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached(priority: .userInitiated) {
-            appliedBox.value = await ticket.start()
-            semaphore.signal()
-        }
-        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
-        wiredTicketRetainer = ticket
-
-        let applied = outcome == .success ? appliedBox.value : -1
-        let recommended = GPU.maxRecommendedWorkingSetBytes() ?? -1
-        var line = "mlxfast: qwen-mtp wired-zh request=\(target)"
-        line += " applied=\(applied) active=\(active)"
-        line += " slack_mb=\(max(0, slackMB)) fraction=\(fraction)"
-        line += " maxrec=\(recommended)\n"
-        FileHandle.standardError.write(Data(line.utf8))
-    }
-
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
     /// Warms the two forward shapes a round dispatches — the batched verify at
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
-        // Keep the large shape-warm object graph in a separate call frame so
-        // every throwaway cache and tensor is released before residency sizing.
-        try warmAllDepthShapes(maxDepth: maxDepth)
-        Self.wireResidentWeightsIfEnabled()
-    }
-
-    private func warmAllDepthShapes(maxDepth: Int) throws {
         // Warms every legal verify width from 1 (the serial control's
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
@@ -472,6 +414,15 @@ public final class Qwen36MTPBlockSession {
         // eval below materialises it so no seed graph is kept alive.
         seedHiddenForPriming = hidden
         seedTokensForPriming = seedTokens
+
+        // E047: dynamic script hint for the extended draft vocabulary. The
+        // window tracks the most recent committed ids (initialized from the
+        // seed's tail), so an ASCII prompt whose CONTINUATION leaves the
+        // core band gains the wide scan mid-request, and a mostly-ASCII
+        // request with one incidental out-of-core token releases it a few
+        // rounds later instead of paying the wide tax for the whole window.
+        draftScriptWindow = Array(seedTokens.suffix(Self.draftScriptWindowSize))
+        publishDraftVocabularyHint()
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
@@ -838,6 +789,7 @@ public final class Qwen36MTPBlockSession {
             pendingPrimary = nil
             pendingTop2 = nil
             pendingHidden = nil
+            noteCommittedForScriptHint(committed)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -904,6 +856,7 @@ public final class Qwen36MTPBlockSession {
             Self.traceRow(
                 pos: seedTokenCount + committedTokenCount,
                 ids: tailTokens, values: tailLogits)
+            noteCommittedForScriptHint(committed)
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -1227,6 +1180,7 @@ public final class Qwen36MTPBlockSession {
             reachedStopToken = true
         }
 
+        noteCommittedForScriptHint(committed)
         return Qwen36MTPRoundResult(
             tokens: committed,
             declaredRows: draftCount + 1,
