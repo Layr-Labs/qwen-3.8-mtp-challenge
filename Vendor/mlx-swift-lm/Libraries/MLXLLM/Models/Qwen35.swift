@@ -429,6 +429,114 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         ensureRowContiguous: false)
 }()
 
+// MARK: - fused GDN out-chain (verify widths S >= 2)
+//
+// ONE Metal launch replacing the per-GDN-layer pair
+//   rmsOut    = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+//   normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+// at every S >= 2 tail (48 layers × every verify/serial-shaped-S>=2 forward).
+//
+// Exactness: the RMS half is the vendored `rms_single_row` path for
+// axis_size=128 / N_READS=4 / one simdgroup — 32 lanes × 4 sequential
+// loads, `simd_sum` of the per-lane sum-of-squares, then
+// `precise::rsqrt(sumsq / 128 + 1e-6)`. With a single simdgroup the
+// extra threadgroup fold in `rms_single_row` is the identity (one
+// nonzero `local_sums` slot), so skipping it does not change `inv`.
+// The store rounding matches the vendored write:
+//   t = InT(float(x) * inv);  y = w * t
+// The gate half reproduces `Qwen3NextRMSNormGated` / the compiled
+// post-norm body: SiLU in fp32 (`g * sigmoid(g)` via MLX's
+// sign-selected `1/(1+exp(|g|))` form), then `bf16(act * float(y))`.
+// Geometry that does not match (dtype, Hv, Dv, eps, layout) falls
+// back to the two-launch chain, same values either way.
+//
+// `z` may be a strided view of the fused in-proj carrier
+// (ensureRowContiguous: false — a forced copy would erase the
+// launch saving). `x`/`y` stay contiguous [B,S,Hv,Dv].
+// Eight (row, head) pairs per 256-thread group: S*Hv is always a
+// multiple of 8 at Hv=48. Rows are flattened B*S so B>1 is covered.
+
+private let qwen35GDNOutChainKernel: MLXFast.MLXFastKernel = {
+    let header = """
+        typedef bfloat16_t InT;
+        """
+    let source = """
+        const uint lane = thread_index_in_simdgroup;
+        const uint sg = simdgroup_index_in_threadgroup;
+        // Each simdgroup owns one flattened (B*S, head) pair.
+        const uint idx = threadgroup_position_in_grid.y * ROWS_PER_GROUP + sg;
+        const uint row = idx / Hv;
+        const uint head = idx % Hv;
+
+        const ulong base = (ulong(row) * ulong(Hv) + ulong(head)) * ulong(Dv)
+            + ulong(lane * 4);
+        const ulong z_base = ulong(row) * ulong(z_strides[1])
+            + ulong(head) * ulong(z_strides[2])
+            + ulong(lane * 4) * ulong(z_strides[3]);
+
+        InT xv[4];
+        float sumsq = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+          xv[i] = x[base + ulong(i)];
+          const float f = static_cast<float>(xv[i]);
+          sumsq += f * f;
+        }
+        sumsq = simd_sum(sumsq);
+        const float inv = metal::precise::rsqrt(sumsq / Dv + 1e-6f);
+
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4; ++i) {
+          const InT t = static_cast<InT>(static_cast<float>(xv[i]) * inv);
+          const InT y = w[(lane * 4) + i] * t;
+          const float g = static_cast<float>(
+              z[z_base + ulong(i) * ulong(z_strides[3])]);
+          const float sy = 1.0f / (1.0f + metal::exp(metal::abs(g)));
+          const float s = (g < 0) ? sy : 1.0f - sy;
+          const float act = g * s;
+          y_out[base + ulong(i)] = static_cast<InT>(
+              act * static_cast<float>(y));
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gdn_outchain",
+        inputNames: ["x", "z", "w"],
+        outputNames: ["y_out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: false)
+}()
+
+/// Apply the fused out-chain when the geometry matches the baked
+/// constants; the stock two-launch chain otherwise.
+private func qwen35GatedDeltaOutChain(
+    out: MLXArray, z: MLXArray, weight: MLXArray, eps: Float
+) -> MLXArray {
+    let B = out.dim(0)
+    let S = out.dim(1)
+    let Hv = out.dim(2)
+    let Dv = out.dim(3)
+    let rows = B * S
+    guard out.dtype == .bfloat16, z.dtype == .bfloat16,
+          weight.dtype == .bfloat16,
+          Dv == 128, Hv == 48, eps == 1e-6,
+          rows > 0, (rows * Hv) % 8 == 0,
+          out.strides == [S * Hv * Dv, Hv * Dv, Dv, 1]
+    else {
+        let rmsOut = MLXFast.rmsNorm(out, weight: weight, eps: eps)
+        return qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+    }
+    let kernel = qwen35GDNOutChainKernel(
+        [out, z, weight],
+        template: [("Hv", Hv), ("Dv", Dv), ("ROWS_PER_GROUP", 8)],
+        grid: (256, (rows * Hv) / 8, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[B, S, Hv, Dv]],
+        outputDTypes: [.bfloat16]
+    )
+    return kernel[0]
+}
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -1174,8 +1282,8 @@ final class Qwen35GatedDeltaNet: Module {
 
         let normedOut: MLXArray
         if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            normedOut = qwen35GatedDeltaOutChain(
+                out: out, z: z, weight: norm.weight, eps: norm.eps)
         } else {
             normedOut = norm(out, gate: z)
         }
