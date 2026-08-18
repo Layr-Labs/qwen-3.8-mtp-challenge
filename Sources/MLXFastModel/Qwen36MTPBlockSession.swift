@@ -328,6 +328,24 @@ public final class Qwen36MTPBlockSession {
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
 
+        // Verify-token concat warm. The scored round assembles its verify
+        // block as concatenated([primary] + draftIdArrays) — int32 device
+        // arrays — whose concatenate rides a `copyint32int32` Metal library
+        // that no warm above ever builds: every warm verify block is
+        // constructed directly from host ints, and every other concat on the
+        // path is bf16. Left cold, the FIRST drafting round compiles that
+        // library inside the timed window (measured: the only in-window
+        // library build on a traced leg, ~50-100 ms of Metal compile against
+        // a ~145 ms round). One two-array int32 concat builds the
+        // dtype-keyed library for the whole process. Zero tokens in, nothing
+        // read out — same pure-shape-warm contract as the rest of this
+        // function.
+        let warmConcatIds = [
+            MLXArray([Int32(0)]).reshaped([1, 1]),
+            MLXArray([Int32(0)]).reshaped([1, 1]),
+        ]
+        eval(concatenated(warmConcatIds, axis: 1))
+
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
         // The phase trace measured

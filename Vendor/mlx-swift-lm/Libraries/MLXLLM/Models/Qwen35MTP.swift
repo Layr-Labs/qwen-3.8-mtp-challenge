@@ -55,9 +55,34 @@ final class Qwen35MTPDecoderLayer: Module {
         cache: (any KVCache)?
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
+        let (residual, mlpOut) = forwardParts(x, mask: mask, cache: cache)
+        return residual + mlpOut
+    }
+
+    /// Attention/MLP halves with the residual boundary left UNMERGED, so the
+    /// caller can finish the layer through the boundary-fused add+RMSNorm
+    /// junction (one launch instead of a standalone add plus a standalone
+    /// norm). Bit-exact against the eager sequence: the fused kernel rounds
+    /// the sum to bf16 before squaring and mirrors `rms_norm.metal`'s
+    /// reduction tree — the same contract the backbone's promoted chain uses.
+    /// Head side — proposal-only — but the kernel is the backbone's
+    /// ranked-green one, so the schedule fingerprint is unchanged anyway.
+    /// Falls back to the eager expression for any non-bf16 input.
+    func forwardParts(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (residual: MLXArray, mlpOut: MLXArray) {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 {
+            let junction = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return (junction.residual, (mlp as! UnaryLayer)(junction.normed))
+        }
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -65,6 +90,187 @@ final class Qwen35MTPDecoderLayer: Module {
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
         selfAttn.appendHistoryKV(inputLayerNorm(x), cache: cache)
     }
+}
+
+// MARK: - fused pre-fc gather + dual RMSNorm + concat
+
+/// Fused `concat([RMSNorm_e(embed(ids)), RMSNorm_h(hidden)])` in ONE launch,
+/// replacing the gather, two RMSNorm, and concat dispatches that precede `fc`
+/// on every head forward (four launches to one). Head side — proposal-only —
+/// but the arithmetic mirrors `rms_norm.metal` exactly (same 1024-thread
+/// looped read, same simd_sum → per-simd-group local_sums → simd_sum tree,
+/// same precise::rsqrt, same `w * bf16(x * inv_mean)` write rounding), so the
+/// fused output is bit-identical to the eager chain and the draft schedule is
+/// unchanged. The gather itself is a pure row copy, exact by construction.
+private let qwen35MTPPreFcFusedKernel = MLXFast.metalKernel(
+    name: "qwen35_mtp_prefc_fused",
+    inputNames: ["ids", "table", "hidden", "e_weight", "h_weight", "eps_e", "eps_h"],
+    outputNames: ["fused"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(hidden_shape[hidden_ndim - 1]);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        ulong tok = ulong(ids[row]);
+        ulong e_offset = tok * ulong(axis_size);
+        ulong h_offset = ulong(row) * ulong(axis_size);
+        ulong out_row = ulong(row) * ulong(2 * axis_size);
+
+        // ---- phase 1: RMSNorm of the gathered embedding row (left half) ----
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(table[e_offset + elem + i]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(table[e_offset + elem + i]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+        acc = simd_sum(acc);
+        if (simd_group == 0) { local_sums[simd_thread] = 0.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) { local_sums[simd_group] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps_e);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_mean_e = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(table[e_offset + elem + i]);
+                    bfloat wi = e_weight[elem + i];
+                    fused[out_row + elem + i] = wi * bfloat(xi * inv_mean_e);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(table[e_offset + elem + i]);
+                        bfloat wi = e_weight[elem + i];
+                        fused[out_row + elem + i] = wi * bfloat(xi * inv_mean_e);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- phase 2: RMSNorm of the hidden row (right half) ----
+        acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(hidden[h_offset + elem + i]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(hidden[h_offset + elem + i]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+        acc = simd_sum(acc);
+        if (simd_group == 0) { local_sums[simd_thread] = 0.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) { local_sums[simd_group] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps_h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_mean_h = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(hidden[h_offset + elem + i]);
+                    bfloat wi = h_weight[elem + i];
+                    fused[out_row + axis_size + elem + i] =
+                        wi * bfloat(xi * inv_mean_h);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(hidden[h_offset + elem + i]);
+                        bfloat wi = h_weight[elem + i];
+                        fused[out_row + axis_size + elem + i] =
+                            wi * bfloat(xi * inv_mean_h);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Fused pre-fc chain. `ids` is `[1, L]` int32, `table` the bf16 embedding
+/// `[V, H]`, `hidden` `[1, L, H]` bf16; returns `[1, L, 2H]` bf16 laid out
+/// exactly as `concatenated([normE(embed(ids)), normH(hidden)], axis: -1)`.
+/// Returns nil for any shape/dtype outside the fused envelope so the caller
+/// can fall back to the eager chain.
+func qwen35MTPPreFcFused(
+    ids: MLXArray,
+    table: MLXArray,
+    hidden: MLXArray,
+    eWeight: MLXArray,
+    hWeight: MLXArray,
+    epsE: Float,
+    epsH: Float
+) -> MLXArray? {
+    let H = hidden.dim(-1)
+    guard hidden.dtype == .bfloat16,
+          table.dtype == .bfloat16,
+          (ids.dtype == .int32 || ids.dtype == .uint32 || ids.dtype == .int64),
+          hidden.ndim == 3,
+          hidden.dim(0) == 1,
+          ids.dim(0) == 1,
+          ids.size == hidden.dim(1),
+          table.dim(-1) == H,
+          eWeight.shape == [H],
+          hWeight.shape == [H],
+          eWeight.dtype == .bfloat16,
+          hWeight.dtype == .bfloat16
+    else { return nil }
+    let L = hidden.dim(1)
+    let outputs = qwen35MTPPreFcFusedKernel(
+        [ids, table, hidden, eWeight, hWeight, MLXArray(epsE), MLXArray(epsH)],
+        grid: (L * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, L, 2 * H]],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
 }
 
 // MARK: - MTPModule
@@ -111,19 +317,46 @@ final class Qwen35MTPModule: Module {
         cache: [any KVCache]
     ) -> MLXArray {
         // omlx: MTPModule.__call__
-        // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        // 1. Embed next-token ids and fuse with normed hidden state. The
+        //    gather + dual RMSNorm + concat rides one fused kernel when the
+        //    shapes allow (bit-identical to the eager chain); any surprise
+        //    falls back to the eager expression.
+        let fusedCat = qwen35MTPPreFcFused(
+            ids: nextTokenIds, table: embedTokens.weight, hidden: hidden,
+            eWeight: preFcNormEmbedding.weight, hWeight: preFcNormHidden.weight,
+            epsE: preFcNormEmbedding.eps, epsH: preFcNormHidden.eps)
+        var fused: MLXArray
+        if let fusedCat {
+            fused = fc(fusedCat)
+        } else {
+            let embeds = embedTokens(nextTokenIds)
+            let e = preFcNormEmbedding(embeds)
+            let h = preFcNormHidden(hidden)
+            fused = fc(concatenated([e, h], axis: -1))
+        }
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
+        // 3. Run each MTPDecoderLayer. The LAST layer's exit junction rides
+        //    the boundary-fused add+RMSNorm kernel (one launch instead of a
+        //    standalone add plus the module norm), bit-exact against the
+        //    eager `norm(h + mlpOut)` — the backbone chain's ranked-green
+        //    kernel and contract. Non-bf16 or multi-layer heads keep the
+        //    eager boundary.
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
+            if i == layers.count - 1, fused.dtype == .bfloat16 {
+                let parts = layer.forwardParts(fused, mask: mask, cache: c)
+                if parts.mlpOut.dtype == .bfloat16 {
+                    return qwen35FusedResidualRMSNorm(
+                        x: parts.residual, r: parts.mlpOut,
+                        weight: norm.weight, eps: norm.eps
+                    ).normed
+                }
+                return norm(parts.residual + parts.mlpOut)
+            }
             fused = layer(fused, mask: mask, cache: c)
         }
 
@@ -146,10 +379,19 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fusedCat = qwen35MTPPreFcFused(
+            ids: nextTokenIds, table: embedTokens.weight, hidden: hidden,
+            eWeight: preFcNormEmbedding.weight, hWeight: preFcNormHidden.weight,
+            epsE: preFcNormEmbedding.eps, epsH: preFcNormHidden.eps)
+        let fused: MLXArray
+        if let fusedCat {
+            fused = fc(fusedCat)
+        } else {
+            let embeds = embedTokens(nextTokenIds)
+            let e = preFcNormEmbedding(embeds)
+            let h = preFcNormHidden(hidden)
+            fused = fc(concatenated([e, h], axis: -1))
+        }
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
@@ -157,7 +399,14 @@ final class Qwen35MTPModule: Module {
 
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
-        return norm(layers[0](current, mask: mask, cache: cache[0]))
+        let parts = layers[0].forwardParts(current, mask: mask, cache: cache[0])
+        if current.dtype == .bfloat16, parts.mlpOut.dtype == .bfloat16 {
+            return qwen35FusedResidualRMSNorm(
+                x: parts.residual, r: parts.mlpOut,
+                weight: norm.weight, eps: norm.eps
+            ).normed
+        }
+        return norm(parts.residual + parts.mlpOut)
     }
 
 }
