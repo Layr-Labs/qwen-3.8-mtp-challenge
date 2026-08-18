@@ -173,110 +173,15 @@ public final class Qwen36MTPBlockSession {
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
-        // Cost-model schedule (replaces the streak ladder). Choose the depth
-        // that maximizes expected committed tokens per unit round time under
-        // the round's measured economics:
-        //
-        //   T(d) = V + d·H        one width-(d+1) verify + d head steps
-        //   E[tokens](d) = 1 + Σ_{k=1..d} Π_{i<k} p_i
-        //
-        // where p_i is the EMA-estimated acceptance of draft position i GIVEN
-        // the prefix before it was accepted, and h = H/V is the head step's
-        // cost relative to the weight-stream-bound verify forward (near-flat
-        // in width up to the qmv limit). Greedy marginal rule: extend to
-        // position k+1 exactly while
-        //
-        //   Π_{i<=k+1} p_i  >  h · (1 + S_k) / (1 + k·h)
-        //
-        // which is f(k+1) > f(k) rearranged. On hot prose (p→0.9) this runs
-        // straight to the offer; on cold prompts it collapses to 1, and to a
-        // free adaptive skip (0) only when even the first draft's odds are
-        // below h. The streak ladder's behavior is the degenerate one-EMA
-        // version of this; the per-position EMAs let depth 5-8 pay where the
-        // ladder's cap of 4 left committed tokens on the table.
-        draftPolicy = { [weak self] offeredDepth, _ in
-            guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+        // Single-draft schedule. Every positive offer uses the eager K=1
+        // checkpoint/restore path; depth 0 remains the untouched serial control.
+        // The returned width is always inside 0 ... offeredDepth.
+        draftPolicy = { offeredDepth, _ in
+            Swift.min(offeredDepth, 1)
         }
     }
 
     // MARK: - warm
-
-    /// Keep the ranked M5-Max model allocations in Metal's residency set
-    /// after the input-independent warm. MLX attaches a residency set to every
-    /// command queue, but its capacity is zero until a wired limit is applied;
-    /// without this one-time resize the driver must re-establish residency for
-    /// the whole tower on later command buffers.
-    ///
-    /// Capacity is deliberately the live post-warm footprint plus only a small
-    /// page-rounding allowance. After cached warm temporaries are cleared,
-    /// persistent weights fit in the one resize while later scratch fails the
-    /// fit test and stays on the commit-free unwired path. The ticket is never
-    /// ended because shrinking the limit would evict the resident weights.
-    private static let wiredZHDefaultFraction = 1.0
-    private static let wiredZHDefaultSlackMB = 64
-    private static let wiredTicketLock = NSLock()
-    nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
-
-    private final class QwenMTPWiredLimitBox: @unchecked Sendable {
-        var value: Int = 0
-    }
-
-    private static func wireResidentWeightsIfEnabled() {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["DARKBLOOM_QWEN_MTP_WIRED_ZH"] != "0" else { return }
-        guard ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
-        else { return }
-
-        wiredTicketLock.lock()
-        defer { wiredTicketLock.unlock() }
-        guard wiredTicketRetainer == nil else { return }
-
-        // Shape-warm locals have left scope before this method is called.
-        // Remove their cached storage so the active count describes the live
-        // backbone, head, and persistent runtime tensors rather than scratch.
-        Memory.clearCache()
-        let active = Memory.activeMemory
-        guard active > 0 else { return }
-
-        let fraction = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_FRACTION"]
-            .flatMap(Double.init) ?? wiredZHDefaultFraction
-        let slackMB = environment["DARKBLOOM_QWEN_MTP_WIRED_ZH_SLACK_MB"]
-            .flatMap(Int.init) ?? wiredZHDefaultSlackMB
-        var target = Int(Double(active) * min(max(fraction, 0.0), 1.0))
-        target += max(0, slackMB) << 20
-
-        // The MLX backend rejects a wired limit above the recommended working
-        // set. Keep a 256 MiB margin for system bookkeeping and fail closed on
-        // nonsensical geometry.
-        if let recommended = GPU.maxRecommendedWorkingSetBytes() {
-            target = min(target, max(0, recommended - (256 << 20)))
-        }
-        guard target > 0 else { return }
-
-        let ticket = WiredMemoryTicket(
-            size: target,
-            policy: MLXLMCommon.WiredSumPolicy(cap: target),
-            manager: .shared,
-            kind: .active
-        )
-        let appliedBox = QwenMTPWiredLimitBox()
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached(priority: .userInitiated) {
-            appliedBox.value = await ticket.start()
-            semaphore.signal()
-        }
-        let outcome = semaphore.wait(timeout: .now() + .seconds(30))
-        wiredTicketRetainer = ticket
-
-        let applied = outcome == .success ? appliedBox.value : -1
-        let recommended = GPU.maxRecommendedWorkingSetBytes() ?? -1
-        var line = "mlxfast: qwen-mtp wired-zh request=\(target)"
-        line += " applied=\(applied) active=\(active)"
-        line += " slack_mb=\(max(0, slackMB)) fraction=\(fraction)"
-        line += " maxrec=\(recommended)\n"
-        FileHandle.standardError.write(Data(line.utf8))
-    }
 
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
@@ -284,13 +189,6 @@ public final class Qwen36MTPBlockSession {
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
-        // Keep the large shape-warm object graph in a separate call frame so
-        // every throwaway cache and tensor is released before residency sizing.
-        try warmAllDepthShapes(maxDepth: maxDepth)
-        Self.wireResidentWeightsIfEnabled()
-    }
-
-    private func warmAllDepthShapes(maxDepth: Int) throws {
         // Warms every legal verify width from 1 (the serial control's
         // single-token forward) up to maxDepth + 1, plus the head's draft step.
         // The head warm runs even for a serial-only session: the head is resident
@@ -531,9 +429,7 @@ public final class Qwen36MTPBlockSession {
         Swift.min(offeredDepth, 1)
     }
 
-    /// Consecutive fully-accepted DRAFTING rounds. Kept as a public-ish
-    /// telemetry counter; the cost-model schedule below reads the per-position
-    /// EMAs, not this.
+    /// Consecutive fully-accepted drafting rounds, retained as telemetry.
     private var fullAcceptStreak = 0
 
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
@@ -561,196 +457,10 @@ public final class Qwen36MTPBlockSession {
         traceWrite("mtp-row: pos=\(pos) ids=\(ids[0]),\(ids[1]) v=\(hex)\n")
     }
 
-    // MARK: - cost-model depth schedule
+    // MARK: - one-draft schedule
 
-    /// Per-position acceptance EMAs: `positionAcceptEMA[i]` estimates
-    /// P(draft i accepted | drafts 0..<i accepted). Seeded with an optimistic,
-    /// gently decaying prior so the first rounds draft rather than stall; the
-    /// EMA half-life (~9 observed rounds at 0.15) adapts well inside a
-    /// 512-token window while surviving one unlucky reject.
-    /// PRIORS: optimistic-decaying, by measurement. The real-prose
-    /// production conditionals (0.92/0.70/0.50, MTPLX) were tried and taxed
-    /// the ramp two extra rounds on easy prose (22.15 vs 21.5 local) — and
-    /// the published MEDIAN is set by the easy-mid prompts, so a ramp tax
-    /// lands exactly where it hurts. The EMAs converge to the prompt's
-    /// truth within ~10 rounds regardless; what protects the hard prompts
-    /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
-    /// uncapped transfer, not the prior).
-    private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
-    private static let acceptEMAAlpha = 0.15
-
-    /// h = (one head draft step) / (one batched verify forward), the only
-    /// constant the marginal rule needs. Derivation from the campaign's
-    /// measured budgets: the verify forward is weight-stream bound on the
-    /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
-    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
-    /// carries the chained-launch overhead of the committed-history path.
-    /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
-    /// (arm 2) both divided total window time by rounds WITHOUT subtracting
-    /// the ~0.9 s seed prologue charged inside the local window — a prologue
-    /// artifact that made depth look nearly free. Steady-state regression on
-    /// the phase-traced receipts (draft_build ≈ 2.4 ms/step CPU, eval_wall
-    /// 79→89→106 ms for widths 7→8→9) puts the TRUE marginal cost of an
-    /// extra draft at ~10-16 ms against a ~24-40 ms round base: h ≈ 0.6 on
-    /// the bf16-head (pinned) stack. Underpricing h over-drafts d=6-8 on
-    /// hard hidden prompts — invisible on degenerate local prose at accept
-    /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
-    /// forced-depth arms after every head-variant change.
-    ///
-    /// FOURTH FIT — and the resolution of the 0.20-vs-0.43 dispute. The
-    /// capped-regime phase trace measured ~10.75 ms marginal per draft on a
-    /// ~27 ms base (0.20) in the fully-accepted case. MTPLX ships a
-    /// break-even of ~0.43 — but their reject pays a REPAIR FORWARD, while
-    /// this stack's per-row GDN checkpoints make a prefix reject nearly
-    /// free (restoreAfterPrefixReject, no repair at any depth). Their
-    /// constant prices a cost this stack deleted; 0.40 measured -4.5% on
-    /// the easy-prose receipt (held d2-3 where d4 pays). h = 0.20 is the
-    /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
-    /// reject does keep (the drafted head steps past the break) is already
-    /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
-
-    /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
-    /// stack, by bitwise measurement (hexfloat row gate, two attempts):
-    /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
-    /// (ids hold) even with (a) <= 5-row query chunking and (b) per-row
-    /// prefix-sliced sdpa at exactly the serial kL — identical mismatch
-    /// pattern both times, so the attention was never the (only) source;
-    /// the gated-delta scan's internal chunk geometry changes above S=5
-    /// (the invariant-#7 note warned about exactly this). Worse, the
-    /// drifted K/V rows the wide forwards write CONTAMINATE every later
-    /// round — a single wide round poisons the whole window under the
-    /// ranked exact-value replay, while staying invisible to the local
-    /// argmax-only check. Width 5 measured 5/5 bit-exact, which is why
-    /// every promoted receipt at cap 4 survived rank. Do not raise this
-    /// without a bit-exact >width-5 GDN scan AND a fresh hexfloat row gate.
-    ///
-    /// RESOLUTION of the wall's mechanism, and the door through it: the GDN
-    /// scan kernel is sequential in T with T-independent per-row arithmetic
-    /// (one register-resident fp32 state walked t = 0..<T), so the scan was
-    /// never the drift source. Quantized projections at M in 6..9 still ride
-    /// the per-row-exact QMV dispatch (host qmv batch limit 10+ on this
-    /// generation for these shapes). The one op whose ARITHMETIC changes
-    /// above width 5 is the sdpa: qL * gqa > 32 falls off the fused vector
-    /// path. `attentionWithCacheUpdate` therefore splits a 6..9-row causal
-    /// decode attention into two <= 5-row sdpa calls whose bottom-right-
-    /// aligned windows are byte-identical to the promoted <= 5 rounds' —
-    /// after which a deep round is ONE ordinary model call. Measured on the
-    /// hexfloat row gate: widths 6..8 bit-exact per position against the
-    /// serial trajectory. Segmenting the whole FORWARD instead (two model
-    /// calls, 5+k) was measured bit-exact too but pays a second full weight
-    /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
-
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
-    /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
-    /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
-    /// 2, not 3 — the FOURTH restore of this literal, and it has still never
-    /// lost on its merits.
-    ///
-    /// Ranked history: newjordan 2.91995 (PROMOTED, then reverted by a later
-    /// archive that happened to carry 3); hadakang 2.92976 against the 2.92622
-    /// frontier of its day (beat its contemporary crown, lost the race); and my
-    /// own `4650c96e` scored 2.93524 against the 2.93429 base it was built on
-    /// (+0.03%) and again lost only because the crown moved to 2.94662 while it
-    /// validated. Three independent runs, three times ahead of its own base.
-    ///
-    /// A fourth, independent line of evidence, from a negative result of mine.
-    /// I raised `headStepCostRatio` 0.18 -> 0.32 on the directly measured
-    /// marginal (`fc62d1aa`): it scored 2.84585, a clean -3% with the baseline
-    /// leg FLAT (0.038092 -> 0.038070, so not a draw artifact). It shortened
-    /// every draft — 4.35/4.89/5.78/5.33/5.04 -> 3.36/4.01/4.53/4.03/4.76 — and
-    /// candidate decode time ROSE 0.95%. **This pool rewards depth**: the
-    /// marginal draft is worth more than its verify row costs. With 0.15 (2.667)
-    /// and 0.14 (2.766) failing below, h is now bracketed on both sides and 0.18
-    /// is a true local optimum — so the way to buy depth is NOT the price.
-    ///
-    /// It is the cap, and that is what makes it safe. `h` moves the marginal
-    /// rule on EVERY round including the hard prompts (0.32 dragged prompt 6
-    /// from 0.17 drafts to 0.06). This gate is conditioned on OBSERVED perfect
-    /// acceptance and any reject resets `fullAcceptStreak` to 0, so it cannot
-    /// touch a cold or hard prompt at all — it only shortens the
-    /// re-qualification ramp on stretches the head is already proving. Gate 1 is
-    /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
-    private static let segmentedStreakGate = 2
-
-    /// The greedy marginal-depth rule described at the policy's assignment.
-    private func costModelDepth(offeredDepth: Int) -> Int {
-        // The width wall binds the SINGLE-CALL verify; a qualifying
-        // full-accept streak opens the segmented cap (the round then feeds
-        // the target <= 5-row segments, never a wider launch). Any reject
-        // resets the streak, so a cold or struggling prompt never sees a
-        // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
-        let cap = Swift.min(
-            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
-            widthCap)
-        guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
-        var reach = 1.0
-        var expected = 0.0
-        var depth = 0
-        while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
-            }
-            reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
-            guard reach > threshold else { break }
-            expected += reach
-            depth += 1
-        }
-        return depth
-    }
-
-    /// Fold one round's acceptance outcome into the per-position EMAs.
-    /// Positions before the accepted count observed a success; the position
-    /// AT the accepted count observed a failure only if the walk actually
-    /// rejected there (not when it ended early on a committed stop token);
-    /// deeper positions were never reached and observe nothing.
-    private func recordAcceptOutcome(acceptedCount: Int, drafts: [Int]) {
-        let alpha = Self.acceptEMAAlpha
-        for index in 0 ..< acceptedCount where index < positionAcceptEMA.count {
-            positionAcceptEMA[index] += alpha * (1.0 - positionAcceptEMA[index])
-        }
-        let stoppedEarly = acceptedCount > 0 && acceptedCount <= drafts.count
-            && stopTokens.contains(drafts[acceptedCount - 1])
-        if acceptedCount < drafts.count, !stoppedEarly,
-           acceptedCount < positionAcceptEMA.count
-        {
-            positionAcceptEMA[acceptedCount] +=
-                alpha * (0.0 - positionAcceptEMA[acceptedCount])
-        } else if acceptedCount == drafts.count, !drafts.isEmpty,
-                  acceptedCount < positionAcceptEMA.count
-        {
-            // Optimism transfer: a FULLY accepted round is evidence about the
-            // position just past the round's depth too — the chain was hot and
-            // only the schedule ended it. Without this the first unreached
-            // position keeps its cold prior and the product-of-EMAs reach can
-            // never clear the deep threshold inside a short window; this is
-            // the streak ladder's widening step, recast as evidence. Capped
-            // at 0.95: transferred optimism is inference, not observation,
-            // and deep positions never merit a certainty estimate
-            // without treating that inference as a real observation.
-            if positionAcceptEMA[acceptedCount] < 0.95 {
-                positionAcceptEMA[acceptedCount] +=
-                    alpha * (0.95 - positionAcceptEMA[acceptedCount])
-            }
-        }
-    }
+    /// Every speculative round verifies two rows: primary plus one draft.
+    /// Serial offers remain zero through `min(offeredDepth, 1)`.
 
     /// The shipped schedule's width. See `draftPolicy`.
     public static let defaultDraftDepth = 2
@@ -1180,7 +890,6 @@ public final class Qwen36MTPBlockSession {
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
-        recordAcceptOutcome(acceptedCount: acceptedCount, drafts: drafts)
         if Self.traceRounds {
             // Row i's distribution follows (primary + drafts[0..<i]); only
             // rows on the accepted trajectory align with the serial leg.
