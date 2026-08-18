@@ -141,7 +141,10 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // that, so 320 MiB groups adjacent kernels without long command
             // buffers; decode's explicit async-eval groups remain the outer
             // command-buffer boundary, and this referenced-buffer budget
-            // governs within them.
+            // governs within them. (The full-profile 512 MiB post-wire
+            // geometry is installed separately by
+            // `installQwenMTPFullProfileCommandBufferDefaults` before the
+            // first device access, matching the promoted crown.)
             maxMegabytesPerCommandBuffer: 320,
             maxOperationsPerCommandBuffer: 128,
             clearAllocatorCacheAfterWarmup: false,

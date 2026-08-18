@@ -252,6 +252,154 @@ private let qwen35CompiledSigmoidMultiply:
 }()
 
 
+// MARK: - fused GDN postwork (rmsNorm + fp32 SiLU gate)
+
+/// Fuses the GatedDeltaNet output block — `MLXFast.rmsNorm(out, ...)` followed
+/// by the compiled fp32 SiLU-gate elementwise (`qwen35CompiledGatedDeltaPostNorm`)
+/// — into ONE dispatch.
+///
+/// BIT-EXACTNESS CONTRACT, same bar as `qwen35FusedResidualRMSNormKernel`:
+///
+/// 1. The norm reduces over the last dim of `out` ([B, S, Hv, Dv] rows of
+///    Dv = 128), so the vendored dispatch is `rms_single_row` (128 <=
+///    RMS_LOOPED_LIMIT = 4096): threadgroup = 32 * ceil(ceil(128/4)/32) = 32 —
+///    one simdgroup per row, deterministic — and grid = n_rows * 32. The
+///    reduction body below is a verbatim copy of `rms_single_row`
+///    (backend/metal/kernels/rms_norm.metal): 4-element fp32 chunks,
+///    `simd_sum`, the degenerate single-simdgroup `local_sums` tree, and
+///    `metal::precise::rsqrt(acc / axis_size + eps)` in fp32.
+/// 2. `rmsOut` is rounded to bf16 at exactly the vendored output point
+///    (`w[i] * static_cast<bfloat16_t>(x[i] * inv)`) and held in registers;
+///    the eager graph materializes it, but its only consumer is the gate, so
+///    the fused kernel needs only the one gated output.
+/// 3. The gate replicates the compiled `qwen35CompiledGatedDeltaPostNorm`
+///    tape op for op: `g32 = static_cast<float>(z[i])`,
+///    `act = g32 * Sigmoid()(g32)`, `out = static_cast<bfloat16_t>(act *
+///    static_cast<float>(rmsOut[i]))`. The compiled Metal backend emits the
+///    vendored `Sigmoid` functor at T = float:
+///    `y = 1 / (1 + metal::exp(metal::abs(g))); (g < 0) ? y : 1 - y`.
+///    Everything runs in fp32 and rounds ONCE at the final bf16 cast.
+private let qwen35FusedGatedDeltaPostworkKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_gdn_postwork",
+    inputNames: ["x", "z", "w", "eps"],
+    outputNames: ["out"],
+    source: """
+        typedef bfloat16_t InT;
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        constexpr int SIMD_SIZE = 32;
+        constexpr int N_READS = 4;
+        constexpr uint axis_size = uint(Dv);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const device InT* x_row = x + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* z_row = z + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* w_row = w + lid * N_READS;
+
+        // rms_single_row reduction, verbatim.
+        float acc = 0;
+        InT rms_local[N_READS];
+        if (lid * N_READS + N_READS <= axis_size) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+                const InT xv = x_row[i];
+                rms_local[i] = xv;
+                float xi = xv;
+                acc += xi * xi;
+            }
+        } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+                if ((lid * N_READS + i) < axis_size) {
+                    const InT xv = x_row[i];
+                    rms_local[i] = xv;
+                    float xi = xv;
+                    acc += xi * xi;
+                }
+            }
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+            if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Gated output: rmsOut rounded to bf16 at the vendored rms_norm
+        // output point, then the fp32 SiLU gate and final product exactly as
+        // the compiled qwen35CompiledGatedDeltaPostNorm tape.
+        device InT* out_row = out + gid * size_t(axis_size) + lid * N_READS;
+        if (lid * N_READS + N_READS <= axis_size) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+                const InT rmsv = w_row[i] *
+                    static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+                const float g = static_cast<float>(z_row[i]);
+                const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+                const float sg = (g < 0) ? ys : 1 - ys;
+                const float act = g * sg;
+                out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+            }
+        } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+                if ((lid * N_READS + i) < axis_size) {
+                    const InT rmsv = w_row[i] *
+                        static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+                    const float g = static_cast<float>(z_row[i]);
+                    const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+                    const float sg = (g < 0) ? ys : 1 - ys;
+                    const float act = g * sg;
+                    out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+                }
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Dispatches the fused GDN postwork kernel, returning
+/// `silu(z) * rmsNorm(x) * w` bit-identical to the eager two-step
+/// (`MLXFast.rmsNorm` + `qwen35CompiledGatedDeltaPostNorm`), or `nil` when the
+/// operands are outside the kernel's validated envelope ([.., Dv = 128] bf16
+/// rows, matching z shape, 1-D contiguous bf16 weight).
+private func qwen35FusedGatedDeltaPostwork(
+    _ x: MLXArray, _ z: MLXArray, _ weight: MLXArray, _ eps: Float
+) -> MLXArray? {
+    guard x.dtype == .bfloat16, z.dtype == .bfloat16,
+        weight.dtype == .bfloat16,
+        x.ndim >= 1, x.dim(x.ndim - 1) == 128, x.shape == z.shape,
+        weight.ndim == 1, weight.dim(0) == 128, weight.strides == [1]
+    else { return nil }
+    let nRows = x.size / 128
+    return qwen35FusedGatedDeltaPostworkKernel(
+        [x, z, weight, MLXArray(eps)],
+        template: [("Dv", 128)],
+        grid: (nRows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
 // ONE launch replacing the wide verify's GDN prework chain — conv1d + SiLU +
@@ -1174,8 +1322,17 @@ final class Qwen35GatedDeltaNet: Module {
 
         let normedOut: MLXArray
         if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            // Fused postwork: rmsNorm + fp32 SiLU gate in ONE dispatch,
+            // bit-identical to the eager two-step it replaces. On any
+            // envelope mismatch, fall back to the exact eager expression.
+            if let fusedPost = qwen35FusedGatedDeltaPostwork(
+                out, z, norm.weight, norm.eps)
+            {
+                normedOut = fusedPost
+            } else {
+                let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+                normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            }
         } else {
             normedOut = norm(out, gate: z)
         }
@@ -1222,10 +1379,6 @@ private let qwen35CompiledFusedSwiGLU:
         return silu(y[.ellipsis, ..<half]) * y[.ellipsis, half...]
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        // NOT shapeless: the half-split Slice cannot re-infer output shapes
-        // under a shapeless replay (measured: worker fatal
-        // "[Primitive::output_shapes] Slice cannot infer output shapes").
-        // The per-shape traces are the price of the fused form.
         return compile(body)
     }
     return body
@@ -1290,9 +1443,65 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+            let replaced = replaceExactGateUpRows(y, input: x)
+            let activation = qwen35CompiledFusedSwiGLU(replaced)
+            return replaceExactDownRows(downProj(activation), input: activation)
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
+        let y = silu(gateProj(x)) * upProj(x)
+        return replaceExactDownRows(downProj(y), input: y)
+    }
+
+    // MARK: - proposal-only precision islands (gate/up fused rows, down rows)
+
+    private var _exactGateUpWeight: MLXArray?
+    private var _exactGateUpIndices: MLXArray?
+    private var _exactDownWeight: MLXArray?
+    private var _exactDownIndices: MLXArray?
+
+    private func replaceExactGateUpRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactGateUpWeight, let indices = _exactGateUpIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    private func replaceExactDownRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactDownWeight, let indices = _exactDownIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactMLPRows(
+        gateWeight: MLXArray, gateIndices: MLXArray, gateOutputCount: Int,
+        upWeight: MLXArray, upIndices: MLXArray,
+        downWeight: MLXArray, downIndices: MLXArray
+    ) {
+        precondition(
+            gateWeight.dim(0) == gateIndices.dim(0)
+                && upWeight.dim(0) == upIndices.dim(0)
+                && downWeight.dim(0) == downIndices.dim(0),
+            "Qwen MTP precision-island MLP weights and indices must have equal row counts")
+        let gateUpWeight = concatenated([gateWeight, upWeight], axis: 0)
+            .contiguous()
+        let gateUpIndices = concatenated(
+            [gateIndices, upIndices + gateOutputCount], axis: 0)
+            .asType(.int32).contiguous()
+        let downIdx = downIndices.asType(.int32).contiguous()
+        eval(gateUpWeight, gateUpIndices, downWeight, downIdx)
+
+        _exactGateUpWeight = gateUpWeight
+        _exactGateUpIndices = gateUpIndices
+        _exactDownWeight = downWeight
+        _exactDownIndices = downIdx
     }
 
 }
@@ -1645,6 +1854,12 @@ final class Qwen35Attention: Module {
     private var _kvMode = QuantizationMode.affine
     private var _kvOut = 0
     private var _kvDenseW: MLXArray?
+    /// Complete-permutation islands fast path: inverse-permuted BF16 K/V
+    /// weight in natural output order (shape [2*K, in]), transposed to
+    /// [in, 2*K] for the single BF16 matmul that replaces the dead affine-4
+    /// pass plus scatter. Nil unless the installed K/V island indices cover
+    /// the full output row space exactly.
+    private var _kvNaturalW: MLXArray?
 
     // Proposal-head-only precision islands.  The declared artifact preserves
     // the promoted affine-4 head and additionally carries selected exact BF16
@@ -1757,6 +1972,15 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let w = _kvNaturalW {
+            // Complete-permutation islands: every K/V output row is exactly
+            // overwritten by a BF16 row, so the affine-4 pass and its scatter
+            // are dead. One BF16 matmul with the inverse-permuted natural
+            // order produces the identical values with strictly less work
+            // (the quantized pass plus scatter are not emitted at all).
+            let y = matmul(x, w)
+            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1836,6 +2060,33 @@ final class Qwen35Attention: Module {
             .asType(.int32).contiguous()
         eval(weight, qkvIndices, kvIndices)
 
+        // Complete-permutation fast path: if the island K (resp. V) indices
+        // are a permutation of the full output row space, every K/V row is
+        // overwritten by an exact BF16 row, so the quantized pass plus its
+        // scatter are dead. Build the natural-order weight ONCE (untimed) and
+        // let kv() run a single BF16 matmul. Any other geometry keeps the
+        // overlay path. The matmul is `x [.., in] x [in, 2K]`, so the packed
+        // weight is stored already transposed.
+        func isFullPermutation(_ indices: MLXArray, _ count: Int) -> Bool {
+            guard indices.dim(0) == count else { return false }
+            let sorted = MLX.sorted(indices, axis: 0).asType(.int32)
+            let expected = MLX.arange(count).asType(.int32)
+            return MLX.all(MLX.equal(sorted, expected)).item(Bool.self)
+        }
+        if isFullPermutation(kIndices, kOutputCount),
+           isFullPermutation(vIndices, vIndices.dim(0))
+        {
+            let kSorted = MLX.argSort(kIndices, axis: 0).asType(.int32)
+            let vSorted = MLX.argSort(vIndices, axis: 0).asType(.int32)
+            let naturalKV = concatenated(
+                [MLX.take(kWeight, kSorted, axis: 0),
+                 MLX.take(vWeight, vSorted, axis: 0)], axis: 0)
+                .transposed(1, 0).contiguous()
+            eval(naturalKV)
+            _kvNaturalW = naturalKV
+            _kvOut = kOutputCount
+        }
+
         _exactQKVWeight = weight
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
@@ -1865,10 +2116,6 @@ final class Qwen35Attention: Module {
         let (qProjOutput, keysIn, valuesIn) = qkv(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
-        // Keep the gate 4-D: flattening here merged a head axis across the
-        // packed q/gate interleave, which is a REAL Copy kernel per call. The
-        // compiled elementwise below takes strided inputs without copies; the
-        // element pairing (h, d) <-> flat h*D+d is identical either way.
         let gate = qSplit[1]
 
         var keys = keysIn
@@ -1911,10 +2158,6 @@ final class Qwen35Attention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        // Transpose is a view; the old post-transpose flatten was the second
-        // REAL Copy of this function. Multiply 4-D (strided inputs are
-        // copy-free in the compiled elementwise), then flatten the compiled
-        // kernel's CONTIGUOUS output, which is a free view.
         let output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
@@ -1925,8 +2168,39 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
-        return oProj(
-            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+        // Transpose is a view; the old post-transpose flatten was a REAL Copy
+        // per call. Multiply 4-D (strided inputs are copy-free in the compiled
+        // elementwise), then flatten the compiled kernel's CONTIGUOUS output,
+        // which is a free view.
+        let oInput = qwen35CompiledSigmoidMultiply(output, gate)
+            .reshaped(B, L, -1)
+        return replaceExactORows(oProj(oInput), input: oInput)
+    }
+
+    // MARK: - proposal-only precision islands (o_proj rows)
+
+    private var _exactOWeight: MLXArray?
+    private var _exactOIndices: MLXArray?
+
+    private func replaceExactORows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactOWeight, let indices = _exactOIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactORows(oWeight: MLXArray, oIndices: MLXArray) {
+        precondition(
+            oWeight.dim(0) == oIndices.dim(0),
+            "Qwen MTP precision-island o_proj weights and indices must have equal row counts")
+        let idx = oIndices.asType(.int32).contiguous()
+        eval(oWeight, idx)
+        _exactOWeight = oWeight
+        _exactOIndices = idx
     }
 }
 
@@ -2046,9 +2320,6 @@ final class Qwen35DecoderLayer: Module {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
 
-        // Fused residual+RMSNorm when shapes and dtype match the common
-        // decode path (hidden 5120, BF16).  Bit-exact with the eager
-        // h = x + r; postAttentionLayerNorm(h) sequence.
         let h: MLXArray
         let postAttnNorm: MLXArray
         if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
@@ -2373,10 +2644,6 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
-// incumbent affine-4 compact readout evaluates those rows, and this single
-// SIMDgroup applies the incumbent value/id total order to select the proposal.
-// The target lm_head, verify values, cache state, and row ledger are untouched.
 private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_rerank",
     inputNames: ["logits", "candidate_ids"],
@@ -2678,26 +2945,6 @@ private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
 /// the two selection kernels against `MLX.argPartition` on synthetic bf16 rows
 /// of the live width. Returns (checked, mismatches, firstBadTrial).
 /// Never called on a scored path.
-/// Isolated micro-benchmark: times the two-dispatch top-32 against
-/// `MLX.argPartition` on a real-width bf16 row. Never called on a scored path.
-public func qwen35BenchDraftTop32(iters: Int = 200) -> (Double, Double, Int, Int) {
-    MLXRandom.seed(3)
-    let row = MLXRandom.normal([qwen35Top32RealCount]).asType(.bfloat16)
-    let kth = qwen35Top32RealCount - qwen35Top32K
-    // warm both paths (JIT + allocator)
-    for _ in 0 ..< 10 {
-        eval(qwen35DraftTop32(row))
-        eval(MLX.argPartition(row, kth: kth, axis: -1)[(kth)...])
-    }
-    var t0 = Date()
-    for _ in 0 ..< iters { eval(MLX.argPartition(row, kth: kth, axis: -1)[(kth)...]) }
-    let baseUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    t0 = Date()
-    for _ in 0 ..< iters { eval(qwen35DraftTop32(row)) }
-    let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    return (baseUs, mineUs, qwen35Top32Tiles, qwen35Top32PerThread)
-}
-
 public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, Int, Int) {
     MLXRandom.seed(seed)
     var bad = 0
@@ -2873,6 +3120,38 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
                     kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
                     vWeight: vWeight, vIndices: vIndices)
+            }
+            // Optional BF16 row corrections for the remaining proposal
+            // projections. Absent keys keep the corresponding 4-bit path.
+            let oWeight = weights.removeValue(forKey: islandPrefix + "o.weight")
+            let oIndices = weights.removeValue(forKey: islandPrefix + "o.indices")
+            if let oWeight, let oIndices {
+                layer.selfAttn.installExactORows(
+                    oWeight: oWeight, oIndices: oIndices)
+            }
+            let gateWeight = weights.removeValue(forKey: islandPrefix + "gate.weight")
+            let gateIndices = weights.removeValue(forKey: islandPrefix + "gate.indices")
+            let upWeight = weights.removeValue(forKey: islandPrefix + "up.weight")
+            let upIndices = weights.removeValue(forKey: islandPrefix + "up.indices")
+            let downWeight = weights.removeValue(forKey: islandPrefix + "down.weight")
+            let downIndices = weights.removeValue(forKey: islandPrefix + "down.indices")
+            if let mlp = (layer.mlp as? Qwen35FusedMLP),
+               let gateWeight, let gateIndices,
+               let upWeight, let upIndices,
+               let downWeight, let downIndices,
+               let gateLinear = mlp.gateProj as? QuantizedLinear
+            {
+                mlp.installExactMLPRows(
+                    gateWeight: gateWeight, gateIndices: gateIndices,
+                    gateOutputCount: gateLinear.shape.0,
+                    upWeight: upWeight, upIndices: upIndices,
+                    downWeight: downWeight, downIndices: downIndices)
+            }
+            // Optional BF16 row corrections for the fusion projection.
+            let fcWeight = weights.removeValue(forKey: islandPrefix + "fc.weight")
+            let fcIndices = weights.removeValue(forKey: islandPrefix + "fc.indices")
+            if let fcWeight, let fcIndices, let mtp {
+                mtp.installExactFCRows(fcWeight: fcWeight, fcIndices: fcIndices)
             }
         }
 
@@ -3165,7 +3444,7 @@ extension Qwen35TextModel: MTPCapable {
         let coarse = quantizedMM(
             x, coarseWeight, scales: coarseScales, biases: coarseBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
-        )
+        )[0..., 0..., 0 ..< Self.compactDraftRealCount]
         let candidateCount = Self.draftRerankCandidateCount
         // Drift guard: the kernels bake these shapes in as constexpr.
         guard qwen35Top32RealCount == Self.compactDraftRealCount,
