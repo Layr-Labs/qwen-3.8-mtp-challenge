@@ -526,7 +526,11 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    // Amal's q2-shortlist + q4 rerank made each proposal-head step cheaper
+    // than the affine-4 full compact scan this 0.18 was fit against. The
+    // same price now over-charges the marginal draft. 0.16 is a one-tick
+    // reprice, not a reopen of the 0.15/0.14/0.32 schedule graveyard.
+    private static let headStepCostRatio = 0.16
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
