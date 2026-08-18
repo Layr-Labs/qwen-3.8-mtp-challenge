@@ -429,6 +429,362 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         ensureRowContiguous: false)
 }()
 
+// MARK: - Fused residual-add + RMSNorm kernel
+
+/// Fuses one decoder-layer `(residual add, RMSNorm)` pair into a single
+/// dispatch: `h = x + r` (materialized — it is the new residual stream) and
+/// `y = rmsnorm(h) * w`, both bf16.
+///
+/// BIT-EXACTNESS CONTRACT (the track's gates demand bit-identical tokens;
+/// near-tie argmaxes flip on any numeric drift):
+///
+/// 1. `h` is rounded to bf16 at exactly the eager binary-add point: the
+///    vendored `Add` (binary_ops.h) is `x + y` on `bfloat16_t`, and this
+///    kernel computes the identical expression on the identical types.
+/// 2. The sumsq reduction reads the ROUNDED bf16 h — exactly what the eager
+///    `MLXFast.rmsNorm(h, ...)` sees when it reads the materialized add
+///    output. Per-thread values are held in `h_local` registers, so the
+///    normalized-output pass consumes the same bits the reduction did.
+/// 3. The reduction is a structural verbatim copy of the vendored
+///    `rms_looped` kernel (backend/metal/kernels/rms_norm.metal) — the
+///    variant dispatched for axis_size 5120 > RMS_LOOPED_LIMIT (4096) — with
+///    N_READS = 4: strided 4-element-chunk fp32 accumulation, `simd_sum`,
+///    zero-initialized `local_sums`, lane-0 per-simdgroup partial write,
+///    simdgroup-0 `simd_sum(local_sums[lane])`, and
+///    `metal::precise::rsqrt(acc / axis_size + eps)` in fp32. The output
+///    expression keeps the vendored multiply order and cast point:
+///    `w[i] * static_cast<bfloat16_t>(h[i] * inv)`.
+/// 4. The vendored looped dispatch launches threadgroup =
+///    `kernel->maxTotalThreadsPerThreadgroup()` (1024 for this trivial kernel
+///    on Apple GPUs — probe-verified) with grid = n_rows * threadgroup. The
+///    per-thread element assignment — and therefore the fp32 reduction tree —
+///    depends on that size, so the Swift call site fixes threadgroup = 1024
+///    and `MAX_CHUNKS` derives from it. The reduction arithmetic is
+///    row-count-independent, so all widths (S = 1, 2..9, 512) are exact.
+/// 5. Both the AOT metallib (cmake `-fno-fast-math`) and this JIT string
+///    (`fastMathEnabled(false)` in device.cpp) compile without fast math, so
+///    no contraction moves any rounding.
+/// 6. RMSNorm's weight is 1-D contiguous (w_stride == 1), so `w[r + i]` is
+///    the vendored `w[w_stride * (i + r)]`; `qwen35FusedAddRMSNorm` gates on
+///    it and falls back to the exact eager expression otherwise.
+///
+/// The kernel body below was validated bit-exact against the eager
+/// two-kernel sequence (vendored Add + verbatim rms_looped replica) on
+/// 517 x 5120 bf16 rows over three stress distributions — normal(0, 1.5),
+/// full-mantissa moderate-exponent bit patterns, and near-max magnitudes —
+/// with zero mismatches on both outputs.
+///
+/// Internal (not private) so `Tests/MLXFastTests/Model/
+/// Qwen35FusedAddRMSNormTests.swift` can dispatch it via `@testable`.
+let qwen35FusedAddRMSNormKernel: MLXFast.MLXFastKernel = {
+    let header = """
+        typedef bfloat16_t InT;
+        """
+    let source = """
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lsize = threads_per_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        constexpr int SIMD_SIZE = 32;
+        constexpr int N_READS = 4;
+        constexpr uint axis_size = uint(H);
+        // See the doc comment: the reduction tree is only bit-identical under
+        // the vendored looped dispatch's threadgroup size (1024), which the
+        // Swift call site passes.
+        constexpr int TG_SIZE = 1024;
+        constexpr int MAX_CHUNKS =
+            (H + TG_SIZE * N_READS - 1) / (TG_SIZE * N_READS);
+        static_assert(MAX_CHUNKS >= 1, "MAX_CHUNKS must cover H");
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const device InT* x_row = x + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* r_row = r + gid * size_t(axis_size) + lid * N_READS;
+        device InT* h_row = h + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* w_row = w + lid * N_READS;
+
+        // Pass 1: h = x + r rounded to bf16 at the eager binary-add point,
+        // materialized to the h output; the fp32 sumsq accumulates the
+        // ROUNDED h exactly as the eager rms_norm reads it.
+        float acc = 0;
+        InT h_local[MAX_CHUNKS * N_READS];
+        uint chunk = 0;
+        for (uint rr = 0; rr < axis_size; rr += lsize * N_READS) {
+          if (rr + lid * N_READS + N_READS <= axis_size) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              const InT hv = x_row[i + rr] + r_row[i + rr];
+              h_local[chunk * N_READS + i] = hv;
+              h_row[i + rr] = hv;
+              float xi = hv;
+              acc += xi * xi;
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              if ((rr + lid * N_READS + i) < axis_size) {
+                const InT hv = x_row[i + rr] + r_row[i + rr];
+                h_local[chunk * N_READS + i] = hv;
+                h_row[i + rr] = hv;
+                float xi = hv;
+                acc += xi * xi;
+              }
+            }
+          }
+          chunk++;
+        }
+        acc = simd_sum(acc);
+        //  Initialize shared memory
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write simd accumulations into shared memory
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate over simd groups
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write the normalized output, keeping the vendored multiply order
+        // and cast point.
+        device InT* y_row = y + gid * size_t(axis_size) + lid * N_READS;
+        chunk = 0;
+        for (uint rr = 0; rr < axis_size; rr += lsize * N_READS) {
+          if (rr + lid * N_READS + N_READS <= axis_size) {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              y_row[rr + i] = w_row[rr + i] *
+                  static_cast<InT>(h_local[chunk * N_READS + i] * local_inv_mean[0]);
+            }
+          } else {
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < N_READS; i++) {
+              if ((rr + lid * N_READS + i) < axis_size) {
+                y_row[rr + i] = w_row[rr + i] *
+                    static_cast<InT>(h_local[chunk * N_READS + i] * local_inv_mean[0]);
+              }
+            }
+          }
+          chunk++;
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_fused_add_rmsnorm",
+        inputNames: ["x", "r", "w", "eps"],
+        outputNames: ["h", "y"],
+        source: source,
+        header: header,
+        ensureRowContiguous: true)
+}()
+
+/// Dispatches the fused (residual add + RMSNorm) kernel, returning
+/// `(h, y)` = (`x + r`, `rmsNorm(x + r) * w`) bit-identical to the eager
+/// two-op sequence, or `nil` when the operands are outside the kernel's
+/// validated envelope ([.., .., 5120] bf16 activations, 1-D contiguous bf16
+/// weight) and the caller must use the exact eager expression instead.
+private func qwen35FusedAddRMSNorm(
+    _ x: MLXArray, _ r: MLXArray, _ norm: RMSNorm
+) -> (h: MLXArray, y: MLXArray)? {
+    let w = norm.weight
+    guard x.dtype == .bfloat16, r.dtype == .bfloat16, w.dtype == .bfloat16,
+        x.ndim == 3, x.dim(2) == 5120, x.shape == r.shape,
+        w.ndim == 1, w.dim(0) == 5120, w.strides == [1]
+    else { return nil }
+    let nRows = x.size / 5120
+    let outs = qwen35FusedAddRMSNormKernel(
+        [x, r, w, MLXArray(norm.eps)],
+        template: [("H", 5120)],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [x.shape, x.shape],
+        outputDTypes: [.bfloat16, .bfloat16])
+    return (outs[0], outs[1])
+}
+
+// MARK: - Fused GDN postwork kernel (RMSNorm + fp32 SiLU gate)
+
+/// Fuses the GatedDeltaNet output block — `MLXFast.rmsNorm(out, ...)` followed
+/// by the compiled fp32 SiLU-gate elementwise
+/// (`qwen35CompiledGatedDeltaPostNorm(rmsOut, z)`) — into ONE dispatch.
+///
+/// BIT-EXACTNESS CONTRACT, same bar as `qwen35FusedAddRMSNormKernel`:
+///
+/// 1. The norm reduces over the last dim of `out` ([B, S, Hv, Dv] rows of
+///    Dv = 128), so the vendored dispatch is `rms_single_row` (128 <=
+///    RMS_LOOPED_LIMIT = 4096), NOT `rms_looped`: normalization.cpp computes
+///    threadgroup = 32 * ceil(ceil(128 / 4) / 32) = 32 — one simdgroup per
+///    row, deterministic, hardware-independent — and grid = n_rows * 32. The
+///    reduction body below is a verbatim copy of `rms_single_row`
+///    (backend/metal/kernels/rms_norm.metal): 4-element fp32 chunks,
+///    `simd_sum`, the (degenerate, single-simdgroup) `local_sums` tree, and
+///    `metal::precise::rsqrt(acc / axis_size + eps)` in fp32.
+/// 2. `rmsOut` is rounded to bf16 at exactly the vendored output point
+///    (`w[i] * static_cast<bfloat16_t>(x[i] * inv)`) and held in registers;
+///    the eager graph materializes it, but its only consumer is the gate, so
+///    the fused kernel needs only the one gated output.
+/// 3. The gate replicates the compiled `qwen35CompiledGatedDeltaPostNorm`
+///    tape op for op: `g32 = static_cast<float>(z[i])`,
+///    `act = g32 * Sigmoid()(g32)`, `out = static_cast<bfloat16_t>(act *
+///    static_cast<float>(rmsOut[i]))`. The compiled Metal backend emits the
+///    vendored `Sigmoid` functor (backend/metal/compiled.cpp prints
+///    `primitive().name()` — `Sigmoid` — and prepends unary_ops.h), here
+///    instantiated at T = float:
+///    `y = 1 / (1 + metal::exp(metal::abs(g))); (g < 0) ? y : 1 - y`.
+///    Everything runs in fp32 and rounds ONCE at the final bf16 cast, so the
+///    0xC0DB bf16-sigmoid fixup carried by the prework kernel does NOT apply
+///    (that fixup covers a bf16-rounded sigmoid; this sigmoid never is).
+/// 4. Both the eager compiled kernel and this JIT string compile with fast
+///    math disabled, so no contraction moves any rounding.
+///
+/// Validated against the eager two-kernel sequence (verbatim rms_single_row
+/// replica + compiled-tape gate replica): EXHAUSTIVE over all 65,536 bf16
+/// gate values crossed with two x distributions (realistic and heavy-tail /
+/// denormal / near-overflow) plus random-z rows — zero mismatches.
+///
+/// Internal (not private) so `Tests/MLXFastTests/Model/
+/// Qwen35FusedAddRMSNormTests.swift` can dispatch it via `@testable`.
+let qwen35FusedGatedDeltaPostworkKernel: MLXFast.MLXFastKernel = {
+    let header = """
+        typedef bfloat16_t InT;
+        """
+    let source = """
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        constexpr int SIMD_SIZE = 32;
+        constexpr int N_READS = 4;
+        constexpr uint axis_size = uint(Dv);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const device InT* x_row = x + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* z_row = z + gid * size_t(axis_size) + lid * N_READS;
+        const device InT* w_row = w + lid * N_READS;
+
+        // rms_single_row reduction, verbatim.
+        float acc = 0;
+        InT rms_local[N_READS];
+        if (lid * N_READS + N_READS <= axis_size) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            const InT xv = x_row[i];
+            rms_local[i] = xv;
+            float xi = xv;
+            acc += xi * xi;
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            if ((lid * N_READS + i) < axis_size) {
+              const InT xv = x_row[i];
+              rms_local[i] = xv;
+              float xi = xv;
+              acc += xi * xi;
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        //  Initialize shared memory
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write simd accumulations into shared memory
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate over simd groups
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write the gated output: rmsOut rounded to bf16 at exactly the
+        // vendored rms_norm output point, then the fp32 SiLU gate and final
+        // product exactly as the compiled qwen35CompiledGatedDeltaPostNorm
+        // tape (vendored Sigmoid functor at T = float).
+        device InT* out_row = out + gid * size_t(axis_size) + lid * N_READS;
+        if (lid * N_READS + N_READS <= axis_size) {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            const InT rmsv = w_row[i] *
+                static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+            const float g = static_cast<float>(z_row[i]);
+            const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+            const float sg = (g < 0) ? ys : 1 - ys;
+            const float act = g * sg;
+            out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+          }
+        } else {
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < N_READS; i++) {
+            if ((lid * N_READS + i) < axis_size) {
+              const InT rmsv = w_row[i] *
+                  static_cast<InT>(rms_local[i] * local_inv_mean[0]);
+              const float g = static_cast<float>(z_row[i]);
+              const float ys = 1 / (1 + metal::exp(metal::abs(g)));
+              const float sg = (g < 0) ? ys : 1 - ys;
+              const float act = g * sg;
+              out_row[i] = static_cast<InT>(act * static_cast<float>(rmsv));
+            }
+          }
+        }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_fused_gdn_postwork",
+        inputNames: ["x", "z", "w", "eps"],
+        outputNames: ["out"],
+        source: source,
+        header: header,
+        ensureRowContiguous: true)
+}()
+
+/// Dispatches the fused GDN postwork kernel, returning
+/// `silu(z) * rmsNorm(x) * w` bit-identical to the eager two-step
+/// (`MLXFast.rmsNorm` + `qwen35CompiledGatedDeltaPostNorm`), or `nil` when the
+/// operands are outside the kernel's validated envelope ([.., Dv = 128] bf16
+/// rows, matching z shape, 1-D contiguous bf16 weight) and the caller must
+/// use the exact eager expression instead.
+private func qwen35FusedGatedDeltaPostwork(
+    _ x: MLXArray, _ z: MLXArray, _ norm: Qwen3NextRMSNormGated
+) -> MLXArray? {
+    let w = norm.weight
+    guard x.dtype == .bfloat16, z.dtype == .bfloat16, w.dtype == .bfloat16,
+        x.ndim >= 1, x.dim(x.ndim - 1) == 128, x.shape == z.shape,
+        w.ndim == 1, w.dim(0) == 128, w.strides == [1]
+    else { return nil }
+    let nRows = x.size / 128
+    return qwen35FusedGatedDeltaPostworkKernel(
+        [x, z, w, MLXArray(norm.eps)],
+        template: [("Dv", 128)],
+        grid: (nRows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [.bfloat16])[0]
+}
+
 // MARK: - GatedDelta kernel with mid-state checkpoint
 
 /// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with a
@@ -729,6 +1085,30 @@ final class Qwen35GatedDeltaNet: Module {
     ///   - ssmState: Initial SSM state (nil on first token)
     ///   - mask: SSM mask for `gatedDeltaUpdate` (optional)
     /// - Returns: `(out, newConvState, newSsmState)`
+    // Memoized q/k norm scale constants. Geometry-derived and input-
+    // independent, but the previous inline `MLXArray(...).asType(...)` form
+    // rebuilt them as two fresh graph nodes (two encoder dispatches) per
+    // layer per round. Bytes are identical: same scalar, same cast, same
+    // consumers — only the rebuild disappears. Stored as plain optionals
+    // (the `_qkvW` pattern above) so Module parameter reflection never sees
+    // them at load time.
+    private var _qScaleConst: MLXArray?
+    private var _kScaleConst: MLXArray?
+
+    fileprivate func normScaleConstants(_ dtype: DType) -> (MLXArray, MLXArray) {
+        if dtype == .bfloat16, let q = _qScaleConst, let k = _kScaleConst {
+            return (q, k)
+        }
+        let invScale = pow(Float(headKDim), -0.5)
+        let q = MLXArray(pow(invScale, 2)).asType(dtype)
+        let k = MLXArray(invScale).asType(dtype)
+        if dtype == .bfloat16 {
+            _qScaleConst = q
+            _kScaleConst = k
+        }
+        return (q, k)
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -751,12 +1131,12 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
+        let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
         let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
+            qScaleConst
             * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
         let kNormed =
-            MLXArray(invScale).asType(dtype)
+            kScaleConst
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newSsmState) = gatedDeltaUpdateMemoG(
@@ -808,11 +1188,11 @@ final class Qwen35GatedDeltaNet: Module {
         let beta: MLXArray
         let newConvState: MLXArray
         if mixerHit {
-            let invScale = pow(Float(headKDim), -0.5)
+            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
             let outs = qwen35PackedGDNPreworkKernel(
                 [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
-                 MLXArray(pow(invScale, 2)).asType(.bfloat16),
-                 MLXArray(invScale).asType(.bfloat16)],
+                 qScaleConst,
+                 kScaleConst],
                 template: [
                     ("Hk", numKHeads), ("Dk", headKDim),
                     ("Hv", numVHeads), ("Dv", headVDim),
@@ -850,12 +1230,12 @@ final class Qwen35GatedDeltaNet: Module {
             v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
+            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
             qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
+                qScaleConst
                 * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
             kNormed =
-                MLXArray(invScale).asType(dtype)
+                kScaleConst
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             // Keep the recurrence and conv prologue wide. The promoted
@@ -1040,12 +1420,12 @@ final class Qwen35GatedDeltaNet: Module {
             let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
+            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
             let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
+                qScaleConst
                 * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
             let kNormed =
-                MLXArray(invScale).asType(dtype)
+                kScaleConst
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
@@ -1150,8 +1530,16 @@ final class Qwen35GatedDeltaNet: Module {
 
         let normedOut: MLXArray
         if S >= 2 {
-            let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            // Fused postwork: rmsNorm + fp32 SiLU gate in ONE dispatch,
+            // bit-identical to the eager two-step it replaces (see
+            // qwen35FusedGatedDeltaPostworkKernel). On any envelope mismatch,
+            // fall back to the exact eager expression.
+            if let fusedPost = qwen35FusedGatedDeltaPostwork(out, z, norm) {
+                normedOut = fusedPost
+            } else {
+                let rmsOut = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+                normedOut = qwen35CompiledGatedDeltaPostNorm(rmsOut, z)
+            }
         } else {
             normedOut = norm(out, gate: z)
         }
@@ -1709,7 +2097,11 @@ final class Qwen35Attention: Module {
         let (qProjOutput, keysIn, valuesIn) = qkv(x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
-        let gate = qSplit[1].reshaped(B, L, -1)
+        // Keep the gate 4-D: flattening here merged a head axis across the
+        // packed q/gate interleave, which is a REAL Copy kernel per call. The
+        // compiled elementwise below takes strided inputs without copies; the
+        // element pairing (h, d) <-> flat h*D+d is identical either way.
+        let gate = qSplit[1]
 
         var keys = keysIn
         var values = valuesIn
@@ -1751,6 +2143,10 @@ final class Qwen35Attention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
+        // Transpose is a view; the old post-transpose flatten was the second
+        // REAL Copy of this function. Multiply 4-D (strided inputs are
+        // copy-free in the compiled elementwise), then flatten the compiled
+        // kernel's CONTIGUOUS output, which is a free view.
         let output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
@@ -1760,9 +2156,9 @@ final class Qwen35Attention: Module {
             mask: mask
         )
         .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
 
-        return oProj(qwen35CompiledSigmoidMultiply(output, gate))
+        return oProj(
+            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
     }
 }
 
@@ -1863,27 +2259,62 @@ final class Qwen35DecoderLayer: Module {
         super.init()
     }
 
+    /// Forward pass for one decoder layer.
+    ///
+    /// Returns `(hidden, preNormedNext)`:
+    /// - `hidden` is the layer's residual-stream output (the eager
+    ///   `h + mlp(postAttentionLayerNorm(h))`), always bit-identical to the
+    ///   unfused expression.
+    /// - `preNormedNext` is non-nil only when the fused tail add produced it:
+    ///   it is `nextInputLayerNorm(hidden)` computed inside the same kernel,
+    ///   bit-identical to the next layer applying its own `inputLayerNorm`.
+    ///
+    /// `preNormedInput`, when provided by the previous layer's fused tail, is
+    /// used in place of `inputLayerNorm(x)` (it carries the identical bits).
     func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        nConfirmed: Int = 0
-    ) -> MLXArray {
+        nConfirmed: Int = 0,
+        preNormedInput: MLXArray? = nil,
+        nextInputLayerNorm: RMSNorm? = nil
+    ) -> (hidden: MLXArray, preNormedNext: MLXArray?) {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
         // Passes nConfirmed through to the linear-attention sublayer.
+        let normedInput = preNormedInput ?? inputLayerNorm(x)
         let r: MLXArray
         if isLinear {
             r = linearAttn!(
-                inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
+                normedInput, mask: ssmMask, cache: cache as? MambaCache,
                 nConfirmed: nConfirmed)
         } else {
-            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            r = selfAttn!(normedInput, mask: attentionMask, cache: cache)
         }
 
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Stage A: fuse (h = x + r) + (normedH = postAttentionLayerNorm(h))
+        // into one kernel. Bit-identical to the eager pair; on any envelope
+        // mismatch, fall back to the exact eager expression.
+        guard let (h, normedH) = qwen35FusedAddRMSNorm(x, r, postAttentionLayerNorm)
+        else {
+            let hEager = x + r
+            return (
+                hEager + (mlp as! UnaryLayer)(postAttentionLayerNorm(hEager)),
+                nil
+            )
+        }
+        let mlpOut = (mlp as! UnaryLayer)(normedH)
+
+        // Stage B: fuse the tail add with the NEXT layer's input norm. The
+        // final layer keeps the plain tail add — the trunk returns pre-norm
+        // hidden and its `norm` is applied separately by Qwen35TextModel.
+        if let nextInputLayerNorm,
+            let (xNext, normedNext) = qwen35FusedAddRMSNorm(h, mlpOut, nextInputLayerNorm)
+        {
+            return (xNext, normedNext)
+        }
+        return (h + mlpOut, nil)
     }
 }
 
@@ -1952,14 +2383,28 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        // Fused (add + RMSNorm) wiring: each layer's tail add is fused with
+        // the NEXT layer's input norm (Stage B), so a layer whose predecessor
+        // fused receives `preNormedInput` and skips its own inputLayerNorm
+        // dispatch. Bit-identical in both directions: the fused kernel's
+        // outputs equal the eager `x + r` / `MLXFast.rmsNorm` pair bit for
+        // bit (see qwen35FusedAddRMSNormKernel). Layer 0 has no predecessor
+        // and norms eagerly; the final layer keeps the plain tail add because
+        // the trunk returns PRE-norm hidden (Qwen35TextModel applies `norm`).
+        var preNormedInput: MLXArray? = nil
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
+            let nextNorm: RMSNorm? =
+                (i + 1 < layers.count) ? layers[i + 1].inputLayerNorm : nil
+            let (newHidden, normedNext) = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
+                cache: cacheArray?[i], nConfirmed: nConfirmed,
+                preNormedInput: preNormedInput, nextInputLayerNorm: nextNorm)
+            hiddenStates = newHidden
+            preNormedInput = normedNext
             if ladderActive {
                 if prefillLadder {
                     if i == 0 || i % 3 == 2 {
