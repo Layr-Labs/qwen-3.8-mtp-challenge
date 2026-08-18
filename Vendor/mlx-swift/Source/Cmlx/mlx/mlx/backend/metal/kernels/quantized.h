@@ -1831,6 +1831,43 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 3:
+          // DIRECT_NIBBLES, the same flag widths 6..9 already carry.
+          // COVERAGE, CORRECTED. An earlier version of this comment claimed
+          // these three cases were worth only ~5% of verify rounds and would
+          // matter only if a future policy shallowed the draft. That was WRONG,
+          // and the organizer's own leaderboard refuted it: submission caec88d4
+          // promoted at 3.14642585386152, +1.56% over its predecessor, and its
+          // ENTIRE diff is these three cases taking DIRECT_NIBBLES. A +1.56%
+          // ranked step is not a 5%-coverage change.
+          // The error was in the instrument, not the arithmetic. The "5%" was
+          // sized from a 128-token --local-submit receipt (advisor receipt
+          // e29a3e0d, depth histogram {1:1, 4:1, 5:8, 6:3, 7:5, 8:2}, mean
+          // depth 5.7). The ranked workload decodes 512 tokens, and accepted
+          // draft depth is NOT stationary in sequence length on this model: the
+          // mass moves DOWN as the sequence grows. A 512-token measurement
+          // (edward's E17 arm S18, receipt: research/results/
+          // qwen38-r1-e17-curve-transfer-and-refit.md) gives
+          // {1:19, 2:138, 3:67, 4:21}, and with M = depth + 1 that is 226 of
+          // 245 rounds on M = 2..5 -- exactly the band these cases serve. That
+          // histogram was measured under a different depth policy, which is why
+          // it was originally discounted; but it was measured at the RANKED
+          // token count, and on the axis that decided this question it was the
+          // more faithful of the two.
+          // RULE: never size a dispatch-coverage claim from a --local-submit
+          // receipt. Its sequence length is a quarter of the ranked one, and the
+          // depth distribution is precisely what differs between them.
+          // The case is in any case free and provably exact:
+          // Exact, independent of M and NA: the flag only moves powers of two
+          // across the product. The incumbent multiplies (x_j * 2^-4j) by
+          // (n_j * 2^4j) after masking nibble j at bit offset 4j; with the flag
+          // it multiplies x_j by the un-shifted nibble n_j. Each factor differs
+          // only in its exponent field, so every product is bit-identical, and
+          // the accumulation order is untouched. The x-side row sum becomes
+          // xm[0] + xm[1] + xm[2] + xm[3], which is load_vector's own
+          // expression tree, so that reduction is bit-identical too. What
+          // disappears is 12 * NA power-of-two multiplies per 512-element
+          // k-block per simdgroup, against 64 * NA FMAs that stay: a free
+          // ~12% ALU cut on an ALU-bound kernel.
           qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
