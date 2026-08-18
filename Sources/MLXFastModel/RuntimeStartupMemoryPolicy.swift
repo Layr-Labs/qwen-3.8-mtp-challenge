@@ -106,12 +106,16 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             cacheLimitBytes: 32 << 30,
             // The MLX M5 Max default commits a command buffer after
             // referencing 50 MiB. Many 4-bit projections individually exceed
-            // that, so 320 MiB groups adjacent kernels without long command
-            // buffers; decode's explicit async-eval groups remain the outer
-            // command-buffer boundary, and this referenced-buffer budget
-            // governs within them.
-            maxMegabytesPerCommandBuffer: 320,
-            maxOperationsPerCommandBuffer: 128,
+            // that, so 512 MiB groups a full decode layer into one command
+            // buffer once the tower is wired (the zero-headroom residency
+            // ticket's premise: post-residency, splitting buys nothing).
+            // This is the promoted post-wire configuration from the 3.2322
+            // crown (SSHdotCodes 3a995c2b: MLX_MAX_MB_PER_BUFFER=512, stock
+            // 50-operation cap); decode's explicit async-eval groups remain
+            // the outer command-buffer boundary, and this referenced-buffer
+            // budget governs within them.
+            maxMegabytesPerCommandBuffer: 512,
+            maxOperationsPerCommandBuffer: 50,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )

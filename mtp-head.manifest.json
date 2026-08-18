@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-v9@c8b77b86cd0573f75fb684d09be34d54774d71f5",
+  "sha256": "2edd8b91f222a88b73ced9d7f30fc5247eac49f601a5c049e0e09e224c5da162",
+  "bytes": 528431512,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "v13-redo head: the v9 diverse-corpus island re-selection, the exact artifact v10 scored 3.1833 with (revision c8b77b86, runner tree digest 2edd8b91). v11 reverted to the v6 easy-prose islands and added an adaptive hard-prompt depth cap; the ranked result collapsed to 3.1257 vs v10 3.1833 on the same code stack, so both revert. This manifest restores the v9 artifact verbatim."
 }
