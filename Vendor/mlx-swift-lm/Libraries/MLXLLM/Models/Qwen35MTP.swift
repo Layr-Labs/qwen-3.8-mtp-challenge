@@ -116,6 +116,8 @@ final class Qwen35MTPModule: Module {
         let e = preFcNormEmbedding(embeds)
         let h = preFcNormHidden(hidden)
         var fused = fc(concatenated([e, h], axis: -1))
+        fused = replaceExactFCRows(
+            fused, input: concatenated([e, h], axis: -1))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -158,6 +160,32 @@ final class Qwen35MTPModule: Module {
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
         return norm(layers[0](current, mask: mask, cache: cache[0]))
+    }
+
+    // MARK: - proposal-only precision islands (fc rows)
+
+    private var _exactFCWeight: MLXArray?
+    private var _exactFCIndices: MLXArray?
+
+    private func replaceExactFCRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactFCWeight, let indices = _exactFCIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactFCRows(fcWeight: MLXArray, fcIndices: MLXArray) {
+        precondition(
+            fcWeight.dim(0) == fcIndices.dim(0),
+            "Qwen MTP precision-island fc weights and indices must have equal row counts")
+        let idx = fcIndices.asType(.int32).contiguous()
+        eval(fcWeight, idx)
+        _exactFCWeight = fcWeight
+        _exactFCIndices = idx
     }
 
 }

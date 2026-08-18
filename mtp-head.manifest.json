@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Spangler3000/qwen3.8-27b-mtp-head-v9@c8b77b86cd0573f75fb684d09be34d54774d71f5",
+  "sha256": "2edd8b91f222a88b73ced9d7f30fc5247eac49f601a5c049e0e09e224c5da162",
+  "bytes": 528431512,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "v9 breakthrough head: BF16 precision islands re-selected on a DIVERSE calibration corpus. The v6 island rows were selected on 3 easy-prose prompts only (3,456 states), which overfit that genre. v9 re-selects every projection's island rows by activation-weighted error on 6,007 states spanning easy prose, code, mathematics, and history (collected by running the v6 head on diverse public texts). The re-selected rows overlap the old ones by only 22-49% per projection (k/v unchanged at 100%) - the easy-prose selection was badly overfit. Final-hidden MSE vs the bf16 head: v9 is 83% of v6's error on easy states and 86% on diverse states (46-47% vs 55% of the un-islanded 4-bit error). All other v6 levers unchanged: affine-2 shortlist rerank readout, warm draft schedule, and the depth-floor-1 hard-prompt fix. The target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
 }
