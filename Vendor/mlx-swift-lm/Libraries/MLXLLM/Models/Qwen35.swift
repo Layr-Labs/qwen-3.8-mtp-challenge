@@ -2125,8 +2125,10 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     outputNames: ["token_id"],
     source: """
         uint lane = thread_index_in_simdgroup;
-        float best_value = float(logits[lane]);
-        uint best_id = uint(candidate_ids[lane]);
+        float best_value = (lane < CANDIDATE_COUNT)
+            ? float(logits[lane]) : NAN;
+        uint best_id = (lane < CANDIDATE_COUNT)
+            ? uint(candidate_ids[lane]) : 0xFFFFFFFFu;
 
         for (uint offset = 16; offset > 0; offset >>= 1) {
             float other_value = simd_shuffle_down(best_value, offset);
@@ -2152,6 +2154,8 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
             float current_value,
             uint current_id
         ) {
+            if (candidate_id == 0xFFFFFFFFu) { return false; }
+            if (current_id == 0xFFFFFFFFu) { return true; }
             bool candidate_nan = isnan(candidate_value);
             bool current_nan = isnan(current_value);
             if (candidate_nan != current_nan) { return !candidate_nan; }
@@ -2200,7 +2204,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 16
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
@@ -2623,12 +2627,13 @@ extension Qwen35TextModel: MTPCapable {
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
             template: [
+                ("CANDIDATE_COUNT", candidateCount),
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
             ],
-            grid: (candidateCount, 1, 1),
-            threadGroup: (candidateCount, 1, 1),
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]
