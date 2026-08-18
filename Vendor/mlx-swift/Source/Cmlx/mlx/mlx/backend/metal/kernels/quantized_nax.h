@@ -522,10 +522,10 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 
   else if (bits == 4) {
-    U s[2] = {scale, scale / static_cast<U>(16.0f)};
+    U s[2] = {scale, scale};
     for (int i = 0; i < (N / 2); i++) {
       w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
-      w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+      w_local[2 * i + 1] = s[1] * ((w[i] >> 4) & 0x0f) + bias;
     }
   }
 
