@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:orangezh007/qwen38-mtp-head-ft@74e5151faf077191865cfbe3b02623aee41a90fd",
+  "sha256": "ea99b263dc292d9679913c95eda2754a2bc719f10b7702f0a6ae54a2d2e1b6e2",
+  "bytes": 270404274,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "Fine-tuned MTP head (rev v4-islands): the v3 revision of the full-parameter distillation recipe, trained on an expanded mixed corpus (1.9M wikitext-103 prose + 850K Swift/Python source + 1.05M multi-turn chat + 0.5M math + 0.2M structured text) against the deployed 4-bit trunk's hidden-state distribution. On top of the quantized head this revision carries six BF16 precision-island tensors in the promoted island geometry (mtp.precision_islands.{q,k,v}.{weight,indices}): the full 1,024 K and V projection rows and the 1,024 Q rows with the largest 4-bit reconstruction SSE, restoring exact proposal-side arithmetic where quantization error concentrates. The candidate code path is the unmodified tip of main (island loader included); the trunk, verify kernels, emitted-token decision and rollback are unchanged. The head only proposes; every emitted token remains target-verified."
 }
