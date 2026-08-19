@@ -2566,83 +2566,44 @@ private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// Stage 2: one threadgroup reduces the 2,048 candidates to the final 32,
-// written ASCENDING so the result is element-wise identical to
+// Stage 2: the 64 partial lists are already sorted DESCENDING by the exact
+// `(ordinal, index)` total order. One SIMD lane owns two list heads and the
+// SIMD performs a 64-way k-way merge: 32 head reductions, no rescans, no
+// threadgroup memory, and no barrier. The maxima are written in reverse so
+// the output remains ASCENDING and element-wise identical to
 // `argPartition(...)[kth...]`.
 private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_top32_finalize",
     inputNames: ["cand_ord", "cand_idx"],
     outputNames: ["token_ids"],
     source: """
-        constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
-        constexpr uint TOPK       = \(qwen35Top32K);
-        constexpr uint SIMD_SIZE  = 32;
-        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
-        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
-        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+        constexpr uint TOPK      = \(qwen35Top32K);
+        constexpr uint LISTS     = \(qwen35Top32Tiles);
+        constexpr uint SIMD_SIZE = 32;
+        static_assert(LISTS == 2 * SIMD_SIZE, "k-way merge expects two lists per lane");
 
-        uint tid  = thread_position_in_threadgroup.x;
         uint lane = thread_index_in_simdgroup;
-        uint sg   = simdgroup_index_in_threadgroup;
+        uint base0 = lane * TOPK;
+        uint base1 = (lane + SIMD_SIZE) * TOPK;
+        uint cursor0 = 0u;
+        uint cursor1 = 0u;
 
-        uint ord[PER_THREAD];
-        uint idx[PER_THREAD];
-        for (uint t = 0; t < PER_THREAD; ++t) {
-            uint p = t * TG_SIZE + tid;
-            ord[t] = cand_ord[p];
-            idx[t] = cand_idx[p];
-        }
-
-        threadgroup uint sc_ord[NSIMD * TOPK];
-        threadgroup uint sc_idx[NSIMD * TOPK];
-
-        uint taken = 0u;
         for (uint r = 0; r < TOPK; ++r) {
-            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-            for (uint t = 0; t < PER_THREAD; ++t) {
-                if ((taken & (1u << t)) != 0u) { continue; }
-                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
-                    bo = ord[t]; bi = idx[t]; bs = t;
-                }
-            }
-            uint mo = simd_max(bo);
-            uint mi = simd_max((bo == mo) ? bi : 0u);
-            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                taken |= (1u << bs);
-            }
-            if (lane == 0) {
-                sc_ord[sg * TOPK + r] = mo;
-                sc_idx[sg * TOPK + r] = mi;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint o0 = cursor0 < TOPK ? cand_ord[base0 + cursor0] : 0u;
+            uint i0 = cursor0 < TOPK ? cand_idx[base0 + cursor0] : 0u;
+            uint o1 = cursor1 < TOPK ? cand_ord[base1 + cursor1] : 0u;
+            uint i1 = cursor1 < TOPK ? cand_idx[base1 + cursor1] : 0u;
 
-        if (sg == 0) {
-            uint o2[PB];
-            uint i2[PB];
-            for (uint t = 0; t < PB; ++t) {
-                uint p = t * SIMD_SIZE + lane;
-                o2[t] = sc_ord[p];
-                i2[t] = sc_idx[p];
+            bool take0 = o0 > o1 || (o0 == o1 && i0 > i1);
+            uint local_o = take0 ? o0 : o1;
+            uint local_i = take0 ? i0 : i1;
+
+            uint max_o = simd_max(local_o);
+            uint max_i = simd_max((local_o == max_o) ? local_i : 0u);
+            if (local_o == max_o && local_i == max_i) {
+                if (take0) { cursor0++; } else { cursor1++; }
             }
-            uint tk2 = 0u;
-            for (uint r = 0; r < TOPK; ++r) {
-                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-                for (uint t = 0; t < PB; ++t) {
-                    if ((tk2 & (1u << t)) != 0u) { continue; }
-                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
-                        bo = o2[t]; bi = i2[t]; bs = t;
-                    }
-                }
-                uint mo = simd_max(bo);
-                uint mi = simd_max((bo == mo) ? bi : 0u);
-                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                    tk2 |= (1u << bs);
-                }
-                if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
-            }
+            if (lane == 0) { token_ids[TOPK - 1u - r] = max_i; }
         }
         """,
     header: "",
@@ -2667,8 +2628,8 @@ private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
     )
     return qwen35DraftTop32FinalizeKernel(
         [partial[0], partial[1]],
-        grid: (qwen35Top32TG, 1, 1),
-        threadGroup: (qwen35Top32TG, 1, 1),
+        grid: (qwen35Top32K, 1, 1),
+        threadGroup: (qwen35Top32K, 1, 1),
         outputShapes: [[qwen35Top32K]],
         outputDTypes: [.uint32]
     )[0]
