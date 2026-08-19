@@ -1305,7 +1305,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
 /// are entirely input-derived; the caller gates only on the frozen Qwen model
 /// semantics that determine the numerical contract.
 private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
-    name: "qwen35_attention_qk_rms_rope_bf16_v1",
+    name: "qwen35_attention_qk_rms_rope_bf16_v2",
     inputNames: ["q", "k", "q_weight", "k_weight", "eps", "offset", "log2_base"],
     outputNames: ["q_out", "k_out"],
     source: """
@@ -1353,7 +1353,10 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
 
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
-        threadgroup bfloat normalized[256];
+        // Only the rotary prefix lives in threadgroup. The pass-through tail
+        // (dims rotary_dimensions .. axis_size) is identity-RoPE and is
+        // written once, directly to global output, during the RMS store.
+        threadgroup bfloat normalized[rotary_dimensions];
 
         float acc = 0.0f;
         uint first = thread_id * n_reads;
@@ -1396,24 +1399,20 @@ private let qwen35AttentionQKRMSRoPEKernel = MLXFast.metalKernel(
                 bfloat weight = is_query
                     ? q_weight[ulong(element) * weight_stride]
                     : k_weight[ulong(element) * weight_stride];
-                normalized[element] = weight * rms_value;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // The stock RoPE primitive copies dimensions 64...255 unchanged before
-        // rotating nontraditional pairs (i, i + 32).  Here the final output is
-        // new storage, so only the pass-through tail needs an explicit copy.
-        for (uint i = 0; i < n_reads; ++i) {
-            uint element = first + i;
-            if (element >= rotary_dimensions && element < axis_size) {
-                if (is_query) {
-                    q_out[output_base + ulong(element)] = normalized[element];
+                bfloat scaled = weight * rms_value;
+                // Partial RoPE (NeoX / Qwen-3.8): dims [0, rotary) rotate as
+                // pairs (i, i+32). Dims [rotary, D) are identity. Writing the
+                // tail here deletes the stock "copy unrotated dims" store.
+                if (element < rotary_dimensions) {
+                    normalized[element] = scaled;
+                } else if (is_query) {
+                    q_out[output_base + ulong(element)] = scaled;
                 } else {
-                    k_out[output_base + ulong(element)] = normalized[element];
+                    k_out[output_base + ulong(element)] = scaled;
                 }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (thread_id < rotary_pairs / n_reads) {
             for (uint i = 0; i < n_reads; ++i) {
