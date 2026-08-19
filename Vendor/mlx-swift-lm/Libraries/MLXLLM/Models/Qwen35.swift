@@ -1653,6 +1653,11 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    /// KV-island weights permuted into output-column order so `kv()` can
+    /// skip both the overwritten affine-4 GEMM and the per-call `putAlong`.
+    /// Nil unless the declared islands are a bijection of `0..<kOut+vOut`.
+    private var _exactKVOrderedWeight: MLXArray?
+    private var _exactKVCoversAll = false
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1757,6 +1762,19 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        // Full-cover precision islands already overwrite every K/V column.
+        // When those islands are a bijection of 0..<kOut+vOut, the affine-4
+        // GEMM is dead and the scatter is an install-time permute. A single
+        // dense matmul in output order is then identical to
+        // putAlong(quantizedMM, perm, island_matmul). Operator A/B:
+        // MLX_QWEN_MTP_SKIP_DEAD_KV=0. Ranked does not set that name.
+        if _exactKVCoversAll,
+           ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SKIP_DEAD_KV"] != "0",
+           let ordered = _exactKVOrderedWeight, _kvOut > 0
+        {
+            let y = matmul(x, ordered.transposed(1, 0))
+            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1840,6 +1858,38 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+
+        // Amal q2-q4-rerank islands are 1024+1024 rows over K/V (2048). When
+        // the index vector is a permutation of 0..<kOut+vOut, every quantized
+        // KV column is overwritten. Pre-scatter island rows into output order
+        // so history-flush `kv()` is one dense GEMM, not qmm+matmul+putAlong.
+        // Q remains a 1024/12288 subset — fused `qkv()` keeps the quantized
+        // pack. Fail closed (leave _exactKVCoversAll false) on any gap.
+        let kvOut = kOutputCount + vWeight.dim(0)
+        if kWeight.dim(0) == kOutputCount, kvIndices.dim(0) == kvOut {
+            let idx = kvIndices.asArray(Int32.self)
+            var seen = Set<Int32>()
+            seen.reserveCapacity(idx.count)
+            var covers = true
+            for value in idx {
+                if value < 0 || value >= Int32(kvOut) || !seen.insert(value).inserted {
+                    covers = false
+                    break
+                }
+            }
+            if covers, seen.count == kvOut {
+                let kvIsland = weight[_exactQRowCount...]
+                let ordered = putAlong(
+                    MLXArray.zeros(kvIsland.shape, dtype: kvIsland.dtype),
+                    kvIndices.reshaped([kvOut, 1]),
+                    values: kvIsland,
+                    axis: 0)
+                eval(ordered)
+                _exactKVOrderedWeight = ordered
+                _kvOut = kOutputCount
+                _exactKVCoversAll = true
+            }
+        }
     }
 
     /// Append rows to an attention cache without producing query outputs.
