@@ -378,6 +378,26 @@ public final class Qwen36MTPBlockSession {
             }
             eval(concatenated(parts, axis: 1))
         }
+        // HEAD-HISTORY FLUSH CONCAT JIT WARM.
+        // The first drafting round of every candidate prompt does
+        //   draftInputHidden = concatenated(
+        //     [applyFinalNorm(seedHidden[0..<L-1]), pendingHidden], axis: 1)
+        // because flushHidden.count > 1 on a 512-token seed (pool note:
+        // every timed golden is a 512-token prose seed, so primeCount is
+        // 511). The 512-row primeHidden / seedWarm forwards below are
+        // SINGLE allocations — they never compile a 2-input concatenate
+        // over hidden dtype. The int32 verify-token concat warm above is
+        // a different JIT family (copyint32int32, rank-2, width 1…9).
+        // Serial depth-0 never drafts, so this compile is candidate-only
+        // and sits inside the timed window unless moved here.
+        // Both operands are applyFinalNorm outputs of the same dtype as
+        // the live flush (hiddenRow applies final-norm when postNorm).
+        // Values are zeros; the result is discarded. Shape + dtype +
+        // 2-input concat select the kernels. 7b33621 rule: warm the
+        // SAME expression the scored path dispatches.
+        let flushLeft = model.applyFinalNorm(primeHidden[0..., 0 ..< 511, 0...])
+        let flushRight = model.applyFinalNorm(primeHidden[0..., 511 ..< 512, 0...])
+        eval(concatenated([flushLeft, flushRight], axis: 1))
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
