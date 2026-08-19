@@ -370,6 +370,14 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+        // Warm the exact multi-input int32 concat used by scored verify
+        // rounds: a host primary plus device-resident draft IDs. A single
+        // host-built [1, width] tensor does not compile this family.
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra { parts.append(primedDraftID) }
+            eval(concatenated(parts, axis: 1))
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
@@ -467,16 +475,37 @@ public final class Qwen36MTPBlockSession {
         _ = seedLogits
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
-        // Retain the full pre-norm seed hidden for lazy head-history priming.
-        // ~5 MB at 512x5120 bf16; released at the first drafting round. The
-        // eval below materialises it so no seed graph is kept alive.
-        seedHiddenForPriming = hidden
-        seedTokensForPriming = seedTokens
+        // Prime the committed seed prefix during begin, outside the scored
+        // decode window. This is the same head-history graph the first drafting
+        // round used to build lazily; only the current (pendingHidden, primary)
+        // transition remains for that round. A serial-control session never
+        // reads this cache, so its decode work is unchanged.
+        var beginHeadState: [MLXArray] = []
+        if seedTokens.count > 1 {
+            let headCache = model.makeMTPCache()
+            headHistoryCache = headCache
+            let primeCount = seedTokens.count - 1
+            let primeHidden = model.applyFinalNorm(
+                hidden[0..., 0 ..< primeCount, 0...])
+            let primeTokens = MLXArray(
+                seedTokens.dropFirst().map(Int32.init)).reshaped([1, primeCount])
+            let primed = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: primeHidden, nextTokenIds: primeTokens,
+                cache: headCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: primeHidden, nextTokenIds: primeTokens,
+                    cache: headCache)
+            beginHeadState = headCache.flatMap { $0.state }
+                + [primed, primeHidden]
+        } else {
+            seedHiddenForPriming = hidden
+            seedTokensForPriming = seedTokens
+        }
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
-        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+        eval(cache.flatMap { $0.state } + beginHeadState
+            + [tailIDs, tailValues, pendingHidden!, hidden])
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
