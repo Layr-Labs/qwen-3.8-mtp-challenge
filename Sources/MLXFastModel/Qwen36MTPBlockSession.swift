@@ -1054,10 +1054,8 @@ public final class Qwen36MTPBlockSession {
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
         // same ordering `argMax` uses (larger logit wins, lower id wins an
-        // exact tie), so the separate vocabulary-wide argMax launch is
-        // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
-        let verifyArgmax = stride(
-            from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+        // exact tie). Read those IDs in place below instead of materializing a
+        // second host array for the acceptance walk and carried primary.
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -1065,7 +1063,7 @@ public final class Qwen36MTPBlockSession {
         //    used on full acceptance.
         var acceptedCount = 0
         for index in 0 ..< drafts.count {
-            guard verifyArgmax[index] == drafts[index] else { break }
+            guard flatTop2IDs[index * 2] == drafts[index] else { break }
             acceptedCount += 1
             if stopTokens.contains(drafts[index]) { break }
         }
@@ -1089,7 +1087,7 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimary = flatTop2IDs[drafts.count * 2]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1115,7 +1113,7 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimary = flatTop2IDs[acceptedCount * 2]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
