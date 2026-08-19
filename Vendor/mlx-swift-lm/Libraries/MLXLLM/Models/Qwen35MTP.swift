@@ -113,9 +113,20 @@ final class Qwen35MTPModule: Module {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused: MLXArray
+        if let pair = qwen35CompiledPreFcPair(
+            embedding: embeds,
+            hidden: hidden,
+            embeddingWeight: preFcNormEmbedding.weight,
+            hiddenWeight: preFcNormHidden.weight,
+            eps: preFcNormEmbedding.eps)
+        {
+            fused = fc(pair)
+        } else {
+            let e = preFcNormEmbedding(embeds)
+            let h = preFcNormHidden(hidden)
+            fused = fc(concatenated([e, h], axis: -1))
+        }
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -147,9 +158,20 @@ final class Qwen35MTPModule: Module {
         else { return nil }
 
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused: MLXArray
+        if let pair = qwen35CompiledPreFcPair(
+            embedding: embeds,
+            hidden: hidden,
+            embeddingWeight: preFcNormEmbedding.weight,
+            hiddenWeight: preFcNormHidden.weight,
+            eps: preFcNormEmbedding.eps)
+        {
+            fused = fc(pair)
+        } else {
+            let e = preFcNormEmbedding(embeds)
+            let h = preFcNormHidden(hidden)
+            fused = fc(concatenated([e, h], axis: -1))
+        }
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(

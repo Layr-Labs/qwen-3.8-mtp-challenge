@@ -251,6 +251,44 @@ private let qwen35CompiledSigmoidMultiply:
     return body
 }()
 
+/// Proposal-side `concat(RMSNorm(emb), RMSNorm(hid), axis: -1)` as one
+/// shapeless compiled graph of the stock primitives. Not a new Metal kernel
+/// (`13011880` dual-norm Metal lost 0.022 on this 512-cmdbuf tip). Fail
+/// closed unless eps is the config default 1e-6 and both sides are BF16/5120.
+private let qwen35CompiledDualRMSNormConcat:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+{
+    let body: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+        { emb, hid, wEmb, wHid in
+            let e = MLXFast.rmsNorm(emb, weight: wEmb, eps: 1e-6)
+            let h = MLXFast.rmsNorm(hid, weight: wHid, eps: 1e-6)
+            return concatenated([e, h], axis: -1)
+        }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
+
+func qwen35CompiledPreFcPair(
+    embedding: MLXArray,
+    hidden: MLXArray,
+    embeddingWeight: MLXArray,
+    hiddenWeight: MLXArray,
+    eps: Float
+) -> MLXArray? {
+    guard eps == 1e-6,
+          embedding.dtype == .bfloat16,
+          hidden.dtype == .bfloat16,
+          embedding.dim(-1) == 5120,
+          hidden.dim(-1) == 5120,
+          embeddingWeight.shape == [5120],
+          hiddenWeight.shape == [5120]
+    else { return nil }
+    return qwen35CompiledDualRMSNormConcat(
+        embedding, hidden, embeddingWeight, hiddenWeight)
+}
+
 
 // MARK: - packed GDN prework mixer (verify widths 3...9)
 //
