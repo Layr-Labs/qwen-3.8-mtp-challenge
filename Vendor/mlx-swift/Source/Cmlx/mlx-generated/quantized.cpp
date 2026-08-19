@@ -881,7 +881,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(M >= 2 && M <= 9, "multi-row QMV supports M in [2, 9]");
+  static_assert(M >= 1 && M <= 9, "multi-row QMV supports M in [1, 9]");
   constexpr int inputs_per_group = 2;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -1981,6 +1981,11 @@ template <typename T, int group_size, int bits, bool batched>
       }
     } else {
       switch (ntg.x) {
+        case 1:
+          qmv_fast_crossrow_affine4_g64<T, 1>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
