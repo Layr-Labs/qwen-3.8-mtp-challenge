@@ -141,17 +141,20 @@ public final class Qwen36MTPBlockSession {
     // Layout invariant: head position p holds fused(embed(token_{p+1}),
     // trunk_hidden_p) — hidden at a position pairs with the NEXT token.
     //
-    // Priming is LAZY (first drafting round), so a serial-control session
-    // (offers always 0) never builds the cache and stays bit-identical to the
-    // previous behaviour. History upkeep is FOLDED into the next draft
-    // forward as extra leading rows — the head weights are read once per
-    // drafting round either way.
+    // Seed-prefix priming used to be LAZY (first drafting generateRound) so a
+    // serial-control session never built the cache. Ranked scoring is
+    // decode-only: that 511-row MTP head pass sat inside the timed decode
+    // window even though it depends only on begin's seed. `begin` now primes
+    // the persistent cache in the same eval as the seed readout (prefill).
+    // Depth-0 generateRound still never reads the cache — its compute stream
+    // is unchanged. History upkeep after that is FOLDED into the next draft
+    // forward as extra leading rows.
     private var headHistoryCache: [any KVCache]?
     /// Committed fused rows not yet appended: (post-norm trunk hidden at t,
     /// token at t+1). Flushed as leading rows of the next draft forward.
     private var headHistoryBacklogHidden: [MLXArray] = []
     private var headHistoryBacklogTokens: [Int] = []
-    /// Seed rows retained for lazy priming; released at the first flush.
+    /// Seed rows retained only when begin could not prime (seed length 1).
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
@@ -467,16 +470,40 @@ public final class Qwen36MTPBlockSession {
         _ = seedLogits
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
-        // Retain the full pre-norm seed hidden for lazy head-history priming.
-        // ~5 MB at 512x5120 bf16; released at the first drafting round. The
-        // eval below materialises it so no seed graph is kept alive.
-        seedHiddenForPriming = hidden
-        seedTokensForPriming = seedTokens
-        // One batched readout: the first primary and its tail-row top-2
-        // evidence come out of the same eval as the cache roots.
+        // One batched readout: the first primary, tail-row top-2, cache roots,
+        // and — when the seed is long enough — the seed-prefix MTP head prime.
+        // That prime is the same 511-row `mtpHeadLastHiddenWithKVOnlyHistory`
+        // the first drafting generateRound used to run inside timed decode.
+        // RMSNorm is row-local; the pairing is still hidden[t] with token[t+1].
+        // Folding it here is a schedule move of independent ops into prefill.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
-        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+        var beginEval: [MLXArray] = cache.flatMap { $0.state } + [
+            tailIDs, tailValues, pendingHidden!, hidden
+        ]
+        if seedTokens.count > 1 {
+            let fresh = model.makeMTPCache()
+            headHistoryCache = fresh
+            let primeCount = seedTokens.count - 1
+            let primedHidden = model.applyFinalNorm(
+                hidden[0..., 0 ..< primeCount, 0...])
+            let primedTokens = MLXArray(
+                seedTokens[1...].map { Int32($0) }
+            ).reshaped([1, primeCount])
+            let primed = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: primedHidden, nextTokenIds: primedTokens,
+                cache: fresh)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: primedHidden, nextTokenIds: primedTokens,
+                    cache: fresh)
+            seedHiddenForPriming = nil
+            seedTokensForPriming = []
+            beginEval.append(primed)
+            beginEval.append(contentsOf: fresh.flatMap { $0.state })
+        } else {
+            seedHiddenForPriming = hidden
+            seedTokensForPriming = seedTokens
+        }
+        eval(beginEval)
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
