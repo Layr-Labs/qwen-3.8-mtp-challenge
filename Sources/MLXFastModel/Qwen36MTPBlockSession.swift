@@ -1324,7 +1324,7 @@ public final class Qwen36MTPBlockSession {
         if draftCount > 1 {
             for entry in cache where !(entry is ArraysCache) {
                 guard entry.isTrimmable,
-                      entry.offset == committedOffset + rejected
+                      entry.offset == committedOffset + rejected + 1
                 else { return false }
             }
             guard model.replayRecurrentPrefix(
@@ -1343,7 +1343,7 @@ public final class Qwen36MTPBlockSession {
                 guard arrays.rollbackCheckpoints.count > acceptedCount
                 else { return false }
             } else if entry.isTrimmable {
-                guard entry.offset == committedOffset + rejected
+                guard entry.offset == committedOffset + rejected + 1
                 else { return false }
             } else {
                 return false
