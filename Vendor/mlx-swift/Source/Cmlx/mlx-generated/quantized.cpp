@@ -1079,11 +1079,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 }
 
 // Single-row (M == 1) affine2/g64 fast QMV for the coarse compact draft
-// readout (out_vec_size == 98_336, bits == 2) of the promoted draft-rerank
-// scheme, at 32 values per lane: each lane loads ONE uint64 (32 packed
-// 2-bit values) per row per k-block, halving load count and k-blocks versus
-// the generic 16-value form. Duo values are extracted by shift and
-// multiplied by the UNSCALED activation: (x / 4^k) * (w & (3 << 2k)) and
+// readout (out_vec_size == 98_336, bits == 2). values_per_thread = 64: each
+// lane covers one g64 group (two consecutive u64, 16 B) so the scale/bias
+// pair is loaded once per lane per 2048-wide block. in_vec_size is 5120, and
+// 5120 % 2048 == 1024, so the k-loop is two full 64-value blocks plus a
+// 32-value epilogue (one u64 / lane) that covers the last 1024. x is walked
+// as two 32-value halves that reuse one x0[32] buffer -- the 64-float
+// materialization is avoided on purpose. Duo values are extracted by shift
+// and multiplied by the UNSCALED activation: (x / 4^k) * (w & (3 << 2k)) and
 // x * ((w >> 2k) & 3) are the same real product (power-of-two scaling is
 // exact in FP32), so every elementary product equals the generic
 // qmv_fast_impl<T, 64, 2> value; the wider lane coverage reassociates the
@@ -1093,6 +1096,9 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 // 2-bit matmul (all its projections are affine-4), and out_vec_size ==
 // 98_336 exists only in the compact draft readout, so the dispatch gate
 // below cannot touch the serial numerator or the denominator band.
+//
+// Identifier note: never name a Metal loop variable `half` -- it is a
+// reserved MSL type. 90df6c3 died on that parse error; this body uses `hf`.
 template <typename T>
 METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     const device uint32_t* w,
@@ -1106,11 +1112,13 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     uint simd_gid,
     uint simd_lid) {
   constexpr int rows_per_simd = 4;
-  constexpr int values_per_thread = 32;
+  constexpr int values_per_thread = 64;
+  constexpr int values_per_half = 32;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int bytes_per_lane = 8;  // 32 values x 2 bits = 8 bytes
-  const int in_vec_size_w = in_vec_size / 4;   // weight bytes per output row
-  const int in_vec_size_g = in_vec_size / 64;  // scale groups per output row
+  constexpr int bytes_per_lane = 16;
+  constexpr int tail_bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 4;
+  const int in_vec_size_g = in_vec_size / 64;
 
   const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
 
@@ -1119,26 +1127,68 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     result[r] = 0.0f;
   }
 
-  for (int k = 0; k < in_vec_size; k += block_size) {
+  int k = 0;
+  for (; k + block_size <= in_vec_size; k += block_size) {
+    thread ulong packed[2][rows_per_simd];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
+          row * in_vec_size_w + k / 4 + int(simd_lid) * bytes_per_lane;
+      packed[0][r] = *reinterpret_cast<const device ulong*>(ws);
+      packed[1][r] = *reinterpret_cast<const device ulong*>(ws + 8);
+      const int group_index = row * in_vec_size_g + k / 64 + int(simd_lid);
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    float sum = 0.0f;
+    thread float x0[values_per_half];
+#pragma unroll
+    for (int hf = 0; hf < 2; hf++) {
+      const device T* xm =
+          x + k + int(simd_lid) * values_per_thread + hf * values_per_half;
+      for (int i = 0; i < values_per_half; i += 4) {
+        x0[i] = static_cast<float>(xm[i]);
+        x0[i + 1] = static_cast<float>(xm[i + 1]);
+        x0[i + 2] = static_cast<float>(xm[i + 2]);
+        x0[i + 3] = static_cast<float>(xm[i + 3]);
+        sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        float accum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+          accum += x0[j] * float((packed[hf][r] >> (2 * j)) & 0x03ul);
+        }
+        result[r] += scale_local[r] * accum;
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      result[r] += sum * bias_local[r];
+    }
+  }
+
+  if (k < in_vec_size) {
     thread ulong packed[rows_per_simd];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
-          row * in_vec_size_w + k / 4 + simd_lid * bytes_per_lane;
+          row * in_vec_size_w + k / 4 + int(simd_lid) * tail_bytes_per_lane;
       packed[r] = *reinterpret_cast<const device ulong*>(ws);
-      // 32 values per lane = half of one 64-value group.
       const int group_index =
-          row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
+          row * in_vec_size_g + k / 64 + (int(simd_lid) * values_per_half) / 64;
       scale_local[r] = scales[group_index];
       bias_local[r] = biases[group_index];
     }
 
-    thread float x0[values_per_thread];
-    const device T* xm = x + k + simd_lid * values_per_thread;
+    thread float x0[values_per_half];
+    const device T* xm = x + k + int(simd_lid) * values_per_half;
     float sum = 0.0f;
-    for (int i = 0; i < values_per_thread; i += 4) {
+    for (int i = 0; i < values_per_half; i += 4) {
       x0[i] = static_cast<float>(xm[i]);
       x0[i + 1] = static_cast<float>(xm[i + 1]);
       x0[i + 2] = static_cast<float>(xm[i + 2]);
@@ -1148,7 +1198,7 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
 
     for (int r = 0; r < rows_per_simd; r++) {
       float accum = 0.0f;
-      #pragma unroll
+#pragma unroll
       for (int j = 0; j < 32; j++) {
         accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
       }
