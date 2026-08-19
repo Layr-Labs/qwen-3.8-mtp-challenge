@@ -1076,7 +1076,7 @@ public final class Qwen36MTPBlockSession {
         perRowTop2Logits.reserveCapacity(draftCount + 1)
         for index in 0 ..< draftCount {
             let base = index * 2
-            perRowTop2Tokens.append(Array(flatTop2IDs[base ..< (base + 2)]))
+            perRowTop2Tokens.append([flatTop2IDs[base], flatTop2IDs[base + 1]])
             perRowTop2Logits.append(Array(flatTop2Values[base ..< (base + 2)]))
         }
 
@@ -1093,7 +1093,7 @@ public final class Qwen36MTPBlockSession {
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
-            let ids = Array(flatTop2IDs[base ..< (base + 2)])
+            let ids = [flatTop2IDs[base], flatTop2IDs[base + 1]]
             let values = Array(flatTop2Values[base ..< (base + 2)])
             pendingTop2 = (ids, values)
             perRowTop2Tokens.append(ids)
