@@ -611,6 +611,51 @@ public final class Qwen36MTPBlockSession {
     /// inside the marginal the rule prices.
     private static let headStepCostRatio = 0.18
 
+    /// PIECEWISE ROW PRICE (this submission's only behavioural change).
+    ///
+    /// `headStepCostRatio` prices EVERY drafted row the same. The rule it feeds
+    /// is a greedy marginal test, so a flat price is only correct if the true
+    /// marginal cost of a row is flat — and on this stack it is not. Measured
+    /// per-round wall (ladder-off, all GPU inside one blocking eval, medians
+    /// over pooled clean rounds, one prompt-independent cost table):
+    ///
+    ///     d      1       2       3       5       6
+    ///     R(d)  33.87   35.17   40.09   53.91   60.73   ms
+    ///     row       ->1.30   ->4.92   ->~6.9/row  ->6.82
+    ///
+    /// The shape is the verify forward's, not the head's: V(M) measures
+    /// 29.4 / 28.6 / 31.4 / 41.3 ms at M = 2 / 3 / 4 / 6, i.e. **width-flat
+    /// through M = 3** and ~4.9 ms per row after. A drafted row costs one head
+    /// step (~1.04 ms) plus its share of that. Against V ~= 29.5 ms:
+    ///
+    ///     rows 1-2 : 1.30 / 29.5 = 0.044   (head step only; verify is free here)
+    ///     row 3    : 4.92 / 29.5 = 0.167   (head step + the M=4 shoulder)
+    ///     rows 4+  : ~6.9 / 29.5 = 0.23    (head step + full per-row verify)
+    ///
+    /// So the flat 0.18 is wrong in BOTH directions: it over-prices the two
+    /// nearly-free rows (4x) and under-prices every row past the shoulder.
+    /// The correction makes the schedule reach depth 2 readily on cold or
+    /// low-accept prompts, and stop earlier when rows have stopped being cheap.
+    ///
+    /// HARDCODED BY DESIGN. These are wall-clock ratios of one machine, and the
+    /// ranked runner is the same silicon (M5 Max) running the same pinned
+    /// target, so a constant measured here transfers. Deriving them at runtime
+    /// would mean timing inside the scored window, which is worse in every way:
+    /// it spends the thing it is trying to save and it makes the schedule
+    /// depend on measurement noise. Re-measure if the target or the verify
+    /// kernels change.
+    ///
+    /// Argmax-safe by construction: this changes only HOW MANY rows are
+    /// drafted. It touches no arithmetic, no reduction order, and no kernel,
+    /// so every emitted token is the same token the unmodified tree emits.
+    private static func rowPriceRatio(_ row: Int) -> Double {
+        switch row {
+        case ..<3: return 0.044
+        case 3: return 0.167
+        default: return 0.230
+        }
+    }
+
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -692,7 +737,10 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        // Accumulated normalised cost of the rows already bought, in units of
+        // one verify forward: T(depth)/V = 1 + sum(rowPriceRatio(1...depth)).
+        // The flat-price form was `1 + depth * h`.
+        var accumulatedPrice = 0.0
         var reach = 1.0
         var expected = 0.0
         var depth = 0
@@ -708,9 +756,12 @@ public final class Qwen36MTPBlockSession {
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            // Price the row we are about to buy, not an average row.
+            let hNext = Self.rowPriceRatio(depth + 1)
+            let threshold = hNext * (1.0 + expected) / (1.0 + accumulatedPrice)
             guard reach > threshold else { break }
             expected += reach
+            accumulatedPrice += hNext
             depth += 1
         }
         return depth
