@@ -124,15 +124,23 @@ public func attentionWithCacheUpdate(
         {
             let split = 5
             let kSplit = kL - (qL - split)
+            // Query slices along axis 2 of a packed [B, H, qL, D] tensor are
+            // not row-contiguous: each head keeps parent stride qL*D, not
+            // chunk*D. Vector / 2-pass SDPA threadgroup is (32, gqa, qL_chunk)
+            // and wants compact Q. `.contiguous()` copies those tiny Q views
+            // only (width 6–7: 5+1 or 5+2 heads-major rows). Keys/values stay
+            // the existing sliced views. Split=5 and k-windows are unchanged.
+            let qA = queries[0..., 0..., 0 ..< split, 0...].contiguous()
+            let qB = queries[0..., 0..., split..., 0...].contiguous()
             let outA = MLXFast.scaledDotProductAttention(
-                queries: queries[0..., 0..., 0 ..< split, 0...],
+                queries: qA,
                 keys: cachedKeys[0..., 0..., 0 ..< kSplit, 0...],
                 values: cachedValues[0..., 0..., 0 ..< kSplit, 0...],
                 scale: scale,
                 mask: .causal
             )
             let outB = MLXFast.scaledDotProductAttention(
-                queries: queries[0..., 0..., split..., 0...],
+                queries: qB,
                 keys: cachedKeys,
                 values: cachedValues,
                 scale: scale,
