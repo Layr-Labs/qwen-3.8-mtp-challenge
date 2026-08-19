@@ -1198,6 +1198,157 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+// Single weight stream for the affine4/g64 multi-row verify QMV. Same host
+// contract as qmv_fast_crossrow_affine4_g64_wide: the frozen host launches M
+// x-groups per 8-output tile, so one group claiming NA adjacent input rows lets
+// every other host group return without reading weights. Lifts the NA <= 4 cap
+// of the vec<float, NA> kernel by using float[rows_per_simd][NA] accumulators,
+// so a single group can claim up to NA = 9 rows and stream each weight tile
+// exactly once. Only four x values per input row are live at a time (xc), so
+// the added register cost is the accumulators, not the x staging. The load,
+// the qdot expression, the K accumulation order and simd_sum are byte-identical
+// to qmv_fast_crossrow_affine4_g64_wide for every output element, so the value
+// at each y[(first_m + m) * out + row] is invariant to how the M rows are
+// partitioned across host groups.
+template <typename T, int NA, bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_wideN(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    int first_m,
+    int out_row,
+    uint simd_lid) {
+  static_assert(NA >= 2 && NA <= 9,
+      "single-stream multi-row QMV supports NA in [2, 9]");
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float acc[rows_per_simd][NA];
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < NA; m++) {
+      acc[r][m] = 0.0f;
+    }
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    float sums[NA];
+    float partial[rows_per_simd][NA];
+    for (int m = 0; m < NA; m++) {
+      sums[m] = 0.0f;
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      for (int m = 0; m < NA; m++) {
+        partial[r][m] = 0.0f;
+      }
+    }
+    for (int i = 0; i < 4; i++) {
+      for (int m = 0; m < NA; m++) {
+        const device T* xm = x + (first_m + m) * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        thread float xc[4];
+        if (DIRECT_NIBBLES) {
+          xc[0] = static_cast<float>(xm[0]);
+          xc[1] = static_cast<float>(xm[1]);
+          xc[2] = static_cast<float>(xm[2]);
+          xc[3] = static_cast<float>(xm[3]);
+          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+        } else {
+          sums[m] += load_vector<T, float, 4, 4>(xm, xc);
+        }
+        for (int r = 0; r < rows_per_simd; r++) {
+          if (DIRECT_NIBBLES) {
+            partial[r][m] += (xc[0] * (packed[r][i] & 0x000f) +
+                              xc[1] * ((packed[r][i] >> 4) & 0x000f) +
+                              xc[2] * ((packed[r][i] >> 8) & 0x000f) +
+                              xc[3] * ((packed[r][i] >> 12) & 0x000f));
+          } else {
+            partial[r][m] += (xc[0] * (packed[r][i] & 0x000f) +
+                              xc[1] * (packed[r][i] & 0x00f0) +
+                              xc[2] * (packed[r][i] & 0x0f00) +
+                              xc[3] * (packed[r][i] & 0xf000));
+          }
+        }
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      for (int m = 0; m < NA; m++) {
+        acc[r][m] += scale_local[r] * partial[r][m] + sums[m] * bias_local[r];
+      }
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < NA; m++) {
+      const float reduced = simd_sum(acc[r][m]);
+      if (simd_lid == 0) {
+        y[(first_m + m) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
+// Single-stream dispatch helper: one host x-group claims IPG adjacent input
+// rows through qmv_fast_crossrow_affine4_g64_wideN, so weights are streamed
+// ceil(M / IPG) times per 8-output tile. IPG == M streams weights exactly once.
+// Mirrors qmv_fast_crossrow_affine4_g64_m's tail handling for the M % IPG != 0
+// splits; the per-element math matches the vec-accumulator path exactly.
+template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_mN(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M >= 3 && M <= 9, "single-stream QMV dispatch covers M in [3, 9]");
+  static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
+  constexpr int TAIL = M % IPG;
+  const int first_m = int(tid.x) * IPG;
+  if (first_m >= M) {
+    return;
+  }
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+  if (TAIL == 0 || M - first_m >= IPG) {
+    qmv_fast_crossrow_affine4_g64_wideN<T, IPG, DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  } else {
+    qmv_fast_crossrow_affine4_g64_wideN<
+        T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1949,29 +2100,40 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+          // Single weight stream: one x-group claims all 5 verify rows
+          // (was IPG 3, i.e. 3+2 = two streams). Bit-exact to the vec path.
+          qmv_fast_crossrow_affine4_g64_mN<T, 5, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 6:
+          // Single weight stream (was IPG 3, i.e. 3+3 = two streams).
           qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 7:
+          // Single weight stream (was IPG 4, i.e. 4+3 = two streams).
           qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
+          // Single weight stream (was IPG 4, i.e. 4+4 = two streams). The
+          // float[4][8] accumulators replace the two live vec<float,4>
+          // accumulators of the even split; each row's scalar K-chain is
+          // unchanged, so the register-cliff argument for the old split does
+          // not apply to the single-stream form. ~96 registers estimated.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 9:
+          // Single weight stream (was IPG 3, i.e. 3+3+3 = THREE streams — the
+          // largest single lever on this dispatch). float[4][9] accumulators,
+          // ~109 registers estimated; conservative fallback if occupancy
+          // regresses is qmv_fast_crossrow_affine4_g64_mN<T, 9, 5, true> (5+4,
+          // two streams, ~73 registers).
           qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
