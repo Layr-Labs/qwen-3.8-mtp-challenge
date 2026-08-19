@@ -511,6 +511,7 @@ public final class Qwen36MTPBlockSession {
         eval(outs)
     }
 
+
     // MARK: - begin
 
     /// Bulk-forward the seed and return the argmax of its last row — the first
@@ -676,10 +677,11 @@ public final class Qwen36MTPBlockSession {
     /// free (restoreAfterPrefixReject, no repair at any depth). Their
     /// constant prices a cost this stack deleted; 0.40 measured -4.5% on
     /// the easy-prose receipt (held d2-3 where d4 pays). h = 0.20 is the
-    /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
-    /// reject does keep (the drafted head steps past the break) is already
-    /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    /// Marginal cost of one MTP draft step relative to a full 64-layer target
+    /// verify forward. Under the 4-bit affine group-64 MTP head (238 MB vs 849 MB bf16),
+    /// draft forward latency drops to ~0.9 ms on Apple Silicon GPU, yielding a breakeven
+    /// cost ratio h ≈ 0.08.
+    private static let headStepCostRatio = 0.08
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -719,34 +721,9 @@ public final class Qwen36MTPBlockSession {
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
     private static let segmentedVerifyDepthCap = 8
-    /// 2, not 3 — the FOURTH restore of this literal, and it has still never
-    /// lost on its merits.
-    ///
-    /// Ranked history: newjordan 2.91995 (PROMOTED, then reverted by a later
-    /// archive that happened to carry 3); hadakang 2.92976 against the 2.92622
-    /// frontier of its day (beat its contemporary crown, lost the race); and my
-    /// own `4650c96e` scored 2.93524 against the 2.93429 base it was built on
-    /// (+0.03%) and again lost only because the crown moved to 2.94662 while it
-    /// validated. Three independent runs, three times ahead of its own base.
-    ///
-    /// A fourth, independent line of evidence, from a negative result of mine.
-    /// I raised `headStepCostRatio` 0.18 -> 0.32 on the directly measured
-    /// marginal (`fc62d1aa`): it scored 2.84585, a clean -3% with the baseline
-    /// leg FLAT (0.038092 -> 0.038070, so not a draw artifact). It shortened
-    /// every draft — 4.35/4.89/5.78/5.33/5.04 -> 3.36/4.01/4.53/4.03/4.76 — and
-    /// candidate decode time ROSE 0.95%. **This pool rewards depth**: the
-    /// marginal draft is worth more than its verify row costs. With 0.15 (2.667)
-    /// and 0.14 (2.766) failing below, h is now bracketed on both sides and 0.18
-    /// is a true local optimum — so the way to buy depth is NOT the price.
-    ///
-    /// It is the cap, and that is what makes it safe. `h` moves the marginal
-    /// rule on EVERY round including the hard prompts (0.32 dragged prompt 6
-    /// from 0.17 drafts to 0.06). This gate is conditioned on OBSERVED perfect
-    /// acceptance and any reject resets `fullAcceptStreak` to 0, so it cannot
-    /// touch a cold or hard prompt at all — it only shortens the
-    /// re-qualification ramp on stretches the head is already proving. Gate 1 is
-    /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
+
+
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
@@ -1072,7 +1049,10 @@ public final class Qwen36MTPBlockSession {
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        let allDraftsTensor = draftIdArrays.count == 1
+            ? draftIdArrays[0]
+            : concatenated(draftIdArrays, axis: -1)
+        asyncEval(allDraftsTensor)
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1114,12 +1094,11 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        let bundle: [MLXArray] = [top2IDs, top2Values, allDraftsTensor]
+        eval(cache.flatMap { $0.state } + (headCache.flatMap { $0.state }) + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = allDraftsTensor.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
