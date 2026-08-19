@@ -359,6 +359,25 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
+        // VERIFY-CONCAT JIT WARM. Scored rounds assemble verifyTokens as
+        // concatenated([host primary] + device draftIds) over int32 [1, 1]
+        // arrays. The width loop below feeds callWithHidden a single host
+        // [1, width] tensor, so it never compiles that multi-input concat.
+        // MLX JIT-specializes copy/concat by dtype and input count
+        // (ml-explore/mlx metal JIT; first launch pays Metal library
+        // compile — see Kernel Management / JIT Compilation). Those
+        // copyint32int32 kernels otherwise land inside scored round 1.
+        // Values are zeros / already-eval'd draft IDs and the result is
+        // discarded: shape + dtype + host/device mix select the kernels.
+        // Warm every legal extra-count 0...maxDepth so an adaptive
+        // draftPolicy that returns 0..8 does not hit a cold width later.
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra {
+                parts.append(primedDraftID)
+            }
+            eval(concatenated(parts, axis: 1))
+        }
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -1039,14 +1058,27 @@ public final class Qwen36MTPBlockSession {
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
         // this round — the per-row argmaxes (accept walk AND both candidates
         // for the next primary), the draft ids, the top-2 evidence of every
-        // row including the bonus row, and the cache roots — is materialised
-        // in ONE eval. The `.item()`/`.asArray` calls below then copy from
-        // materialised buffers without waiting on the GPU. (MTPLX production
-        // budget: 1 sync/cycle, batched_decode.py:504-525.)
+        // row including the bonus row — is materialised here in ONE eval. The
+        // `.item()`/`.asArray` calls below then copy from materialised buffers
+        // without waiting on the GPU. (MTPLX production budget: 1 sync/cycle,
+        // batched_decode.py:504-525.)
+        //
+        // DO NOT bundle `cache.flatMap { $0.state }`. Those arrays are pure
+        // GPU-only inputs to the next round's forward (`callWithHidden(cache:)`
+        // and `callWithHiddenAndNormed(cache:)`, both of which consume the
+        // cache state through their MLX stream ordering). Including them in
+        // the sync bundle forced the host to materialise every layer's KV
+        // cache root before any draft id could be read — a synchronous GPU
+        // stall sized by the whole 64-layer × 2-cache root tree instead of by
+        // the small (K+1) row top-2 + (K) draft id bundle the host needs. The
+        // rollback path uses `restore()`/Swift-side slot assignment only,
+        // `clearRecurrentRollback` is purely structural, and the rare generic
+        // K>1 repair runs its OWN second eval later, so no host read here ever
+        // needs the cache state synchronously on the happy path.
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
