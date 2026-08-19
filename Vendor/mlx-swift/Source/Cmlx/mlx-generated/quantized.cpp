@@ -1108,7 +1108,6 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 32;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int bytes_per_lane = 8;  // 32 values x 2 bits = 8 bytes
   const int in_vec_size_w = in_vec_size / 4;   // weight bytes per output row
   const int in_vec_size_g = in_vec_size / 64;  // scale groups per output row
 
@@ -1120,39 +1119,41 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    thread ulong packed[rows_per_simd];
-    thread float scale_local[rows_per_simd];
-    thread float bias_local[rows_per_simd];
+    const int k0 = k + int(simd_lid) * values_per_thread;
+    thread float x_thread[values_per_thread];
+    const device T* xm = x + k0;
+    float sumx = 0.0f;
+    for (int i = 0; i < values_per_thread; i += 4) {
+      const float xv0 = static_cast<float>(xm[i]);
+      const float xv1 = static_cast<float>(xm[i + 1]);
+      const float xv2 = static_cast<float>(xm[i + 2]);
+      const float xv3 = static_cast<float>(xm[i + 3]);
+      sumx += xv0 + xv1 + xv2 + xv3;
+      // qdot AND-mask 0x03/0x0c/0x30/0xc0 with x prescale /4 /16 /64:
+      // (x / 4^k) * (w & (3 << 2k)) == x * ((w >> 2k) & 3) in FP32.
+      x_thread[i] = xv0;
+      x_thread[i + 1] = xv1 * (1.f / 4.f);
+      x_thread[i + 2] = xv2 * (1.f / 16.f);
+      x_thread[i + 3] = xv3 * (1.f / 64.f);
+    }
+
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
-      const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
-          row * in_vec_size_w + k / 4 + simd_lid * bytes_per_lane;
-      packed[r] = *reinterpret_cast<const device ulong*>(ws);
-      // 32 values per lane = half of one 64-value group.
-      const int group_index =
-          row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
-      scale_local[r] = scales[group_index];
-      bias_local[r] = biases[group_index];
-    }
-
-    thread float x0[values_per_thread];
-    const device T* xm = x + k + simd_lid * values_per_thread;
-    float sum = 0.0f;
-    for (int i = 0; i < values_per_thread; i += 4) {
-      x0[i] = static_cast<float>(xm[i]);
-      x0[i + 1] = static_cast<float>(xm[i + 1]);
-      x0[i + 2] = static_cast<float>(xm[i + 2]);
-      x0[i + 3] = static_cast<float>(xm[i + 3]);
-      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
-    }
-
-    for (int r = 0; r < rows_per_simd; r++) {
+      const device uint8_t* ws =
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k0 / 4;
       float accum = 0.0f;
       #pragma unroll
-      for (int j = 0; j < 32; j++) {
-        accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+      for (int i = 0; i < 8; i++) {
+        const uint8_t ww = ws[i];
+        accum += x_thread[4 * i + 0] * float(ww & 0x03) +
+            x_thread[4 * i + 1] * float(ww & 0x0c) +
+            x_thread[4 * i + 2] * float(ww & 0x30) +
+            x_thread[4 * i + 3] * float(ww & 0xc0);
       }
-      result[r] += scale_local[r] * accum + sum * bias_local[r];
+      const int group_index = row * in_vec_size_g + k0 / 64;
+      result[r] += float(scales[group_index]) * accum +
+          sumx * float(biases[group_index]);
     }
   }
 

@@ -365,7 +365,16 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          const InT scale = is_q ? q_scale : k_scale;
+          // Geometry-derived scales, baked as bf16 immediates. mixerHit
+          // already requires headKDim == 128, so these bits are the unique
+          // values of the previous host path:
+          //   q = MLXArray(pow(pow(Float(128), -0.5), 2)).asType(.bfloat16)
+          //     f32 0x3BFFFFFF rounds-to-nearest-even -> bf16 0x3C00 (1/128)
+          //   k = MLXArray(pow(Float(128), -0.5)).asType(.bfloat16)
+          //     f32 0x3DB504F3 -> bf16 0x3DB5 (low 16 bits 0x04F3 < 0x8000)
+          const InT scale = is_q
+              ? as_type<InT>(uint16_t(0x3C00))
+              : as_type<InT>(uint16_t(0x3DB5));
           const uint output_base = (row * Hk + head) * Dk + lane * 4;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
@@ -419,7 +428,7 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         name: "qwen35_packed_gdn_prework",
         inputNames: [
             "qkv", "a", "b", "conv_state", "conv_weight", "a_log",
-            "dt_bias", "q_scale", "k_scale",
+            "dt_bias",
         ],
         outputNames: [
             "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out",
@@ -795,10 +804,12 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
-    /// Single-chunk verify twin that retains only the ingredients needed to
+    /// Single-chunk verify twin that retains the ingredients needed to
     /// reconstruct a committed recurrent prefix after the target acceptance
-    /// walk. The target output is the ordinary `gatedDeltaUpdate` output; no
-    /// midpoint state tensor is produced on the hot path.
+    /// walk. When the existing mid-state `gated_delta_step` clone is
+    /// available it also records one rec/conv slot per verify boundary
+    /// (depth <= 8) so reject restore is a pointer swap. The compact replay
+    /// tape remains the fail-closed fallback.
     private func processChunkStashingPrefix(
         qkv: MLXArray,
         a: MLXArray,
@@ -808,7 +819,8 @@ final class Qwen35GatedDeltaNet: Module {
         mask: MLXArray?
     ) -> (
         out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
-        tape: ArraysCache.PrefixReplayTape
+        tape: ArraysCache.PrefixReplayTape,
+        checkpoints: [(MLXArray, MLXArray)]
     ) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
@@ -832,11 +844,8 @@ final class Qwen35GatedDeltaNet: Module {
         let beta: MLXArray
         let newConvState: MLXArray
         if mixerHit {
-            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
             let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
-                 qScaleConst,
-                 kScaleConst],
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias],
                 template: [
                     ("Hk", numKHeads), ("Dk", headKDim),
                     ("Hv", numVHeads), ("Dv", headVDim),
@@ -891,18 +900,60 @@ final class Qwen35GatedDeltaNet: Module {
             g = gBeta.0
             beta = gBeta.1
         }
-        let recurrence: (MLXArray, MLXArray)
-        if MLXHardwareInfo.isCompiledDecodeSupported {
-            recurrence = qwen35GatedDeltaPrepared(
+        // Rec/conv slot tape (depth <= 8): reuse the existing mid-state
+        // clone of gated_delta_step so a rejected prefix can restore a
+        // recorded boundary without a new GDN GEMM and without the
+        // worker-killing prefixRestoreFailed path. Replay tape stays as
+        // the fail-closed fallback when this kernel is unavailable.
+        let out: MLXArray
+        let newSsmState: MLXArray
+        var checkpoints: [(MLXArray, MLXArray)] = []
+        if mask == nil, S >= 2, S <= 9, let midKernel = qwen35GatedDeltaMidKernel {
+            var state = ssmState
+                ?? MLXArray.zeros(
+                    [B, numVHeads, headVDim, headKDim], dtype: .float32)
+            if state.dtype != .float32 { state = state.asType(.float32) }
+            let outputs = midKernel(
+                [qNormed, kNormed, v, g, beta, state, MLXArray(S)],
+                template: [
+                    ("InT", qNormed.dtype),
+                    ("StT", DType.float32),
+                    ("Dk", headKDim),
+                    ("Dv", headVDim),
+                    ("Hk", numKHeads),
+                    ("Hv", numVHeads),
+                ],
+                grid: (32, headVDim, B * numVHeads),
+                threadGroup: (32, 4, 1),
+                outputShapes: [
+                    [B, S, numVHeads, headVDim],
+                    state.shape,
+                    [B, S - 1, numVHeads, headVDim, headKDim],
+                ],
+                outputDTypes: [qNormed.dtype, .float32, .float32]
+            )
+            out = outputs[0]
+            newSsmState = outputs[1]
+            checkpoints.reserveCapacity(S - 1)
+            for t in 0 ..< (S - 1) {
+                checkpoints.append((
+                    convInput[0..., (t + 1) ..< (t + 1 + nKeep)],
+                    outputs[2][0..., t]
+                ))
+            }
+        } else if MLXHardwareInfo.isCompiledDecodeSupported {
+            let recurrence = qwen35GatedDeltaPrepared(
                 q: qNormed, k: kNormed, v: v,
                 g: g, beta: beta, state: ssmState, mask: mask)
+            out = recurrence.0
+            newSsmState = recurrence.1
         } else {
-            recurrence = gatedDeltaUpdate(
+            let recurrence = gatedDeltaUpdate(
                 q: qNormed, k: kNormed, v: v, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: ssmState, mask: mask)
+            out = recurrence.0
+            newSsmState = recurrence.1
         }
-        let out = recurrence.0
-        let newSsmState = recurrence.1
         let tape = ArraysCache.PrefixReplayTape(
             convInput: convInput,
             q: qNormed,
@@ -916,7 +967,7 @@ final class Qwen35GatedDeltaNet: Module {
             mask: mask.map { $0[.ellipsis] },
             rowCount: S,
             convStateRows: nKeep)
-        return (out, newConvState, newSsmState, tape)
+        return (out, newConvState, newSsmState, tape, checkpoints)
     }
 
     fileprivate func canReplayPrefix(
@@ -1029,19 +1080,21 @@ final class Qwen35GatedDeltaNet: Module {
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
         var pendingPrefixTape: ArraysCache.PrefixReplayTape?
+        var pendingCheckpoints: [(MLXArray, MLXArray)] = []
 
         if nConfirmed == 1 && S >= 3 && mask == nil {
-            // K>=2 verify: keep the ordinary single-chunk recurrence and a
-            // compact replay tape. This avoids writing one 3 MiB fp32 state per
-            // boundary per GDN layer on every round. K=1 deliberately remains
-            // on the already-promoted eager-checkpoint kernel below.
-            let (o, c, s, tape) = processChunkStashingPrefix(
+            // K>=2 verify: one fused recurrence plus a rec/conv slot tape
+            // (existing mid-state gated_delta_step clone, depth <= 8). The
+            // compact replay tape stays as the fail-closed fallback. K=1
+            // remains on the already-promoted eager-checkpoint kernel below.
+            let (o, c, s, tape, slots) = processChunkStashingPrefix(
                 qkv: qkv, a: a, b: b,
                 convState: convState, ssmState: ssmState, mask: mask)
             out = o
             finalConvState = c
             finalSsmState = s
             pendingPrefixTape = tape
+            pendingCheckpoints = slots
         } else if nConfirmed == 1 && S == 2 && mask == nil,
            let midKernel = qwen35GatedDeltaMidKernel
         {
@@ -1166,7 +1219,10 @@ final class Qwen35GatedDeltaNet: Module {
             // A forward that did not request replay must erase any prior tape;
             // otherwise a later partial miss could restore a stale frame.
             cache.prefixReplayTape = pendingPrefixTape
-            if pendingPrefixTape != nil {
+            if !pendingCheckpoints.isEmpty {
+                cache.rollbackCheckpoints = pendingCheckpoints
+                cache.rollbackState = pendingCheckpoints.first
+            } else if pendingPrefixTape != nil {
                 cache.rollbackState = nil
                 cache.rollbackCheckpoints = []
             }
