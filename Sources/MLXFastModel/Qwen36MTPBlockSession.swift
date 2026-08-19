@@ -359,6 +359,22 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
+        // PROPOSAL SIDE ONLY: warm DFlash2 selector kernels outside scored window.
+        // Default ON; set MLXFAST_QWEN_MTP_SELECTOR=0 to disable.
+        if ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_SELECTOR"] != "0" {
+            let primedSlice = primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...]
+            let topKProbe = model.draftTopK(primedSlice, k: 8)
+            let gateProbe = model.selectorGate(primedSlice)
+            let aRowsProbe = model.selectorEmbeddingRows(for: topKProbe.0)
+            // Score probe: dummy prev row = first of topK, curr rows = same topK
+            let scoreProbe = model.selectorScoreBatch(
+                candidateLogits: topKProbe.1,
+                prevARow: aRowsProbe[0 ..< 1],
+                currBRows: aRowsProbe,
+                gate: gateProbe,
+                lambda: 0.05)
+            eval(topKProbe.0, topKProbe.1, gateProbe, aRowsProbe, scoreProbe)
+        }
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -609,7 +625,7 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    private static let headStepCostRatio = 0.179
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
@@ -696,16 +712,20 @@ public final class Qwen36MTPBlockSession {
         var reach = 1.0
         var expected = 0.0
         var depth = 0
+        // DFlash2 §3a: extend top2-gap pessimism beyond depth 0..1 to 2..7
+        // with widening sigmoid scales so deeper depths also benefit from
+        // confidence clamping but with diminishing correction. Keeps
+        // pessimistic min (never optimistic on margin); EMA remains ceiling
+        // when margin is confident. Uses same pendingTop2 tail-row gap as
+        // before — conservative proxy until per-step draft margin is plumbed
+        // through device arrays (future: draftStepMargin[i]).
+        let marginScales: [Double] = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
         while depth < cap {
             var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+            if depth < marginScales.count, let tail = pendingTop2, tail.1.count >= 2 {
                 let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+                let conf = 1.0 / (1.0 + exp(-margin / marginScales[depth]))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
@@ -733,6 +753,15 @@ public final class Qwen36MTPBlockSession {
         {
             positionAcceptEMA[acceptedCount] +=
                 alpha * (0.0 - positionAcceptEMA[acceptedCount])
+            // §3c floor: prevent post-reject EMA collapse to undraftability.
+            // Deep slots (depth≥4) otherwise decay below useful reach inside
+            // a single 512-token window and never recover; warm prose recovers
+            // via transfer anyway. Floor 0.25 chosen per plan (alternative
+            // depth-dependent 0.35-0.03*n floored at 0.20 considered but 0.25
+            // uniform is simpler and protects botany-cold prompts without
+            // hurting medicine-hot).
+            positionAcceptEMA[acceptedCount] = Swift.max(
+                positionAcceptEMA[acceptedCount], 0.25)
         } else if acceptedCount == drafts.count, !drafts.isEmpty,
                   acceptedCount < positionAcceptEMA.count
         {
@@ -745,9 +774,13 @@ public final class Qwen36MTPBlockSession {
             // at 0.95: transferred optimism is inference, not observation,
             // and deep positions never merit a certainty estimate
             // without treating that inference as a real observation.
+            // §3b: 1.5× alpha for transferred slot only (0.15→0.225) — faster
+            // ramp on proven hot stretches; streak gate already bounds exposure
+            // so cold prompts stay protected. Cap 0.95 retained.
             if positionAcceptEMA[acceptedCount] < 0.95 {
+                let transferAlpha = alpha * 1.5
                 positionAcceptEMA[acceptedCount] +=
-                    alpha * (0.95 - positionAcceptEMA[acceptedCount])
+                    transferAlpha * (0.95 - positionAcceptEMA[acceptedCount])
             }
         }
     }
@@ -977,32 +1010,106 @@ public final class Qwen36MTPBlockSession {
         // (Per-step asyncEval was tried here and measured NEUTRAL — the
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
         // idea.md V6 journal. Single submission after the loop, as before.)
+        // PROPOSAL SIDE ONLY: DFlash2 selector branching.
+        // Default ON for ranked median; set MLXFAST_QWEN_MTP_SELECTOR=0 to
+        // disable. When disabled, the else branch is bit-identical to greedy.
+        // Selector does not touch verify/ledger.
+        let qwenSelectorKLocal = 8
+        let qwenSelectorLambdaLocal: Float = {
+            if let s = ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_SELECTOR_LAMBDA"],
+               let v = Float(s) { return v }
+            return 0.05
+        }()
+        let qwenSelectorEnabledLocal =
+            ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_SELECTOR"] != "0"
         var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
+        // DFlash2 2-tap conv boundary handling (proposal-only).
+        // `prevForConv` threads the last verified hidden's last row into the
+        // first MTP layer's first conv when T>1, and chains single-token
+        // drafts via the previous draft's hidden. Nil => zeros (identity).
+        var convPrev: MLXArray? = nil
+        if qwenSelectorEnabledLocal, qwenSelectorKLocal > 1 {
+            // Selector path: keep top-K buffers, score adjacency
+            // S_t(a,b)=U_t(b)+lambda*dot(A(a)*H, B(b)), greedy walk picks argmax.
+            var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-                cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
-        draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
+                cache: headCache, prevForConv: convPrev)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache, prevForConv: convPrev)
+            var curHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            var draftTopKBuffers: [(ids: MLXArray, logits: MLXArray, hidden: MLXArray)] = []
+            var (idsK, logitsK) = model.draftTopK(curHidden, k: qwenSelectorKLocal)
+            draftTopKBuffers.append((idsK, logitsK, curHidden))
+            // Greedy pick at t=0 has no predecessor; pick argmax U (S_0(b)=U_0(b)).
+            var pickIdx: Int
+            // When lambda==0, score is just logits, so argmax(logits) is correct.
+            // Compute pickIdx from logitsK.
+            pickIdx = Int(argMax(logitsK, axis: -1).item(Int32.self))
+            var draftId = model.mapDraftTokenIds(
+                MLX.take(idsK, MLXArray([Int32(pickIdx)]), axis: 0).reshaped([1, 1]))
             draftIdArrays.append(draftId)
+            asyncEval(draftId)
+            convPrev = curHidden
+            for _ in 1 ..< draftCount {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: curHidden, nextTokenIds: draftId, cache: headCache, prevForConv: convPrev)
+                curHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                let (idsKt, logitsKt) = model.draftTopK(curHidden, k: qwenSelectorKLocal)
+                draftTopKBuffers.append((idsKt, logitsKt, curHidden))
+                // Score adjacency: need A(prevPick), H(curHidden_prev) vs B(candidates_t)
+                let prevEntry = draftTopKBuffers[draftTopKBuffers.count - 2]
+                let hGate = model.selectorGate(prevEntry.hidden)
+                let prevPickIds = MLX.take(prevEntry.ids, MLXArray([Int32(pickIdx)]), axis: 0)
+                let aRowsPrev = model.selectorEmbeddingRows(for: prevPickIds)
+                let bRowsCurr = model.selectorEmbeddingRows(for: idsKt)
+                let scores = model.selectorScoreBatch(
+                    candidateLogits: logitsKt,
+                    prevARow: aRowsPrev,
+                    currBRows: bRowsCurr,
+                    gate: hGate,
+                    lambda: qwenSelectorLambdaLocal)
+                pickIdx = Int(argMax(scores, axis: -1).item(Int32.self))
+                draftId = model.mapDraftTokenIds(
+                    MLX.take(idsKt, MLXArray([Int32(pickIdx)]), axis: 0).reshaped([1, 1]))
+                draftIdArrays.append(draftId)
+                convPrev = curHidden
+            }
+            if !draftIdArrays.isEmpty {
+                asyncEval(draftIdArrays[draftIdArrays.count - 1])
+            }
+        } else {
+            // Existing greedy loop verbatim — neutral fallback when selector disabled.
+            var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                cache: headCache, prevForConv: convPrev)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache, prevForConv: convPrev)
+            var draftHidden = headHidden[
+                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            var draftId = model.draftTokenID(draftHidden)
+            draftIdArrays.append(draftId)
+            // Early submission of the FIRST head step: its graph exists ~2.4 ms
+            // before the rest of the chain is built, and unlike the per-step
+            // variant (measured neutral — nothing but build time between steps)
+            // the first step carries the history flush, which IS real GPU work
+            // the device can start while the host builds steps 2..d.
+            asyncEval(draftId)
+            convPrev = draftHidden
+            for _ in 1 ..< draftCount {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache, prevForConv: convPrev)
+                draftHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                draftId = model.draftTokenID(draftHidden)
+                draftIdArrays.append(draftId)
+                convPrev = draftHidden
+            }
+            asyncEval(draftIdArrays[draftIdArrays.count - 1])
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1046,7 +1153,7 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
