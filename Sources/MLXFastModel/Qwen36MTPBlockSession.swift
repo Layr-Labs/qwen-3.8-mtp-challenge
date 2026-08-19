@@ -456,7 +456,6 @@ public final class Qwen36MTPBlockSession {
     /// first decode step past the 512-row seed does not first-touch those
     /// pipeline variants inside the scored window.
     private static func warmTargetLaterWindowSDPA(_ cache: [KVCache]) {
-        var extended: [MLXArray] = []
         var firstKV: (MLXArray, MLXArray)?
         var faCount = 0
         for entry in cache {
@@ -468,6 +467,7 @@ public final class Qwen36MTPBlockSession {
             guard k.ndim == 4, v.ndim == 4, k.dim(2) > 0, v.dim(2) == k.dim(2)
             else { continue }
             faCount += 1
+            guard firstKV == nil else { continue }
             let pad = max(0, 1024 - k.dim(2))
             let extK: MLXArray
             let extV: MLXArray
@@ -482,13 +482,19 @@ public final class Qwen36MTPBlockSession {
                 extK = k
                 extV = v
             }
-            extended.append(contentsOf: [extK, extV])
-            if firstKV == nil { firstKV = (extK, extV) }
+            firstKV = (extK, extV)
         }
         // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
         guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
         else { return }
-        eval(extended)
+        // HEAP-FRIENDLY EVAL: SDPA PSOs are keyed on (B,H,D,dtype,mask), and all
+        // 16 FA layers share identical geometry on this tower — so compiling the
+        // first layer's K/V pipeline covers every layer. Evaluating only 2 arrays
+        // (vs the previous 32 = 16 K + 16 V) eliminates ~30 MB of throwaway GPU
+        // buffers that fragmented the Metal heap immediately before residency
+        // sizing. The concats for layers 2-16 are skipped entirely — they were
+        // lazy graphs never consumed below, so omitting them is free.
+        eval([extK, extV])
         // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
         // (config pins 256). Scale matches Qwen35Attention.
         let qHeads = extK.dim(1) * 6
