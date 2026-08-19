@@ -2422,6 +2422,131 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
 )
 
 // ---------------------------------------------------------------------------
+// FUSED RERANK TAIL (proposal-side only)
+//
+// Collapses the five-dispatch draft rerank tail (three MLX.take row gathers +
+// affine4 QMV N=32 + select) into ONE dispatch: each simdgroup gathers one
+// candidate's exact-head row inside the kernel, computes the affine4/g64 QMV
+// with the IDENTICAL per-lane arithmetic and simd_sum tree as the generic
+// `qmv_fast_impl` path the unfused QMV N=32 uses (values_per_thread=16,
+// block_size=512, scale_step_per_thread=4), then a threadgroup reduce applies
+// the same `qwen_draft_rerank_better` total order. Logits are bit-identical
+// to the unfused path, so the winner is identical and acceptance is unchanged.
+//
+// The head only PROPOSES, so nothing routed through this call can affect an
+// emitted token; the fused kernel is a pure dispatch-count reduction.
+private let qwen35DraftRerankFusedKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_rerank_fused",
+    inputNames: ["x", "w", "scales", "biases", "candidate_ids"],
+    outputNames: ["token_id"],
+    source: """
+        constexpr uint IN_VEC = 5120;
+        constexpr uint GROUPS_PER_ROW = IN_VEC / 64;   // 80
+        constexpr uint WORDS_PER_ROW = IN_VEC / 8;     // 640 uint32 per row
+        constexpr uint BYTES_PER_ROW = WORDS_PER_ROW * 4;
+        constexpr uint VALUES_PER_THREAD = 16;
+        constexpr uint BLOCK = VALUES_PER_THREAD * 32; // 512
+        constexpr uint BLOCKS = IN_VEC / BLOCK;        // 10
+        constexpr uint SCALE_STEP = 4;                 // 64/16
+
+        uint g = simdgroup_index_in_threadgroup;   // candidate index 0..31
+        uint l = thread_index_in_simdgroup;        // lane 0..31
+        uint row = uint(candidate_ids[g]);
+
+        // Per-lane offsets identical to qmv_fast_impl for out_row = row.
+        const device uint8_t* ws = (const device uint8_t*)w
+            + row * BYTES_PER_ROW + l * 8;
+        const device bfloat16_t* sl = scales
+            + row * GROUPS_PER_ROW + l / SCALE_STEP;
+        const device bfloat16_t* bl = biases
+            + row * GROUPS_PER_ROW + l / SCALE_STEP;
+        const device bfloat16_t* xl = x + l * VALUES_PER_THREAD;
+
+        float result = 0.0f;
+        for (uint k = 0; k < BLOCKS; k++) {
+            // load_vector for bits=4: raw sum for the bias term, x pre-scaled
+            // by 16^k so the shifted-nibble masks in qdot recover x * nibble.
+            float x_thread[VALUES_PER_THREAD];
+            float sum = 0.0f;
+            for (uint i = 0; i < VALUES_PER_THREAD; i += 4) {
+                float a = float(xl[i]);
+                float b = float(xl[i + 1]);
+                float c = float(xl[i + 2]);
+                float d = float(xl[i + 3]);
+                sum += a + b + c + d;
+                x_thread[i] = a;
+                x_thread[i + 1] = b / 16.0f;
+                x_thread[i + 2] = c / 256.0f;
+                x_thread[i + 3] = d / 4096.0f;
+            }
+            const device uint16_t* w16 = (const device uint16_t*)ws;
+            float scale = float(sl[0]);
+            float bias = float(bl[0]);
+            float accum = 0.0f;
+            for (uint i = 0; i < VALUES_PER_THREAD / 4; i++) {
+                accum += x_thread[4 * i] * float(w16[i] & 0x000f)
+                       + x_thread[4 * i + 1] * float(w16[i] & 0x00f0)
+                       + x_thread[4 * i + 2] * float(w16[i] & 0x0f00)
+                       + x_thread[4 * i + 3] * float(w16[i] & 0xf000);
+            }
+            result += scale * accum + sum * bias;
+            ws += BLOCK * 4 / 8;   // 256 bytes per block
+            sl += BLOCK / 64;      // 8 groups per block
+            bl += BLOCK / 64;
+            xl += BLOCK;           // 512 values per block
+        }
+
+        float logit = float(bfloat16_t(simd_sum(result)));
+
+        // Threadgroup reduce across the 32 candidates under the same strict
+        // total order the unfused select kernel applies.
+        threadgroup float tg_logits[32];
+        threadgroup uint tg_ids[32];
+        if (l == 0) {
+            tg_logits[g] = logit;
+            tg_ids[g] = row;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (g == 0) {
+            float best_value = tg_logits[l];
+            uint best_id = tg_ids[l];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (l < offset && qwen_draft_rerank_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (l == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
+        }
+    """,
+    header: """
+        inline bool qwen_draft_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+// ---------------------------------------------------------------------------
 // PROPOSAL-SIDE TOP-32 SHORTLIST
 //
 // Replaces `MLX.argPartition(coarse, kth: 98_298, axis: -1)[98_298...]`.
@@ -2652,6 +2777,11 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
+
+// `MLXFAST_QWEN_MTP_FUSED_RERANK=0` restores the five-dispatch rerank tail
+// (three MLX.take gathers + affine4 QMV N=32 + select) bit-for-bit.
+private let qwen35FusedRerankEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_FUSED_RERANK"] != "0"
 
 /// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
 private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
@@ -3182,6 +3312,24 @@ extension Qwen35TextModel: MTPCapable {
                 coarse[0..., 0..., 0 ..< Self.compactDraftRealCount],
                 kth: kth, axis: -1
             )[.ellipsis, (kth)...].reshaped([candidateCount])
+        }
+
+        if qwen35FusedRerankEnabled,
+           x.dtype == .bfloat16,
+           exact.scales.dtype == .bfloat16,
+           exactBiases.dtype == .bfloat16 {
+            return qwen35DraftRerankFusedKernel(
+                [x, exact.weight, exact.scales, exactBiases, candidateIDs],
+                template: [
+                    ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                    ("CONTROL_OFFSET",
+                     Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ],
+                grid: (1, 1, 1),
+                threadGroup: (1024, 1, 1),
+                outputShapes: [[1, 1]],
+                outputDTypes: [.int32]
+            )[0]
         }
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
