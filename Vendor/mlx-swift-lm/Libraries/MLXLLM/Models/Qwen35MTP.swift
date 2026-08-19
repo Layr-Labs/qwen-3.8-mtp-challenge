@@ -36,11 +36,13 @@ final class Qwen35MTPDecoderLayer: Module {
         } else {
             // Same fused gate/up MLP as the backbone layers; here the linears
             // stay bf16 and the fuse takes the plain-weight path. Head side —
-            // proposal-only, no exactness constraint.
-            _mlp.wrappedValue = Qwen35FusedMLP(
+            // proposal-only, no exactness constraint. Flag for M=1 unfuse (9b4550d).
+            let headMLP = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
+            headMLP.isHeadMLP = true
+            _mlp.wrappedValue = headMLP
         }
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)

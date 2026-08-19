@@ -1235,6 +1235,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
+    var isHeadMLP: Bool = false
 
     private var _fqW: MLXArray?
     private var _fqS: MLXArray?
@@ -1285,6 +1286,13 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Head MLP at M=1: unfused path is proposal-side and exactness-free.
+        // At M=1 the fused quantizedMM falls through to stock qmv_fast_impl;
+        // two separate N=17408 projections have identical cost but reduce
+        // graph-build overhead (9b4550d: 1167/1343/929 vs 1331/1433/1330 us, 3/3).
+        if isHeadMLP && x.dim(-2) == 1 {
+            return downProj(silu(gateProj(x)) * upProj(x))
+        }
         // The fused path is only taken when the gate/up split is provably
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
@@ -3121,7 +3129,7 @@ extension Qwen35TextModel: MTPCapable {
             _compactDraftHead = makeCompactDraftHead()
         }
         let padded = _compactDraftHead!(x)
-        let tgSize = 1024
+        let tgSize = 896
         let outputs = qwen35DraftSelectKernel(
             [padded.reshaped([Self.compactDraftPaddedCount])],
             template: [
