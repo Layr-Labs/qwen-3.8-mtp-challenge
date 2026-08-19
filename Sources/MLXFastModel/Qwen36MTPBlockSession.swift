@@ -453,18 +453,13 @@ public final class Qwen36MTPBlockSession {
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
+        let (_, hidden) = model.callWithHidden(
             input: LMInput.Text(
                 tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
             cache: cache, nConfirmed: 0)
         let tBeginBuilt = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
-        // Seed vocabulary trim: `seedLogits` projects lm_head over all 512
-        // seed rows but only the last row is ever used. It is deliberately
-        // NEVER evaluated — a dead lazy graph costs nothing — and the one row
-        // we need is projected directly from the post-norm hidden below.
-        // RMSNorm is row-local, so norm(row)+lmHead == the sliced full
-        // projection bit-for-bit (ranked receipt b5130678: +0.09%).
-        _ = seedLogits
+        // Discard the unused full-sequence logits; project only the final
+        // hidden row needed by the primary sampler.
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
         // Retain the full pre-norm seed hidden for lazy head-history priming.
