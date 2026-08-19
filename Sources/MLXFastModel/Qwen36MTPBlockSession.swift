@@ -77,6 +77,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case notBegun
     case alreadyBegun
     case invalidDepth(Int)
+    case missingSingleDraftRollbackCheckpoint
     case emptySeed
 
     public var description: String {
@@ -92,6 +93,8 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
             return "MTP seed prefill requested twice"
         case .invalidDepth(let depth):
             return "MTP draft depth \(depth) is out of range"
+        case .missingSingleDraftRollbackCheckpoint:
+            return "single-draft verify did not publish its recurrent rollback checkpoint"
         case .emptySeed:
             return "MTP seed prefill requires a non-empty seed"
         }
@@ -439,76 +442,6 @@ public final class Qwen36MTPBlockSession {
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
             + [seedWarmIDs, seedWarmValues, seedWarmNorm])
-
-        // TARGET-SIDE later-window SDPA compile. Distinct from the rejected
-        // #674 proposal-head HOST KV walk (3.23670). After the 512-row seed
-        // the 16 FA caches sit at kL=512; scored decode walks that prefix to
-        // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
-        // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
-        Self.warmTargetLaterWindowSDPA(seedWarmCache)
-    }
-
-    /// Untimed. Throwaway FA caches only. Token-neutral: dummy K/V never
-    /// enter a scored forward. Compiles later-window `MLXFast` SDPA so the
-    /// first decode step past the 512-row seed does not first-touch those
-    /// pipeline variants inside the scored window.
-    private static func warmTargetLaterWindowSDPA(_ cache: [KVCache]) {
-        var extended: [MLXArray] = []
-        var firstKV: (MLXArray, MLXArray)?
-        var faCount = 0
-        for entry in cache {
-            guard entry is KVCacheSimple else { continue }
-            let st = entry.state
-            guard st.count == 2 else { continue }
-            let k = st[0]
-            let v = st[1]
-            guard k.ndim == 4, v.ndim == 4, k.dim(2) > 0, v.dim(2) == k.dim(2)
-            else { continue }
-            faCount += 1
-            let pad = max(0, 1024 - k.dim(2))
-            let extK: MLXArray
-            let extV: MLXArray
-            if pad > 0 {
-                let kPad = MLXArray.zeros(
-                    [k.dim(0), k.dim(1), pad, k.dim(3)], dtype: k.dtype)
-                let vPad = MLXArray.zeros(
-                    [v.dim(0), v.dim(1), pad, v.dim(3)], dtype: v.dtype)
-                extK = concatenated([k, kPad], axis: 2)
-                extV = concatenated([v, vPad], axis: 2)
-            } else {
-                extK = k
-                extV = v
-            }
-            extended.append(contentsOf: [extK, extV])
-            if firstKV == nil { firstKV = (extK, extV) }
-        }
-        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
-        guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
-        else { return }
-        eval(extended)
-        // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
-        // (config pins 256). Scale matches Qwen35Attention.
-        let qHeads = extK.dim(1) * 6
-        let headDim = extK.dim(3)
-        let scale = 1 / Float(headDim).squareRoot()
-        var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
-            let q = MLXArray.zeros(
-                [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
-            outs.append(
-                MLXFast.scaledDotProductAttention(
-                    queries: q,
-                    keys: extK,
-                    values: extV,
-                    scale: scale,
-                    mask: .causal
-                )
-            )
-        }
-        eval(outs)
     }
 
     // MARK: - begin
@@ -996,6 +929,9 @@ public final class Qwen36MTPBlockSession {
         //    lm_head. Deeper sub-steps chain the head's OWN post-`mtp.norm`
         //    hidden exactly as before.
         let headCache: [any KVCache]
+        let draftInputHidden: MLXArray
+        let draftInputTokens: MLXArray
+        let flushedTokenCount: Int
         var flushHidden: [MLXArray] = []
         var flushTokens: [Int] = []
         if let existing = headHistoryCache {
@@ -1023,8 +959,23 @@ public final class Qwen36MTPBlockSession {
             headHistoryBacklogHidden.removeAll(keepingCapacity: true)
             headHistoryBacklogTokens.removeAll(keepingCapacity: true)
         }
-        flushHidden.append(hidden)
-        flushTokens.append(primary)
+        // A singleton head forward has no earlier flush rows: feed the existing
+        // device hidden and a scalar token array directly instead of appending
+        // into two one-element staging arrays and mapping the token back out.
+        // Priming and adaptive-skip backlog flushes retain the generic batched
+        // path at every draft width.
+        if flushHidden.isEmpty && flushTokens.isEmpty {
+            draftInputHidden = hidden
+            draftInputTokens = MLXArray([Int32(primary)]).reshaped([1, 1])
+            flushedTokenCount = 1
+        } else {
+            flushHidden.append(hidden)
+            flushTokens.append(primary)
+            draftInputHidden = concatenated(flushHidden, axis: 1)
+            draftInputTokens = MLXArray(flushTokens.map(Int32.init))
+                .reshaped([1, flushTokens.count])
+            flushedTokenCount = flushTokens.count
+        }
 
         let draftBase = headCache.first?.offset ?? 0
         // Every flushed position is committed history plus the (pendingHidden,
@@ -1032,11 +983,7 @@ public final class Qwen36MTPBlockSession {
         // valid whatever the verify decides. Deeper drafted positions are
         // speculative and are trimmed after the round (MTPLX
         // `_rollback_mtp_cache(cycle_offset + 1)`).
-        let validHistoryOffset = draftBase + flushTokens.count
-        let draftInputHidden =
-            flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
-        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
-            .reshaped([1, flushTokens.count])
+        let validHistoryOffset = draftBase + flushedTokenCount
 
         // Draft ids stay ON DEVICE and chain straight into the verify input —
         // no host readback between the head forward and the verify forward
@@ -1047,41 +994,60 @@ public final class Qwen36MTPBlockSession {
         // (Per-step asyncEval was tried here and measured NEUTRAL — the
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
         // idea.md V6 journal. Single submission after the loop, as before.)
-        var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
+        // Keep the production K=1 proposal in a scalar slot. The generic
+        // array-backed chain remains unchanged for wider experimental depths.
+        let firstDraftId: MLXArray
+        let tailDraftIdArrays: [MLXArray]
+        if draftCount == 1 {
+            let headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
-        draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache)
+            let draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            firstDraftId = model.draftTokenID(draftHidden)
+            tailDraftIdArrays = []
+            asyncEval(firstDraftId)
+        } else {
+            var draftIdArrays: [MLXArray] = []
+            var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                cache: headCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache)
+            var draftHidden = headHidden[
+                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            var draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
+            asyncEval(draftId)
+            for _ in 1 ..< draftCount {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                draftHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                draftId = model.draftTokenID(draftHidden)
+                draftIdArrays.append(draftId)
+            }
+            firstDraftId = draftIdArrays[0]
+            tailDraftIdArrays = Array(draftIdArrays.dropFirst())
+            asyncEval(draftIdArrays[draftIdArrays.count - 1])
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        // 2. The vendored nConfirmed checkpoint is complete for K=1, the hot
+        //    schedule. Avoid constructing 64 defensive slice snapshots every
+        //    round when that checkpoint can restore every recurrent layer. Keep
+        //    the generic snapshot only for wider experimental schedules, whose
+        //    replay tape may still fall back to the repair forward. A missing K=1
+        //    checkpoint is an invariant failure: taking a snapshot after verify
+        //    would capture the already-mutated state and cannot repair safely.
+        let snapshot = draftCount == 1 ? nil : Self.snapshotRecurrent(cache)
         let verifyTokens = concatenated(
-            [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
+            [MLXArray([Int32(primary)]).reshaped([1, 1]), firstDraftId]
+                + tailDraftIdArrays,
             axis: 1)
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
@@ -1114,30 +1080,36 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        var bundle: [MLXArray] = [top2IDs, top2Values, firstDraftId]
+        bundle.append(contentsOf: tailDraftIdArrays)
+        eval(Self.qwenEvalRoots(cache) + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        var drafts = [Int(firstDraftId.item(Int32.self))]
+        drafts.reserveCapacity(draftCount)
+        drafts.append(contentsOf: tailDraftIdArrays.map { Int($0.item(Int32.self)) })
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
         // same ordering `argMax` uses (larger logit wins, lower id wins an
         // exact tie), so the separate vocabulary-wide argMax launch is
         // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
-        let verifyArgmax = stride(
-            from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+        // The winning ID for row i is already at flatTop2IDs[i * 2].
+        // Read it in place instead of allocating a duplicate row-winner array.
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
         //    truth for draft i. Row `draftCount` is the BONUS row and is only
         //    used on full acceptance.
         var acceptedCount = 0
+        var acceptedStopToken = false
         for index in 0 ..< drafts.count {
-            guard verifyArgmax[index] == drafts[index] else { break }
+            guard flatTop2IDs[index * 2] == drafts[index] else { break }
             acceptedCount += 1
-            if stopTokens.contains(drafts[index]) { break }
+            if stopTokens.contains(drafts[index]) {
+                acceptedStopToken = true
+                break
+            }
         }
 
         var perRowTop2Tokens: [[Int]] = []
@@ -1159,7 +1131,7 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimary = flatTop2IDs[drafts.count * 2]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1185,7 +1157,7 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimary = flatTop2IDs[acceptedCount * 2]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1197,9 +1169,15 @@ public final class Qwen36MTPBlockSession {
             } else {
                 // Generic K>1 / defensive fallback: undo the whole verify window
                 // and re-forward the committed block. This rare path pays a
-                // second blocking eval for its own readout.
+                // second blocking eval for its own readout. K=1 has no generic
+                // snapshot by design; its eager checkpoint is an invariant of
+                // nConfirmed == 1, so fail before mutating caches if it vanished.
+                guard let snapshot else {
+                    throw Qwen36MTPSessionError.missingSingleDraftRollbackCheckpoint
+                }
                 Self.rollbackAfterVerify(
-                    cache, snapshot, verifiedTokens: draftCount + 1, to: base)
+                    cache, snapshot,
+                    verifiedTokens: draftCount + 1, to: base)
                 let (repairLogits, repairHidden) = model.callWithHidden(
                     input: LMInput.Text(
                         tokens: MLXArray(committed).reshaped([1, committed.count])),
@@ -1288,12 +1266,11 @@ public final class Qwen36MTPBlockSession {
         // them. The rare generic-repair path ran its own second eval.
         // `pendingHidden` is likewise device-only until the next round.
 
-        // Truncate after the first committed stop token, keeping the stop token
-        // itself — the same rule the serial reference applies.
-        if let stopIndex = committed.firstIndex(where: { stopTokens.contains($0) }) {
-            let dropped = committed.count - (stopIndex + 1)
-            committed = Array(committed.prefix(stopIndex + 1))
-            committedTokenCount -= dropped
+        // The acceptance walk stops immediately after its first matched stop
+        // token, while the primary stop case returned before drafting. Therefore
+        // `committed` cannot contain anything after a stop and does not need a
+        // second Set lookup / linear scan here merely to rediscover that token.
+        if acceptedStopToken {
             reachedStopToken = true
         }
 
@@ -1408,10 +1385,13 @@ public final class Qwen36MTPBlockSession {
             return true
         }
 
+        // K=1 has only boundary zero. The GDN kernel publishes that boundary
+        // in `rollbackState`; using the dedicated slot avoids allocating and
+        // retaining a one-element checkpoint array in every recurrent layer.
+        precondition(acceptedCount == 0)
         for entry in cache {
             if let arrays = entry as? ArraysCache {
-                guard arrays.rollbackCheckpoints.count > acceptedCount
-                else { return false }
+                guard arrays.rollbackState != nil else { return false }
             } else if entry.isTrimmable {
                 guard entry.offset == committedOffset + rejected
                 else { return false }
@@ -1422,11 +1402,12 @@ public final class Qwen36MTPBlockSession {
 
         for entry in cache {
             if let arrays = entry as? ArraysCache {
-                let saved = arrays.rollbackCheckpoints[acceptedCount]
+                // Safe after the complete no-mutation preflight above.
+                let saved = arrays.rollbackState!
                 arrays[0] = saved.0
                 arrays[1] = saved.1
                 arrays.rollbackState = nil
-                arrays.rollbackCheckpoints = []
+                arrays.rollbackCheckpoints.removeAll(keepingCapacity: true)
                 arrays.prefixReplayTape = nil
             } else if entry.isTrimmable {
                 _ = entry.trim(entry.offset - committedOffset)
@@ -1443,6 +1424,26 @@ public final class Qwen36MTPBlockSession {
                 arrays.prefixReplayTape = nil
             }
         }
+    }
+
+    /// Gather the Qwen backbone's eval roots without asking every recurrent
+    /// cache to allocate a temporary `state` array. This session's target
+    /// contract fixes the stack to two-slot `MambaCache` entries and ordinary
+    /// attention caches; read the recurrent slots directly, while retaining
+    /// the protocol state fallback for the attention entries. Kept on the MTP
+    /// verify path only so the paired serial denominator is unchanged.
+    private static func qwenEvalRoots(_ cache: [any KVCache]) -> [MLXArray] {
+        var roots: [MLXArray] = []
+        roots.reserveCapacity(cache.count * 2)
+        for entry in cache {
+            if let mamba = entry as? MambaCache {
+                if let first = mamba[0] { roots.append(first) }
+                if let second = mamba[1] { roots.append(second) }
+            } else {
+                roots.append(contentsOf: entry.state)
+            }
+        }
+        return roots
     }
 
     /// Trim every trimmable cache in the stack back to `offset`. Used on the

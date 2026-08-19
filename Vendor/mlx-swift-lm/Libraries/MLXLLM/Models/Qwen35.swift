@@ -1100,20 +1100,16 @@ final class Qwen35GatedDeltaNet: Module {
                 ],
                 outputDTypes: [dtype, .float32, .float32]
             )
-            // Per-boundary checkpoints: after row t, the conv state is rows
-            // (t+1)..(t+nKeep) of [convState | x0 .. x_{S-1}] and the SSM
-            // state is the kernel's mid output slice t. Checkpoint 0 doubles
-            // as the legacy single-slot `rollbackState` for the K=1 path.
-            var checkpoints: [(MLXArray, MLXArray)] = []
-            checkpoints.reserveCapacity(S - 1)
-            for t in 0 ..< (S - 1) {
-                checkpoints.append((
-                    convInput[0..., (t + 1) ..< (t + 1 + nKeep)],
-                    outputs[2][0..., t]
-                ))
-            }
-            cache?.rollbackState = checkpoints.first
-            cache?.rollbackCheckpoints = checkpoints
+            // K=1 has exactly one rollback boundary. Publish it through the
+            // dedicated single-slot checkpoint instead of constructing a
+            // one-element Swift Array in every recurrent layer on every round.
+            // Wider verifies use the compact prefix replay tape above and never
+            // consume `rollbackCheckpoints`.
+            cache?.rollbackState = (
+                convInput[0..., 1 ..< (1 + nKeep)],
+                outputs[2][0..., 0]
+            )
+            cache?.rollbackCheckpoints.removeAll(keepingCapacity: true)
             out = outputs[0]
             finalConvState = newConvState
             finalSsmState = outputs[1]
