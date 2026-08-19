@@ -2118,6 +2118,13 @@ public class Qwen35TextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
 
+    /// DFlash2 consumes the outputs of target layers 5/19/33/47/61.  Capture
+    /// is completely dormant for the native-MTP and serial configurations;
+    /// the load-time mode bit is copied onto the model so the process-global
+    /// selector can be restored immediately after loading.
+    fileprivate let capturesDFlash2Features: Bool
+    fileprivate var lastDFlash2Features: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
 
@@ -2134,6 +2141,7 @@ public class Qwen35TextModelInner: Module {
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
+        self.capturesDFlash2Features = _qwen35DFlash2Enabled
 
         super.init()
     }
@@ -2153,6 +2161,10 @@ public class Qwen35TextModelInner: Module {
         nConfirmed: Int = 0
     ) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
+        var dflash2Features: [MLXArray] = []
+        if capturesDFlash2Features {
+            dflash2Features.reserveCapacity(5)
+        }
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -2192,6 +2204,14 @@ public class Qwen35TextModelInner: Module {
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
                 base = out.base
                 delta = out.delta
+                if capturesDFlash2Features {
+                    switch i {
+                    case 5, 19, 33, 47, 61:
+                        dflash2Features.append(out.base + out.delta)
+                    default:
+                        break
+                    }
+                }
                 if ladderActive {
                     if prefillLadder {
                         if i == 0 || i % 3 == 2 {
@@ -2217,6 +2237,14 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates = layer(
                     hiddenStates, attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
+                if capturesDFlash2Features {
+                    switch i {
+                    case 5, 19, 33, 47, 61:
+                        dflash2Features.append(hiddenStates)
+                    default:
+                        break
+                    }
+                }
                 if ladderActive {
                     if prefillLadder {
                         if i == 0 || i % 3 == 2 {
@@ -2232,6 +2260,13 @@ public class Qwen35TextModelInner: Module {
                     }
                 }
             }
+        }
+
+        if capturesDFlash2Features {
+            precondition(
+                dflash2Features.count == 5,
+                "DFlash2 target capture requires layers 5,19,33,47,61")
+            lastDFlash2Features = concatenated(dflash2Features, axis: -1)
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
@@ -2725,6 +2760,7 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
+    public let hasDFlash2Head: Bool
 
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
@@ -2770,6 +2806,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
+        self.hasDFlash2Head = _qwen35DFlash2Enabled
         self.model = Qwen35TextModelInner(args)
 
         if !args.tieWordEmbeddings {
@@ -2778,7 +2815,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         // Attach MTP head only when enabled and config declares MTP layers.
         // omlx: `if n_mtp > 0 and is_mtp_active(): self.mtp = q35.MTPModule(args)`
-        if args.mtpNumHiddenLayers > 0 && _qwen35MTPEnabled {
+        if args.mtpNumHiddenLayers > 0 && _qwen35MTPEnabled
+            && !_qwen35DFlash2Enabled
+        {
             _mtp.wrappedValue = Qwen35MTPModule(args)
         }
     }
@@ -2914,7 +2953,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
-    public var hasMTPHead: Bool { mtp != nil }
+    public var hasMTPHead: Bool { mtp != nil || hasDFlash2Head }
 
     /// Run a backbone forward that also returns pre-norm hidden states.
     ///
@@ -2957,6 +2996,35 @@ extension Qwen35TextModel: MTPCapable {
             logits = model.embedTokens.asLinear(normed)
         }
         return (logits, hidden, normed)
+    }
+
+    /// Target forward plus the five intermediate feature streams consumed by
+    /// z-lab's Qwen3.8 DFlash2 drafter.  The ordinary final hidden/logits are
+    /// identical to `callWithHiddenAndNormed`; capture only retains layer
+    /// outputs that the same target pass has already computed.
+    public func callWithDFlash2Features(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        precondition(hasDFlash2Head, "DFlash2 feature forward used outside DFlash2 mode")
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        guard let features = model.lastDFlash2Features else {
+            fatalError("Qwen DFlash2 target forward produced no captured features")
+        }
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed, features)
+    }
+
+    /// Target token embedding shared by the independently loaded DFlash2
+    /// proposal module.  Proposal-only: the target still verifies every row.
+    public func embedTokensForDFlash2(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
     }
 
     /// Rebuild the target's recurrent cache after an accepted verify prefix.
@@ -3327,6 +3395,7 @@ extension Qwen35Model: LoRAModel {
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
     public var hasMTPHead: Bool { languageModel.hasMTPHead }
+    public var hasDFlash2Head: Bool { languageModel.hasDFlash2Head }
 
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
@@ -3340,6 +3409,17 @@ extension Qwen35Model: MTPCapable {
     ) -> (MLXArray, MLXArray, MLXArray?) {
         languageModel.callWithHiddenAndNormed(
             input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func callWithDFlash2Features(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        languageModel.callWithDFlash2Features(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func embedTokensForDFlash2(_ tokens: MLXArray) -> MLXArray {
+        languageModel.embedTokensForDFlash2(tokens)
     }
 
     /// See `Qwen35TextModel.replayRecurrentPrefix`.

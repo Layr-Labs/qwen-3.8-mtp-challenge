@@ -37,6 +37,10 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// True when the MTP head is attached and operational.
     var hasMTPHead: Bool { get }
 
+    /// True when the declared proposal artifact is the five-layer DFlash2
+    /// block drafter rather than the native autoregressive MTP module.
+    var hasDFlash2Head: Bool { get }
+
     /// The hybrid cache stack: `MambaCache` on the gated-delta layers,
     /// `KVCacheSimple` on the full-attention layers.
     func newCache(parameters: GenerateParameters?) -> [KVCache]
@@ -58,6 +62,16 @@ public protocol Qwen36MTPTarget: AnyObject {
     func callWithHiddenAndNormed(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?)
+
+    /// Target forward with outputs from layers 5/19/33/47/61 concatenated on
+    /// the feature axis. DFlash2 uses these already-computed target features as
+    /// its cross-attention context for the next parallel proposal block.
+    func callWithDFlash2Features(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)
+
+    /// The target's token embedding, shared read-only with the DFlash2 head.
+    func embedTokensForDFlash2(_ tokens: MLXArray) -> MLXArray
 
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
