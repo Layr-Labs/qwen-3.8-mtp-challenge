@@ -118,6 +118,9 @@ public final class Qwen36MTPBlockSession {
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
     /// identical value, one less blocking boundary per round.
     private var pendingPrimary: Int?
+    /// Device-resident view of the same pending primary row used by verify
+    /// concatenation. The host integer remains the ledger authority.
+    private var pendingPrimaryArray: MLXArray?
     /// Top-2 (ids, logit values) of the row that produced `pendingPrimary` —
     /// the tail-row evidence a stop-token round must declare. Recorded from
     /// the same batched readout that produced the primary.
@@ -489,6 +492,7 @@ public final class Qwen36MTPBlockSession {
         )
         // Top-2 first ID == row argmax (same ordering); no separate argMax.
         pendingPrimary = readTail.0[0]
+        pendingPrimaryArray = tailIDs[0 ..< 1, 0 ..< 1]
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
@@ -836,6 +840,7 @@ public final class Qwen36MTPBlockSession {
             // its top-2 was read out of the previous round's batched eval.
             let (tailTokens, tailLogits) = tailPending
             pendingPrimary = nil
+            pendingPrimaryArray = nil
             pendingTop2 = nil
             pendingHidden = nil
             return Qwen36MTPRoundResult(
@@ -899,6 +904,7 @@ public final class Qwen36MTPBlockSession {
             )
             // Top-2 first ID == row argmax (same ordering); no separate argMax.
             pendingPrimary = readTail.0[0]
+            pendingPrimaryArray = tailIDs[0 ..< 1, 0 ..< 1]
             pendingTop2 = readTail
             let (tailTokens, tailLogits) = readTail
             Self.traceRow(
@@ -1010,8 +1016,10 @@ public final class Qwen36MTPBlockSession {
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
         let snapshot = Self.snapshotRecurrent(cache)
+        let primaryArray = pendingPrimaryArray
+            ?? MLXArray([Int32(primary)]).reshaped([1, 1])
         let verifyTokens = concatenated(
-            [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
+            [primaryArray] + draftIdArrays,
             axis: 1)
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
@@ -1090,6 +1098,8 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimaryArray = top2IDs[
+                drafts.count ..< drafts.count + 1, 0 ..< 1]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1115,7 +1125,9 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+            pendingPrimary = verifyArgmax[acceptedCount]
+            pendingPrimaryArray = top2IDs[
+                acceptedCount ..< acceptedCount + 1, 0 ..< 1]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1144,6 +1156,7 @@ public final class Qwen36MTPBlockSession {
                 let values = tailValues.asArray(Float.self).map { Double($0) }
                 // Top-2 first ID == row argmax; no separate argMax launch.
                 pendingPrimary = ids[0]
+                pendingPrimaryArray = tailIDs[0 ..< 1, 0 ..< 1]
                 pendingTop2 = (ids, values)
                 perRowTop2Tokens.append(ids)
                 perRowTop2Logits.append(values)
