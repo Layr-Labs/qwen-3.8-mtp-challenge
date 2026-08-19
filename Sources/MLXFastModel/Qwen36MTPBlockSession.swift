@@ -965,8 +965,10 @@ public final class Qwen36MTPBlockSession {
         let validHistoryOffset = draftBase + flushTokens.count
         let draftInputHidden =
             flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
-        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
-            .reshaped([1, flushTokens.count])
+        let draftInputTokens =
+            flushTokens.count == 1
+            ? MLXArray([Int32(primary)]).reshaped([1, 1])
+            : MLXArray(flushTokens.map(Int32.init)).reshaped([1, flushTokens.count])
 
         // Draft ids stay ON DEVICE and chain straight into the verify input —
         // no host readback between the head forward and the verify forward
@@ -1219,8 +1221,15 @@ public final class Qwen36MTPBlockSession {
         // `pendingHidden` is likewise device-only until the next round.
 
         // Truncate after the first committed stop token, keeping the stop token
-        // itself — the same rule the serial reference applies.
-        if let stopIndex = committed.firstIndex(where: { stopTokens.contains($0) }) {
+        // itself — the same rule the serial reference applies. Most callers use
+        // one EOS token, so avoid the generic collection membership search.
+        let stopIndex: Int?
+        if stopTokens.count == 1, let stopToken = stopTokens.first {
+            stopIndex = committed.firstIndex(of: stopToken)
+        } else {
+            stopIndex = committed.firstIndex(where: { stopTokens.contains($0) })
+        }
+        if let stopIndex {
             let dropped = committed.count - (stopIndex + 1)
             committed = Array(committed.prefix(stopIndex + 1))
             committedTokenCount -= dropped
