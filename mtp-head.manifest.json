@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Lie24/qwen38-mtp-head-q2q4-cons@20d1733226edc4657b8ec7433a4273b14986f1b7",
+  "sha256": "213315edf7d9d1bbdfba149d0ce4b44eeaa9077a375b98f1d7117b6e1423e89d",
+  "bytes": 427742168,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "Conservative per-group best-of-two recode of the live Amal q2-q4-rerank-v1 affine-4 decoder stage. Affine-2 shortlist, precision islands, and all seven norms are byte-identical to amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae628274. The eight affine-4/g64 decoder triples are recoded from the same organizer-pinned bf16 source: classic mx.quantize vs bf16-consistent coding, keep the lower as-stored error per group. No range shrink, outliers pointwise identical. Digest is the Hugging Face LFS SHA-256 of model.safetensors at immutable revision 20d1733226edc4657b8ec7433a4273b14986f1b7 (x-linked-etag). Target forward, exact top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged."
 }
