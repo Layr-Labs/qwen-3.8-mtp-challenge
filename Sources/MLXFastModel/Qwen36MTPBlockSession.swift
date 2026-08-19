@@ -118,6 +118,13 @@ public final class Qwen36MTPBlockSession {
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
     /// identical value, one less blocking boundary per round.
     private var pendingPrimary: Int?
+    /// Device-resident `[1, 1]` int32 copy of `pendingPrimary`. Same token,
+    /// same `linearTopTwoRows` first-column (row argmax). Kept so the drafting
+    /// verify concat is all-device instead of host-upload + device drafts.
+    /// The host `Int` stays for stop-set membership, the committed ledger,
+    /// and the serial (depth-0) forward — serial is the score denominator
+    /// and must not inherit this upload elimination.
+    private var pendingPrimaryDevice: MLXArray?
     /// Top-2 (ids, logit values) of the row that produced `pendingPrimary` —
     /// the tail-row evidence a stop-token round must declare. Recorded from
     /// the same batched readout that produced the primary.
@@ -489,6 +496,7 @@ public final class Qwen36MTPBlockSession {
         )
         // Top-2 first ID == row argmax (same ordering); no separate argMax.
         pendingPrimary = readTail.0[0]
+        pendingPrimaryDevice = Self.devicePrimaryToken(tailIDs, row: 0)
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
@@ -648,7 +656,21 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    private static let segmentedVerifyDepthCap: Int = {
+        // 7, not 8: the width-9 verify (8 drafts) measured 106 ms vs 89 ms
+        // at width 8 on the M5 ranked box (crown note), and the local
+        // block-time curve (0.056/0.063/0.0695/0.081 at widths 6/7/8/9 at
+        // p~0.965) makes the 8th draft's marginal cost exceed its
+        // amortized benefit: cap-8 per-token 10.95 ms vs cap-7 10.40 ms
+        // (+5.3%). Emitted tokens are unchanged (proposal-side cap; the
+        // 8th token is emitted by the next round's serial forward).
+        // Env override for A/B: MLXFAST_QWEN_MTP_SEGMENTED_CAP=8 restores.
+        if let v = ProcessInfo.processInfo.environment[
+            "MLXFAST_QWEN_MTP_SEGMENTED_CAP"], let cap = Int(v) {
+            return cap
+        }
+        return 7
+    }()
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -780,6 +802,7 @@ public final class Qwen36MTPBlockSession {
     /// round from the last round's accept run.
     public func generateRound(depth: Int) throws -> Qwen36MTPRoundResult {
         guard began, let primaryPending = pendingPrimary,
+              let primaryDevice = pendingPrimaryDevice,
               let tailPending = pendingTop2, let hidden = pendingHidden
         else { throw Qwen36MTPSessionError.notBegun }
         guard depth >= Qwen36MTPLimits.serialControlDepth,
@@ -836,6 +859,7 @@ public final class Qwen36MTPBlockSession {
             // its top-2 was read out of the previous round's batched eval.
             let (tailTokens, tailLogits) = tailPending
             pendingPrimary = nil
+            pendingPrimaryDevice = nil
             pendingTop2 = nil
             pendingHidden = nil
             return Qwen36MTPRoundResult(
@@ -899,6 +923,7 @@ public final class Qwen36MTPBlockSession {
             )
             // Top-2 first ID == row argmax (same ordering); no separate argMax.
             pendingPrimary = readTail.0[0]
+            pendingPrimaryDevice = Self.devicePrimaryToken(tailIDs, row: 0)
             pendingTop2 = readTail
             let (tailTokens, tailLogits) = readTail
             Self.traceRow(
@@ -1010,8 +1035,15 @@ public final class Qwen36MTPBlockSession {
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
         let snapshot = Self.snapshotRecurrent(cache)
+        // All-device verify input: `primaryDevice` is a slice of the previous
+        // round's already-eval'd `[rows, 2]` top-2 IDs; `draftIdArrays` are
+        // on-device `draftTokenID` outputs. Do not rebuild the primary from
+        // a host `Int` here — that is a per-round host→device upload of a
+        // token the GPU already holds, and it specialises concat as
+        // host-int32 + device-int32 (the mix concat-warm tried to JIT-hide
+        // and which official receipts killed on this 512/50 tip).
         let verifyTokens = concatenated(
-            [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
+            [primaryDevice] + draftIdArrays,
             axis: 1)
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
@@ -1090,6 +1122,7 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimaryDevice = Self.devicePrimaryToken(top2IDs, row: drafts.count)
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1116,6 +1149,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimaryDevice = Self.devicePrimaryToken(top2IDs, row: acceptedCount)
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1144,6 +1178,7 @@ public final class Qwen36MTPBlockSession {
                 let values = tailValues.asArray(Float.self).map { Double($0) }
                 // Top-2 first ID == row argmax; no separate argMax launch.
                 pendingPrimary = ids[0]
+                pendingPrimaryDevice = Self.devicePrimaryToken(tailIDs, row: 0)
                 pendingTop2 = (ids, values)
                 perRowTop2Tokens.append(ids)
                 perRowTop2Logits.append(values)
@@ -1579,6 +1614,19 @@ public final class Qwen36MTPBlockSession {
         header: linearTopTwoHeader,
         ensureRowContiguous: false
     )
+
+    /// Device `[1, 1]` int32 view of row `row`'s first top-2 ID.
+    ///
+    /// `top2IDs` is `[rows, 2]` from `linearTopTwoRows`. Column 0 is the row
+    /// argmax under the same total order as `argMax` (larger logit wins,
+    /// lower id wins a tie) — identical to `verifyArgmax[row]` / `readTail.0[0]`.
+    /// Slicing a materialised array does not launch GPU work and does not
+    /// copy the token through the host.
+    static func devicePrimaryToken(_ top2IDs: MLXArray, row: Int) -> MLXArray {
+        precondition(top2IDs.ndim == 2 && top2IDs.dim(1) == 2)
+        precondition(row >= 0 && row < top2IDs.dim(0))
+        return top2IDs[row ..< (row + 1), 0 ..< 1]
+    }
 
     /// Exact top-2 (ids, values) for every row of a `[1, rows, V]` logits
     /// array, as `[rows, 2]` int32 / float32 device arrays.
