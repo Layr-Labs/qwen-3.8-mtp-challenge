@@ -359,17 +359,92 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
-        let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
-        let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
-        let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: foldHidden, nextTokenIds: foldTokens,
-            cache: historyWarmCache)
-            ?? model.mtpHeadHiddenForward(
+        // VERIFY-CONCAT JIT WARM. Scored rounds assemble verifyTokens as
+        // concatenated([host primary] + device draftIds) over int32 [1, 1]
+        // arrays. The width loop below feeds callWithHidden a single host
+        // [1, width] tensor, so it never compiles that multi-input concat.
+        // MLX JIT-specializes copy/concat by dtype and input count
+        // (ml-explore/mlx metal JIT; first launch pays Metal library
+        // compile — see Kernel Management / JIT Compilation). Those
+        // copyint32int32 kernels otherwise land inside scored round 1.
+        // Values are zeros / already-eval'd draft IDs and the result is
+        // discarded: shape + dtype + host/device mix select the kernels.
+        // Warm every legal extra-count 0...maxDepth so an adaptive
+        // draftPolicy that returns 0..8 does not hit a cold width later.
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra {
+                parts.append(primedDraftID)
+            }
+            eval(concatenated(parts, axis: 1))
+        }
+        // HEAD FLUSH-WIDTH JIT WARM. The 512-row prime compiles QMM (M=512)
+        // and a 2-row fold would only compile QMV M=2. Scored round 2 is a
+        // HOST flush of S = 1 + accepted (typically 5 after a d=4 full
+        // accept) onto the populated 512-row cache: fc is QMV M=S, kv() is
+        // QMV M=S-1, island overlay is a small-M gemm. Those M=3..9 families
+        // otherwise JIT inside draft_build. Same class as the backbone width
+        // loop against a 512-row cache. Live mix: HOST int32 [1, S] tokens,
+        // two-piece hidden concat for S>1 (backlog block + current), then
+        // DEVICE [1,1] draft ids. Trim back to 512 after each width so every
+        // S hits the round-2 family, not a drifted KV. Disable with
+        // MLX_QWEN_MTP_HEAD_FLUSH_WARM=0 (worker-visible MLX_ prefix).
+        if ProcessInfo.processInfo.environment["MLX_QWEN_MTP_HEAD_FLUSH_WARM"] != "0" {
+            for flushS in 1 ... (maxDepth + 1) {
+                let flushHidden: MLXArray
+                let flushTokens: MLXArray
+                if flushS == 1 {
+                    flushHidden = MLXArray.zeros([1, 1, hDim], dtype: row.dtype)
+                    flushTokens = MLXArray([Int32(0)]).reshaped([1, 1])
+                } else {
+                    flushHidden = concatenated([
+                        MLXArray.zeros([1, flushS - 1, hDim], dtype: row.dtype),
+                        MLXArray.zeros([1, 1, hDim], dtype: row.dtype),
+                    ], axis: 1)
+                    flushTokens = MLXArray(
+                        Array(repeating: Int32(0), count: flushS)
+                    ).reshaped([1, flushS])
+                }
+                var headHidden =
+                    flushS == 1
+                    ? model.mtpHeadHiddenForward(
+                        hidden: flushHidden, nextTokenIds: flushTokens,
+                        cache: historyWarmCache)
+                    : (model.mtpHeadLastHiddenWithKVOnlyHistory(
+                        hidden: flushHidden, nextTokenIds: flushTokens,
+                        cache: historyWarmCache)
+                        ?? model.mtpHeadHiddenForward(
+                            hidden: flushHidden, nextTokenIds: flushTokens,
+                            cache: historyWarmCache))
+                var draftHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                var draftId = model.draftTokenID(draftHidden)
+                eval(draftId)
+                for _ in 1 ..< maxDepth {
+                    headHidden = model.mtpHeadHiddenForward(
+                        hidden: draftHidden, nextTokenIds: draftId,
+                        cache: historyWarmCache)
+                    draftHidden = headHidden[
+                        0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                    draftId = model.draftTokenID(draftHidden)
+                }
+                eval(draftId)
+                Self.trimTrimmable(historyWarmCache, to: 512)
+                eval(historyWarmCache.flatMap { $0.state })
+            }
+        } else {
+            let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
+            let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
+            let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: foldHidden, nextTokenIds: foldTokens,
                 cache: historyWarmCache)
-        eval(model.draftTokenID(
-            folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
-        eval(historyWarmCache.flatMap { $0.state })
+                ?? model.mtpHeadHiddenForward(
+                    hidden: foldHidden, nextTokenIds: foldTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+            eval(historyWarmCache.flatMap { $0.state })
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses

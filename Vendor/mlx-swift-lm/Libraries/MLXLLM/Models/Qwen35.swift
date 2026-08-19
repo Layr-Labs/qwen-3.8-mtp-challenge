@@ -1653,6 +1653,11 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    /// True when the installed K and V islands cover every output row, so
+    /// `putAlong` already replaces the entire affine-4 KV result. History
+    /// flush can then skip `quantizedMM`. Q is only a 1024/12288 subset;
+    /// fused `qkv()` must keep the quantized GEMM.
+    private var _exactKVCoversAll = false
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1757,6 +1762,31 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        // Full K/V islands overwrite every quantized KV column. Skip the
+        // dead affine-4 GEMM and scatter the bf16 island result onto zeros.
+        // `putAlong(zeros, perm, exact)` is bit-exact with
+        // `putAlong(dead_qmm, perm, exact)` when `perm` is a bijection of
+        // 0..<N. Kill switch `MLXFAST_QWEN_MTP_EXACT_QKV_ROWS=0` skips
+        // install, so `_exactKVCoversAll` stays false. Operator A/B:
+        // `MLX_QWEN_MTP_SKIP_DEAD_KV=0` (worker-visible `MLX_` prefix).
+        if _exactKVCoversAll,
+           ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SKIP_DEAD_KV"] != "0",
+           let exactW = _exactQKVWeight,
+           let indices = _exactKVIndices,
+           _kvOut > 0
+        {
+            let weight = exactW[_exactQRowCount...]
+            let exact = matmul(x, weight.transposed(1, 0))
+            let indexShape = Array(repeating: 1, count: max(0, x.ndim - 1)) + [-1]
+            let y = putAlong(
+                MLXArray.zeros(
+                    Array(x.shape.dropLast()) + [exact.dim(-1)],
+                    dtype: exact.dtype),
+                indices.reshaped(indexShape),
+                values: exact,
+                axis: -1)
+            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1840,6 +1870,17 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+        let kOut = kProj.shape.0
+        let vOut = vProj.shape.0
+        let kvIdx = kvIndices.asArray(Int32.self)
+        _exactKVCoversAll =
+            kWeight.dim(0) == kOut
+            && vWeight.dim(0) == vOut
+            && kOut > 0 && vOut > 0
+            && Set(kvIdx).count == kOut + vOut
+        if _exactKVCoversAll {
+            _kvOut = kOut
+        }
     }
 
     /// Append rows to an attention cache without producing query outputs.
