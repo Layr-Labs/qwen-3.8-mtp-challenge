@@ -2382,21 +2382,24 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     inputNames: ["logits", "candidate_ids"],
     outputNames: ["token_id"],
     source: """
-        uint lane = thread_index_in_simdgroup;
-        float best_value = float(logits[lane]);
-        uint best_id = uint(candidate_ids[lane]);
-
-        for (uint offset = 16; offset > 0; offset >>= 1) {
-            float other_value = simd_shuffle_down(best_value, offset);
-            uint other_id = simd_shuffle_down(best_id, offset);
-            if (lane < offset && qwen_draft_rerank_better(
-                    other_value, other_id, best_value, best_id)) {
-                best_value = other_value;
-                best_id = other_id;
+        constexpr uint K = \(qwen35Top32K);
+        uint tid = thread_position_in_threadgroup.x;
+        threadgroup float tv[K];
+        threadgroup uint ti[K];
+        tv[tid] = float(logits[tid]);
+        ti[tid] = uint(candidate_ids[tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint offset = K / 2; offset > 0; offset >>= 1) {
+            if (tid < offset && qwen_draft_rerank_better(
+                    tv[tid + offset], ti[tid + offset],
+                    tv[tid], ti[tid])) {
+                tv[tid] = tv[tid + offset];
+                ti[tid] = ti[tid + offset];
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-
-        if (lane == 0) {
+        if (tid == 0) {
+            uint best_id = ti[0];
             token_id[0] = int(
                 best_id < PREFIX_COUNT
                     ? best_id
@@ -2456,7 +2459,7 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
 // identity would suffice. Element-wise identity is a strictly stronger
 // property and makes the offline gate a plain array equality.
 private let qwen35Top32RealCount    = 98_330
-private let qwen35Top32K            = 32
+private let qwen35Top32K            = 128
 private let qwen35Top32TG           = 256
 private let qwen35Top32Tiles        = 64
 private let qwen35Top32Stride       = qwen35Top32Tiles * qwen35Top32TG
@@ -2759,7 +2762,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 128
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
