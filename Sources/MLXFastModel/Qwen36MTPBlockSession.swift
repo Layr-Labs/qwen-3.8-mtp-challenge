@@ -445,9 +445,11 @@ public final class Qwen36MTPBlockSession {
         // the 16 FA caches sit at kL=512; scored decode walks that prefix to
         // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
         // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // forward) and dispatch the fused-vector shapes the ranked path
+        // actually fires. Crown 59b321e compiled qL=1 / 5 / 4. This slot
+        // adds qL=2 / 3: the cost-model's default verify widths, and the
+        // exactness-chunk tails of width 7 (5+2) and width 8 (5+3). Live
+        // `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
@@ -491,11 +493,18 @@ public final class Qwen36MTPBlockSession {
         eval(extended)
         // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
         // (config pins 256). Scale matches Qwen35Attention.
+        //
+        // qL is the 2-pass threadgroup Z (group_dims = (32, gqa=6, qL) in
+        // sdpa_vector_2pass). A new Z is a new Metal PSO even when the
+        // kernel name is the same. Crown 59b321e compiled Z=1/4/5. Z=2
+        // and Z=3 are the live cost-model widths (primary+1 / primary+2)
+        // and the 5+2 / 5+3 chunk tails; first-touching them at kL>=1024
+        // inside the last scored rounds is the stall this list closes.
         let qHeads = extK.dim(1) * 6
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        for qL in [1, 2, 3, 5, 4] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
