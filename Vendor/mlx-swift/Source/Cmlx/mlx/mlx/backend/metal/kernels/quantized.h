@@ -1185,6 +1185,145 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+// Non-uniform input-row schedule for the affine4/g64 multi-row QMV.
+//
+// `qmv_fast_crossrow_affine4_g64_m` partitions the M input rows into groups of
+// a single uniform width IPG (plus one shorter tail), which forces IPG = 4 at
+// M = 4, 7 and 8 -- the only three cells that instantiate
+// `qmv_fast_crossrow_affine4_g64_wide<T, 4, ...>`. This template lifts that
+// restriction: the partition is given explicitly as up to four group widths
+// N0..N3 (0 = group absent) that must sum to M, so a width can be chosen per
+// group. It subsumes the uniform form -- `_m<T, M, IPG>` is exactly
+// `_sched<T, IPG, ..., TAIL>` -- and is used only where a mixed partition is
+// wanted.
+//
+// EXACTNESS. This template performs no arithmetic. It only decides WHICH host
+// x-group evaluates which contiguous run of input rows, i.e. it renames
+// (threadgroup -> input row) while leaving every per-output-element reduction
+// untouched: each y[m][n] is still produced by exactly one simdgroup running
+// `qmv_fast_crossrow_affine4_g64_wide`, whose lane -> K mapping
+// (`values_per_thread = 16`, lane `simd_lid` owning
+// `[k + 16*simd_lid, k + 16*simd_lid + 16)` of every 512-value k-block), whose
+// k-block order, whose i / nibble order, whose `load_vector` and `qdot`
+// expression trees, and whose terminating `simd_sum` are all unchanged.
+// Row-to-threadgroup assignment is not part of any accumulation order, so any
+// partition of [0, M) into groups of width 2..4 produces bit-identical output.
+// The invariant that must hold is only coverage: N0 + N1 + N2 + N3 == M, so
+// every input row is claimed by exactly one group and no group reads or writes
+// a row >= M. The caller asserts that; the widths are asserted here.
+template <
+    typename T,
+    int N0,
+    int N1,
+    int N2,
+    int N3,
+    bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_sched(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(N0 >= 2 && N0 <= 4, "group 0 width must be in [2, 4]");
+  static_assert(N1 == 0 || (N1 >= 2 && N1 <= 4), "group 1 width in [2, 4] or 0");
+  static_assert(N2 == 0 || (N2 >= 2 && N2 <= 4), "group 2 width in [2, 4] or 0");
+  static_assert(N3 == 0 || (N3 >= 2 && N3 <= 4), "group 3 width in [2, 4] or 0");
+  static_assert(N1 != 0 || (N2 == 0 && N3 == 0), "no gaps in the schedule");
+  static_assert(N2 != 0 || N3 == 0, "no gaps in the schedule");
+  // The distinct widths PRESENT in this schedule. Only these get an inlined
+  // `_wide` body, so a schedule of (3,2,2) costs the same instruction footprint
+  // as `_m<T, 5, 3>` -- one NA=3 body and one NA=2 body -- rather than one body
+  // per group. A width absent from the schedule is clamped to 2 in the template
+  // argument so nothing wider is instantiated; that branch is compile-time
+  // dead and is eliminated.
+  constexpr bool HAS2 = (N0 == 2) || (N1 == 2) || (N2 == 2) || (N3 == 2);
+  constexpr bool HAS3 = (N0 == 3) || (N1 == 3) || (N2 == 3) || (N3 == 3);
+  constexpr bool HAS4 = (N0 == 4) || (N1 == 4) || (N2 == 4) || (N3 == 4);
+
+  const int g = int(tid.x);
+  int first_m = 0;
+  int na = 0;
+  if (g == 0) {
+    first_m = 0;
+    na = N0;
+  } else if (g == 1) {
+    first_m = N0;
+    na = N1;
+  } else if (g == 2) {
+    first_m = N0 + N1;
+    na = N2;
+  } else if (g == 3) {
+    first_m = N0 + N1 + N2;
+    na = N3;
+  }
+  if (na == 0) {
+    // Host x-groups past the end of the schedule return without reading
+    // weights, exactly as they do in the uniform `_m` form.
+    return;
+  }
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+  if (HAS2 && na == 2) {
+    qmv_fast_crossrow_affine4_g64_wide<T, 2, DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  } else if (HAS3 && na == 3) {
+    qmv_fast_crossrow_affine4_g64_wide<T, (HAS3 ? 3 : 2), DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  } else if (HAS4 && na == 4) {
+    qmv_fast_crossrow_affine4_g64_wide<T, (HAS4 ? 4 : 2), DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-M input-row schedule selector for the wide (out_vec_size >= 4096)
+// affine4/g64 crossrow QMV cells. A/B ladder, one digit:
+//
+//   0  STOCK. The uniform-IPG table exactly as promoted:
+//      M=3 (3) | M=4 (4) | M=5 (3,2) | M=6 (3,3) | M=7 (4,3) | M=8 (4,4) |
+//      M=9 (3,3,3).  Instantiates `_wide<T, 4, true>`.
+//   1  CONSERVATIVE. Only the M=7 cell moves, (4,3) -> (3,2,2). M=4 and the
+//      receipted M=8 (4,4) cell are untouched, so `_wide<T, 4, true>` is still
+//      instantiated and the pipeline's register allocation is unchanged.
+//   2  NA<=3 (default). Every group width is 2 or 3, chosen to minimise the
+//      number of weight streams subject to that bound:
+//      M=4 (2,2) | M=7 (3,2,2) | M=8 (3,3,2).  `_wide<T, 4, true>` becomes
+//      unreachable and is dead-code eliminated, which also lowers the register
+//      high-water mark of the single `affine_qmv_fast` pipeline that every M
+//      (including the M=1 serial path) shares.
+//
+// Rationale, from the local g16s per-M sweep (see
+// local-docs/kb/50-strategies/W2-qmv-per-M-dispatch.md): per weight stream the
+// wide kernel costs ~32 ms (NA=2, bandwidth bound), ~48 ms (NA=3) and ~93 ms
+// (NA=4) for one whole 14.4 GB target forward, i.e. 16.0 / 16.0 / 23.3 ms per
+// verify row. NA=4 falls off a register cliff; NA=2 and NA=3 are equal per row,
+// so among NA<=3 partitions the right objective is fewest groups, which is what
+// the level-2 table encodes. All three levels emit bit-identical results -- the
+// selector only changes which threadgroup evaluates which input row.
+//
+// A/B WITHOUT A REBUILD. The level is `#ifndef`-guarded so it can be overridden
+// by a `#define` prepended to this source string. The JIT twin's C++ wrapper
+// does exactly that when the host environment variable
+// `MLX_QMV_CROSSROW_SCHEDULE` is set to 0, 1 or 2 (see the wrapper at the top
+// of mlx-generated/quantized.cpp); unset, or set to anything else, leaves the
+// default below. The AOT twin (kernels/quantized.h -> mlx.metallib) has no host
+// to read an environment from and is therefore always built at the default
+// level -- which is harmless because this vendored package builds in JIT mode
+// (Package.swift excludes nojit_kernels.cpp and compiles jit_kernels.cpp), so
+// every `affine_qmv_fast` pipeline decode dispatches is compiled at runtime
+// from THIS string, not from the metallib.
+// ---------------------------------------------------------------------------
+#ifndef MLX_QMV_CROSSROW_SCHEDULE
+#define MLX_QMV_CROSSROW_SCHEDULE 2
+#endif
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1931,9 +2070,20 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 4:
+#if MLX_QMV_CROSSROW_SCHEDULE >= 2
+          // (2,2), not (4). Two NA=2 weight streams instead of one NA=4 stream:
+          // doubles this width's weight traffic but leaves the NA=4 register
+          // cliff, which the local g16s sweep prices at 23.3 ms/row against
+          // NA=2's 16.0 ms/row over a whole 14.4 GB target forward
+          // (68.34 ms vs 64.84 ms measured at M=4).
+          qmv_fast_crossrow_affine4_g64_m<T, 4, 2, true>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+#else
           qmv_fast_crossrow_affine4_g64_m<T, 4, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
+#endif
           return;
         case 5:
           qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
@@ -1946,16 +2096,32 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 7:
+#if MLX_QMV_CROSSROW_SCHEDULE >= 1
+          // (3,2,2) instead of (4,3). The uniform form has no legal three-group
+          // partition at M=7 (IPG=3 leaves a one-row tail, which the wide
+          // kernel cannot express; IPG=2 leaves one too), so M=7 was pinned to
+          // an NA=4 group purely by the uniformity constraint -- not by a
+          // measurement. Three groups of width <=3 cost 48+32+32 = 112 ms
+          // against (4,3)'s 93+48 = 141 ms on the local g16s per-stream cost
+          // model, and 112 also beats the all-NA=2 (2,2,2,1) alternative's four
+          // streams (119.71 ms measured).
+          qmv_fast_crossrow_affine4_g64_sched<T, 3, 2, 2, 0, true>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+#else
           qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
+#endif
           return;
         case 8:
+#if MLX_QMV_CROSSROW_SCHEDULE >= 2
           // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
           // two simultaneous vec<float,4> accumulators in every active worker;
           // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
           // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
+          // — a register cliff, not work scaling. Independently reproduced by a
+          // local g16s forward sweep: 186.95 ms at M=8 against 157.05 ms at M=9.
           // Exact: these lanes carry INDEPENDENT input rows and are never reduced
           // across (simd_sum reduces along K WITHIN a row), so moving a row from
           // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
@@ -1964,9 +2130,21 @@ template <typename T, int group_size, int bits, bool batched>
           // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
           // SYNERGY with the streak gate above, which is why they ship together:
           // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
+          // CONTESTED: the (4,4) form below has its own ranked receipt
+          // (3.195804751396457 as a promoted submission), though a later
+          // re-import of it measured NEUTRAL on four goldens. Set
+          // MLX_QMV_CROSSROW_SCHEDULE to 1 to restore (4,4).
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+#else
+          // 4+4: two weight streams, receipted on this benchmark (scored
+          // 3.195804751396457 as a promoted submission) before a later
+          // stale-base REPLACE overlay reverted it; restored here.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
+#endif
           return;
         case 9:
           qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
