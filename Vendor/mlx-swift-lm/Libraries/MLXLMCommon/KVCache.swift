@@ -385,7 +385,15 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
-    public var step = 256
+    /// Backing-store growth chunk. Ranked Qwen MTP times a 512-token seed
+    /// (untimed) plus 512 decode tokens. The previous 256-token chunk made
+    /// the seed fill the buffer exactly (`nSteps = (256+512-1)/256 = 2` →
+    /// cap 512), so the first scored verify concat-copied 16 FA-layer KV
+    /// prefixes, then copied again at 768. 1024 admits the whole window in
+    /// the untimed seed alloc. Returned SDPA views stay `..<offset`; this
+    /// does not enlarge the attended prefix (unlike PR 105's head-cache
+    /// preallocation, which advanced observed length).
+    public var step = 1024
 
     public override init() {
         super.init()
