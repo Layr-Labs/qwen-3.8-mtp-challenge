@@ -448,6 +448,9 @@ public final class Qwen36MTPBlockSession {
         // forward) and dispatch the three fused-vector shapes the ranked
         // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
         // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // Leftover on this tip: also dispatch the LIVE query layout
+        // ([B, qL, H, D].transposed → not row-contiguous). #693's zeros
+        // were [B, H, qL, D] contiguous and compiled the other PSO.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
@@ -498,6 +501,27 @@ public final class Qwen36MTPBlockSession {
         for qL in [1, 5, 4] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
+            outs.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: q,
+                    keys: extK,
+                    values: extV,
+                    scale: scale,
+                    mask: .causal
+                )
+            )
+        }
+        // LIVE QUERY LAYOUT. Qwen35Attention emits Q as
+        // [B, qL, H, D].transposed(0, 2, 1, 3): not row-contiguous.
+        // Metal hashes `query_transposed = !row_contiguous` into the PSO
+        // (`_qt` vs `_qnt`). The contiguous zeros above (and #693 / #704 /
+        // #709 / #710 / #712) compile `_qnt`. Scored decode first-touches
+        // `_qt` at kL>=1024. Same qL={1,5,4}, same keys, dummy values,
+        // no cache mutation. Do not add qL=2,3 (#704 REJ 3.24631).
+        for qL in [1, 5, 4] {
+            let qHost = MLXArray.zeros(
+                [extK.dim(0), qL, qHeads, headDim], dtype: extK.dtype)
+            let q = qHost.transposed(0, 2, 1, 3)
             outs.append(
                 MLXFast.scaledDotProductAttention(
                     queries: q,
