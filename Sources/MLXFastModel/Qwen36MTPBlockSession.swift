@@ -606,6 +606,108 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    // MARK: - H1: speculative head pipelining (default OFF)
+    //
+    // WHAT THIS IS. A round is strictly serial today:
+    //
+    //   [head chain: build + encode]  ->  [verify: build + encode]  ->  [eval]
+    //
+    // The head chain is the FIRST GPU work of a round, so at round top the
+    // device is idle and the chain's whole host cost is exposed. E004 measured
+    // that cost at 3.92 ms of a 128.76 ms round (3.0%), split 1.21 ms graph
+    // CONSTRUCTION / 2.71 ms Metal ENCODING. Meanwhile the host sits blocked in
+    // the round's single `eval` for ~92 ms with nothing to do.
+    //
+    // Round k+1's head chain is a function of round k's verify output alone:
+    //   flush rows   = verifyNormed[0 ... a]
+    //   flush tokens = verifyArgmax[0 ... a]        (a = acceptedCount)
+    // -- because an ACCEPTED draft equals the verify row's own argmax, and the
+    // trailing row is (pendingHidden, pendingPrimary) = (verifyNormed[a],
+    // verifyArgmax[a]). Both are device-resident before the eval, and the token
+    // ids can be taken straight out of `top2IDs` without a host readback. So the
+    // ONLY thing missing before the eval is the LENGTH `a`.
+    //
+    // We bet a == draftCount (full acceptance), build that chain into a branched
+    // head cache while the GPU chews the verify, and keep it only if the bet
+    // lands. A losing bet is dropped whole: the branch cache is discarded, the
+    // ids are never proposed and never enter the ledger.
+    //
+    // TWO MODES, because the two halves of the cost have opposite risk:
+    //
+    //  .construct  Build the graph, DO NOT submit it. Round k+1 does the
+    //              `asyncEval` itself. Saves the 31% construction share on a
+    //              hit; on a miss the only loss is host time already hidden
+    //              behind the GPU. Byte-neutral and dispatch-neutral in every
+    //              outcome: nothing that is not used is ever evaluated.
+    //
+    //  .submit     Also `asyncEval` the chain inside round k's shadow. Saves the
+    //              full 3.92 ms on a hit -- and on a MISS spends a whole wasted
+    //              head chain of real GPU time (~2.1 ms/step x depth) that the
+    //              next round's real chain then queues behind. The schedule's
+    //              own marginal rule stops at Pi p_i ~= h ~= 0.18, so
+    //              P(full accept) ~= 0.27 by construction and this arm is
+    //              predicted to LOSE ~9% of round wall time. It exists to be
+    //              falsified, not to be shipped.
+    //
+    // Default is `.off`: the untouched code path, byte-for-byte.
+    enum SpeculativeHeadMode: String {
+        case off
+        case construct
+        case submit
+    }
+
+    /// `MLX_QWEN_MTP_SPEC_HEAD=construct|submit`. `MLX_` prefix on purpose --
+    /// the trusted harness strips `MLXFAST_*` from the sandboxed worker's env
+    /// and lets the `MLX_` family through. Unset / unrecognised / `0` / `off`
+    /// all mean off, and off means the pre-existing code path with no reorder.
+    /// SHIPPED DEFAULT IS `.construct`. The ranked workflow sets no `MLX_QWEN_*`
+    /// variable, so a default of `.off` would make this submission a no-op.
+    /// `.construct` builds the next round's head chain in the previous round's
+    /// GPU shadow but never submits it, so it is byte-neutral in every outcome
+    /// (a missed plan's graph nodes are simply never evaluated).
+    /// `MLX_QWEN_MTP_SPEC_HEAD=off` restores the pre-existing path exactly and
+    /// is the A/B control; `submit` is measure-only and is predicted to LOSE
+    /// (it is byte-ADDING: +3.2 GB on a missed round against a 16.4 GB budget).
+    static let specHeadMode: SpeculativeHeadMode = {
+        let raw = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_SPEC_HEAD"]?
+            .lowercased() ?? ""
+        if raw.isEmpty { return .construct }
+        return SpeculativeHeadMode(rawValue: raw) ?? .off
+    }()
+
+    /// A head chain built in the previous round's GPU shadow under the
+    /// full-acceptance bet. Consumed only by the round that immediately
+    /// follows it, and only at the exact depth it was built for.
+    private struct SpeculativeHeadPlan {
+        /// `roundCount` of the round that built it; the consumer requires
+        /// `roundCount - 1` so a plan can never outlive one round boundary.
+        let builtInRound: Int
+        /// Draft depth this chain was built at — an UPPER BOUND on what the
+        /// next round can ask for (see `predictedNextDepth`). A shallower round
+        /// consumes a prefix and rewinds the branch cache to `stepStates[j-1]`,
+        /// so the discarded steps' graph nodes become unreferenced and are
+        /// never evaluated.
+        let depth: Int
+        /// The branched head-history cache, already carrying the flush rows.
+        let cache: [any KVCache]
+        /// `depth` device-resident `[1,1]` int32 proposals, in verify order.
+        let draftIds: [MLXArray]
+        /// `stepStates[j]` is the branch cache immediately after step `j+1`,
+        /// one entry per head layer.
+        let stepStates: [[KVCacheSimple.BranchState]]
+        /// Head-cache offset after the flush rows -- the next round's
+        /// `validHistoryOffset`.
+        let validHistoryOffset: Int
+        /// True when the chain was already submitted with `asyncEval`.
+        let submitted: Bool
+    }
+
+    private var specPlan: SpeculativeHeadPlan?
+    /// Telemetry only: how often the bet landed. Never read by any decision.
+    public private(set) var specPlanHitCount = 0
+    public private(set) var specPlanMissCount = 0
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -613,10 +715,31 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+    /// E004 finding, ported here: the comment below is WRONG for `mtp-timed`.
+    /// `runQwenMTPTimed` omits `forwardsWorkerStderr`, so the drain gets the
+    /// no-op emitter and the phase trace has NEVER been visible on that verb.
+    /// Both sites are TRUSTED, so the fix cannot live there. Setting
+    /// `MLX_QWEN_MTP_TRACE_PATH=/abs/path` redirects the trace to a file the
+    /// parent can read afterwards (`MLX_` is the forwarded env family). The
+    /// worker sandbox denies `file-write*`, so the run also needs
+    /// `MLXFAST_NO_SANDBOX=1`. Unset or unopenable path falls back to stderr.
+    private static let traceHandle: FileHandle? = {
+        let path = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_TRACE_PATH"] ?? ""
+        guard !path.isEmpty else { return nil }
+        if !FileManager.default.fileExists(atPath: path) {
+            _ = FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        guard let handle = FileHandle(forWritingAtPath: path) else { return nil }
+        handle.seekToEndOfFile()
+        return handle
+    }()
+
     private static func traceWrite(_ line: String) {
-        // stderr: the worker sandbox denies file-write*, and the parent's
-        // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
-        // `forwardsWorkerStderr` on the local mtp-timed verb.
+        if let handle = traceHandle {
+            handle.write(Data(line.utf8))
+            return
+        }
         FileHandle.standardError.write(Data(line.utf8))
     }
 
@@ -762,20 +885,37 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
+        let margin: Double? = (pendingTop2?.1.count ?? 0) >= 2
+            ? pendingTop2!.1[0] - pendingTop2!.1[1]
+            : nil
+        return Self.greedyDepth(
+            cap: cap, emas: positionAcceptEMA, tailMargin: margin)
+    }
+
+    /// The greedy marginal rule as a PURE function of its inputs, so the H1
+    /// plan builder can ask "what depth will the next round choose?" with the
+    /// identical arithmetic instead of a second, drifting copy of it.
+    ///
+    /// `tailMargin` is the previous tail row's top-2 logit gap; nil means the
+    /// confidence clamp does not apply. The clamp can only LOWER `p`, so
+    /// evaluating the rule with `tailMargin == nil` yields an UPPER BOUND on
+    /// the depth the round will actually pick — which is exactly the guarantee
+    /// the plan consumer needs to be able to take a prefix.
+    private static func greedyDepth(
+        cap: Int, emas: [Double], tailMargin: Double?
+    ) -> Int {
+        let h = headStepCostRatio
         var reach = 1.0
         var expected = 0.0
         var depth = 0
-        while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
+        while depth < cap, depth < emas.count {
+            var p = emas[depth]
+            if let margin = tailMargin {
+                if depth == 0 {
+                    p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 2.0)))
+                } else if depth == 1 {
+                    p = Swift.min(p, 1.0 / (1.0 + exp(-margin / 3.0)))
+                }
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
@@ -784,6 +924,38 @@ public final class Qwen36MTPBlockSession {
             depth += 1
         }
         return depth
+    }
+
+    /// H1 depth prediction: the depth the NEXT round's schedule will ask for,
+    /// assuming this round fully accepts `acceptedCount` drafts.
+    ///
+    /// Reproduces `recordAcceptOutcome`'s full-accept branch on a COPY of the
+    /// EMAs (nothing is mutated), raises the streak by one, and then runs the
+    /// same greedy rule with the confidence clamp disabled. The result is an
+    /// upper bound on the real answer for three independent reasons: the clamp
+    /// only lowers `p`, the parent's offer only ever shrinks inside a window,
+    /// and the streak only ever grows on a full accept. An over-estimate costs
+    /// nothing — the consumer takes a prefix.
+    private func predictedNextDepth(
+        acceptedCount: Int, offeredDepth: Int
+    ) -> Int {
+        var emas = positionAcceptEMA
+        let alpha = Self.acceptEMAAlpha
+        for index in 0 ..< acceptedCount where index < emas.count {
+            emas[index] += alpha * (1.0 - emas[index])
+        }
+        if acceptedCount > 0, acceptedCount < emas.count,
+           emas[acceptedCount] < 0.95
+        {
+            emas[acceptedCount] += alpha * (0.95 - emas[acceptedCount])
+        }
+        let widthCap = (fullAcceptStreak + 1) >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
+        let cap = Swift.min(
+            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth), widthCap)
+        guard cap > 0 else { return 0 }
+        return Self.greedyDepth(cap: cap, emas: emas, tailMargin: nil)
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -858,6 +1030,13 @@ public final class Qwen36MTPBlockSession {
             throw Qwen36MTPSessionError.invalidDepth(depth)
         }
         roundCount += 1
+        // Take the speculative plan unconditionally. Every early return below
+        // (stop token, depth 0, adaptive skip) therefore DROPS it, and it can
+        // never survive more than one round boundary. Dropping is free: an
+        // unconsumed plan's graph is never evaluated in `.construct` mode, and
+        // its branch cache holds no state the session depends on.
+        let inheritedPlan = specPlan
+        specPlan = nil
         // Local-only phase trace (MLXFAST_QWEN_MTP_TRACE=1): three boundaries
         // split a round into head-chain graph build, verify graph build, and
         // the single blocking eval's GPU wall. Never on in a ranked run.
@@ -995,15 +1174,60 @@ public final class Qwen36MTPBlockSession {
         //    forward. Only the last row's logits are projected through the
         //    lm_head. Deeper sub-steps chain the head's OWN post-`mtp.norm`
         //    hidden exactly as before.
+        //
+        //    H1 FAST PATH. If the previous round left a speculative plan built
+        //    at exactly this depth, the flush and the whole chain already exist
+        //    and this round does none of that work. The plan is only kept when
+        //    the previous round fully accepted, and a full-accept round's
+        //    committed transitions are exactly the rows the plan flushed --
+        //    (verifyNormed[i], verifyArgmax[i]) for i = 0 ... draftCount -- so
+        //    the backlog this round would have flushed is redundant and is
+        //    dropped rather than double-appended.
         let headCache: [any KVCache]
+        let validHistoryOffset: Int
+        var draftIdArrays: [MLXArray] = []
+
+        if let plan = inheritedPlan,
+           plan.builtInRound == roundCount - 1,
+           draftCount >= 1,
+           draftCount <= plan.depth,
+           plan.draftIds.count == plan.depth,
+           plan.stepStates.count == plan.depth,
+           plan.cache.count == plan.stepStates[draftCount - 1].count
+        {
+            specPlanHitCount += 1
+            headCache = plan.cache
+            headHistoryCache = plan.cache
+            validHistoryOffset = plan.validHistoryOffset
+            draftIdArrays = Array(plan.draftIds.prefix(draftCount))
+            // Rewind the branch to the instant after step `draftCount`. In
+            // `.construct` mode the deeper steps were never submitted, so
+            // dropping their nodes here means they cost exactly nothing.
+            if draftCount < plan.depth {
+                let state = plan.stepStates[draftCount - 1]
+                for (index, entry) in plan.cache.enumerated() {
+                    (entry as? KVCacheSimple)?.restore(state[index])
+                }
+            }
+            headHistoryBacklogHidden.removeAll(keepingCapacity: true)
+            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+            if !plan.submitted {
+                // `.construct` mode: the graph exists, the encoding does not.
+                // Same single submission the ordinary path makes below.
+                asyncEval(draftIdArrays[draftIdArrays.count - 1])
+            }
+        } else {
+        if inheritedPlan != nil { specPlanMissCount += 1 }
+
+        let liveHeadCache: [any KVCache]
         var flushHidden: [MLXArray] = []
         var flushTokens: [Int] = []
         if let existing = headHistoryCache {
-            headCache = existing
+            liveHeadCache = existing
         } else {
             let fresh = model.makeMTPCache()
             headHistoryCache = fresh
-            headCache = fresh
+            liveHeadCache = fresh
             if let seedHidden = seedHiddenForPriming,
                seedTokensForPriming.count > 1
             {
@@ -1017,6 +1241,7 @@ public final class Qwen36MTPBlockSession {
             seedHiddenForPriming = nil
             seedTokensForPriming = []
         }
+        headCache = liveHeadCache
         if !headHistoryBacklogHidden.isEmpty {
             flushHidden.append(contentsOf: headHistoryBacklogHidden)
             flushTokens.append(contentsOf: headHistoryBacklogTokens)
@@ -1032,7 +1257,7 @@ public final class Qwen36MTPBlockSession {
         // valid whatever the verify decides. Deeper drafted positions are
         // speculative and are trimmed after the round (MTPLX
         // `_rollback_mtp_cache(cycle_offset + 1)`).
-        let validHistoryOffset = draftBase + flushTokens.count
+        validHistoryOffset = draftBase + flushTokens.count
         let draftInputHidden =
             flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
         let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
@@ -1047,7 +1272,6 @@ public final class Qwen36MTPBlockSession {
         // (Per-step asyncEval was tried here and measured NEUTRAL — the
         // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
         // idea.md V6 journal. Single submission after the loop, as before.)
-        var draftIdArrays: [MLXArray] = []
         var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
             hidden: draftInputHidden, nextTokenIds: draftInputTokens,
             cache: headCache)
@@ -1073,6 +1297,7 @@ public final class Qwen36MTPBlockSession {
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        } // end of the ordinary (non-speculative) draft-chain path
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1116,7 +1341,28 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        var candidatePlan: SpeculativeHeadPlan?
+        if Self.specHeadMode == .off {
+            eval(cache.flatMap { $0.state } + bundle)
+        } else {
+            // H1. Submit the round's work FIRST, so the device is already
+            // saturated, then spend the next ~1.2 ms of host time building the
+            // NEXT round's head chain inside that shadow, then wait. `asyncEval`
+            // followed by `eval` on the same arrays is the idiom the draft ids
+            // already use: the second call finds the work scheduled and waits.
+            // No op is added, removed or reordered inside either graph.
+            let roundOutputs = cache.flatMap { $0.state } + bundle
+            asyncEval(roundOutputs)
+            candidatePlan = buildSpeculativeHeadPlan(
+                headCache: headCache,
+                verifyHidden: verifyHidden,
+                verifyNormed: verifyNormed,
+                top2IDs: top2IDs,
+                draftCount: draftCount,
+                validHistoryOffset: validHistoryOffset,
+                offeredDepth: depth)
+            eval(roundOutputs)
+        }
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
@@ -1279,7 +1525,9 @@ public final class Qwen36MTPBlockSession {
                 + "readout_us=\((tReadDone - tEvalDone) / 1000) "
                 + "commit_us=\((tCommitDone - tReadDone) / 1000) "
                 + "upkeep_us=\((tTailDone - tCommitDone) / 1000) "
-                + "round_us=\((tTailDone - tRound0) / 1000)\n"
+                + "round_us=\((tTailDone - tRound0) / 1000) "
+                + "spec=\(Self.specHeadMode.rawValue) "
+                + "spec_hit=\(specPlanHitCount) spec_miss=\(specPlanMissCount)\n"
             Self.traceWrite(line)
         }
         // No trailing eval: every host-read value was materialised by the
@@ -1297,6 +1545,21 @@ public final class Qwen36MTPBlockSession {
             reachedStopToken = true
         }
 
+        // H1. THE BET RESOLVES HERE. The plan was built assuming every draft
+        // would be accepted; keep it only if that actually happened and the run
+        // is continuing. Any other outcome drops it and the next round rebuilds
+        // its chain from the real committed history, exactly as it does today.
+        //
+        // Why full acceptance is the only admissible outcome: the plan's flush
+        // is `(verifyNormed[i], verifyArgmax[i])` for i = 0 ... draftCount. On a
+        // partial accept the real history is that same sequence truncated at
+        // `acceptedCount`, so the plan's LAST flush row -- the only one whose
+        // full decoder output the chain consumes -- is conditioned on rows the
+        // target rejected. It is not salvageable by trimming.
+        if acceptedCount == drafts.count, !reachedStopToken {
+            specPlan = candidatePlan
+        }
+
         return Qwen36MTPRoundResult(
             tokens: committed,
             declaredRows: draftCount + 1,
@@ -1308,6 +1571,115 @@ public final class Qwen36MTPBlockSession {
             targetCacheOffset: seedTokenCount + committedTokenCount,
             reachedStopToken: reachedStopToken
         )
+    }
+
+    // MARK: - H1 speculative head plan
+
+    /// Build the NEXT round's head chain from THIS round's verify output, under
+    /// the bet that every draft is accepted. Called only after the round's work
+    /// has been submitted with `asyncEval`, so every microsecond spent here is
+    /// spent while the device is executing the verify forward.
+    ///
+    /// EVERY INPUT IS DEVICE-RESIDENT AND ALREADY DECIDED. No host readback, no
+    /// `.item()`, no synchronisation: the flush hidden rows are a slice of the
+    /// post-norm block the verify forward already published, and the flush
+    /// tokens are column 0 of the same `top2IDs` the accept walk reads. Column 0
+    /// of row i IS the row argmax under the reducer's pinned ordering, and an
+    /// accepted draft equals its row's argmax, so under full acceptance these
+    /// are bit-for-bit the ids the ordinary path would have uploaded from the
+    /// host.
+    ///
+    /// Returns nil (and leaves no state behind) whenever anything is not
+    /// exactly as expected. The caller treats nil as "no plan".
+    private func buildSpeculativeHeadPlan(
+        headCache: [any KVCache],
+        verifyHidden: MLXArray,
+        verifyNormed: MLXArray?,
+        top2IDs: MLXArray,
+        draftCount: Int,
+        validHistoryOffset: Int,
+        offeredDepth: Int
+    ) -> SpeculativeHeadPlan? {
+        guard Self.specHeadMode != .off, draftCount >= 1 else { return nil }
+        let rows = draftCount + 1
+        // Require the published post-norm block. The per-row `applyFinalNorm`
+        // fallback would add real RMSNorm dispatches on a speculative branch,
+        // which is precisely the byte-adding behaviour this lane must not have.
+        guard let flushHidden = normedRows(verifyHidden, verifyNormed, 0 ..< rows)
+        else { return nil }
+        guard top2IDs.ndim == 2, top2IDs.dim(0) >= rows, top2IDs.dim(1) >= 1
+        else { return nil }
+
+        // The depth the next round's schedule will ask for, assuming this round
+        // fully accepts. `predictedNextDepth` runs the schedule's own rule with
+        // the confidence clamp disabled, so it is an upper bound and the
+        // consumer can always take a prefix.
+        let predictedDepth = predictedNextDepth(
+            acceptedCount: draftCount, offeredDepth: offeredDepth)
+        guard predictedDepth >= 1 else { return nil }
+
+        // Branch the head-history cache. `shallowCopy` shares the buffers and
+        // the offset; the two objects then slice-update the same base array,
+        // and `slice_update` on a multiply-referenced input is out-of-place, so
+        // neither branch can see the other's writes.
+        var branch: [any KVCache] = []
+        branch.reserveCapacity(headCache.count)
+        for entry in headCache {
+            guard let simple = entry as? KVCacheSimple else { return nil }
+            branch.append(simple.shallowCopy())
+        }
+        guard !branch.isEmpty else { return nil }
+        // This round's own deeper draft rows are speculative and are trimmed at
+        // the end of the round; the branch starts from the committed boundary.
+        Self.trimTrimmable(branch, to: validHistoryOffset)
+        guard let branchOffset = branch.first?.offset,
+              branchOffset == validHistoryOffset
+        else { return nil }
+
+        let flushTokens = top2IDs[0 ..< rows, 0 ..< 1].reshaped([1, rows])
+        guard let firstHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
+            hidden: flushHidden, nextTokenIds: flushTokens, cache: branch)
+            ?? Optional(model.mtpHeadHiddenForward(
+                hidden: flushHidden, nextTokenIds: flushTokens, cache: branch))
+        else { return nil }
+
+        func snapshotBranch() -> [KVCacheSimple.BranchState] {
+            branch.map { ($0 as! KVCacheSimple).branchState() }
+        }
+
+        var headHidden = firstHidden
+        var draftHidden = headHidden[
+            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        var draftId = model.draftTokenID(draftHidden)
+        var ids: [MLXArray] = [draftId]
+        var stepStates: [[KVCacheSimple.BranchState]] = [snapshotBranch()]
+        ids.reserveCapacity(predictedDepth)
+        stepStates.reserveCapacity(predictedDepth)
+        for _ in 1 ..< predictedDepth {
+            headHidden = model.mtpHeadHiddenForward(
+                hidden: draftHidden, nextTokenIds: draftId, cache: branch)
+            draftHidden = headHidden[
+                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            draftId = model.draftTokenID(draftHidden)
+            ids.append(draftId)
+            stepStates.append(snapshotBranch())
+        }
+
+        let submitted = Self.specHeadMode == .submit
+        if submitted {
+            // AGGRESSIVE ARM. This spends real GPU time on a chain that a
+            // rejected round throws away. See the mode comment: predicted to
+            // lose, kept so the prediction can be falsified rather than argued.
+            asyncEval(ids[ids.count - 1])
+        }
+        return SpeculativeHeadPlan(
+            builtInRound: roundCount,
+            depth: predictedDepth,
+            cache: branch,
+            draftIds: ids,
+            stepStates: stepStates,
+            validHistoryOffset: validHistoryOffset + rows,
+            submitted: submitted)
     }
 
     // MARK: - cache snapshot / rollback (MTPLX cache_state.py)

@@ -523,6 +523,50 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
+    /// Allocation-free branch of this cache.
+    ///
+    /// `copy()` above round-trips through `state`, whose getter hands back
+    /// `keys[..., ..<offset, ...]` whenever the logical offset is short of the
+    /// padded buffer. Feeding that VIEW back in means the clone's very next
+    /// `update` trips the `reset` branch and pays a full `concatenated` of the
+    /// whole cache. This variant shares the underlying buffers and the logical
+    /// offset verbatim, so a clone that is written once behaves exactly like
+    /// the original would have.
+    ///
+    /// Both objects then slice-update the same base array. `slice_update` is
+    /// out-of-place whenever the input is multiply referenced, so neither
+    /// branch can observe the other's writes -- which is the property a
+    /// speculative branch needs. The cost is that a written clone materialises
+    /// its own copy of the buffer instead of donating the original's.
+    public func shallowCopy() -> KVCacheSimple {
+        let new = KVCacheSimple()
+        new.step = self.step
+        new.keys = self.keys
+        new.values = self.values
+        new.offset = self.offset
+        return new
+    }
+
+    /// The three fields that fully describe this cache's contents, captured by
+    /// reference. Restoring one rewinds the cache to that exact instant --
+    /// including dropping any unevaluated `slice_update` nodes written after
+    /// it, which is what makes an over-built speculative branch free.
+    public struct BranchState {
+        public let keys: MLXArray?
+        public let values: MLXArray?
+        public let offset: Int
+    }
+
+    public func branchState() -> BranchState {
+        BranchState(keys: keys, values: values, offset: offset)
+    }
+
+    public func restore(_ state: BranchState) {
+        self.keys = state.keys
+        self.values = state.values
+        self.offset = state.offset
+    }
+
     public var debugDescription: String {
         "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
     }
