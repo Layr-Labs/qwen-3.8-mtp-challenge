@@ -411,6 +411,36 @@ public final class Qwen36MTPBlockSession {
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
 
+        // Target FA SDPA 2-pass compile (untimed). On M-series devices whose
+        // Metal arch suffix is 's' or 'd' (the ranked M5 Max), MLX routes
+        // vector SDPA to `sdpa_vector_2pass` once kL >= 1024, and the N>1024
+        // / n_simds>4 path rehashes again. The ranked window is a 512-token
+        // seed plus 512 decode tokens, so that specialization first appears
+        // near the end of every prompt. The width loop above only grows this
+        // throwaway cache by a few tens of rows past 512. A 1024-row prefix
+        // plus one median-width verify (qL=6, nConfirmed=1) and one extra
+        // token pulls both 2-pass hashes out of the scored window. Dummy
+        // zeros, throwaway cache, nothing observed by generation.
+        let twoPassCache = model.newCache(parameters: nil)
+        let twoPassPrefix = Array(repeating: 0, count: 1024)
+        let (twoPassLogits, _) = model.callWithHidden(
+            input: LMInput.Text(
+                tokens: MLXArray(twoPassPrefix).reshaped([1, 1024])),
+            cache: twoPassCache, nConfirmed: 0)
+        _ = twoPassLogits
+        eval(twoPassCache.flatMap { $0.state })
+        for width in [6, 1] {
+            let step = Array(repeating: 0, count: width)
+            let (stepLogits, stepHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(step).reshaped([1, width])),
+                cache: twoPassCache, nConfirmed: width >= 2 ? 1 : 0)
+            _ = stepLogits
+            eval(
+                twoPassCache.flatMap { $0.state }
+                    + [hiddenRow(stepHidden, stepHidden.dim(1) - 1)])
+        }
+
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
         // The phase trace measured
