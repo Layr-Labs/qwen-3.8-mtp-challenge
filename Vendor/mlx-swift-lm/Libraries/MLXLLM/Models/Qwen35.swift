@@ -675,9 +675,12 @@ final class Qwen35GatedDeltaNet: Module {
         _ x: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
         if let w = _inW, let s = _inS, let zp = _inZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: zp, transpose: true,
-                groupSize: _inGS, bits: _inBits, mode: _inMode)
+            let y = qwen35CrossRowQMV(
+                    x, w: w, scales: s, biases: zp,
+                    groupSize: _inGS, bits: _inBits, mode: _inMode)
+                ?? quantizedMM(
+                    x, w, scales: s, biases: zp, transpose: true,
+                    groupSize: _inGS, bits: _inBits, mode: _inMode)
             let qkvEnd = keyDim * 2 + valueDim
             let zEnd = qkvEnd + valueDim
             let bEnd = zEnd + numVHeads
@@ -1179,7 +1182,8 @@ final class Qwen35GatedDeltaNet: Module {
         } else {
             normedOut = norm(out, gate: z)
         }
-        return outProj(normedOut.reshaped(B, S, -1))
+        let outIn = normedOut.reshaped(B, S, -1)
+        return qwen35CrossRowLinear(outProj, outIn) ?? outProj(outIn)
     }
 }
 
@@ -1231,6 +1235,175 @@ private let qwen35CompiledFusedSwiGLU:
     return body
 }()
 
+
+// MARK: - Cross-row quantized matvec (affine 4-bit, group 64)
+
+/// Cross-row `qmv_fast`: one threadgroup serves ALL M rows of a small
+/// multi-row matvec, so each packed weight word is fetched and nibble-masked
+/// once instead of once per row.
+///
+/// WHY THIS IS DISPATCHED HERE AND NOT LEFT TO MLX. MLX launches `qmv_fast`
+/// with grid `(M, ceil(N/8), B)` — one threadgroup per (x-row, output-row
+/// group) — because the stock kernel indexes both `x` and `y` by `tid.x`. A
+/// cross-row kernel needs only `ceil(N/8)` threadgroups, so under the stock
+/// grid `M-1` of every `M` threadgroups launch and immediately return. That
+/// waste, not the kernel body, is the bulk of the cost this removes: the same
+/// kernel body inside the stock grid is SLOWER than the vendored cross-row
+/// kernels it would replace. The grid lives in the MLX host dispatch, so the
+/// only place it can be chosen correctly is at the call site.
+///
+/// At M = 1 the target forward is bandwidth-bound at close to peak and the
+/// weights are read once whatever M is; every extra verify row therefore adds
+/// arithmetic, not traffic, and this removes the redundant part of it.
+///
+/// BIT-EXACT BY CONSTRUCTION, and deliberately so: the two inner expressions
+/// are transcribed operand-for-operand from `load_vector<T,U,16,4>` and
+/// `qdot<U,16,4>` in `mlx-generated/metal/quantized.h`, including the fact
+/// that `sum += x[i]+x[i+1]+x[i+2]+x[i+3]` adds in `T` and that the nibble
+/// masks stay INLINE in the multiply. Naming those masks as floats one line
+/// earlier — same values, same order — moved the compiler's fma contraction
+/// and changed 70% of the outputs by one ULP. Every row's `accum` is summed
+/// over the same `i` in the same order, `result += scale*accum + sum*bias` is
+/// the same expression, and the final `simd_sum` reduces the same 32 lanes.
+/// Nothing about a row's arithmetic depends on how many rows ride along.
+private let qwen35CrossRowQMVKernel = MLXFast.metalKernel(
+    name: "qwen35_qmv_crossrow_affine4_g64",
+    inputNames: ["w", "scales", "biases", "x"],
+    outputNames: ["y"],
+    source: """
+        constexpr int VPT = 16;      // values per thread   (pack 8 * packs 2)
+        constexpr int BLOCK = 512;   // VPT * 32
+        constexpr int RPS = 4;       // results per simdgroup
+        constexpr int NSG = 2;       // simdgroups per threadgroup
+
+        uint tg = threadgroup_position_in_grid.x;
+        uint sgid = simdgroup_index_in_threadgroup;
+        uint lid = thread_index_in_simdgroup;
+
+        const int in_w = KD / 2;     // packed bytes per output row
+        const int in_g = KD / 64;    // scale/bias groups per output row
+        const int out_row = int(tg) * (NSG * RPS) + int(sgid) * RPS;
+
+        const device uint8_t* ws = (const device uint8_t*) w;
+        ws += out_row * in_w + int(lid) * 8;
+        const device T* sc = scales + out_row * in_g + int(lid) / 4;
+        const device T* bi = biases + out_row * in_g + int(lid) / 4;
+
+        float accum[M][RPS];
+        float sums[M];
+        float result[M][RPS];
+        for (int m = 0; m < M; ++m) {
+            for (int r = 0; r < RPS; ++r) { result[m][r] = 0.0f; }
+        }
+
+        for (int k = 0; k < KD; k += BLOCK) {
+            for (int m = 0; m < M; ++m) {
+                sums[m] = 0.0f;
+                for (int r = 0; r < RPS; ++r) { accum[m][r] = 0.0f; }
+            }
+            // The x window is 4 wide, not 16. Holding x_thread[M][16] was
+            // measurably worse: the working set cost more in occupancy than
+            // the shared unpack saved, monotonically in M.
+            for (int i = 0; i < VPT / 4; ++i) {
+                float xw[M][4];
+                for (int m = 0; m < M; ++m) {
+                    const device T* xx =
+                        x + m * KD + k + int(lid) * VPT + 4 * i;
+                    sums[m] += xx[0] + xx[1] + xx[2] + xx[3];
+                    xw[m][0] = xx[0];
+                    xw[m][1] = xx[1] / 16.0f;
+                    xw[m][2] = xx[2] / 256.0f;
+                    xw[m][3] = xx[3] / 4096.0f;
+                }
+                for (int r = 0; r < RPS; ++r) {
+                    const device uint16_t* wq =
+                        (const device uint16_t*)(ws + r * in_w);
+                    uint16_t pw = wq[i];
+                    for (int m = 0; m < M; ++m) {
+                        accum[m][r] +=
+                            (xw[m][0] * (pw & 0x000f) +
+                             xw[m][1] * (pw & 0x00f0) +
+                             xw[m][2] * (pw & 0x0f00) +
+                             xw[m][3] * (pw & 0xf000));
+                    }
+                }
+            }
+            for (int r = 0; r < RPS; ++r) {
+                float sv = sc[r * in_g];
+                float bv = bi[r * in_g];
+                for (int m = 0; m < M; ++m) {
+                    result[m][r] += sv * accum[m][r] + sums[m] * bv;
+                }
+            }
+            ws += BLOCK / 2;
+            sc += BLOCK / 64;
+            bi += BLOCK / 64;
+        }
+
+        for (int r = 0; r < RPS; ++r) {
+            for (int m = 0; m < M; ++m) {
+                float v = simd_sum(result[m][r]);
+                if (lid == 0) {
+                    y[m * ND + out_row + r] = static_cast<T>(v);
+                }
+            }
+        }
+    """
+)
+
+enum Qwen35CrossRowQMV {
+    /// Inclusive maximum row count served by the cross-row kernel.
+    ///
+    /// LOCAL_M3_SELECTED_POLICY. There is a register cliff: on the machine
+    /// this was selected on, M <= 5 is strongly positive and M = 6 and 7 are
+    /// net losses, so wider verifies keep the vendored dispatch. The cliff is
+    /// a register-budget property and the optimal boundary is HARDWARE
+    /// SPECIFIC; 5 is a conservative choice, not a tuned optimum, and it has
+    /// not been validated on the ranked generation.
+    static let maxRows = 5
+}
+
+/// `x @ w.T` for an affine 4-bit / group-64 weight, all M rows in one
+/// threadgroup. Returns nil, without any side effect, whenever a precondition
+/// of the bit-exact reproduction fails, so the caller falls back to the stock
+/// dispatch.
+func qwen35CrossRowQMV(
+    _ x: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray,
+    groupSize: Int, bits: Int, mode: QuantizationMode
+) -> MLXArray? {
+    guard bits == 4, groupSize == 64, mode == .affine,
+          x.ndim == 3, x.dim(0) == 1
+    else { return nil }
+    let m = x.dim(1)
+    let k = x.dim(2)
+    let n = w.dim(0)
+    guard m >= 2, m <= Qwen35CrossRowQMV.maxRows,
+          k % 512 == 0, n % 8 == 0,
+          w.dim(1) == k / 8,
+          scales.ndim == 2, scales.dim(0) == n, scales.dim(1) == k / 64,
+          biases.ndim == 2, biases.dim(0) == n, biases.dim(1) == k / 64,
+          x.dtype == .bfloat16 || x.dtype == .float16
+    else { return nil }
+    let out = qwen35CrossRowQMVKernel(
+        [w, scales, biases, x.reshaped([m, k])],
+        template: [("T", x.dtype), ("M", m), ("KD", k), ("ND", n)],
+        grid: (n * 4, 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[m, n]],
+        outputDTypes: [x.dtype]
+    )
+    return out[0].reshaped([1, m, n])
+}
+
+/// Cross-row path for a plain `QuantizedLinear` (no bias vector).
+func qwen35CrossRowLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray? {
+    guard let q = layer as? QuantizedLinear, q.bias == nil, let zp = q.biases
+    else { return nil }
+    return qwen35CrossRowQMV(
+        x, w: q.weight, scales: q.scales, biases: zp,
+        groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+}
+
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1253,6 +1426,12 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
 
     private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
+            if let y = qwen35CrossRowQMV(
+                x, w: w, scales: s, biases: z,
+                groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+            {
+                return y
+            }
             return quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
@@ -1290,7 +1469,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+            let act = qwen35CompiledFusedSwiGLU(y)
+            return qwen35CrossRowLinear(downProj, act) ?? downProj(act)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
@@ -2789,7 +2969,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let hidden = model(inputs, cache: cache)
         var out = model.norm(hidden)
         if let lmHead {
-            out = lmHead(out)
+            out = qwen35CrossRowLinear(lmHead, out) ?? lmHead(out)
         } else {
             out = model.embedTokens.asLinear(out)
         }
@@ -2932,7 +3112,8 @@ extension Qwen35TextModel: MTPCapable {
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(normed)
+            logits = qwen35CrossRowLinear(lmHead, normed)
+                ?? lmHead(normed)
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
@@ -2952,7 +3133,8 @@ extension Qwen35TextModel: MTPCapable {
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(normed)
+            logits = qwen35CrossRowLinear(lmHead, normed)
+                ?? lmHead(normed)
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
