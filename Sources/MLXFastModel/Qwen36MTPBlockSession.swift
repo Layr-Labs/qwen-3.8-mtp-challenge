@@ -494,21 +494,47 @@ public final class Qwen36MTPBlockSession {
         let qHeads = extK.dim(1) * 6
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
-        var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
-            let q = MLXArray.zeros(
-                [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
-            outs.append(
-                MLXFast.scaledDotProductAttention(
-                    queries: q,
-                    keys: extK,
-                    values: extV,
-                    scale: scale,
-                    mask: .causal
+        // blocks bucket (scaled_dot_product_attention.cpp, devc 's' = M5 Max):
+        // N <= 1024 selects blocks=64; N in (1024, 8192] selects blocks=128
+        // (n_simds = 6*qL > 4 always). blocks IS part of the kernel hash name,
+        // so the two buckets are distinct compiled kernels. The ranked window
+        // is PARENT-counted: accepted drafts are free tokens that still occupy
+        // FA cache rows, so transient kL during scored decode walks past 1024
+        // to ~1300-1700 and the blocks=128 kernels fire for most of the second
+        // half of the window. Warming N=1024 alone (blocks=64) leaves the
+        // blocks=128 first-touch compile inside the scored window.
+        for targetN in [1024, 1536] {
+            let pad = targetN - extK.dim(2)
+            let k2 = pad > 0
+                ? concatenated(
+                    [extK,
+                     MLXArray.zeros([extK.dim(0), extK.dim(1), pad, extK.dim(3)],
+                                    dtype: extK.dtype)],
+                    axis: 2)
+                : extK
+            let v2 = pad > 0
+                ? concatenated(
+                    [extV,
+                     MLXArray.zeros([extV.dim(0), extV.dim(1), pad, extV.dim(3)],
+                                    dtype: extV.dtype)],
+                    axis: 2)
+                : extV
+            var outs: [MLXArray] = []
+            for qL in [1, 5] {
+                let q = MLXArray.zeros(
+                    [k2.dim(0), qHeads, qL, headDim], dtype: k2.dtype)
+                outs.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: q,
+                        keys: k2,
+                        values: v2,
+                        scale: scale,
+                        mask: .causal
+                    )
                 )
-            )
+            }
+            eval(outs)
         }
-        eval(outs)
     }
 
     // MARK: - begin
