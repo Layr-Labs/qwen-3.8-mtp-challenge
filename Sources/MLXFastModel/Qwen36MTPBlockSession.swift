@@ -208,13 +208,15 @@ public final class Qwen36MTPBlockSession {
     /// without this one-time resize the driver must re-establish residency for
     /// the whole tower on later command buffers.
     ///
-    /// Capacity is deliberately the live post-warm footprint plus only a small
-    /// page-rounding allowance. After cached warm temporaries are cleared,
-    /// persistent weights fit in the one resize while later scratch fails the
-    /// fit test and stays on the commit-free unwired path. The ticket is never
-    /// ended because shrinking the limit would evict the resident weights.
+    /// Capacity is the live post-warm footprint with zero spare slack.
+    /// After cached warm temporaries are cleared, persistent weights fit in
+    /// the one resize while later scratch fails the fit test and stays on
+    /// the commit-free unwired path. Spare slack (64 MiB) let scored-window
+    /// temporaries join the wired set and pay insert/erase commit traffic.
+    /// The ticket is never ended because shrinking the limit would evict
+    /// the resident weights.
     private static let wiredZHDefaultFraction = 1.0
-    private static let wiredZHDefaultSlackMB = 64
+    private static let wiredZHDefaultSlackMB = 0
     private static let wiredTicketLock = NSLock()
     nonisolated(unsafe) private static var wiredTicketRetainer: WiredMemoryTicket?
 
@@ -230,7 +232,26 @@ public final class Qwen36MTPBlockSession {
 
         wiredTicketLock.lock()
         defer { wiredTicketLock.unlock() }
-        guard wiredTicketRetainer == nil else { return }
+
+        // The constructor JIT-warms a throwaway session first. The live
+        // session warms again after the trusted phase-start allocator reset.
+        // A one-shot retainer left that second warm as a no-op, so the scored
+        // session never resized Metal's residency set. End the previous ticket
+        // and re-apply so the limit matches the post-reset working set.
+        if let previous = wiredTicketRetainer {
+            let endBox = QwenMTPWiredLimitBox()
+            let endSem = DispatchSemaphore(value: 0)
+            Task.detached(priority: .userInitiated) {
+                endBox.value = await previous.end()
+                endSem.signal()
+            }
+            _ = endSem.wait(timeout: .now() + .seconds(30))
+            wiredTicketRetainer = nil
+        }
+
+        // Drain any ticket-end / warm-eval work so activeMemory is the live
+        // set, not in-flight scratch that would inflate zero-headroom.
+        Stream.gpu.synchronize()
 
         // Shape-warm locals have left scope before this method is called.
         // Remove their cached storage so the active count describes the live
@@ -370,6 +391,14 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+        // Warm the exact multi-input int32 concat used by scored verify
+        // rounds: a host primary plus device-resident draft IDs. A single
+        // host-built [1, width] tensor does not compile this family.
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra { parts.append(primedDraftID) }
+            eval(concatenated(parts, axis: 1))
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
@@ -648,7 +677,21 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    private static let segmentedVerifyDepthCap: Int = {
+        // 7, not 8: the width-9 verify (8 drafts) measured 106 ms vs 89 ms
+        // at width 8 on the M5 ranked box (crown note), and the local
+        // block-time curve (0.056/0.063/0.0695/0.081 at widths 6/7/8/9 at
+        // p~0.965) makes the 8th draft's marginal cost exceed its
+        // amortized benefit: cap-8 per-token 10.95 ms vs cap-7 10.40 ms
+        // (+5.3%). Emitted tokens are unchanged (proposal-side cap; the
+        // 8th token is emitted by the next round's serial forward).
+        // Env override for A/B: MLXFAST_QWEN_MTP_SEGMENTED_CAP=8 restores.
+        if let v = ProcessInfo.processInfo.environment[
+            "MLXFAST_QWEN_MTP_SEGMENTED_CAP"], let cap = Int(v) {
+            return cap
+        }
+        return 7
+    }()
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
