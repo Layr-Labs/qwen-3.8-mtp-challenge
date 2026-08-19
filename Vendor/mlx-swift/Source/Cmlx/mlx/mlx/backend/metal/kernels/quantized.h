@@ -1185,6 +1185,121 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+
+// qmv_fast_weightstat_affine4_g64 — corrected 1-stream affine4/g64 QMV for M=5,6,7.
+// Do NOT flatten thread uint16_t packed[4][4] as &packed[0][0], and do NOT
+// qdot packed[r*4+i] in a callee: that was maxabs 586 even on row 0.
+// Load the 4-row tile and qdot packed[r][i] IN THIS FUNCTION (copy of _wide).
+// Walk M with for (m=0;m<M;m++) into float acc[4][M]; no 4+2 chunk, no 2nd vec.
+// Extra x-groups: if (tid.x != 0) return; store y[m*out_vec_size + out_row + r].
+// One weight stream, all M inputs in-kernel. Host grid stays (M, (N+7)/8):
+// group 0 walks every m; groups 1..M-1 return without writing. Load/qdot/store
+// text is qmv_fast_crossrow_affine4_g64_wide (quantized.h ~998-1063) with the
+// NA vec replaced by tinygrad affine4_qmm's scalar T-loop (affine4_gemv.py
+// _metal_src_qmm). DIRECT_NIBBLES=true, VPT=16, block=512.
+template <typename T, int M, bool DIRECT_NIBBLES = true>
+METAL_FUNC void qmv_fast_weightstat_affine4_g64(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M >= 5 && M <= 7, "weightstat affine4/g64 covers M in {5,6,7}");
+  if (int(tid.x) != 0) {
+    return;
+  }
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float acc[4][M];
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < M; m++) {
+      acc[r][m] = 0.0f;
+    }
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    for (int m = 0; m < M; m++) {
+      float sums = 0.0f;
+      float partial[rows_per_simd];
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial[r] = 0.0f;
+      }
+      for (int i = 0; i < 4; i++) {
+        const device T* xm = x + m * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        thread float xc[4];
+        if (DIRECT_NIBBLES) {
+          xc[0] = static_cast<float>(xm[0]);
+          xc[1] = static_cast<float>(xm[1]);
+          xc[2] = static_cast<float>(xm[2]);
+          xc[3] = static_cast<float>(xm[3]);
+          // Preserve the incumbent BF16 expression tree used for the affine
+          // bias correction; only the qdot nibble extraction changes.
+          sums += xm[0] + xm[1] + xm[2] + xm[3];
+        } else {
+          sums += load_vector<T, float, 4, 4>(xm, xc);
+        }
+        const float a0 = xc[0];
+        const float a1 = xc[1];
+        const float a2 = xc[2];
+        const float a3 = xc[3];
+        for (int r = 0; r < rows_per_simd; r++) {
+          if (DIRECT_NIBBLES) {
+            partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                           a1 * ((packed[r][i] >> 4) & 0x000f) +
+                           a2 * ((packed[r][i] >> 8) & 0x000f) +
+                           a3 * ((packed[r][i] >> 12) & 0x000f));
+          } else {
+            partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                           a1 * (packed[r][i] & 0x00f0) +
+                           a2 * (packed[r][i] & 0x0f00) +
+                           a3 * (packed[r][i] & 0xf000));
+          }
+        }
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        acc[r][m] += scale_local[r] * partial[r] + sums * bias_local[r];
+      }
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < M; m++) {
+      const float reduced = simd_sum(acc[r][m]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1936,19 +2051,37 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
-              w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+          if (in_vec_size % 1024 == 0) {
+            qmv_fast_weightstat_affine4_g64<T, 5, true>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+          } else {
+            qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+          }
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
-              w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+          if (in_vec_size % 1024 == 0) {
+            qmv_fast_weightstat_affine4_g64<T, 6, true>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+          } else {
+            qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+          }
           return;
         case 7:
-          qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
-              w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+          if (in_vec_size % 1024 == 0) {
+            qmv_fast_weightstat_affine4_g64<T, 7, true>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+          } else {
+            qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+          }
           return;
         case 8:
           // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
