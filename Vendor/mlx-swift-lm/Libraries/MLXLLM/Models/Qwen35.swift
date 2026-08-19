@@ -1653,6 +1653,19 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    /// True when the installed K and V islands cover every output row, so
+    /// `putAlong` already replaces the entire affine-4 KV result. History
+    /// flush can then skip `quantizedMM`. Q is only a 1024/12288 subset;
+    /// fused `qkv()` still needs the Q GEMM, but K/V 4-bit is dead there too.
+    private var _exactKVCoversAll = false
+    /// Q-island indices in Q-output space (no K/V offset). Overlay only.
+    private var _exactQIndices: MLXArray?
+    /// K then V island rows permuted into output-row order 0..<kOut+vOut.
+    /// When set, `matmul(x, W^T)` is already `(K, V)` and needs no `putAlong`.
+    private var _exactKVOrderedWeight: MLXArray?
+    /// Q-island rows followed by identity-ordered K then V. One matmul overlays
+    /// Q and produces KV, matching the old fused-island launch count.
+    private var _exactQPlusKVWeight: MLXArray?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1706,7 +1719,50 @@ final class Qwen35Attention: Module {
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
+    ///
+    /// When K/V islands cover every KV row, the K/V slice of that fused GEMM
+    /// is dead: `putAlong` overwrites it. Split: affine-4 Q only, identity-
+    /// ordered island matmul for K/V. Same kill switch as skip-dead `kv()`.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if _exactKVCoversAll,
+           ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SKIP_DEAD_KV"] != "0",
+           let overlayW = _exactQPlusKVWeight,
+           let qIdx = _exactQIndices,
+           _kvOut > 0, _exactQRowCount > 0
+        {
+            // Affine-4 Q only (K/V 4-bit is dead). One bf16 matmul: Q islands
+            // then identity-ordered K/V. Same launch count as the old fused
+            // island overlay, without the dead KV slice of quantizedMM.
+            var queries: MLXArray
+            if let q = qProj as? QuantizedLinear, let qz = q.biases,
+               q.mode == .affine
+            {
+                queries = quantizedMM(
+                    x, q.weight, scales: q.scales, biases: qz, transpose: true,
+                    groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+                _qOut = q.shape.0
+            } else {
+                queries = qProj(x)
+                _qOut = qProj.weight.dim(0)
+            }
+            let overlay = matmul(x, overlayW.transposed(1, 0))
+            let qN = _exactQRowCount
+            let indexShape = Array(repeating: 1, count: max(0, queries.ndim - 1)) + [-1]
+            queries = putAlong(
+                queries, qIdx.reshaped(indexShape),
+                values: overlay[.ellipsis, ..<qN], axis: -1)
+            let kv = overlay[.ellipsis, qN...]
+            return (queries, kv[.ellipsis, ..<_kvOut], kv[.ellipsis, _kvOut...])
+        }
+        if _exactKVCoversAll,
+           ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SKIP_DEAD_KV"] != "0",
+           let kvW = _exactKVOrderedWeight,
+           _kvOut > 0
+        {
+            let queries = exactQuery(x)
+            let kv = matmul(x, kvW.transposed(1, 0))
+            return (queries, kv[.ellipsis, ..<_kvOut], kv[.ellipsis, _kvOut...])
+        }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1757,6 +1813,39 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        // Full K/V islands overwrite every quantized KV column. Skip the
+        // dead affine-4 GEMM and scatter the bf16 island result onto zeros.
+        // `putAlong(zeros, perm, exact)` is bit-exact with
+        // `putAlong(dead_qmm, perm, exact)` when `perm` is a bijection of
+        // 0..<N. Kill switch `MLXFAST_QWEN_MTP_EXACT_QKV_ROWS=0` skips
+        // install, so `_exactKVCoversAll` stays false. Operator A/B:
+        // `MLX_QWEN_MTP_SKIP_DEAD_KV=0` (worker-visible `MLX_` prefix).
+        if _exactKVCoversAll,
+           ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SKIP_DEAD_KV"] != "0",
+           let ordered = _exactKVOrderedWeight,
+           _kvOut > 0
+        {
+            let y = matmul(x, ordered.transposed(1, 0))
+            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
+        }
+        if _exactKVCoversAll,
+           ProcessInfo.processInfo.environment["MLX_QWEN_MTP_SKIP_DEAD_KV"] != "0",
+           let exactW = _exactQKVWeight,
+           let indices = _exactKVIndices,
+           _kvOut > 0
+        {
+            let weight = exactW[_exactQRowCount...]
+            let exact = matmul(x, weight.transposed(1, 0))
+            let indexShape = Array(repeating: 1, count: max(0, x.ndim - 1)) + [-1]
+            let y = putAlong(
+                MLXArray.zeros(
+                    Array(x.shape.dropLast()) + [exact.dim(-1)],
+                    dtype: exact.dtype),
+                indices.reshaped(indexShape),
+                values: exact,
+                axis: -1)
+            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1816,6 +1905,51 @@ final class Qwen35Attention: Module {
             base, indices.reshaped(indexShape), values: exact, axis: -1)
     }
 
+    /// Affine-4 Q/gate plus Q-island overlay. Used when K/V come from islands.
+    private func exactQuery(_ x: MLXArray) -> MLXArray {
+        if let q = qProj as? QuantizedLinear, let qz = q.biases, q.mode == .affine {
+            var y = quantizedMM(
+                x, q.weight, scales: q.scales, biases: qz, transpose: true,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            y = replaceExactQRows(y, input: x)
+            _qOut = q.shape.0
+            return y
+        }
+        return replaceExactQRows(qProj(x), input: x)
+    }
+
+    private func replaceExactQRows(_ base: MLXArray, input: MLXArray) -> MLXArray {
+        guard let exactWeight = _exactQKVWeight,
+              let indices = _exactQIndices,
+              _exactQRowCount > 0
+        else { return base }
+        let weight = exactWeight[0 ..< _exactQRowCount]
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    /// Permute island rows so `result[output] = island[src]` where
+    /// `indices[src] == output`. Nil if `indices` is not a permutation of
+    /// `0..<count`.
+    private func identityOrderedRows(
+        _ weight: MLXArray, indices: MLXArray, count: Int
+    ) -> MLXArray? {
+        let idx = indices.asArray(Int32.self)
+        guard idx.count == count, count > 0 else { return nil }
+        var seen = Set<Int32>()
+        var inv = [Int32](repeating: -1, count: count)
+        for (src, dst) in idx.enumerated() {
+            guard dst >= 0, dst < Int32(count), seen.insert(dst).inserted else {
+                return nil
+            }
+            inv[Int(dst)] = Int32(src)
+        }
+        guard inv.allSatisfy({ $0 >= 0 }) else { return nil }
+        return MLX.take(weight, MLXArray(inv), axis: 0)
+    }
+
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
@@ -1834,12 +1968,36 @@ final class Qwen35Attention: Module {
         let kvIndices = concatenated(
             [kIndices, vIndices + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
-        eval(weight, qkvIndices, kvIndices)
+        let qIdx = qIndices.asType(.int32).contiguous()
+        eval(weight, qkvIndices, kvIndices, qIdx)
 
         _exactQKVWeight = weight
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
+        _exactQIndices = qIdx
         _exactQRowCount = qWeight.dim(0)
+        let kOut = kProj.shape.0
+        let vOut = vProj.shape.0
+        let kvIdx = kvIndices.asArray(Int32.self)
+        _exactKVCoversAll =
+            kWeight.dim(0) == kOut
+            && vWeight.dim(0) == vOut
+            && kOut > 0 && vOut > 0
+            && Set(kvIdx).count == kOut + vOut
+        _exactKVOrderedWeight = nil
+        _exactQPlusKVWeight = nil
+        if _exactKVCoversAll {
+            _kvOut = kOut
+            if let kOrd = identityOrderedRows(kWeight, indices: kIndices, count: kOut),
+               let vOrd = identityOrderedRows(vWeight, indices: vIndices, count: vOut)
+            {
+                let ordered = concatenated([kOrd, vOrd], axis: 0).contiguous()
+                let qPlusKV = concatenated([qWeight, ordered], axis: 0).contiguous()
+                eval(ordered, qPlusKV)
+                _exactKVOrderedWeight = ordered
+                _exactQPlusKVWeight = qPlusKV
+            }
+        }
     }
 
     /// Append rows to an attention cache without producing query outputs.
