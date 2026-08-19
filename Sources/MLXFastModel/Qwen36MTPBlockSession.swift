@@ -1110,7 +1110,7 @@ public final class Qwen36MTPBlockSession {
         // this round — the per-row argmaxes (accept walk AND both candidates
         // for the next primary), the draft ids, the top-2 evidence of every
         // row including the bonus row, and the cache roots — is materialised
-        // in ONE eval. The `.item()`/`.asArray` calls below then copy from
+        // in ONE eval. The `.item()`/`.asArray` calls below copy directly from
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
