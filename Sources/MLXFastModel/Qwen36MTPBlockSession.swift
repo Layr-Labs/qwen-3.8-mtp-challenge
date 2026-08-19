@@ -495,18 +495,29 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
-            let q = MLXArray.zeros(
-                [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
-            outs.append(
-                MLXFast.scaledDotProductAttention(
-                    queries: q,
-                    keys: extK,
-                    values: extV,
-                    scale: scale,
-                    mask: .causal
+        // Single-kL dispatch at 1024 leaves every intermediate (qL, kL) pair
+        // the exactness chunk fires to first-touch inside the timed window.
+        // The kL ladder closes that gap: every rung compiles the full qL set
+        // at that kL, so the scored path's first encounter of any shape is
+        // already resident.
+        let qLs = [1, 5, 4, 3, 2]
+        let kLLadder = stride(from: 512, through: 1024, by: 64)
+        for kL in kLLadder {
+            let kSlice = extK[0..., 0..., 0 ..< kL, 0...]
+            let vSlice = extV[0..., 0..., 0 ..< kL, 0...]
+            for qL in qLs {
+                let q = MLXArray.zeros(
+                    [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
+                outs.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: q,
+                        keys: kSlice,
+                        values: vSlice,
+                        scale: scale,
+                        mask: .causal
+                    )
                 )
-            )
+            }
         }
         eval(outs)
     }
