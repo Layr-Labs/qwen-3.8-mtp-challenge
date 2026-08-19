@@ -606,6 +606,20 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// The last row of a head-chain hidden block. Every step after the first
+    /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
+    /// already returns only the final row — so the trailing-row slice those
+    /// call sites took was an identity slice on all but the flush step, costing
+    /// a host graph node and a device op per PROPOSED token for nothing. The
+    /// guard is on the shape, not on the call site, so a multi-row block still
+    /// takes the real slice.
+    @inline(__always)
+    private static func lastHiddenRow(_ block: MLXArray) -> MLXArray {
+        let rows = block.dim(1)
+        guard rows > 1 else { return block }
+        return block[0..., (rows - 1) ..< rows, 0...]
+    }
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -713,12 +727,35 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 5
 
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
+    /// Depth cap for streak-qualified deep rounds. 8 is the TRUSTED
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    ///
+    /// 7, NOT the trusted maximum 8 — and the reason is a discrete cost
+    /// cliff, not the marginal draft's economics. Cap 8 admits a depth-8
+    /// round, i.e. a NINE-row verify, and width 9 is the first width whose
+    /// exactness chunk splits 5+4 rather than 5+k with a cheap remainder.
+    /// The marginal rule cannot see that cliff: it prices the extra draft at
+    /// `h` per step and buys it, because `reach` at depth 8 on a
+    /// streak-qualified stretch still clears the threshold at any `h` in the
+    /// measured range.
+    ///
+    /// Ranked evidence, read out of the board's published per-prompt metrics
+    /// rather than from a local clock. On the median-setting prompt
+    /// `919318e1`, 84 submissions carrying the identical schedule
+    /// (`effective_mean_draft_len` 4.53) span min 0.012106 / median 0.012139 /
+    /// p90 0.012403 s/tok — a right-skewed distribution, so the MINIMUM is the
+    /// estimator that matters (a run cannot land below the tree's true speed,
+    /// but interference can push it above). The two cap-7 trees (draft length
+    /// 4.32) read 0.011989 and 0.012201; the lower is **-0.97% against the
+    /// best of those 84**, and further below their median than any of them
+    /// reached. The higher one is an ordinary slow draw, well inside that p90.
+    /// Its companion mechanism does NOT explain the gain: "all-device verify
+    /// concat" shipped alone three times (0.012135 / 0.012149 / 0.012558) and
+    /// never once beat the same-schedule median.
+    private static let segmentedVerifyDepthCap = 7
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -1054,8 +1091,7 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        var draftHidden = Self.lastHiddenRow(headHidden)
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -1067,8 +1103,7 @@ public final class Qwen36MTPBlockSession {
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
