@@ -1036,17 +1036,17 @@ public final class Qwen36MTPBlockSession {
                 cache: cache, nConfirmed: 1)
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
-        // this round — the per-row argmaxes (accept walk AND both candidates
-        // for the next primary), the draft ids, the top-2 evidence of every
-        // row including the bonus row, and the cache roots — is materialised
-        // in ONE eval. The `.item()`/`.asArray` calls below then copy from
-        // materialised buffers without waiting on the GPU. (MTPLX production
-        // budget: 1 sync/cycle, batched_decode.py:504-525.)
+        // THE ROUND'S SINGLE BLOCKING EVAL. Host-side reads this round are
+        // only the top-2 IDs/values and the draft ids. Cache roots are NOT
+        // in this bundle: the next forward (or the reject-repair eval below)
+        // already depends on them, so listing every KV/SSM array here is a
+        // second, wider sync of outputs the host never copies. MTPLX's
+        // 1 sync/cycle is the ledger read, not a full residency fence.
+        // Serial-control and repair evals still include cache.state.
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
-        eval(cache.flatMap { $0.state } + bundle)
+        eval(bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
