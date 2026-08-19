@@ -2421,6 +2421,124 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// Geometry for the fused rerank tail (proposal-side readout). Mirrors the
+// shape guards in draftTokenIDWithDeclaredRerank: the compact affine-4 head
+// is hiddenSize x compactDraftPaddedCount, groupSize 64, 8 nibbles/uint32.
+private let qwen35DraftRerankHiddenSize   = 5120
+private let qwen35DraftRerankGroups       = 80    // 5120 / 64
+private let qwen35DraftRerankWordsPerRow  = 640   // 5120 / 8
+private let qwen35DraftRerankCandidates   = 32
+
+// `MLXFAST_QWEN_MTP_FUSED_RERANK=0` restores the incumbent five-dispatch
+// tail bit-for-bit (same convention as MLXFAST_QWEN_MTP_TOP32 above).
+private let qwen35DraftRerankFusedEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_FUSED_RERANK"] != "0"
+
+// PROPOSAL SIDE ONLY. Fuses the incumbent rerank tail — three MLX.take
+// gathers (weight/scales/biases rows for the 32 coarse candidates) plus the
+// affine-4 rerank QMV plus the select kernel — into ONE launch. One
+// 1024-thread threadgroup = 32 SIMD groups; SIMD group `sg` computes the
+// exact affine-4 logit of candidate `sg` (row cid = candidate_ids[sg]) by
+// striding the 80 scale-groups across its 32 lanes, then SIMD group 0
+// reduces the 32 (value, id) pairs with the incumbent qwen_draft_rerank_better
+// total order. The per-group arithmetic is the generic qmv path's:
+// scale * Σ(x·d) + bias · Σx over the group's 64 values, nibble j of a
+// uint32 word at bit offset 4j — so each candidate logit is the same
+// expression quantizedMM computes, just in one dispatch instead of five.
+// The target lm_head, verify values, cache state, and row ledger are
+// untouched (the comment on qwen35DraftRerankKernel above applies
+// verbatim).
+private let qwen35DraftRerankFusedKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_rerank_fused",
+    inputNames: ["x", "weight", "scales", "biases", "candidate_ids"],
+    outputNames: ["token_id"],
+    source: """
+        constexpr uint HIDDEN      = \(qwen35DraftRerankHiddenSize);
+        constexpr uint GROUPS      = \(qwen35DraftRerankGroups);
+        constexpr uint WORDS_ROW   = \(qwen35DraftRerankWordsPerRow);
+        constexpr uint CANDIDATES  = \(qwen35DraftRerankCandidates);
+        constexpr uint SIMD_SIZE   = 32;
+        constexpr uint VALS_GROUP  = 64;
+        constexpr uint WORDS_GROUP = VALS_GROUP / 8;  // 8 nibbles per uint32
+        static_assert(HIDDEN == GROUPS * VALS_GROUP, "geometry mismatch");
+        static_assert(WORDS_ROW == HIDDEN / 8, "word packing mismatch");
+
+        uint lane = thread_index_in_simdgroup;
+        uint sg   = simdgroup_index_in_threadgroup;  // 0 .. CANDIDATES-1
+
+        uint cid = uint(candidate_ids[sg]);
+        uint rowW = cid * WORDS_ROW;
+        uint rowS = cid * GROUPS;
+
+        // Each lane accumulates its strided share of the 5120-length dot.
+        float partial = 0.0f;
+        for (uint g = lane; g < GROUPS; g += SIMD_SIZE) {
+            float scale = float(scales[rowS + g]);
+            float bias  = float(biases[rowS + g]);
+            float accum = 0.0f;
+            float sum   = 0.0f;
+            uint wb = rowW + g * WORDS_GROUP;
+            #pragma clang loop unroll(full)
+            for (uint wi = 0; wi < WORDS_GROUP; ++wi) {
+                uint word = uint(weight[wb + wi]);
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 8; ++j) {
+                    float xv = float(x[g * VALS_GROUP + wi * 8 + j]);
+                    float d  = float((word >> (4 * j)) & 0xFu);
+                    accum += xv * d;
+                    sum   += xv;
+                }
+            }
+            partial += scale * accum + sum * bias;
+        }
+        float logit = simd_sum(partial);
+
+        threadgroup float tg_val[CANDIDATES];
+        threadgroup uint  tg_id[CANDIDATES];
+        if (lane == 0) {
+            tg_val[sg] = logit;
+            tg_id[sg] = cid;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            float best_value = tg_val[lane];
+            uint  best_id    = tg_id[lane];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (lane < offset && qwen_draft_rerank_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
+        }
+    """,
+    header: """
+        inline bool qwen_draft_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 // ---------------------------------------------------------------------------
 // PROPOSAL-SIDE TOP-32 SHORTLIST
 //
@@ -3182,6 +3300,29 @@ extension Qwen35TextModel: MTPCapable {
                 coarse[0..., 0..., 0 ..< Self.compactDraftRealCount],
                 kth: kth, axis: -1
             )[.ellipsis, (kth)...].reshaped([candidateCount])
+        }
+
+        // Fused one-launch tail when the geometry matches what the kernel
+        // bakes in as constexpr; otherwise the incumbent five-dispatch tail.
+        // `MLXFAST_QWEN_MTP_FUSED_RERANK=0` restores the incumbent tail.
+        if qwen35DraftRerankFusedEnabled,
+           configuration.hiddenSize == qwen35DraftRerankHiddenSize,
+           qwen35DraftRerankGroups * 64 == qwen35DraftRerankHiddenSize,
+           qwen35DraftRerankWordsPerRow * 8 == qwen35DraftRerankHiddenSize,
+           candidateCount == qwen35DraftRerankCandidates {
+            return qwen35DraftRerankFusedKernel(
+                [x.reshaped([configuration.hiddenSize]), exact.weight,
+                 exact.scales, exactBiases, candidateIDs],
+                template: [
+                    ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                    ("CONTROL_OFFSET",
+                     Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ],
+                grid: (1024, 1, 1),
+                threadGroup: (1024, 1, 1),
+                outputShapes: [[1, 1]],
+                outputDTypes: [.int32]
+            )[0]
         }
 
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
