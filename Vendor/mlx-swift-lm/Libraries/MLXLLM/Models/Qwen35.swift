@@ -365,7 +365,16 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          const InT scale = is_q ? q_scale : k_scale;
+          // Geometry-derived scales, baked as bf16 immediates. mixerHit
+          // already requires headKDim == 128, so these bits are the unique
+          // values of the previous host path:
+          //   q = MLXArray(pow(pow(Float(128), -0.5), 2)).asType(.bfloat16)
+          //     f32 0x3BFFFFFF rounds-to-nearest-even -> bf16 0x3C00 (1/128)
+          //   k = MLXArray(pow(Float(128), -0.5)).asType(.bfloat16)
+          //     f32 0x3DB504F3 -> bf16 0x3DB5 (low 16 bits 0x04F3 < 0x8000)
+          const InT scale = is_q
+              ? as_type<InT>(uint16_t(0x3C00))
+              : as_type<InT>(uint16_t(0x3DB5));
           const uint output_base = (row * Hk + head) * Dk + lane * 4;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
@@ -419,7 +428,7 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         name: "qwen35_packed_gdn_prework",
         inputNames: [
             "qkv", "a", "b", "conv_state", "conv_weight", "a_log",
-            "dt_bias", "q_scale", "k_scale",
+            "dt_bias",
         ],
         outputNames: [
             "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out",
@@ -832,11 +841,8 @@ final class Qwen35GatedDeltaNet: Module {
         let beta: MLXArray
         let newConvState: MLXArray
         if mixerHit {
-            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
             let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
-                 qScaleConst,
-                 kScaleConst],
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias],
                 template: [
                     ("Hk", numKHeads), ("Dk", headKDim),
                     ("Hv", numVHeads), ("Dv", headVDim),
@@ -1290,9 +1296,65 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+            let replaced = replaceExactGateUpRows(y, input: x)
+            let activation = qwen35CompiledFusedSwiGLU(replaced)
+            return replaceExactDownRows(downProj(activation), input: activation)
         }
-        return downProj(silu(gateProj(x)) * upProj(x))
+        let y = silu(gateProj(x)) * upProj(x)
+        return replaceExactDownRows(downProj(y), input: y)
+    }
+
+    // MARK: - proposal-only precision islands (gate/up fused rows, down rows)
+
+    private var _exactGateUpWeight: MLXArray?
+    private var _exactGateUpIndices: MLXArray?
+    private var _exactDownWeight: MLXArray?
+    private var _exactDownIndices: MLXArray?
+
+    private func replaceExactGateUpRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactGateUpWeight, let indices = _exactGateUpIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    private func replaceExactDownRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactDownWeight, let indices = _exactDownIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactMLPRows(
+        gateWeight: MLXArray, gateIndices: MLXArray, gateOutputCount: Int,
+        upWeight: MLXArray, upIndices: MLXArray,
+        downWeight: MLXArray, downIndices: MLXArray
+    ) {
+        precondition(
+            gateWeight.dim(0) == gateIndices.dim(0)
+                && upWeight.dim(0) == upIndices.dim(0)
+                && downWeight.dim(0) == downIndices.dim(0),
+            "Qwen MTP precision-island MLP weights and indices must have equal row counts")
+        let gateUpWeight = concatenated([gateWeight, upWeight], axis: 0)
+            .contiguous()
+        let gateUpIndices = concatenated(
+            [gateIndices, upIndices + gateOutputCount], axis: 0)
+            .asType(.int32).contiguous()
+        let downIdx = downIndices.asType(.int32).contiguous()
+        eval(gateUpWeight, gateUpIndices, downWeight, downIdx)
+
+        _exactGateUpWeight = gateUpWeight
+        _exactGateUpIndices = gateUpIndices
+        _exactDownWeight = downWeight
+        _exactDownIndices = downIdx
     }
 
 }
@@ -1925,8 +1987,34 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
-        return oProj(
-            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+        let oInput = qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1)
+        return replaceExactORows(oProj(oInput), input: oInput)
+    }
+
+    // MARK: - proposal-only precision islands (o_proj rows)
+
+    private var _exactOWeight: MLXArray?
+    private var _exactOIndices: MLXArray?
+
+    private func replaceExactORows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactOWeight, let indices = _exactOIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactORows(oWeight: MLXArray, oIndices: MLXArray) {
+        precondition(
+            oWeight.dim(0) == oIndices.dim(0),
+            "Qwen MTP precision-island o_proj weights and indices must have equal row counts")
+        let idx = oIndices.asType(.int32).contiguous()
+        eval(oWeight, idx)
+        _exactOWeight = oWeight
+        _exactOIndices = idx
     }
 }
 
@@ -2873,6 +2961,38 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
                     kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
                     vWeight: vWeight, vIndices: vIndices)
+            }
+            // Optional BF16 row corrections for the remaining proposal
+            // projections. Absent keys keep the corresponding 4-bit path.
+            let oWeight = weights.removeValue(forKey: islandPrefix + "o.weight")
+            let oIndices = weights.removeValue(forKey: islandPrefix + "o.indices")
+            if let oWeight, let oIndices {
+                layer.selfAttn.installExactORows(
+                    oWeight: oWeight, oIndices: oIndices)
+            }
+            let gateWeight = weights.removeValue(forKey: islandPrefix + "gate.weight")
+            let gateIndices = weights.removeValue(forKey: islandPrefix + "gate.indices")
+            let upWeight = weights.removeValue(forKey: islandPrefix + "up.weight")
+            let upIndices = weights.removeValue(forKey: islandPrefix + "up.indices")
+            let downWeight = weights.removeValue(forKey: islandPrefix + "down.weight")
+            let downIndices = weights.removeValue(forKey: islandPrefix + "down.indices")
+            if let mlp = (layer.mlp as? Qwen35FusedMLP),
+               let gateWeight, let gateIndices,
+               let upWeight, let upIndices,
+               let downWeight, let downIndices,
+               let gateLinear = mlp.gateProj as? QuantizedLinear
+            {
+                mlp.installExactMLPRows(
+                    gateWeight: gateWeight, gateIndices: gateIndices,
+                    gateOutputCount: gateLinear.shape.0,
+                    upWeight: upWeight, upIndices: upIndices,
+                    downWeight: downWeight, downIndices: downIndices)
+            }
+            // Optional BF16 row corrections for the fusion projection.
+            let fcWeight = weights.removeValue(forKey: islandPrefix + "fc.weight")
+            let fcIndices = weights.removeValue(forKey: islandPrefix + "fc.indices")
+            if let fcWeight, let fcIndices, let mtp {
+                mtp.installExactFCRows(fcWeight: fcWeight, fcIndices: fcIndices)
             }
         }
 
