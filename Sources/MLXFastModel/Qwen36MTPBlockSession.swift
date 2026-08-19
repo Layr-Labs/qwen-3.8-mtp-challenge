@@ -108,6 +108,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
 /// straight into the score.
 public final class Qwen36MTPBlockSession {
     private let model: any Qwen36MTPTarget
+    private let dflash2: QwenDFlash2DraftModel?
     private let stopTokens: Set<Int>
     /// MTPLX default `base_hidden_variant == mtp_hidden_variant == "post_norm"`.
     private let postNorm: Bool
@@ -125,6 +126,11 @@ public final class Qwen36MTPBlockSession {
     /// The (post-norm) trunk hidden that seeds the next draft round. Kept
     /// LAZY: its only consumer is the next round's GPU graph.
     private var pendingHidden: MLXArray?
+    /// Concatenated target-layer outputs from the rows the target advanced
+    /// since DFlash2 last consumed context (seed on round one, then the prior
+    /// round's committed verify prefix).
+    private var pendingDFlash2Features: MLXArray?
+    private var dflash2Cache: [any KVCache]?
 
     // MARK: committed head history (MTPLX `mtp_history_policy="committed"`)
     //
@@ -173,6 +179,16 @@ public final class Qwen36MTPBlockSession {
         self.model = model
         self.stopTokens = stopTokens
         self.postNorm = postNorm
+        if model.hasDFlash2Head {
+            guard let directory = Qwen36MTPHeadAttachment.dflash2HeadDirectory else {
+                throw MLXFastError.invalidInput(
+                    "DFlash2 mode was selected without a declared head directory")
+            }
+            self.dflash2 = try QwenDFlash2DraftModel.load(
+                from: directory, target: model)
+        } else {
+            self.dflash2 = nil
+        }
         // Cost-model schedule (replaces the streak ladder). Choose the depth
         // that maximizes expected committed tokens per unit round time under
         // the round's measured economics:
@@ -196,6 +212,12 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
+            if self.dflash2 != nil {
+                // The released model was trained on one anchor plus seven
+                // masks. Keep the proposal width inside that distribution;
+                // the trusted target remains the authority for every row.
+                return Swift.min(offeredDepth, 7)
+            }
             return self.costModelDepth(offeredDepth: offeredDepth)
         }
     }
@@ -297,6 +319,10 @@ public final class Qwen36MTPBlockSession {
         // on both sides, so warming it on both keeps the load shape identical.
         guard maxDepth >= 1, maxDepth <= Qwen36MTPLimits.maxDepth else {
             throw Qwen36MTPSessionError.invalidDepth(maxDepth)
+        }
+        if let dflash2 {
+            try warmDFlash2Shapes(dflash2, maxDepth: maxDepth)
+            return
         }
         let warmCache = model.newCache(parameters: nil)
         // Decode kernels are not fully described by query width: the wide
@@ -441,6 +467,45 @@ public final class Qwen36MTPBlockSession {
             + [seedWarmIDs, seedWarmValues, seedWarmNorm])
     }
 
+    private func warmDFlash2Shapes(
+        _ drafter: QwenDFlash2DraftModel,
+        maxDepth: Int
+    ) throws {
+        let seed = Array(repeating: 0, count: 512)
+        let targetCache = model.newCache(parameters: nil)
+        let (_, seedHidden, _, seedFeatures) = model.callWithDFlash2Features(
+            input: LMInput.Text(tokens: MLXArray(seed).reshaped([1, seed.count])),
+            cache: targetCache,
+            nConfirmed: 0)
+        eval(targetCache.flatMap { $0.state } + [seedHidden, seedFeatures])
+
+        // Compile every trained proposal width the trusted parent can offer.
+        for depth in 1 ... Swift.min(maxDepth, 7) {
+            let draftCache = drafter.makeCache()
+            let ids = drafter.propose(
+                anchorToken: 0,
+                targetFeatures: seedFeatures,
+                cache: draftCache,
+                draftCount: depth)
+            eval(draftCache.flatMap { $0.state } + [ids])
+        }
+
+        // Compile the matching long-context target verification widths on a
+        // throwaway cache. Sequential calls keep the context in the same
+        // 512-token kernel family while avoiding nine redundant prefills.
+        for width in 1 ... (Swift.min(maxDepth, 7) + 1) {
+            let block = MLXArray(Array(repeating: 0, count: width))
+                .reshaped([1, width])
+            let (logits, hidden, normed, features) =
+                model.callWithDFlash2Features(
+                    input: LMInput.Text(tokens: block),
+                    cache: targetCache,
+                    nConfirmed: width > 1 ? 1 : 0)
+            eval(targetCache.flatMap { $0.state }
+                + [logits, hidden, normed, features])
+        }
+    }
+
     // MARK: - begin
 
     /// Bulk-forward the seed and return the argmax of its last row — the first
@@ -453,10 +518,23 @@ public final class Qwen36MTPBlockSession {
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
-            cache: cache, nConfirmed: 0)
+        let seedInput = LMInput.Text(
+            tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count]))
+        let seedLogits: MLXArray
+        let hidden: MLXArray
+        if dflash2 != nil {
+            let out = model.callWithDFlash2Features(
+                input: seedInput, cache: cache, nConfirmed: 0)
+            seedLogits = out.0
+            hidden = out.1
+            pendingDFlash2Features = out.3
+            dflash2Cache = dflash2?.makeCache()
+        } else {
+            let out = model.callWithHidden(
+                input: seedInput, cache: cache, nConfirmed: 0)
+            seedLogits = out.0
+            hidden = out.1
+        }
         let tBeginBuilt = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         // Seed vocabulary trim: `seedLogits` projects lm_head over all 512
         // seed rows but only the last row is ever used. It is deliberately
@@ -470,13 +548,19 @@ public final class Qwen36MTPBlockSession {
         // Retain the full pre-norm seed hidden for lazy head-history priming.
         // ~5 MB at 512x5120 bf16; released at the first drafting round. The
         // eval below materialises it so no seed graph is kept alive.
-        seedHiddenForPriming = hidden
-        seedTokensForPriming = seedTokens
+        if dflash2 == nil {
+            seedHiddenForPriming = hidden
+            seedTokensForPriming = seedTokens
+        }
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
-        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+        var beginBundle = cache.flatMap { $0.state }
+            + [tailIDs, tailValues, pendingHidden!, hidden]
+        if let features = pendingDFlash2Features {
+            beginBundle.append(features)
+        }
+        eval(beginBundle)
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
@@ -838,6 +922,7 @@ public final class Qwen36MTPBlockSession {
             pendingPrimary = nil
             pendingTop2 = nil
             pendingHidden = nil
+            pendingDFlash2Features = nil
             return Qwen36MTPRoundResult(
                 tokens: committed,
                 declaredRows: 1,
@@ -880,10 +965,27 @@ public final class Qwen36MTPBlockSession {
             // this backlog (the head cache is never created).
             headHistoryBacklogHidden.append(hidden)
             headHistoryBacklogTokens.append(primary)
-            let (serialLogits, serialHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray([primary]).reshaped([1, 1])),
-                cache: cache, nConfirmed: 0)
+            let serialInput = LMInput.Text(
+                tokens: MLXArray([primary]).reshaped([1, 1]))
+            let serialLogits: MLXArray
+            let serialHidden: MLXArray
+            if dflash2 != nil {
+                let out = model.callWithDFlash2Features(
+                    input: serialInput, cache: cache, nConfirmed: 0)
+                serialLogits = out.0
+                serialHidden = out.1
+                if let pending = pendingDFlash2Features {
+                    pendingDFlash2Features = concatenated(
+                        [pending, out.3], axis: 1)
+                } else {
+                    pendingDFlash2Features = out.3
+                }
+            } else {
+                let out = model.callWithHidden(
+                    input: serialInput, cache: cache, nConfirmed: 0)
+                serialLogits = out.0
+                serialHidden = out.1
+            }
             // Still produced, still post-norm: keeping the hidden chain identical
             // means switching depth is the ONLY difference between the two sides.
             pendingHidden = hiddenRow(serialHidden, serialHidden.dim(1) - 1)
@@ -926,83 +1028,85 @@ public final class Qwen36MTPBlockSession {
         //    lm_head. Deeper sub-steps chain the head's OWN post-`mtp.norm`
         //    hidden exactly as before.
         let headCache: [any KVCache]
-        var flushHidden: [MLXArray] = []
-        var flushTokens: [Int] = []
-        if let existing = headHistoryCache {
-            headCache = existing
-        } else {
-            let fresh = model.makeMTPCache()
-            headHistoryCache = fresh
-            headCache = fresh
-            if let seedHidden = seedHiddenForPriming,
-               seedTokensForPriming.count > 1
-            {
-                // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
-                // tokens 1..L-1 (hidden at t predicts alongside token t+1).
-                let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
-            }
-            seedHiddenForPriming = nil
-            seedTokensForPriming = []
-        }
-        if !headHistoryBacklogHidden.isEmpty {
-            flushHidden.append(contentsOf: headHistoryBacklogHidden)
-            flushTokens.append(contentsOf: headHistoryBacklogTokens)
-            headHistoryBacklogHidden.removeAll(keepingCapacity: true)
-            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
-        }
-        flushHidden.append(hidden)
-        flushTokens.append(primary)
-
-        let draftBase = headCache.first?.offset ?? 0
-        // Every flushed position is committed history plus the (pendingHidden,
-        // primary) row — primary commits unconditionally — so all of them stay
-        // valid whatever the verify decides. Deeper drafted positions are
-        // speculative and are trimmed after the round (MTPLX
-        // `_rollback_mtp_cache(cycle_offset + 1)`).
-        let validHistoryOffset = draftBase + flushTokens.count
-        let draftInputHidden =
-            flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
-        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
-            .reshaped([1, flushTokens.count])
-
-        // Draft ids stay ON DEVICE and chain straight into the verify input —
-        // no host readback between the head forward and the verify forward
-        // (MTPLX batched_decode: the draft id is an mx.array stacked into the
-        // verify block; the ledger reads the values from the round's single
-        // batched eval afterwards). `asyncEval` submits the head chain so the
-        // GPU works while the host builds the 64-layer verify graph.
-        // (Per-step asyncEval was tried here and measured NEUTRAL — the
-        // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
-        // idea.md V6 journal. Single submission after the loop, as before.)
+        let validHistoryOffset: Int
         var draftIdArrays: [MLXArray] = []
-        var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
-            hidden: draftInputHidden, nextTokenIds: draftInputTokens,
-            cache: headCache)
-            ?? model.mtpHeadHiddenForward(
+        if let dflash2 {
+            guard let features = pendingDFlash2Features else {
+                throw MLXFastError.invalidInput(
+                    "DFlash2 round has no target-layer feature context")
+            }
+            let persistent = dflash2Cache ?? dflash2.makeCache()
+            dflash2Cache = persistent
+            headCache = persistent
+            let draftBlock = dflash2.propose(
+                anchorToken: primary,
+                targetFeatures: features,
+                cache: persistent,
+                draftCount: draftCount)
+            draftIdArrays = (0 ..< draftCount).map { index in
+                draftBlock[0..., index ..< (index + 1)]
+            }
+            // Only accepted target context enters the DFlash2 cache; proposal
+            // K/V rows are concatenated for attention but never committed.
+            validHistoryOffset = persistent.first?.offset ?? 0
+            asyncEval(draftBlock)
+        } else {
+            var flushHidden: [MLXArray] = []
+            var flushTokens: [Int] = []
+            if let existing = headHistoryCache {
+                headCache = existing
+            } else {
+                let fresh = model.makeMTPCache()
+                headHistoryCache = fresh
+                headCache = fresh
+                if let seedHidden = seedHiddenForPriming,
+                   seedTokensForPriming.count > 1
+                {
+                    let primeCount = seedTokensForPriming.count - 1
+                    flushHidden.append(model.applyFinalNorm(
+                        seedHidden[0..., 0 ..< primeCount, 0...]))
+                    flushTokens.append(contentsOf: seedTokensForPriming[1...])
+                }
+                seedHiddenForPriming = nil
+                seedTokensForPriming = []
+            }
+            if !headHistoryBacklogHidden.isEmpty {
+                flushHidden.append(contentsOf: headHistoryBacklogHidden)
+                flushTokens.append(contentsOf: headHistoryBacklogTokens)
+                headHistoryBacklogHidden.removeAll(keepingCapacity: true)
+                headHistoryBacklogTokens.removeAll(keepingCapacity: true)
+            }
+            flushHidden.append(hidden)
+            flushTokens.append(primary)
+
+            let draftBase = headCache.first?.offset ?? 0
+            validHistoryOffset = draftBase + flushTokens.count
+            let draftInputHidden = flushHidden.count == 1
+                ? hidden : concatenated(flushHidden, axis: 1)
+            let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
+                .reshaped([1, flushTokens.count])
+
+            var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-        var draftId = model.draftTokenID(draftHidden)
-        draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        asyncEval(draftId)
-        for _ in 1 ..< draftCount {
-            headHidden = model.mtpHeadHiddenForward(
-                hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
+                ?? model.mtpHeadHiddenForward(
+                    hidden: draftInputHidden, nextTokenIds: draftInputTokens,
+                    cache: headCache)
+            var draftHidden = headHidden[
                 0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
-            draftId = model.draftTokenID(draftHidden)
+            var draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
+            asyncEval(draftId)
+            for _ in 1 ..< draftCount {
+                headHidden = model.mtpHeadHiddenForward(
+                    hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
+                draftHidden = headHidden[
+                    0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+                draftId = model.draftTokenID(draftHidden)
+                draftIdArrays.append(draftId)
+            }
+            asyncEval(draftIdArrays[draftIdArrays.count - 1])
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1030,10 +1134,27 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
+        let verifyLogits: MLXArray
+        let verifyHidden: MLXArray
+        let verifyNormed: MLXArray?
+        let verifyDFlash2Features: MLXArray?
+        if dflash2 != nil {
+            let out = model.callWithDFlash2Features(
                 input: LMInput.Text(tokens: verifyTokens),
                 cache: cache, nConfirmed: 1)
+            verifyLogits = out.0
+            verifyHidden = out.1
+            verifyNormed = out.2
+            verifyDFlash2Features = out.3
+        } else {
+            let out = model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: verifyTokens),
+                cache: cache, nConfirmed: 1)
+            verifyLogits = out.0
+            verifyHidden = out.1
+            verifyNormed = out.2
+            verifyDFlash2Features = nil
+        }
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -1046,6 +1167,9 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
+        if let features = verifyDFlash2Features {
+            bundle.append(features)
+        }
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
@@ -1092,6 +1216,9 @@ public final class Qwen36MTPBlockSession {
             pendingPrimary = verifyArgmax[drafts.count]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
+            if let features = verifyDFlash2Features {
+                pendingDFlash2Features = features
+            }
             let base = drafts.count * 2
             let ids = Array(flatTop2IDs[base ..< (base + 2)])
             let values = Array(flatTop2Values[base ..< (base + 2)])
@@ -1118,6 +1245,10 @@ public final class Qwen36MTPBlockSession {
                 pendingPrimary = verifyArgmax[acceptedCount]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
+                if let features = verifyDFlash2Features {
+                    pendingDFlash2Features = features[
+                        0..., 0 ..< (acceptedCount + 1), 0...]
+                }
                 pendingTop2 = (
                     perRowTop2Tokens[acceptedCount],
                     perRowTop2Logits[acceptedCount]
@@ -1130,10 +1261,22 @@ public final class Qwen36MTPBlockSession {
                 // second blocking eval for its own readout.
                 Self.rollbackAfterVerify(
                     cache, snapshot, verifiedTokens: draftCount + 1, to: base)
-                let (repairLogits, repairHidden) = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(committed).reshaped([1, committed.count])),
-                    cache: cache, nConfirmed: 0)
+                let repairInput = LMInput.Text(
+                    tokens: MLXArray(committed).reshaped([1, committed.count]))
+                let repairLogits: MLXArray
+                let repairHidden: MLXArray
+                if dflash2 != nil {
+                    let out = model.callWithDFlash2Features(
+                        input: repairInput, cache: cache, nConfirmed: 0)
+                    repairLogits = out.0
+                    repairHidden = out.1
+                    pendingDFlash2Features = out.3
+                } else {
+                    let out = model.callWithHidden(
+                        input: repairInput, cache: cache, nConfirmed: 0)
+                    repairLogits = out.0
+                    repairHidden = out.1
+                }
                 pendingHidden = hiddenRow(repairHidden, repairHidden.dim(1) - 1)
                 let repairLastRow = repairLogits[
                     0..., (repairLogits.dim(1) - 1) ..< repairLogits.dim(1),
@@ -1159,7 +1302,7 @@ public final class Qwen36MTPBlockSession {
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
         Self.trimTrimmable(headCache, to: validHistoryOffset)
-        if acceptedCount > 0 {
+        if dflash2 == nil, acceptedCount > 0 {
             // Keep accepted post-norm rows as one contiguous block. The backlog
             // already supports multi-row blocks (seed priming uses one), while
             // the token list remains flat and preserves the same row order.

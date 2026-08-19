@@ -64,6 +64,13 @@ public enum Qwen36MTPHeadAttachment {
     /// The key prefix the head's bare tensor names are merged under.
     public static let headKeyPrefix = "mtp."
 
+    /// Retained for the lifetime of the one-model worker when the declared
+    /// proposal artifact is DFlash2.  The DFlash2 module lives in
+    /// MLXFastModel (not in the target's MLXLLM module tree), so the session
+    /// loads this digest-verified file independently after the target factory
+    /// returns.
+    public nonisolated(unsafe) static var dflash2HeadDirectory: URL?
+
     /// Which class the factory will build for a backbone tree, and therefore
     /// which tensor-name namespace that tree's weights have to land in.
     ///
@@ -160,13 +167,17 @@ public enum Qwen36MTPHeadAttachment {
 
     /// Run `body` with the head tree registered as an additional weight source,
     /// the primary tree's key rewrite selected from its own config, and
-    /// `_qwen35MTPEnabled` set — restoring all three afterwards.
+    /// `_qwen35MTPEnabled` / `_qwen35DFlash2Enabled` selected — restoring all
+    /// four loader globals afterwards.
     ///
-    /// ALL THREE globals are restored on EVERY exit path. They are process-global
+    /// ALL FOUR loader globals are restored on EVERY exit path. They are process-global
     /// and read by the next load of any model; leaking one would silently change
     /// how an unrelated later load behaves, which on a worker that serves a
     /// reference replay after the candidate is exactly the kind of cross-phase
-    /// coupling this track cannot have.
+    /// coupling this track cannot have. `dflash2HeadDirectory` is deliberately
+    /// retained separately: the returned model records whether it needs that
+    /// proposal artifact, and the session is constructed only after this load
+    /// scope exits. Non-DFlash models never consult the retained URL.
     @discardableResult
     public static func withHeadAttached<T>(
         backboneDirectory: URL,
@@ -175,21 +186,41 @@ public enum Qwen36MTPHeadAttachment {
     ) throws -> T {
         let layout = try backboneLayout(directory: backboneDirectory)
         try verifyHeadTree(headDirectory)
+        let dflash2 = try isDFlash2Head(headDirectory)
         let previousSources = _additionalWeightSources
         let previousStrip = _primaryWeightKeyPrefixStrip
         let previousEnabled = _qwen35MTPEnabled
-        _additionalWeightSources = [
-            AdditionalWeightSource(
-                directory: headDirectory, keyPrefix: headKeyPrefix)
-        ]
+        let previousDFlash2 = _qwen35DFlash2Enabled
+        _additionalWeightSources = dflash2
+            ? []
+            : [AdditionalWeightSource(
+                directory: headDirectory, keyPrefix: headKeyPrefix)]
         _primaryWeightKeyPrefixStrip = layout.primaryKeyPrefixStrip
-        _qwen35MTPEnabled = true
+        _qwen35MTPEnabled = !dflash2
+        _qwen35DFlash2Enabled = dflash2
+        if dflash2 {
+            dflash2HeadDirectory = headDirectory
+        }
         defer {
             _additionalWeightSources = previousSources
             _primaryWeightKeyPrefixStrip = previousStrip
             _qwen35MTPEnabled = previousEnabled
+            _qwen35DFlash2Enabled = previousDFlash2
         }
         return try body(layout)
+    }
+
+    private static func isDFlash2Head(_ directory: URL) throws -> Bool {
+        let single = directory.appendingPathComponent("model.safetensors")
+        guard FileManager.default.fileExists(atPath: single.path) else {
+            return false
+        }
+        let names = try safetensorsTensorNames(single)
+        return names.contains("layers.0.attention_conv.base_kernel")
+            && names.contains(where: {
+                $0 == "candidate_selector.predecessor_codebook"
+                    || $0 == "candidate_selector.predecessor_codebook.weight"
+            })
     }
 
     /// Structural checks that do not need MLX and are therefore unit-testable.
@@ -256,7 +287,12 @@ public enum Qwen36MTPHeadAttachment {
                     + "(e.g. \(prefixed)); this loader merges a BARE head tree and "
                     + "would double-prefix a pre-merged one")
         }
-        for required in ["fc.weight", "norm.weight", "pre_fc_norm_hidden.weight"] {
+        let isDFlash2 = names.contains("layers.0.attention_conv.base_kernel")
+        let required = isDFlash2
+            ? ["fc.weight", "hidden_norm.weight", "norm.weight",
+               "candidate_selector.hidden_projection.weight"]
+            : ["fc.weight", "norm.weight", "pre_fc_norm_hidden.weight"]
+        for required in required {
             guard names.contains(required) else {
                 throw MLXFastError.invalidInput(
                     "the Qwen MTP head safetensors is missing \(required)")

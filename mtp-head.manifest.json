@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:ProCreations/Qwen3.8-27B-DFlash2-MLXFast-Q4@3485116dcbd1e94715036193b57aec4841c60d59",
+  "sha256": "78b989b6f3be43c42540ee6ba834616f2898b31267c29b66a13363d4fc3477af",
+  "bytes": 1265644781,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "The declared proposal artifact is the official Qwen3.8-27B DFlash2 architecture converted to MLX affine 4-bit/group-64 linears with BF16 norms, dynamic convolutions, and selector codebooks. The five-layer parallel drafter consumes already-computed target features from layers 5/19/33/47/61 and shares the target embedding/lm_head read-only. Every proposed row is still verified by the full pinned target; exact target top-2, longest-prefix acceptance, cache rollback/repair, ledger, and trusted serial replay remain authoritative. The public artifact is pinned to an immutable Hugging Face revision and the runner's single-file model.safetensors tree digest; no remote code is executed."
 }

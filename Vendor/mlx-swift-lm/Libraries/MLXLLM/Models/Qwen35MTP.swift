@@ -17,6 +17,14 @@ import MLXNN
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
+/// Selects the separately-loaded DFlash2 proposal head for the Qwen MTP
+/// benchmark worker.  DFlash2 is not a child of MLXLLM (its implementation
+/// lives in the participant-owned MLXFastModel target), so this flag only
+/// records the mode on the Qwen instance and suppresses construction of the
+/// native MTP module.  The organizer-pinned target weights and all target
+/// arithmetic remain unchanged.
+public nonisolated(unsafe) var _qwen35DFlash2Enabled: Bool = false
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
