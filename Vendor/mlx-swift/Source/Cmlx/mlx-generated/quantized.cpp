@@ -1135,22 +1135,38 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
       bias_local[r] = biases[group_index];
     }
 
+    // Shift-free duo extraction. The previous form paid a 64-bit shift plus a
+    // mask for each of the 32 values in the lane's `ulong`; at four rows that
+    // is 128 shifts per k-block on a 32-bit-native GPU. Two changes remove
+    // them, and neither changes any elementary product:
+    //
+    //  1. `as_type` reinterprets the already-loaded ulong as its eight bytes.
+    //     It is a type pun, not an operation, so the byte holding any group of
+    //     four duos is free.
+    //  2. Within a byte the four duos are selected by MASK alone
+    //     (0x03 / 0x0c / 0x30 / 0xc0) against an activation pre-divided by
+    //     1, 4, 16, 64, which is exactly what `load_vector<T, float, N, 2>`
+    //     already produces. `(x / 4^n) * (w & (3 << 2n))` and
+    //     `x * ((w >> 2n) & 3)` are the same real product, and the scaling is
+    //     by powers of two, so it is exact in FP32.
+    //
+    // This is the identical trick the promoted affine4 crossrow kernels use;
+    // the affine2 readout was the one shape still extracting by shifting. The
+    // per-value order of accumulation into `accum` is unchanged.
     thread float x0[values_per_thread];
     const device T* xm = x + k + simd_lid * values_per_thread;
-    float sum = 0.0f;
-    for (int i = 0; i < values_per_thread; i += 4) {
-      x0[i] = static_cast<float>(xm[i]);
-      x0[i + 1] = static_cast<float>(xm[i + 1]);
-      x0[i + 2] = static_cast<float>(xm[i + 2]);
-      x0[i + 3] = static_cast<float>(xm[i + 3]);
-      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
-    }
+    const float sum = load_vector<T, float, values_per_thread, 2>(xm, x0);
 
     for (int r = 0; r < rows_per_simd; r++) {
+      const vec<uchar, 8> wb = as_type<vec<uchar, 8>>(packed[r]);
       float accum = 0.0f;
       #pragma unroll
-      for (int j = 0; j < 32; j++) {
-        accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+      for (int b = 0; b < 8; b++) {
+        const uchar wv = wb[b];
+        accum += x0[4 * b] * float(wv & 0x03);
+        accum += x0[4 * b + 1] * float(wv & 0x0c);
+        accum += x0[4 * b + 2] * float(wv & 0x30);
+        accum += x0[4 * b + 3] * float(wv & 0xc0);
       }
       result[r] += scale_local[r] * accum + sum * bias_local[r];
     }
