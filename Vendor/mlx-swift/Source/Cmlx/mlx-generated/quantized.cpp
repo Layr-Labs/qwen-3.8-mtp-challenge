@@ -759,6 +759,128 @@ METAL_FUNC void qmv_quad_impl(
   }
 }
 
+// Wide-lane single-row (M == 1) affine4/g64 fast QMV for the q4 shapes the
+// head chain dispatches per draft step (fc, qkv pack, o_proj, mlp).
+// values_per_thread = 32 (one 16-byte uint4 = 32 nibbles per lane per pass,
+// half the pass count of the generic form) with the SAME per-uint16 mask
+// sequence, the SAME x pre-division ladder, and the SAME accumulation order
+// as qdot's bits==4 arm at values_per_thread=16 — only the load width
+// changes, so every output element's scalar chain is identical.
+template <typename T>
+METAL_FUNC void qmv_fast_singlerow_affine4_g64_wide(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int values_per_thread = 32;         // 32 nibbles = 16 bytes
+  constexpr int num_simdgroups = 2;
+  constexpr int rows_per_simd = 4;
+  constexpr int SIMD_SIZE = 32;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;  // 1024
+  constexpr int bytes_per_lane = 16;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+
+  thread float result[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    result[r] = 0.0f;
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    // One 16-byte vector load per row per pass (32 nibbles), split back into
+    // the SAME uint16 sequence qdot reads, so masks and order are unchanged.
+    thread uint16_t packed[rows_per_simd][8];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint8_t* wb =
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane;
+      // Two 8-byte loads (the promoted affine-2 singlerow's transaction
+      // width), repacked to the same uint16 sequence the stock kernel walks.
+      const device ulong* wq64 = reinterpret_cast<const device ulong*>(wb);
+      const ulong lo = wq64[0];
+      const ulong hi = wq64[1];
+      const uint32_t halves[4] = {
+          uint32_t(lo & 0xfffffffful), uint32_t(lo >> 32),
+          uint32_t(hi & 0xfffffffful), uint32_t(hi >> 32)};
+      for (int i = 0; i < 8; i++) {
+        packed[r][i] = uint16_t(
+            (halves[i / 2] >> ((i % 2) * 16)) & 0xffffu);
+      }
+      const int group_index =
+          row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    // x ladder: identical to load_vector's bits==4 arm. Two 16-value halves
+    // are kept SEPARATE (sum1/sum2, accum1/accum2) so each 16-value block
+    // rounds into result[] exactly as a stock pass would — the pass count
+    // halves but the scalar chain per output element does not change.
+    thread float x_thread[values_per_thread];
+    const device T* xm = x + k + simd_lid * values_per_thread;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    for (int i = 0; i < 16; i += 4) {
+      sum1 += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+      x_thread[i] = xm[i];
+      x_thread[i + 1] = xm[i + 1] / 16.0f;
+      x_thread[i + 2] = xm[i + 2] / 256.0f;
+      x_thread[i + 3] = xm[i + 3] / 4096.0f;
+    }
+    for (int i = 16; i < values_per_thread; i += 4) {
+      sum2 += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+      x_thread[i] = xm[i];
+      x_thread[i + 1] = xm[i + 1] / 16.0f;
+      x_thread[i + 2] = xm[i + 2] / 256.0f;
+      x_thread[i + 3] = xm[i + 3] / 4096.0f;
+    }
+
+    for (int r = 0; r < rows_per_simd; r++) {
+      // First 16-value block: same accumulation order and rounding point as
+      // one stock qdot pass.
+      float accum1 = 0.0f;
+      #pragma unroll
+      for (int i = 0; i < 4; i++) {
+        accum1 +=
+            (x_thread[4 * i] * (packed[r][i] & 0x000f) +
+             x_thread[4 * i + 1] * (packed[r][i] & 0x00f0) +
+             x_thread[4 * i + 2] * (packed[r][i] & 0x0f00) +
+             x_thread[4 * i + 3] * (packed[r][i] & 0xf000));
+      }
+      result[r] += scale_local[r] * accum1 + sum1 * bias_local[r];
+      // Second 16-value block: the next stock pass's values, same order.
+      float accum2 = 0.0f;
+      #pragma unroll
+      for (int i = 4; i < 8; i++) {
+        accum2 +=
+            (x_thread[4 * i] * (packed[r][i] & 0x000f) +
+             x_thread[4 * i + 1] * (packed[r][i] & 0x00f0) +
+             x_thread[4 * i + 2] * (packed[r][i] & 0x0f00) +
+             x_thread[4 * i + 3] * (packed[r][i] & 0xf000));
+      }
+      result[r] += scale_local[r] * accum2 + sum2 * bias_local[r];
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    const float reduced = simd_sum(result[r]);
+    if (simd_lid == 0) {
+      y[out_row + r] = static_cast<T>(reduced);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
@@ -1928,6 +2050,17 @@ template <typename T, int group_size, int bits, bool batched>
     return;
   }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
+    if (ntg.x == 1 && out_vec_size >= 4096) {
+      // M == 1 head-chain gemvs (fc, qkv pack, o_proj, mlp): the same
+      // wide-lane treatment the promoted affine-2 singlerow gives the coarse
+      // readout — one 16-byte load per lane per pass, half the passes, and
+      // an element-identical scalar chain (per-16-value rounding points,
+      // mask sequence, and x ladder all preserved; see kernel header).
+      qmv_fast_singlerow_affine4_g64_wide<T>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+          simd_lid);
+      return;
+    }
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
       // below 4096 outputs the reduced x-group count thins the grid, so the
