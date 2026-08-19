@@ -1235,6 +1235,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
+    var isHeadMLP: Bool = false
 
     private var _fqW: MLXArray?
     private var _fqS: MLXArray?
@@ -1285,6 +1286,13 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Head MLP at M=1: unfused path is proposal-side and exactness-free.
+        // At M=1 the fused quantizedMM falls through to stock qmv_fast_impl;
+        // two separate N=17408 projections have identical cost but reduce
+        // graph-build overhead (9b4550d: 1167/1343/929 vs 1331/1433/1330 us, 3/3).
+        if isHeadMLP && x.dim(-2) == 1 {
+            return downProj(silu(gateProj(x)) * upProj(x))
+        }
         // The fused path is only taken when the gate/up split is provably
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
@@ -2651,7 +2659,7 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
 
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
-    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] == "1"
 
 /// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
 private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
@@ -2720,6 +2728,32 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
         }
     }
     return (trials, bad, firstBad)
+}
+
+// MARK: - DFlash2 path selector (proposal-only, zero-training)
+// PROPOSAL SIDE ONLY. Nothing here is read by verify/ledger. The selector
+// only affects which draft ids are proposed; verification and ledger remain
+// unchanged. Gated by MLXFAST_QWEN_MTP_SELECTOR == "1" and lambda from
+// MLXFAST_QWEN_MTP_SELECTOR_LAMBDA (default 0.05). When disabled, behavior is
+// bit-identical to draftTokenID path.
+let qwenSelectorK = 8
+let qwenSelectorD = 256
+let qwenSelectorDefaultLambda: Float = 0.05
+
+/// Whether the DFlash2 selector is enabled. Default ON; set MLXFAST_QWEN_MTP_SELECTOR=0 to disable.
+/// Enabled by default for ranked median (hard prompts benefit); disable with
+/// MLXFAST_QWEN_MTP_SELECTOR=0 for hot-prose microbenchmark.
+private func qwenSelectorEnabled() -> Bool {
+    ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_SELECTOR"] == "1"
+}
+
+private func qwenSelectorLambdaValue() -> Float {
+    if let s = ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_SELECTOR_LAMBDA"],
+       let v = Float(s)
+    {
+        return v
+    }
+    return qwenSelectorDefaultLambda
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -2867,7 +2901,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                         + "Q/K/V weight+indices tensors")
             }
             if ProcessInfo.processInfo.environment[
-                "MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] != "0"
+                "MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "1"
             {
                 layer.selfAttn.installExactQKVRows(
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
@@ -3003,6 +3037,13 @@ extension Qwen35TextModel: MTPCapable {
     public func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> (MLXArray, MLXArray) {
+        return mtpForwardWithHidden(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache, prevForConv: nil)
+    }
+
+    /// DFlash2 2-tap conv boundary: `prevForConv` is the last verified hidden's last row `[B,1,H]` for `x_{t-1}` at t=0.
+    public func mtpForwardWithHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache], prevForConv: MLXArray?
+    ) -> (MLXArray, MLXArray) {
         guard let mtp else {
             fatalError("mtpForwardWithHidden called but MTP head is not attached. "
                 + "Set _qwen35MTPEnabled = true before loading the model.")
@@ -3011,7 +3052,8 @@ extension Qwen35TextModel: MTPCapable {
             hidden: hidden,
             nextTokenIds: nextTokenIds,
             embedTokens: model.embedTokens,
-            cache: cache)
+            cache: cache,
+            prev: prevForConv)
         let logits: MLXArray
         if configuration.tieWordEmbeddings {
             logits = model.embedTokens.asLinear(mtpOut)
@@ -3040,6 +3082,13 @@ extension Qwen35TextModel: MTPCapable {
     public func mtpHeadHiddenForward(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
+        return mtpHeadHiddenForward(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache, prevForConv: nil)
+    }
+
+    /// DFlash2 prev-aware variant (proposal-only).
+    public func mtpHeadHiddenForward(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache], prevForConv: MLXArray?
+    ) -> MLXArray {
         guard let mtp else {
             fatalError("mtpHeadHiddenForward called but MTP head is not attached. "
                 + "Set _qwen35MTPEnabled = true before loading the model.")
@@ -3048,7 +3097,8 @@ extension Qwen35TextModel: MTPCapable {
             hidden: hidden,
             nextTokenIds: nextTokenIds,
             embedTokens: model.embedTokens,
-            cache: cache)
+            cache: cache,
+            prev: prevForConv)
     }
 
     /// Return the final proposal hidden row while populating preceding history
@@ -3056,12 +3106,20 @@ extension Qwen35TextModel: MTPCapable {
     public func mtpHeadLastHiddenWithKVOnlyHistory(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray? {
+        return mtpHeadLastHiddenWithKVOnlyHistory(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache, prevForConv: nil)
+    }
+
+    /// DFlash2 prev-aware KV-only variant (proposal-only).
+    public func mtpHeadLastHiddenWithKVOnlyHistory(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache], prevForConv: MLXArray?
+    ) -> MLXArray? {
         guard let mtp else { return nil }
         return mtp.lastHiddenWithKVOnlyHistory(
             hidden: hidden,
             nextTokenIds: nextTokenIds,
             embedTokens: model.embedTokens,
-            cache: cache)
+            cache: cache,
+            prev: prevForConv)
     }
 
     /// The backbone's lm_head (or tied-embedding projection) applied to hidden
@@ -3121,7 +3179,7 @@ extension Qwen35TextModel: MTPCapable {
             _compactDraftHead = makeCompactDraftHead()
         }
         let padded = _compactDraftHead!(x)
-        let tgSize = 1024
+        let tgSize = 896
         let outputs = qwen35DraftSelectKernel(
             [padded.reshaped([Self.compactDraftPaddedCount])],
             template: [
@@ -3220,6 +3278,87 @@ extension Qwen35TextModel: MTPCapable {
             ids + (Self.compactDraftControlStart - Self.compactDraftPrefixCount))
     }
 
+    // MARK: - DFlash2 selector helpers (proposal-only)
+    // PROPOSAL SIDE ONLY — does not affect verify/ledger.
+
+    /// Top-K proposal interface for the selector. Returns (ids [K] int32, logits [K] bf16).
+    /// Reuses qwen35DraftTop32 then slices to K=8 (Phase 0 prototype). Caller
+    /// applies mapDraftTokenIds to the chosen id. Proposal-only.
+    public func draftTopK(_ x: MLXArray, k: Int = 8) -> (MLXArray, MLXArray) {
+        let K = min(max(k, 1), qwen35Top32K)
+        let logits = applyDraftLMHead(x)
+        // Determine row length from the actual logits shape (compact vs full vocab).
+        let n = logits.dim(-1)
+        let row = logits.reshaped([n])
+        let ids32: MLXArray
+        if n == qwen35Top32RealCount, qwen35Top32Enabled {
+            ids32 = qwen35DraftTop32(row)
+        } else {
+            let kth = n - qwen35Top32K
+            // Fallback to argPartition when not the compact 98_330 case.
+            ids32 = MLX.argPartition(row, kth: kth, axis: -1)[(kth)...].asType(.uint32)
+        }
+        let idsK: MLXArray
+        if K == qwen35Top32K {
+            idsK = ids32
+        } else {
+            idsK = ids32[(qwen35Top32K - K)...]
+        }
+        let candLogits = MLX.take(row, idsK, axis: 0)
+        return (idsK.asType(.int32), candLogits)
+    }
+
+    /// Zero-training gate: H(h) = sigmoid(h[0..<256]).
+    /// Hidden may be [1,1,4096], [1,4096] or [4096]; slice is on last axis.
+    /// PROPOSAL SIDE ONLY.
+    public func selectorGate(_ hiddenRow: MLXArray) -> MLXArray {
+        let h256: MLXArray
+        if hiddenRow.ndim == 3 {
+            h256 = hiddenRow[0..., 0..., 0 ..< qwenSelectorD]
+        } else if hiddenRow.ndim == 2 {
+            h256 = hiddenRow[0..., 0 ..< qwenSelectorD]
+        } else {
+            h256 = hiddenRow[0 ..< qwenSelectorD]
+        }
+        // Host-side dotted path uses sigmoid gating; RMSNorm variant is
+        // optional future — slice+sigmoid is the zero-training instantiation.
+        return MLX.sigmoid(h256)
+    }
+
+    /// View of embedTokens.weight rows truncated to 256 dims (bf16).
+    /// Returned shape [K,256] via MLX.take(embedWeight[:,0..<256], mappedIds, axis:0).
+    /// PROPOSAL SIDE ONLY.
+    public func selectorEmbeddingRows(for ids: MLXArray) -> MLXArray {
+        let mapped = mapDraftTokenIds(ids)
+        let e = model.embedTokens.weight[0..., 0 ..< qwenSelectorD]
+        return MLX.take(e, mapped, axis: 0)
+    }
+
+    /// Batched pairwise scorer: S = U + lambda * dot(A*H, B).
+    /// Host-side dot for K<=16 via MLX graph: dot = sum((A*H) * B, axis: -1).
+    /// Inputs: candidateLogits [K], prevARow [256] or [1,256], currBRows [K,256], gate [256].
+    /// Output: scores [K] float. PROPOSAL SIDE ONLY.
+    public func selectorScoreBatch(
+        candidateLogits: MLXArray,
+        prevARow: MLXArray,
+        currBRows: MLXArray,
+        gate: MLXArray,
+        lambda: Float
+    ) -> MLXArray {
+        let h = gate.reshaped([qwenSelectorD]).asType(.float32)
+        let a = prevARow.reshaped([qwenSelectorD]).asType(.float32)
+        let ah = a * h
+        let b = currBRows.asType(.float32)
+        // Broadcast ah [256] against b [K,256] -> [K,256], sum over last axis.
+        let dots = (ah * b).sum(axis: -1)
+        let logitsF = candidateLogits.asType(.float32).reshaped([candidateLogits.size])
+        // lambda scaling; when lambda==0 this is exactly argmax(logits).
+        if lambda == 0 {
+            return logitsF
+        }
+        return logitsF + dots * lambda
+    }
+
     private var usesCompactDraftVocabulary: Bool {
         configuration.vocabularySize == 248_320
             && lmHead != nil && _draftHeadW == nil
@@ -3276,7 +3415,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)
@@ -3364,6 +3503,13 @@ extension Qwen35Model: MTPCapable {
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
 
+    public func mtpForwardWithHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache], prevForConv: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        languageModel.mtpForwardWithHidden(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache, prevForConv: prevForConv)
+    }
+
     /// See `Qwen35TextModel.mtpHeadHiddenForward`.
     public func mtpHeadHiddenForward(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
@@ -3372,12 +3518,26 @@ extension Qwen35Model: MTPCapable {
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
     }
 
+    public func mtpHeadHiddenForward(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache], prevForConv: MLXArray?
+    ) -> MLXArray {
+        languageModel.mtpHeadHiddenForward(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache, prevForConv: prevForConv)
+    }
+
     /// See `Qwen35TextModel.mtpHeadLastHiddenWithKVOnlyHistory`.
     public func mtpHeadLastHiddenWithKVOnlyHistory(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray? {
         languageModel.mtpHeadLastHiddenWithKVOnlyHistory(
             hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    public func mtpHeadLastHiddenWithKVOnlyHistory(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache], prevForConv: MLXArray?
+    ) -> MLXArray? {
+        languageModel.mtpHeadLastHiddenWithKVOnlyHistory(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache, prevForConv: prevForConv)
     }
 
     /// See `Qwen35TextModel.applyLMHead`.
