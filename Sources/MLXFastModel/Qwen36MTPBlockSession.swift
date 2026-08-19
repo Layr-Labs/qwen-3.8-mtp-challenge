@@ -443,11 +443,12 @@ public final class Qwen36MTPBlockSession {
         // TARGET-SIDE later-window SDPA compile. Distinct from the rejected
         // #674 proposal-head HOST KV walk (3.23670). After the 512-row seed
         // the 16 FA caches sit at kL=512; scored decode walks that prefix to
-        // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
-        // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // kL~1024. The width ladder above only compiled kL≈512+width.
+        // HOST-extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
+        // forward) and dispatch the five fused-vector shapes the ranked
+        // path actually fires: qL=1 (serial / chunk-B of width 6), the
+        // exactness-chunk A qL=5, and chunk-B of widths 9/8/7 (qL=4/3/2).
+        // Live `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
@@ -495,7 +496,16 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // [1, 5, 4, 3, 2]: the exactness chunk in `attentionWithCacheUpdate`
+        // splits every 6..9-row causal verify into chunk A (rows 0..<5, qL=5)
+        // over the trimmed prefix and chunk B (rows 5.., qL = width - 5) over
+        // the full keys. Widths 6..9 therefore dispatch chunk-B qL=1..4; the
+        // serial leg and width-6's bonus row ride qL=1. The merged warm
+        // compiled {1, 5, 4}; widths 7 and 8 — reachable under the
+        // streak-gated segmented cap (8) on exactly the two central prompts —
+        // first-touch qL=3 and qL=2 inside the timed window. Dispatching them
+        // here adds those two fused-vector variants to the same untimed warm.
+        for qL in [1, 5, 4, 3, 2] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
