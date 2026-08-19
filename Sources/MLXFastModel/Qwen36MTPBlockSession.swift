@@ -449,6 +449,14 @@ public final class Qwen36MTPBlockSession {
         // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
         // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
+        // TARGET-SIDE KV *backing-store* grow. Distinct from the SDPA warm
+        // above: #693 compiled concat(512, 512) copies, but KVCacheSimple
+        // grows in step=256 slabs. Live scored decode first-touches
+        // concat(512, 256) on the first token past the seed and
+        // concat(768, 256) when offset hits 768. Compile those two families
+        // (plus the 1-row slice-assign into the grown slab) on this
+        // throwaway cache so the allocator bump is not inside the window.
+        Self.warmTargetKVStepGrow(seedWarmCache)
     }
 
     /// Untimed. Throwaway FA caches only. Token-neutral: dummy K/V never
@@ -507,6 +515,83 @@ public final class Qwen36MTPBlockSession {
                     mask: .causal
                 )
             )
+        }
+        eval(outs)
+    }
+
+    /// Untimed. Throwaway FA caches only. Token-neutral dummy rows never
+    /// enter a scored forward. `KVCacheSimple.step` is 256: a 512-row seed
+    /// fills the backing store exactly, so the first scored decode token
+    /// concatenates a 256-row zero slab (512→768) and the token that pushes
+    /// offset past 768 concatenates the next slab (768→1024). #693's HOST
+    /// pad was 512 zeros onto 512 keys — concat(512, 512) — which is not
+    /// either live grow. This walks the real `update` path on the throwaway
+    /// seed cache: one 1-row update for the first grow, then a HOST jump of
+    /// that same backing to a full 768-row offset so the next 1-row update
+    /// concatenates 768+256. Live `begin()` caches untouched.
+    private static func warmTargetKVStepGrow(_ cache: [KVCache]) {
+        var fa: [KVCacheSimple] = []
+        fa.reserveCapacity(16)
+        for entry in cache {
+            guard let simple = entry as? KVCacheSimple else { continue }
+            let st = simple.state
+            guard st.count == 2 else { continue }
+            let k = st[0]
+            let v = st[1]
+            guard k.ndim == 4, v.ndim == 4, k.dim(2) > 0, v.dim(2) == k.dim(2)
+            else { continue }
+            fa.append(simple)
+        }
+        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
+        guard fa.count == 16 else { return }
+
+        var outs: [MLXArray] = []
+        outs.reserveCapacity(32)
+        // First live grow: 1 new row against a full 512-row (2×256) backing.
+        // `update` allocates a 256-row zero slab and concatenates it, then
+        // slice-assigns the new row at offset 512.
+        for simple in fa {
+            let k = simple.state[0]
+            let v = simple.state[1]
+            let oneK = MLXArray.zeros(
+                [k.dim(0), k.dim(1), 1, k.dim(3)], dtype: k.dtype)
+            let oneV = MLXArray.zeros(
+                [v.dim(0), v.dim(1), 1, v.dim(3)], dtype: v.dtype)
+            let (nk, nv) = simple.update(keys: oneK, values: oneV)
+            outs.append(contentsOf: [nk, nv])
+        }
+        eval(outs)
+
+        // Second live grow: do not walk 255 dummy tokens to reach offset 768.
+        // HOST-extend the post-first-grow view to a full 768-row backing
+        // (offset = 768, 768 % 256 == 0 so the next update does not slice)
+        // and fire one 1-row update, which concatenates the next 256-zero
+        // slab — concat(768, 256) — matching decode when kL crosses 768.
+        outs.removeAll(keepingCapacity: true)
+        let step = 256
+        let secondBacking = 768
+        for simple in fa {
+            let k = simple.state[0]
+            let v = simple.state[1]
+            let pad = secondBacking - k.dim(2)
+            guard pad > 0 else { continue }
+            let k768 = concatenated([
+                k,
+                MLXArray.zeros(
+                    [k.dim(0), k.dim(1), pad, k.dim(3)], dtype: k.dtype),
+            ], axis: 2)
+            let v768 = concatenated([
+                v,
+                MLXArray.zeros(
+                    [v.dim(0), v.dim(1), pad, v.dim(3)], dtype: v.dtype),
+            ], axis: 2)
+            simple.state = [k768, v768]
+            let oneK = MLXArray.zeros(
+                [k.dim(0), k.dim(1), 1, k.dim(3)], dtype: k.dtype)
+            let oneV = MLXArray.zeros(
+                [v.dim(0), v.dim(1), 1, v.dim(3)], dtype: v.dtype)
+            let (nk, nv) = simple.update(keys: oneK, values: oneV)
+            outs.append(contentsOf: [nk, nv])
         }
         eval(outs)
     }
