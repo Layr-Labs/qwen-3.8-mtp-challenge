@@ -997,12 +997,15 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     thread float bias_local[rows_per_simd];
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
-      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+      const device uint8_t* wb =
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
-          k / 2 + simd_lid * bytes_per_lane);
-      for (int i = 0; i < 4; i++) {
-        packed[r][i] = ws[i];
-      }
+          k / 2 + simd_lid * bytes_per_lane;
+      const uint64_t packed64 =
+          *reinterpret_cast<const device uint64_t*>(wb);
+      packed[r][0] = static_cast<uint16_t>(packed64);
+      packed[r][1] = static_cast<uint16_t>(packed64 >> 16);
+      packed[r][2] = static_cast<uint16_t>(packed64 >> 32);
+      packed[r][3] = static_cast<uint16_t>(packed64 >> 48);
       const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
       scale_local[r] = scales[group_index];
       bias_local[r] = biases[group_index];
