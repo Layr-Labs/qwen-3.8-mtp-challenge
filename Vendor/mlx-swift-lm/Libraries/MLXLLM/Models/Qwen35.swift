@@ -1597,6 +1597,139 @@ func qwen35FusedResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - fused dual RMSNorm + concat (MTP pre_fc pair)
+
+/// One launch that writes `concat(RMSNorm(emb), RMSNorm(hid))` along the last
+/// axis. Same reduction tree as the residual kernel above (rms_looped:
+/// simd_sum → threadgroup → rsqrt(mean+eps)), applied independently to each
+/// 5120-wide operand so the values match two eager `RMSNorm` calls plus a
+/// last-axis concat. Proposal-side only: the target never enters this path.
+private let qwen35FusedDualRMSNormConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_dual_rms_norm_concat",
+    inputNames: ["emb", "hid", "w_emb", "w_hid", "eps"],
+    outputNames: ["fused"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(emb_shape[emb_ndim - 1]);
+        ulong in_off = ulong(row) * ulong(axis_size);
+        ulong out_off = ulong(row) * ulong(axis_size) * 2ul;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // Pass 0: RMSNorm(emb) -> fused[..., 0:axis]
+        // Pass 1: RMSNorm(hid) -> fused[..., axis:2*axis]
+        for (uint pass = 0; pass < 2; ++pass) {
+            const device bfloat* in = (pass == 0) ? emb : hid;
+            const device bfloat* w = (pass == 0) ? w_emb : w_hid;
+            ulong write_off = out_off + ulong(pass) * ulong(axis_size);
+
+            float acc = 0.0f;
+            for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+                uint elem = r_start + thread_id * n_reads;
+                if (elem + n_reads <= axis_size) {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        float xi = float(in[in_off + elem + i]);
+                        acc += xi * xi;
+                    }
+                } else {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        if (elem + i < axis_size) {
+                            float xi = float(in[in_off + elem + i]);
+                            acc += xi * xi;
+                        }
+                    }
+                }
+            }
+
+            acc = simd_sum(acc);
+            if (simd_group == 0) {
+                local_sums[simd_thread] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_thread == 0) {
+                local_sums[simd_group] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_group == 0) {
+                acc = simd_sum(local_sums[simd_thread]);
+                if (simd_thread == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(
+                        acc / float(axis_size) + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float inv_mean = local_inv_mean[0];
+            for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+                uint elem = r_start + thread_id * n_reads;
+                if (elem + n_reads <= axis_size) {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        float xi = float(in[in_off + elem + i]);
+                        bfloat wi = w[elem + i];
+                        fused[write_off + elem + i] =
+                            wi * bfloat(xi * inv_mean);
+                    }
+                } else {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        if (elem + i < axis_size) {
+                            float xi = float(in[in_off + elem + i]);
+                            bfloat wi = w[elem + i];
+                            fused[write_off + elem + i] =
+                                wi * bfloat(xi * inv_mean);
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// `concat(RMSNorm(embedding), RMSNorm(hidden), axis: -1)` in one launch when
+/// both operands are BF16/5120. Returns nil so the caller can fall back to
+/// the two eager norms plus `concatenated` on any other shape.
+func qwen35FusedDualRMSNormConcat(
+    embedding: MLXArray,
+    hidden: MLXArray,
+    embeddingWeight: MLXArray,
+    hiddenWeight: MLXArray,
+    eps: Float
+) -> MLXArray? {
+    guard embedding.dtype == .bfloat16,
+          hidden.dtype == .bfloat16,
+          embeddingWeight.dtype == .bfloat16,
+          hiddenWeight.dtype == .bfloat16,
+          embedding.dim(-1) == 5120,
+          hidden.dim(-1) == 5120,
+          embeddingWeight.shape == [5120],
+          hiddenWeight.shape == [5120],
+          Array(embedding.shape.dropLast()) == Array(hidden.shape.dropLast())
+    else { return nil }
+    var outShape = embedding.shape
+    outShape[outShape.count - 1] = 10240
+    let nRows = embedding.size / 5120
+    let outputs = qwen35FusedDualRMSNormConcatKernel(
+        [embedding, hidden, embeddingWeight, hiddenWeight, MLXArray(eps)],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {

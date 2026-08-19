@@ -56,8 +56,20 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Same fused residual+RMSNorm the backbone already uses on BF16/5120.
+        // Proposal-side only; bit-identical to `h = x + r; postAttnNorm(h)`.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -112,10 +124,23 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
+        // Dual RMSNorm+concat is one launch when both sides are BF16/5120;
+        // otherwise the eager two-norm + concatenate path is unchanged.
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused: MLXArray
+        if let pair = qwen35FusedDualRMSNormConcat(
+            embedding: embeds,
+            hidden: hidden,
+            embeddingWeight: preFcNormEmbedding.weight,
+            hiddenWeight: preFcNormHidden.weight,
+            eps: preFcNormEmbedding.eps)
+        {
+            fused = fc(pair)
+        } else {
+            let e = preFcNormEmbedding(embeds)
+            let h = preFcNormHidden(hidden)
+            fused = fc(concatenated([e, h], axis: -1))
+        }
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -147,9 +172,20 @@ final class Qwen35MTPModule: Module {
         else { return nil }
 
         let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused: MLXArray
+        if let pair = qwen35FusedDualRMSNormConcat(
+            embedding: embeds,
+            hidden: hidden,
+            embeddingWeight: preFcNormEmbedding.weight,
+            hiddenWeight: preFcNormHidden.weight,
+            eps: preFcNormEmbedding.eps)
+        {
+            fused = fc(pair)
+        } else {
+            let e = preFcNormEmbedding(embeds)
+            let h = preFcNormHidden(hidden)
+            fused = fc(concatenated([e, h], axis: -1))
+        }
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
