@@ -370,6 +370,14 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+        // Warm the exact multi-input int32 concat used by scored verify
+        // rounds: a host primary plus device-resident draft IDs. A single
+        // host-built [1, width] tensor does not compile this family.
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra { parts.append(primedDraftID) }
+            eval(concatenated(parts, axis: 1))
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
