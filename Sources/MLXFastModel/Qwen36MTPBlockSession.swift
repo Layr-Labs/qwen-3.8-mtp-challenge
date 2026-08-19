@@ -1050,14 +1050,16 @@ public final class Qwen36MTPBlockSession {
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
         let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
-        let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
-        let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
+        let nativeTop2IDs = top2IDs.asArray(Int32.self)
+        let nativeTop2Values = top2Values.asArray(Float.self)
         // The top-2 reducer's first ID per row IS the row argmax under the
         // same ordering `argMax` uses (larger logit wins, lower id wins an
         // exact tie), so the separate vocabulary-wide argMax launch is
         // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
         let verifyArgmax = stride(
-            from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+            from: 0, to: nativeTop2IDs.count, by: 2).map {
+                Int(nativeTop2IDs[$0])
+            }
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -1076,8 +1078,12 @@ public final class Qwen36MTPBlockSession {
         perRowTop2Logits.reserveCapacity(draftCount + 1)
         for index in 0 ..< draftCount {
             let base = index * 2
-            perRowTop2Tokens.append(Array(flatTop2IDs[base ..< (base + 2)]))
-            perRowTop2Logits.append(Array(flatTop2Values[base ..< (base + 2)]))
+            perRowTop2Tokens.append([
+                Int(nativeTop2IDs[base]), Int(nativeTop2IDs[base + 1]),
+            ])
+            perRowTop2Logits.append([
+                Double(nativeTop2Values[base]), Double(nativeTop2Values[base + 1]),
+            ])
         }
 
         if Self.traceRounds { tReadDone = DispatchTime.now().uptimeNanoseconds }
@@ -1093,8 +1099,12 @@ public final class Qwen36MTPBlockSession {
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
-            let ids = Array(flatTop2IDs[base ..< (base + 2)])
-            let values = Array(flatTop2Values[base ..< (base + 2)])
+            let ids = [
+                Int(nativeTop2IDs[base]), Int(nativeTop2IDs[base + 1]),
+            ]
+            let values = [
+                Double(nativeTop2Values[base]), Double(nativeTop2Values[base + 1]),
+            ]
             pendingTop2 = (ids, values)
             perRowTop2Tokens.append(ids)
             perRowTop2Logits.append(values)
