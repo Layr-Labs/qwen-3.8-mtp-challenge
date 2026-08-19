@@ -1010,8 +1010,14 @@ public final class Qwen36MTPBlockSession {
                 // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
                 // tokens 1..L-1 (hidden at t predicts alongside token t+1).
                 let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+                // Submit the 511-row final-norm as soon as it exists so the
+                // GPU runs it while the host builds the rest of the first
+                // drafting-round head graph. Same ops as before — earlier
+                // launch only. Serial never takes this path.
+                let primed = model.applyFinalNorm(
+                    seedHidden[0..., 0 ..< primeCount, 0...])
+                asyncEval(primed)
+                flushHidden.append(primed)
                 flushTokens.append(contentsOf: seedTokensForPriming[1...])
             }
             seedHiddenForPriming = nil
