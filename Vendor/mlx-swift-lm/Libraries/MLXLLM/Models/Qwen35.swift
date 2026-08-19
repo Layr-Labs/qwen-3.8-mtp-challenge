@@ -2170,8 +2170,15 @@ public class Qwen35TextModelInner: Module {
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
+        //
+        // Do NOT extend those rungs to S = 3..9. The even-8 median setters
+        // sit on verify widths ~6–7, where per-layer GPU work is already
+        // large; extra asyncEval splits the command buffer contrary to the
+        // promoted ofou 512/50 grouping (`MLX_MAX_MB_PER_BUFFER=512`,
+        // `MLX_MAX_OPS_PER_BUFFER=50`, overwrite=1). Prefill (>=512) keeps
+        // its own stride ladder.
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = inputs.dim(1) <= 2 || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
