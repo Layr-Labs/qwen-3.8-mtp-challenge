@@ -68,8 +68,12 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         let environment = ProcessInfo.processInfo.environment
         guard environment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"] != "0"
         else { return }
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 0)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 0)
+        // Force-set: the ranked worker / parent may already have exported the
+        // stock 50 MiB MLX default. overwrite=0 left that in place and the
+        // 512 MiB post-wire budget never landed. overwrite=1 makes the
+        // promoted Laguna M5-Max command-buffer profile actually apply.
+        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
     }
 
     public static func resolve(
@@ -142,8 +146,8 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // buffers; decode's explicit async-eval groups remain the outer
             // command-buffer boundary, and this referenced-buffer budget
             // governs within them.
-            maxMegabytesPerCommandBuffer: 320,
-            maxOperationsPerCommandBuffer: 128,
+            maxMegabytesPerCommandBuffer: 512,
+            maxOperationsPerCommandBuffer: 50,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )
