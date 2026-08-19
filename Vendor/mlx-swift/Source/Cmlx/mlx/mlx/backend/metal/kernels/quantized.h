@@ -817,9 +817,9 @@ METAL_FUNC void qmv_fast_impl(
 // for each 8-output tile. Pair adjacent input rows in one group while keeping
 // the stock two-simdgroup by four-output-row layout. Each active group caches a
 // weight tile once and applies the stock arithmetic independently to one or two
-// inputs; unused host groups return without reading weights. load_vector, the
-// qdot expression, K accumulation order, and simd_sum remain identical to
-// qmv_fast_impl for every output element.
+// inputs; unused host groups return without reading weights. Activations use
+// DIRECT_NIBBLES (raw x × isolated nibble); K accumulation order and simd_sum
+// remain identical to qmv_fast_impl for every output element.
 template <typename U>
 inline U qdot_affine4_loaded(
     const thread uint16_t* ws,
@@ -852,6 +852,62 @@ inline float2 qdot_affine4_loaded_pair(
          float2(x0[4 * i + 1], x1[4 * i + 1]) * (ws[i] & 0x00f0) +
          float2(x0[4 * i + 2], x1[4 * i + 2]) * (ws[i] & 0x0f00) +
          float2(x0[4 * i + 3], x1[4 * i + 3]) * (ws[i] & 0xf000));
+  }
+  return scale * accum + sum * bias;
+}
+
+// DIRECT_NIBBLES arithmetic for the pair kernel: raw activations times
+// isolated nibble values. (x / 16^k) * (w & (0xf << 4k)) and
+// x * ((w >> 4k) & 0xf) are the same real product — power-of-two scaling
+// is exact in FP32 — so every elementary product matches
+// qdot_affine4_loaded(_pair). The 4-term inner sum and the K/row
+// accumulation order stay the same. Bias correction keeps the incumbent
+// BF16 add tree (sum of the four raw x values).
+template <typename T>
+inline float load_affine4_direct16(const device T* x, thread float* x_thread) {
+  float sum = 0;
+  for (int i = 0; i < 16; i += 4) {
+    x_thread[i] = static_cast<float>(x[i]);
+    x_thread[i + 1] = static_cast<float>(x[i + 1]);
+    x_thread[i + 2] = static_cast<float>(x[i + 2]);
+    x_thread[i + 3] = static_cast<float>(x[i + 3]);
+    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+  }
+  return sum;
+}
+
+template <typename U>
+inline U qdot_affine4_direct(
+    const thread uint16_t* ws,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  for (int i = 0; i < 4; i++) {
+    accum +=
+        (x_thread[4 * i] * (ws[i] & 0x000f) +
+         x_thread[4 * i + 1] * ((ws[i] >> 4) & 0x000f) +
+         x_thread[4 * i + 2] * ((ws[i] >> 8) & 0x000f) +
+         x_thread[4 * i + 3] * ((ws[i] >> 12) & 0x000f));
+  }
+  return scale * accum + sum * bias;
+}
+
+inline float2 qdot_affine4_direct_pair(
+    const thread uint16_t* ws,
+    const thread float* x0,
+    const thread float* x1,
+    float scale,
+    float bias,
+    float2 sum) {
+  float2 accum = 0;
+  for (int i = 0; i < 4; i++) {
+    accum +=
+        (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
+         float2(x0[4 * i + 1], x1[4 * i + 1]) * ((ws[i] >> 4) & 0x000f) +
+         float2(x0[4 * i + 2], x1[4 * i + 2]) * ((ws[i] >> 8) & 0x000f) +
+         float2(x0[4 * i + 3], x1[4 * i + 3]) * ((ws[i] >> 12) & 0x000f));
   }
   return scale * accum + sum * bias;
 }
@@ -916,21 +972,19 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     thread float x0[values_per_thread];
     const device T* xm0 =
         x + first_m * in_vec_size + k + simd_lid * values_per_thread;
-    const float sum0 =
-        load_vector<T, float, values_per_thread, 4>(xm0, x0);
+    const float sum0 = load_affine4_direct16(xm0, x0);
     if (has_pair) {
       thread float x1[values_per_thread];
       const device T* xm1 = xm0 + in_vec_size;
-      const float sum1 =
-          load_vector<T, float, values_per_thread, 4>(xm1, x1);
+      const float sum1 = load_affine4_direct16(xm1, x1);
       for (int r = 0; r < rows_per_simd; r++) {
-        pair_result[r] += qdot_affine4_loaded_pair(
+        pair_result[r] += qdot_affine4_direct_pair(
             packed[r], x0, x1, scale_local[r], bias_local[r],
             float2(sum0, sum1));
       }
     } else {
       for (int r = 0; r < rows_per_simd; r++) {
-        single_result[r] += qdot_affine4_loaded<float>(
+        single_result[r] += qdot_affine4_direct<float>(
             packed[r], x0, scale_local[r], bias_local[r], sum0);
       }
     }
