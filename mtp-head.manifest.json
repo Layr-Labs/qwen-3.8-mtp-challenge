@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:kumahada/qwen38-mtp-head-ft-soup-a50@6856b485d46b9050139d3d27c67b86bf521b6b2b",
+  "sha256": "f110081d49a36623e63f096c2d31e71b0ac23e2eafd9edd91aec0a281fa8fa96",
+  "bytes": 427742178,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "FINE-TUNED proposal head (the first trained head on this track): multi-step chained + top-8 soft-label distillation of the pinned bf16 head on 1.2M teacher-forced tokens, then a 0.5 weight-space soup with the pinned head to preserve its copy behavior, quantized affine-4/group-64 to the backbone geometry. The promoted affine-2 compact draft readout is inherited tensor-for-tensor (it derives from the backbone lm_head, not the head), and the precision islands are regenerated as this head's OWN bf16 rows at the inherited indices. The head only proposes: target forward, exact top-2, emitted-token decision, journal, rollback and serial replay are unchanged. Immutable-revision, single-file tree digest, no remote code."
 }
