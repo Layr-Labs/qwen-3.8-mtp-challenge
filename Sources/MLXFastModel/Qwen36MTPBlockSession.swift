@@ -118,6 +118,12 @@ public final class Qwen36MTPBlockSession {
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
     /// identical value, one less blocking boundary per round.
     private var pendingPrimary: Int?
+    /// Device `[1, 1]` int32 view of `pendingPrimary` (column 0 of the
+    /// already-eval'd `[rows, 2]` top-2 IDs). Consumed only as the last row
+    /// of the MTP-head flush `nextTokenIds` after the first (all-host) seed
+    /// prime. The verify concat stays the crown's host-primary mix — that
+    /// isolate is the in-flight sibling, not this archive.
+    private var pendingPrimaryHeadToken: MLXArray?
     /// Top-2 (ids, logit values) of the row that produced `pendingPrimary` —
     /// the tail-row evidence a stop-token round must declare. Recorded from
     /// the same batched readout that produced the primary.
@@ -150,7 +156,11 @@ public final class Qwen36MTPBlockSession {
     /// Committed fused rows not yet appended: (post-norm trunk hidden at t,
     /// token at t+1). Flushed as leading rows of the next draft forward.
     private var headHistoryBacklogHidden: [MLXArray] = []
-    private var headHistoryBacklogTokens: [Int] = []
+    /// Accepted / serial-skip tokens not yet flushed into the head KV cache.
+    /// Device `[1, N]` int32 — the same ids previously staged as host `[Int]`
+    /// and re-uploaded via `MLXArray(flushTokens.map(Int32.init))` every
+    /// drafting round. Hidden rows were already device-resident.
+    private var headHistoryBacklogTokensDevice: MLXArray?
     /// Seed rows retained for lazy priming; released at the first flush.
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
@@ -489,6 +499,7 @@ public final class Qwen36MTPBlockSession {
         )
         // Top-2 first ID == row argmax (same ordering); no separate argMax.
         pendingPrimary = readTail.0[0]
+        pendingPrimaryHeadToken = Self.devicePrimaryToken(tailIDs, row: 0)
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
@@ -836,6 +847,7 @@ public final class Qwen36MTPBlockSession {
             // its top-2 was read out of the previous round's batched eval.
             let (tailTokens, tailLogits) = tailPending
             pendingPrimary = nil
+            pendingPrimaryHeadToken = nil
             pendingTop2 = nil
             pendingHidden = nil
             return Qwen36MTPRoundResult(
@@ -878,11 +890,13 @@ public final class Qwen36MTPBlockSession {
             // Pure array retention — no GPU work, so the serial control's
             // compute stream is untouched. A pure-serial session never flushes
             // this backlog (the head cache is never created).
+            // Reuse the same `[1, 1]` int32 the serial forward already builds
+            // so a later drafting flush does not re-upload this token.
+            let serialTokens = MLXArray([primary]).reshaped([1, 1])
             headHistoryBacklogHidden.append(hidden)
-            headHistoryBacklogTokens.append(primary)
+            appendHeadHistoryTokenDevice(serialTokens)
             let (serialLogits, serialHidden) = model.callWithHidden(
-                input: LMInput.Text(
-                    tokens: MLXArray([primary]).reshaped([1, 1])),
+                input: LMInput.Text(tokens: serialTokens),
                 cache: cache, nConfirmed: 0)
             // Still produced, still post-norm: keeping the hidden chain identical
             // means switching depth is the ONLY difference between the two sides.
@@ -899,6 +913,7 @@ public final class Qwen36MTPBlockSession {
             )
             // Top-2 first ID == row argmax (same ordering); no separate argMax.
             pendingPrimary = readTail.0[0]
+            pendingPrimaryHeadToken = Self.devicePrimaryToken(tailIDs, row: 0)
             pendingTop2 = readTail
             let (tailTokens, tailLogits) = readTail
             Self.traceRow(
@@ -927,7 +942,7 @@ public final class Qwen36MTPBlockSession {
         //    hidden exactly as before.
         let headCache: [any KVCache]
         var flushHidden: [MLXArray] = []
-        var flushTokens: [Int] = []
+        var seedTokenHost: [Int] = []
         if let existing = headHistoryCache {
             headCache = existing
         } else {
@@ -942,19 +957,16 @@ public final class Qwen36MTPBlockSession {
                 let primeCount = seedTokensForPriming.count - 1
                 flushHidden.append(
                     model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
-                flushTokens.append(contentsOf: seedTokensForPriming[1...])
+                seedTokenHost.append(contentsOf: seedTokensForPriming[1...])
             }
             seedHiddenForPriming = nil
             seedTokensForPriming = []
         }
         if !headHistoryBacklogHidden.isEmpty {
             flushHidden.append(contentsOf: headHistoryBacklogHidden)
-            flushTokens.append(contentsOf: headHistoryBacklogTokens)
             headHistoryBacklogHidden.removeAll(keepingCapacity: true)
-            headHistoryBacklogTokens.removeAll(keepingCapacity: true)
         }
         flushHidden.append(hidden)
-        flushTokens.append(primary)
 
         let draftBase = headCache.first?.offset ?? 0
         // Every flushed position is committed history plus the (pendingHidden,
@@ -962,11 +974,46 @@ public final class Qwen36MTPBlockSession {
         // valid whatever the verify decides. Deeper drafted positions are
         // speculative and are trimmed after the round (MTPLX
         // `_rollback_mtp_cache(cycle_offset + 1)`).
-        let validHistoryOffset = draftBase + flushTokens.count
         let draftInputHidden =
             flushHidden.count == 1 ? hidden : concatenated(flushHidden, axis: 1)
-        let draftInputTokens = MLXArray(flushTokens.map(Int32.init))
-            .reshaped([1, flushTokens.count])
+        // Token side of the same flush. First priming flush stays the crown's
+        // all-host int32 construction (do not mix a 511-row host seed with a
+        // device primary — that host+device concat is the mix concat-warm
+        // tried to hide and official receipts killed on this 512/50 tip).
+        // Steady-state flushes are all-device: accepted draft ids were already
+        // `[1, 1]` int32 on GPU, and the primary is a slice of the previous
+        // eval'd top-2 IDs. `asyncEval(draftId)` can then start the head
+        // flush without a host→device upload of tokens the GPU already holds.
+        let draftInputTokens: MLXArray
+        let flushTokenCount: Int
+        if !seedTokenHost.isEmpty {
+            var flushTokens = seedTokenHost
+            if let backlog = headHistoryBacklogTokensDevice {
+                flushTokens.append(
+                    contentsOf: backlog.asArray(Int32.self).map { Int($0) })
+                headHistoryBacklogTokensDevice = nil
+            }
+            flushTokens.append(primary)
+            flushTokenCount = flushTokens.count
+            draftInputTokens = MLXArray(flushTokens.map(Int32.init))
+                .reshaped([1, flushTokens.count])
+        } else {
+            var tokenParts: [MLXArray] = []
+            if let backlog = headHistoryBacklogTokensDevice {
+                tokenParts.append(backlog)
+                headHistoryBacklogTokensDevice = nil
+            }
+            if let primaryDev = pendingPrimaryHeadToken {
+                tokenParts.append(primaryDev)
+            } else {
+                tokenParts.append(MLXArray([Int32(primary)]).reshaped([1, 1]))
+            }
+            flushTokenCount = tokenParts.reduce(0) { $0 + $1.dim(1) }
+            draftInputTokens = tokenParts.count == 1
+                ? tokenParts[0]
+                : concatenated(tokenParts, axis: 1)
+        }
+        let validHistoryOffset = draftBase + flushTokenCount
 
         // Draft ids stay ON DEVICE and chain straight into the verify input —
         // no host readback between the head forward and the verify forward
@@ -1090,6 +1137,8 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimaryHeadToken = Self.devicePrimaryToken(
+                top2IDs, row: drafts.count)
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1116,6 +1165,8 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimaryHeadToken = Self.devicePrimaryToken(
+                    top2IDs, row: acceptedCount)
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1144,6 +1195,7 @@ public final class Qwen36MTPBlockSession {
                 let values = tailValues.asArray(Float.self).map { Double($0) }
                 // Top-2 first ID == row argmax; no separate argMax launch.
                 pendingPrimary = ids[0]
+                pendingPrimaryHeadToken = Self.devicePrimaryToken(tailIDs, row: 0)
                 pendingTop2 = (ids, values)
                 perRowTop2Tokens.append(ids)
                 perRowTop2Logits.append(values)
@@ -1175,8 +1227,14 @@ public final class Qwen36MTPBlockSession {
                         hiddenRow(verifyHidden, index))
                 }
             }
-            headHistoryBacklogTokens.append(
-                contentsOf: drafts.prefix(acceptedCount))
+            // Keep the accepted draft ids on device. They are already
+            // `[1, 1]` int32 outputs of `draftTokenID`; concatenating them
+            // is metadata + a device concat, not a host upload of Ints.
+            appendHeadHistoryTokenDevice(
+                acceptedCount == 1
+                    ? draftIdArrays[0]
+                    : concatenated(
+                        Array(draftIdArrays.prefix(acceptedCount)), axis: 1))
         }
         fullAcceptStreak =
             acceptedCount == drafts.count ? fullAcceptStreak + 1 : 0
@@ -1412,7 +1470,38 @@ public final class Qwen36MTPBlockSession {
     // is identical to `argMax` and to `topTwoRead`: value-descending, then
     // id-ascending on exact ties, NaN sorted last.
 
-    /// Shared exact ordering for the two-stage candidate-only top-2 reduction.
+    /// Device `[1, 1]` int32 view of row `row`'s first top-2 ID.
+    ///
+    /// `top2IDs` is `[rows, 2]` from `linearTopTwoRows`. Column 0 is the row
+    /// argmax under the same total order as `argMax` (larger logit wins,
+    /// lower id wins a tie) — identical to `verifyArgmax[row]` / `readTail.0[0]`.
+    /// Slicing a materialised array does not launch GPU work and does not
+    /// copy the token through the host.
+    static func devicePrimaryToken(_ top2IDs: MLXArray, row: Int) -> MLXArray {
+        precondition(top2IDs.ndim == 2 && top2IDs.dim(1) == 2)
+        precondition(row >= 0 && row < top2IDs.dim(0))
+        return top2IDs[row ..< (row + 1), 0 ..< 1]
+    }
+
+    /// Append a `[1, N]` int32 token block onto the unflushed head-history
+    /// backlog. First block is retained as-is; later blocks concatenate on
+    /// device so the next flush is one tensor, not N host Ints.
+    private func appendHeadHistoryTokenDevice(_ tokens: MLXArray) {
+        let row: MLXArray
+        if tokens.ndim == 2 && tokens.dim(0) == 1 {
+            row = tokens
+        } else if tokens.ndim == 1 {
+            row = tokens.reshaped([1, tokens.dim(0)])
+        } else {
+            row = tokens.reshaped([1, 1])
+        }
+        if let existing = headHistoryBacklogTokensDevice {
+            headHistoryBacklogTokensDevice = concatenated([existing, row], axis: 1)
+        } else {
+            headHistoryBacklogTokensDevice = row
+        }
+    }
+
     private static let linearTopTwoHeader = """
         struct qwen_top2_state {
             float first_value;
