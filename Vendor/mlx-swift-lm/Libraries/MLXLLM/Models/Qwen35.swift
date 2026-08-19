@@ -365,7 +365,19 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          const InT scale = is_q ? q_scale : k_scale;
+          // Geometry-derived scales, baked as bf16 immediates. mixerHit
+          // already requires headKDim == 128, so these bits are the unique
+          // values of the previous host path:
+          //   q = MLXArray(pow(pow(Float(128), -0.5), 2)).asType(.bfloat16)
+          //     f32 0x3BFFFFFF rounds-to-nearest-even -> bf16 0x3C00 (1/128)
+          //   k = MLXArray(pow(Float(128), -0.5)).asType(.bfloat16)
+          //     f32 0x3DB504F3 -> bf16 0x3DB5 (low 16 bits 0x04F3 < 0x8000)
+          // Dropping the two 1-element host buffers removes two encoder
+          // binds from every S=3...9 GDN prework launch. Serial never
+          // takes this kernel (S == 1).
+          const InT scale = is_q
+              ? as_type<InT>(uint16_t(0x3C00))
+              : as_type<InT>(uint16_t(0x3DB5));
           const uint output_base = (row * Hk + head) * Dk + lane * 4;
           #pragma clang loop unroll(full)
           for (uint i = 0; i < 4; ++i) {
@@ -419,7 +431,7 @@ private let qwen35PackedGDNPreworkKernel: MLXFast.MLXFastKernel = {
         name: "qwen35_packed_gdn_prework",
         inputNames: [
             "qkv", "a", "b", "conv_state", "conv_weight", "a_log",
-            "dt_bias", "q_scale", "k_scale",
+            "dt_bias",
         ],
         outputNames: [
             "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out",
@@ -832,11 +844,8 @@ final class Qwen35GatedDeltaNet: Module {
         let beta: MLXArray
         let newConvState: MLXArray
         if mixerHit {
-            let (qScaleConst, kScaleConst) = normScaleConstants(.bfloat16)
             let outs = qwen35PackedGDNPreworkKernel(
-                [qkv, a, b, convState, conv1d.weight, aLog, dtBias,
-                 qScaleConst,
-                 kScaleConst],
+                [qkv, a, b, convState, conv1d.weight, aLog, dtBias],
                 template: [
                     ("Hk", numKHeads), ("Dk", headKDim),
                     ("Hv", numVHeads), ("Dv", headVDim),
