@@ -495,18 +495,53 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
-            let q = MLXArray.zeros(
-                [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
-            outs.append(
-                MLXFast.scaledDotProductAttention(
-                    queries: q,
-                    keys: extK,
-                    values: extV,
-                    scale: scale,
-                    mask: .causal
+        // COMPLETE (qL, kL) LADDER. The scored central prompts (the two
+        // even-n median prompts, draft_len ~4.5..4.8) verify at width 6..7,
+        // which `attentionWithCacheUpdate` splits at row 5 into a fused-vector
+        // chunk A (qL=5) over keys[..<kL-(qL-5)] and a chunk B over the full
+        // keys. A SINGLE kL endpoint (even at 1024) leaves every intermediate
+        // (qL, kL) pair the chunk fires to first-touch inside the timed window,
+        // and the width-wall's remaining cost is exactly those first-touch
+        // compiles. Walk kL 512->1024 so each rung's full qL set is resident.
+        let qLs = [1, 5, 4, 3, 2]
+        for kL in stride(from: 512, through: 1024, by: 64) {
+            let kSlice = extK[0..., 0..., 0 ..< kL, 0...]
+            let vSlice = extV[0..., 0..., 0 ..< kL, 0...]
+            for qL in qLs {
+                let q = MLXArray.zeros(
+                    [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
+                outs.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: q,
+                        keys: kSlice,
+                        values: vSlice,
+                        scale: scale,
+                        mask: .causal
+                    )
                 )
-            )
+            }
+            // EXACTNESS-CHUNK-A SHIFTED PARTNERS. The chunk A of a width-w
+            // verify (w in 6..9) is qL=5 over keys[..<kL-(w-5)] — a keys-length
+            // the full-kL qL ladder above never produces (e.g. width-6 at kL=1024
+            // needs keys[..<1023]). Warm those four shifted lengths so the width
+            // 6/7 verifies the central prompts first-touch are fully resident.
+            for d in 1 ... 4 {
+                let kA = kL - d
+                guard kA >= 5 else { continue }
+                let kSliceA = extK[0..., 0..., 0 ..< kA, 0...]
+                let vSliceA = extV[0..., 0..., 0 ..< kA, 0...]
+                let qA = MLXArray.zeros(
+                    [extK.dim(0), qHeads, 5, headDim], dtype: extK.dtype)
+                outs.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: qA,
+                        keys: kSliceA,
+                        values: vSliceA,
+                        scale: scale,
+                        mask: .causal
+                    )
+                )
+            }
         }
         eval(outs)
     }
