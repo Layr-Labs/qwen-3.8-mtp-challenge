@@ -189,7 +189,44 @@ public enum Qwen36MTPHeadAttachment {
             _primaryWeightKeyPrefixStrip = previousStrip
             _qwen35MTPEnabled = previousEnabled
         }
-        return try body(layout)
+        let result = try body(layout)
+        // Untimed. Completes the later-window 2-pass SDPA JIT the live crown
+        // (fkiene `59b321ee`, session `warmTargetLaterWindowSDPA`) started:
+        // that warm compiles qL=1/5/4 at kL>=1024. AttentionUtils splits
+        // verify widths 6–7 into 5+(qL-5), so chunk B is qL=1 (width 6, already
+        // compiled) or qL=2 (width 7, the central-pair height, NOT compiled).
+        // Width 8's chunk B is qL=3. 2-pass threadgroup is (32, gqa=6, qL), so
+        // those qL values are distinct pipeline hashes. Dummy zeros, discarded.
+        warmMissingLaterWindowSDPA()
+        return result
+    }
+
+    /// kL=1024 / bf16 / causal / 4 KV heads × 6 GQA. On arch `'s'` (M5 Max)
+    /// `N==1024` keeps `blocks=64`, matching the second half of the ranked
+    /// 512+512 window. Does not touch live caches or the session file.
+    private static func warmMissingLaterWindowSDPA() {
+        let kvHeads = 4
+        let qHeads = 24
+        let headDim = 256
+        let kL = 1024
+        let scale = 1 / Float(headDim).squareRoot()
+        let keys = MLXArray.zeros([1, kvHeads, kL, headDim], dtype: .bfloat16)
+        let values = MLXArray.zeros([1, kvHeads, kL, headDim], dtype: .bfloat16)
+        var outs: [MLXArray] = []
+        for qL in [2, 3] {
+            let queries = MLXArray.zeros(
+                [1, qHeads, qL, headDim], dtype: .bfloat16)
+            outs.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: .causal
+                )
+            )
+        }
+        eval(outs)
     }
 
     /// Structural checks that do not need MLX and are therefore unit-testable.
