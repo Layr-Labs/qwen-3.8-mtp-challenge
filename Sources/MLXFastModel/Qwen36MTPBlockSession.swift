@@ -468,15 +468,19 @@ public final class Qwen36MTPBlockSession {
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
         // Retain the full pre-norm seed hidden for lazy head-history priming.
-        // ~5 MB at 512x5120 bf16; released at the first drafting round. The
-        // eval below materialises it so no seed graph is kept alive.
+        // ~5 MB at 512x5120 bf16; released at the first drafting round.
+        // Do NOT eval the 512-row block here. `pendingHidden` is the last
+        // row (the only seed output begin reads). The 511 leading rows have
+        // no consumer until the first draft's applyFinalNorm, and
+        // warmAllDepths already compiled that 511-row norm. Materialising
+        // the whole tensor in begin (#671 stored post-norm here and lost
+        // 0.013) adds scored-window work the first flush has to do anyway.
         seedHiddenForPriming = hidden
         seedTokensForPriming = seedTokens
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
-        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+        eval(cache.flatMap { $0.state } + [tailIDs, tailValues, pendingHidden!])
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
