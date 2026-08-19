@@ -1,9 +1,9 @@
 {
-  "version": 1,
-  "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
-  "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+ "version": 1,
+ "source": "remote",
+ "source_url": "hf:Spangler3000/qwen38-mtp-head-hybrid-v1@93e6dfcabbc76da397542dce0ae27008fd9a0a10",
+ "sha256": "c62c446215ae4b417e91842f4bb751b95416d38170b461f5f30cbfde93794ca8",
+ "bytes": 517941656,
+ "max_bytes": 2147483648,
+ "note": "Hybrid proposal head: amal-david's promoted q2-q4 rerank head (affine-4 compact lm_head, affine-2 shortlist readout, Q2048/K1024/V1024 BF16 precision islands) PLUS the v9 AW-selected BF16 precision islands on the remaining proposal projections (fc 1024, o_proj 1024, gate/up 1024 each, down_proj 1024). The islands are exact BF16 output-row corrections applied after the 4-bit base projections; the target model, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. Measured on the 8-domain proxy pool vs the amal head: 6/8 prompts faster (median +2.1% ratio), driven by higher draft acceptance (fewer reject rounds -> less verify re-forward work). The artifact is immutable-revision and runner-tree-digest pinned; no remote code is executed."
 }

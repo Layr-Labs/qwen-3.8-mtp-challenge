@@ -118,6 +118,13 @@ public final class Qwen36MTPBlockSession {
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
     /// identical value, one less blocking boundary per round.
     private var pendingPrimary: Int?
+    /// Device-resident `[1, 1]` int32 copy of `pendingPrimary`. Same token,
+    /// same `linearTopTwoRows` first-column (row argmax). Kept so the drafting
+    /// verify concat is all-device instead of host-upload + device drafts.
+    /// The host `Int` stays for stop-set membership, the committed ledger,
+    /// and the serial (depth-0) forward — serial is the score denominator
+    /// and must not inherit this upload elimination.
+    private var pendingPrimaryDevice: MLXArray?
     /// Top-2 (ids, logit values) of the row that produced `pendingPrimary` —
     /// the tail-row evidence a stop-token round must declare. Recorded from
     /// the same batched readout that produced the primary.
@@ -370,6 +377,18 @@ public final class Qwen36MTPBlockSession {
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
         eval(historyWarmCache.flatMap { $0.state })
+        // Warm the all-device multi-input int32 concat used by scored verify
+        // rounds (device primary + device draft IDs). A single host-built
+        // [1, width] tensor does not compile this family; the first scored
+        // round must not pay the JIT inside the window. Placeholder primary
+        // is a device int32 zero [1,1] (the concat family is dtype/shape
+        // driven; values do not change the compiled kernel).
+        let warmPrimaryDevice = MLXArray.zeros([1, 1], dtype: .int32)
+        for extra in 0 ... maxDepth {
+            var parts = [warmPrimaryDevice]
+            for _ in 0 ..< extra { parts.append(primedDraftID) }
+            eval(concatenated(parts, axis: 1))
+        }
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
@@ -439,76 +458,6 @@ public final class Qwen36MTPBlockSession {
             Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
         eval(seedWarmCache.flatMap { $0.state }
             + [seedWarmIDs, seedWarmValues, seedWarmNorm])
-
-        // TARGET-SIDE later-window SDPA compile. Distinct from the rejected
-        // #674 proposal-head HOST KV walk (3.23670). After the 512-row seed
-        // the 16 FA caches sit at kL=512; scored decode walks that prefix to
-        // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
-        // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
-        Self.warmTargetLaterWindowSDPA(seedWarmCache)
-    }
-
-    /// Untimed. Throwaway FA caches only. Token-neutral: dummy K/V never
-    /// enter a scored forward. Compiles later-window `MLXFast` SDPA so the
-    /// first decode step past the 512-row seed does not first-touch those
-    /// pipeline variants inside the scored window.
-    private static func warmTargetLaterWindowSDPA(_ cache: [KVCache]) {
-        var extended: [MLXArray] = []
-        var firstKV: (MLXArray, MLXArray)?
-        var faCount = 0
-        for entry in cache {
-            guard entry is KVCacheSimple else { continue }
-            let st = entry.state
-            guard st.count == 2 else { continue }
-            let k = st[0]
-            let v = st[1]
-            guard k.ndim == 4, v.ndim == 4, k.dim(2) > 0, v.dim(2) == k.dim(2)
-            else { continue }
-            faCount += 1
-            let pad = max(0, 1024 - k.dim(2))
-            let extK: MLXArray
-            let extV: MLXArray
-            if pad > 0 {
-                let kPad = MLXArray.zeros(
-                    [k.dim(0), k.dim(1), pad, k.dim(3)], dtype: k.dtype)
-                let vPad = MLXArray.zeros(
-                    [v.dim(0), v.dim(1), pad, v.dim(3)], dtype: v.dtype)
-                extK = concatenated([k, kPad], axis: 2)
-                extV = concatenated([v, vPad], axis: 2)
-            } else {
-                extK = k
-                extV = v
-            }
-            extended.append(contentsOf: [extK, extV])
-            if firstKV == nil { firstKV = (extK, extV) }
-        }
-        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
-        guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
-        else { return }
-        eval(extended)
-        // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
-        // (config pins 256). Scale matches Qwen35Attention.
-        let qHeads = extK.dim(1) * 6
-        let headDim = extK.dim(3)
-        let scale = 1 / Float(headDim).squareRoot()
-        var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
-            let q = MLXArray.zeros(
-                [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
-            outs.append(
-                MLXFast.scaledDotProductAttention(
-                    queries: q,
-                    keys: extK,
-                    values: extV,
-                    scale: scale,
-                    mask: .causal
-                )
-            )
-        }
-        eval(outs)
     }
 
     // MARK: - begin
@@ -559,6 +508,7 @@ public final class Qwen36MTPBlockSession {
         )
         // Top-2 first ID == row argmax (same ordering); no separate argMax.
         pendingPrimary = readTail.0[0]
+        pendingPrimaryDevice = Self.devicePrimaryToken(tailIDs, row: 0)
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
@@ -850,6 +800,7 @@ public final class Qwen36MTPBlockSession {
     /// round from the last round's accept run.
     public func generateRound(depth: Int) throws -> Qwen36MTPRoundResult {
         guard began, let primaryPending = pendingPrimary,
+              let primaryDevice = pendingPrimaryDevice,
               let tailPending = pendingTop2, let hidden = pendingHidden
         else { throw Qwen36MTPSessionError.notBegun }
         guard depth >= Qwen36MTPLimits.serialControlDepth,
@@ -906,6 +857,7 @@ public final class Qwen36MTPBlockSession {
             // its top-2 was read out of the previous round's batched eval.
             let (tailTokens, tailLogits) = tailPending
             pendingPrimary = nil
+            pendingPrimaryDevice = nil
             pendingTop2 = nil
             pendingHidden = nil
             return Qwen36MTPRoundResult(
@@ -969,6 +921,7 @@ public final class Qwen36MTPBlockSession {
             )
             // Top-2 first ID == row argmax (same ordering); no separate argMax.
             pendingPrimary = readTail.0[0]
+            pendingPrimaryDevice = Self.devicePrimaryToken(tailIDs, row: 0)
             pendingTop2 = readTail
             let (tailTokens, tailLogits) = readTail
             Self.traceRow(
@@ -1080,8 +1033,15 @@ public final class Qwen36MTPBlockSession {
         //    rejected single draft can then retain the primary's target work and
         //    discard only the draft token instead of re-forwarding the primary.
         let snapshot = Self.snapshotRecurrent(cache)
+        // All-device verify input: `primaryDevice` is a slice of the previous
+        // round's already-eval'd `[rows, 2]` top-2 IDs; `draftIdArrays` are
+        // on-device `draftTokenID` outputs. Do not rebuild the primary from
+        // a host `Int` here — that is a per-round host→device upload of a
+        // token the GPU already holds, and it specialises concat as
+        // host-int32 + device-int32 (the mix concat-warm tried to JIT-hide
+        // and which official receipts killed on this 512/50 tip).
         let verifyTokens = concatenated(
-            [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
+            [primaryDevice] + draftIdArrays,
             axis: 1)
         // nConfirmed: 1 at every drafting width. K=1 writes its promoted eager
         // primary checkpoint; K>=2 keeps exact recurrence inputs so a partial
@@ -1160,6 +1120,7 @@ public final class Qwen36MTPBlockSession {
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
             pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimaryDevice = Self.devicePrimaryToken(top2IDs, row: drafts.count)
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1186,6 +1147,7 @@ public final class Qwen36MTPBlockSession {
                 to: committedOffset)
             {
                 pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimaryDevice = Self.devicePrimaryToken(top2IDs, row: acceptedCount)
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1214,6 +1176,7 @@ public final class Qwen36MTPBlockSession {
                 let values = tailValues.asArray(Float.self).map { Double($0) }
                 // Top-2 first ID == row argmax; no separate argMax launch.
                 pendingPrimary = ids[0]
+                pendingPrimaryDevice = Self.devicePrimaryToken(tailIDs, row: 0)
                 pendingTop2 = (ids, values)
                 perRowTop2Tokens.append(ids)
                 perRowTop2Logits.append(values)
@@ -1649,6 +1612,19 @@ public final class Qwen36MTPBlockSession {
         header: linearTopTwoHeader,
         ensureRowContiguous: false
     )
+
+    /// Device `[1, 1]` int32 view of row `row`'s first top-2 ID.
+    ///
+    /// `top2IDs` is `[rows, 2]` from `linearTopTwoRows`. Column 0 is the row
+    /// argmax under the same total order as `argMax` (larger logit wins,
+    /// lower id wins a tie) — identical to `verifyArgmax[row]` / `readTail.0[0]`.
+    /// Slicing a materialised array does not launch GPU work and does not
+    /// copy the token through the host.
+    static func devicePrimaryToken(_ top2IDs: MLXArray, row: Int) -> MLXArray {
+        precondition(top2IDs.ndim == 2 && top2IDs.dim(1) == 2)
+        precondition(row >= 0 && row < top2IDs.dim(0))
+        return top2IDs[row ..< (row + 1), 0 ..< 1]
+    }
 
     /// Exact top-2 (ids, values) for every row of a `[1, rows, V]` logits
     /// array, as `[rows, 2]` int32 / float32 device arrays.
