@@ -454,9 +454,10 @@ public final class Qwen36MTPBlockSession {
     /// Untimed. Throwaway FA caches only. Token-neutral: dummy K/V never
     /// enter a scored forward. Compiles later-window `MLXFast` SDPA so the
     /// first decode step past the 512-row seed does not first-touch those
-    /// pipeline variants inside the scored window.
+    /// pipeline variants inside the scored window. Pads ONE FA layer to
+    /// kL>=1024 (PSO is shape-keyed, not per-layer). Does not eval 16
+    /// padded copies.
     private static func warmTargetLaterWindowSDPA(_ cache: [KVCache]) {
-        var extended: [MLXArray] = []
         var firstKV: (MLXArray, MLXArray)?
         var faCount = 0
         for entry in cache {
@@ -468,27 +469,32 @@ public final class Qwen36MTPBlockSession {
             guard k.ndim == 4, v.ndim == 4, k.dim(2) > 0, v.dim(2) == k.dim(2)
             else { continue }
             faCount += 1
-            let pad = max(0, 1024 - k.dim(2))
-            let extK: MLXArray
-            let extV: MLXArray
-            if pad > 0 {
-                let kPad = MLXArray.zeros(
-                    [k.dim(0), k.dim(1), pad, k.dim(3)], dtype: k.dtype)
-                let vPad = MLXArray.zeros(
-                    [v.dim(0), v.dim(1), pad, v.dim(3)], dtype: v.dtype)
-                extK = concatenated([k, kPad], axis: 2)
-                extV = concatenated([v, vPad], axis: 2)
-            } else {
-                extK = k
-                extV = v
+            // Only the first FA layer is needed to compile the fused-vector
+            // PSO (all 16 share B/H/L/D). #693 eval'd 16 HOST-padded 1024-row
+            // K/V copies — throwaway buffers scored decode never reads —
+            // pinning a large Metal heap into the timed window. Skip the
+            // other 15 concats and the 16-layer eval.
+            if firstKV == nil {
+                let pad = max(0, 1024 - k.dim(2))
+                let extK: MLXArray
+                let extV: MLXArray
+                if pad > 0 {
+                    let kPad = MLXArray.zeros(
+                        [k.dim(0), k.dim(1), pad, k.dim(3)], dtype: k.dtype)
+                    let vPad = MLXArray.zeros(
+                        [v.dim(0), v.dim(1), pad, v.dim(3)], dtype: v.dtype)
+                    extK = concatenated([k, kPad], axis: 2)
+                    extV = concatenated([v, vPad], axis: 2)
+                } else {
+                    extK = k
+                    extV = v
+                }
+                firstKV = (extK, extV)
             }
-            extended.append(contentsOf: [extK, extV])
-            if firstKV == nil { firstKV = (extK, extV) }
         }
         // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
         guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
         else { return }
-        eval(extended)
         // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
         // (config pins 256). Scale matches Qwen35Attention.
         let qHeads = extK.dim(1) * 6
