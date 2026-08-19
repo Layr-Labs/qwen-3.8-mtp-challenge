@@ -77,6 +77,7 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
     case notBegun
     case alreadyBegun
     case invalidDepth(Int)
+    case missingSingleDraftRollbackCheckpoint
     case emptySeed
 
     public var description: String {
@@ -92,6 +93,8 @@ public enum Qwen36MTPSessionError: Error, CustomStringConvertible {
             return "MTP seed prefill requested twice"
         case .invalidDepth(let depth):
             return "MTP draft depth \(depth) is out of range"
+        case .missingSingleDraftRollbackCheckpoint:
+            return "single-draft verify did not publish its recurrent rollback checkpoint"
         case .emptySeed:
             return "MTP seed prefill requires a non-empty seed"
         }
@@ -1005,11 +1008,14 @@ public final class Qwen36MTPBlockSession {
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
-        // 2. Keep the generic pre-verify snapshot as a fallback, but use the
-        //    vendored post-primary rollback checkpoint for the hot K=1 path. A
-        //    rejected single draft can then retain the primary's target work and
-        //    discard only the draft token instead of re-forwarding the primary.
-        let snapshot = Self.snapshotRecurrent(cache)
+        // 2. The vendored nConfirmed checkpoint is complete for K=1, the hot
+        //    schedule. Avoid constructing 64 defensive slice snapshots every
+        //    round when that checkpoint can restore every recurrent layer. Keep
+        //    the generic snapshot only for wider experimental schedules, whose
+        //    replay tape may still fall back to the repair forward. A missing K=1
+        //    checkpoint is an invariant failure: taking a snapshot after verify
+        //    would capture the already-mutated state and cannot repair safely.
+        let snapshot = draftCount == 1 ? nil : Self.snapshotRecurrent(cache)
         let verifyTokens = concatenated(
             [MLXArray([Int32(primary)]).reshaped([1, 1])] + draftIdArrays,
             axis: 1)
@@ -1056,8 +1062,8 @@ public final class Qwen36MTPBlockSession {
         // same ordering `argMax` uses (larger logit wins, lower id wins an
         // exact tie), so the separate vocabulary-wide argMax launch is
         // redundant (credit GPT-5.6 Sol, promoted b71bb35, 1.37645).
-        let verifyArgmax = stride(
-            from: 0, to: flatTop2IDs.count, by: 2).map { flatTop2IDs[$0] }
+        // The winning ID for row i is already at flatTop2IDs[i * 2].
+        // Read it in place instead of allocating a duplicate row-winner array.
 
         // 3. Longest-common-prefix acceptance over rows 0 ..< draftCount. Row i
         //    is the target's greedy continuation of verify input i, i.e. the
@@ -1065,7 +1071,7 @@ public final class Qwen36MTPBlockSession {
         //    used on full acceptance.
         var acceptedCount = 0
         for index in 0 ..< drafts.count {
-            guard verifyArgmax[index] == drafts[index] else { break }
+            guard flatTop2IDs[index * 2] == drafts[index] else { break }
             acceptedCount += 1
             if stopTokens.contains(drafts[index]) { break }
         }
@@ -1089,7 +1095,7 @@ public final class Qwen36MTPBlockSession {
             Self.clearRecurrentRollback(cache)
             committed.append(contentsOf: drafts)
             committedTokenCount += drafts.count
-            pendingPrimary = verifyArgmax[drafts.count]
+            pendingPrimary = flatTop2IDs[drafts.count * 2]
             pendingHidden = hiddenRow(
                 verifyHidden, verifyNormed, verifyHidden.dim(1) - 1)
             let base = drafts.count * 2
@@ -1115,7 +1121,7 @@ public final class Qwen36MTPBlockSession {
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
             {
-                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingPrimary = flatTop2IDs[acceptedCount * 2]
                 pendingHidden = hiddenRow(
                     verifyHidden, verifyNormed, acceptedCount)
                 pendingTop2 = (
@@ -1127,9 +1133,15 @@ public final class Qwen36MTPBlockSession {
             } else {
                 // Generic K>1 / defensive fallback: undo the whole verify window
                 // and re-forward the committed block. This rare path pays a
-                // second blocking eval for its own readout.
+                // second blocking eval for its own readout. K=1 has no generic
+                // snapshot by design; its eager checkpoint is an invariant of
+                // nConfirmed == 1, so fail before mutating caches if it vanished.
+                guard let snapshot else {
+                    throw Qwen36MTPSessionError.missingSingleDraftRollbackCheckpoint
+                }
                 Self.rollbackAfterVerify(
-                    cache, snapshot, verifiedTokens: draftCount + 1, to: base)
+                    cache, snapshot,
+                    verifiedTokens: draftCount + 1, to: base)
                 let (repairLogits, repairHidden) = model.callWithHidden(
                     input: LMInput.Text(
                         tokens: MLXArray(committed).reshaped([1, committed.count])),
