@@ -91,6 +91,29 @@ final class Qwen35MTPModule: Module {
     let layers: [Qwen35MTPDecoderLayer]
     let norm: RMSNorm
 
+    // MARK: fc embedding-half fold (input-independent, proposal-only)
+    //
+    // `fc` is bias-free, so fc([e; h]) = W_e @ e + W_h @ h where W_e / W_h are
+    // the first / second K-half column blocks. The e-term
+    // `W_e @ preFcNormEmbedding(embed(token))` depends only on the token id and
+    // fixed weights, so it is precomputable for the whole vocabulary once at
+    // first head use (inside the untimed warm window). Each draft step then
+    // pays one row gather + a K=hidden qmv instead of embed-gather + RMSNorm +
+    // a [e;h] concat + a K=2*hidden qmv. The fold is proposal-side only: the
+    // head proposes, the exact target verifies, so the (tiny, bf16-rounding)
+    // numeric difference vs the fused kernel can only move accept rate, never
+    // an emitted token. Fail-closed: any unexpected layout leaves the fused
+    // path in place. Kill switch: MLXFAST_QWEN_MTP_FC_FOLD=0.
+    private var _fcFoldAttempted = false
+    private var _fcEmbedTable: MLXArray?  // [vocab, H] = preFcNormEmbedding(E) @ W_e^T
+    private var _fcHiddenW: MLXArray?  // packed h-half (quantized fc)
+    private var _fcHiddenS: MLXArray?
+    private var _fcHiddenZ: MLXArray?
+    private var _fcHiddenGroupSize = 64
+    private var _fcHiddenBits = 4
+    private var _fcHiddenMode: QuantizationMode = .affine
+    private var _fcHiddenDenseWT: MLXArray?  // [H, H] transposed h-half (bf16 fc)
+
     init(_ args: Qwen35TextConfiguration) {
         _preFcNormHidden.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -104,6 +127,122 @@ final class Qwen35MTPModule: Module {
         super.init()
     }
 
+    /// Build (or refuse, once) the fc embedding-half fold. Runs on the first
+    /// head forward, which the session always issues inside the untimed warm
+    /// window; the serial (never-drafting) leg never calls the head and never
+    /// pays for or holds the table.
+    private func prepareFcFoldIfNeeded(embedTokens: Embedding) {
+        guard !_fcFoldAttempted else { return }
+        _fcFoldAttempted = true
+        if ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_FC_FOLD"] == "0" {
+            return
+        }
+
+        let hiddenSize = preFcNormHidden.weight.dim(0)
+        let vocabRows = embedTokens.weight.dim(0)
+
+        // Split fc into K-halves. Both halves must land exactly on packed-word
+        // and quantization-group boundaries; otherwise leave the fused path.
+        var eHalf: ((MLXArray) -> MLXArray)?
+        if let qfc = fc as? QuantizedLinear {
+            let packedCols = qfc.weight.dim(1)
+            let scaleCols = qfc.scales.dim(1)
+            guard qfc.bias == nil,
+                  qfc.weight.dim(0) == hiddenSize,
+                  packedCols % 2 == 0, scaleCols % 2 == 0,
+                  hiddenSize % qfc.groupSize == 0,
+                  qfc.biases != nil
+            else { return }
+            let pHalf = packedCols / 2
+            let gHalf = scaleCols / 2
+            let wE = qfc.weight[0..., 0 ..< pHalf]
+            let sE = qfc.scales[0..., 0 ..< gHalf]
+            let zE = qfc.biases![0..., 0 ..< gHalf]
+            _fcHiddenW = qfc.weight[0..., pHalf...].contiguous()
+            _fcHiddenS = qfc.scales[0..., gHalf...].contiguous()
+            _fcHiddenZ = qfc.biases![0..., gHalf...].contiguous()
+            _fcHiddenGroupSize = qfc.groupSize
+            _fcHiddenBits = qfc.bits
+            _fcHiddenMode = qfc.mode
+            let wEc = wE.contiguous()
+            let sEc = sE.contiguous()
+            let zEc = zE.contiguous()
+            eHalf = { x in
+                quantizedMM(
+                    x, wEc, scales: sEc, biases: zEc, transpose: true,
+                    groupSize: qfc.groupSize, bits: qfc.bits, mode: qfc.mode)
+            }
+        } else {
+            let w = fc.weight
+            guard fc.bias == nil,
+                  w.dim(0) == hiddenSize, w.dim(1) == 2 * hiddenSize
+            else { return }
+            let wE = w[0..., 0 ..< hiddenSize].contiguous()
+            _fcHiddenDenseWT = w[0..., hiddenSize...].transposed(1, 0).contiguous()
+            eHalf = { x in matmul(x, wE.transposed(1, 0)) }
+        }
+        guard let eHalf else { return }
+
+        // Precompute T[token] = W_e @ preFcNormEmbedding(embed(token)) for the
+        // whole vocabulary, chunked to bound the transient dequant footprint.
+        let chunk = 65536
+        var parts: [MLXArray] = []
+        var row = 0
+        while row < vocabRows {
+            let hi = min(row + chunk, vocabRows)
+            let rows: MLXArray
+            if let qe = embedTokens as? QuantizedEmbedding {
+                rows = dequantized(
+                    qe.weight[row ..< hi], scales: qe.scales[row ..< hi],
+                    biases: qe.biases == nil ? nil : qe.biases![row ..< hi],
+                    groupSize: qe.groupSize, bits: qe.bits, mode: qe.mode)
+            } else {
+                rows = embedTokens.weight[row ..< hi]
+            }
+            let part = eHalf(preFcNormEmbedding(rows))
+            eval(part)
+            parts.append(part)
+            row = hi
+        }
+        let table = parts.count == 1 ? parts[0] : concatenated(parts, axis: 0)
+        eval(table)
+        _fcEmbedTable = table
+        FileHandle.standardError.write(Data(
+            ("Qwen35MTPModule: fc embedding-half fold active "
+             + "(table \(table.dim(0))x\(table.dim(1)) \(table.dtype))\n").utf8))
+    }
+
+    /// Fusion-stage rows: `fc([preFcNormEmbedding(embed(ids)); preFcNormHidden(hidden)])`,
+    /// via the fold when available, else the reference fused path.
+    private func fusedInput(
+        hidden: MLXArray, nextTokenIds: MLXArray, embedTokens: Embedding
+    ) -> MLXArray {
+        prepareFcFoldIfNeeded(embedTokens: embedTokens)
+        if let table = _fcEmbedTable {
+            let shape = nextTokenIds.shape
+            let eTerm = table[nextTokenIds.flattened()].reshaped(shape + [-1])
+            let h = preFcNormHidden(hidden)
+            let hTerm: MLXArray
+            if let w = _fcHiddenW, let s = _fcHiddenS, let z = _fcHiddenZ {
+                hTerm = quantizedMM(
+                    h, w, scales: s, biases: z, transpose: true,
+                    groupSize: _fcHiddenGroupSize, bits: _fcHiddenBits,
+                    mode: _fcHiddenMode)
+            } else if let wt = _fcHiddenDenseWT {
+                hTerm = matmul(h, wt)
+            } else {
+                // Unreachable when the table exists; keep the reference result.
+                let e = preFcNormEmbedding(embedTokens(nextTokenIds))
+                return fc(concatenated([e, h], axis: -1))
+            }
+            return eTerm + hTerm
+        }
+        let embeds = embedTokens(nextTokenIds)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
+        return fc(concatenated([e, h], axis: -1))
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -112,10 +251,8 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = fusedInput(
+            hidden: hidden, nextTokenIds: nextTokenIds, embedTokens: embedTokens)
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -146,10 +283,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let e = preFcNormEmbedding(embeds)
-        let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused = fusedInput(
+            hidden: hidden, nextTokenIds: nextTokenIds, embedTokens: embedTokens)
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
