@@ -445,16 +445,16 @@ public final class Qwen36MTPBlockSession {
         // the 16 FA caches sit at kL=512; scored decode walks that prefix to
         // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
         // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // forward) and dispatch every fused-vector shape the ranked path
+        // actually fires at that kL. Live `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
     /// Untimed. Throwaway FA caches only. Token-neutral: dummy K/V never
-    /// enter a scored forward. Compiles later-window `MLXFast` SDPA so the
-    /// first decode step past the 512-row seed does not first-touch those
-    /// pipeline variants inside the scored window.
+    /// enter a scored forward. Completes the promoted later-window compile
+    /// (`59b321e`, qL=1/5/4 only) so remaining later-window qL and the
+    /// exactness-chunk sliced-stride pipelines do not first-touch inside
+    /// the scored window.
     private static func warmTargetLaterWindowSDPA(_ cache: [KVCache]) {
         var extended: [MLXArray] = []
         var firstKV: (MLXArray, MLXArray)?
@@ -494,13 +494,45 @@ public final class Qwen36MTPBlockSession {
         let qHeads = extK.dim(1) * 6
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
+        let kL = extK.dim(2)
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // Contiguous fused-vector set. Promoted helper compiled 1/5/4
+        // (serial, chunk-A, chunk-B of width 9). Ranked rounds also
+        // dispatch qL=2 and qL=3 as unsplit verify widths 2 and 3, and as
+        // chunk-B of widths 7 and 8.
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
                 MLXFast.scaledDotProductAttention(
                     queries: q,
+                    keys: extK,
+                    values: extV,
+                    scale: scale,
+                    mask: .causal
+                )
+            )
+        }
+        // Exactness-chunk call pattern: attentionWithCacheUpdate splits
+        // qL=6..9 at row 5 with kSplit = kL-(qL-5). Contiguous dummy
+        // qL=5/4 does not compile those sliced-stride pipelines.
+        for qL in 6 ... 9 {
+            let q = MLXArray.zeros(
+                [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
+            let split = 5
+            let kSplit = kL - (qL - split)
+            outs.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: q[0..., 0..., 0 ..< split, 0...],
+                    keys: extK[0..., 0..., 0 ..< kSplit, 0...],
+                    values: extV[0..., 0..., 0 ..< kSplit, 0...],
+                    scale: scale,
+                    mask: .causal
+                )
+            )
+            outs.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: q[0..., 0..., split..., 0...],
                     keys: extK,
                     values: extV,
                     scale: scale,
