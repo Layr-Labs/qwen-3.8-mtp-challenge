@@ -2373,19 +2373,32 @@ private let qwen35DraftSelectKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses 32 rows; the
-// incumbent affine-4 compact readout evaluates those rows, and this single
-// SIMDgroup applies the incumbent value/id total order to select the proposal.
-// The target lm_head, verify values, cache state, and row ledger are untouched.
+// PROPOSAL SIDE ONLY. A coarse affine-2 compact readout chooses
+// `draftRerankCandidateCount` rows; the incumbent affine-4 compact readout
+// evaluates those rows, and this kernel applies the incumbent value/id total
+// order to select the proposal. The shortlist width is baked into the grid as
+// one thread per candidate; 128 candidates span 4 SIMD groups, so the reduce
+// is two-level: SIMD-shuffle within each group, then SIMD group 0 reduces the
+// group winners from threadgroup scratch. Lanes holding no group winner are
+// seeded with NaN / 0xFFFFFFFF, which `qwen_draft_rerank_better` never lets
+// win. The target lm_head, verify values, cache state, and row ledger are
+// untouched.
 private let qwen35DraftRerankKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_rerank",
     inputNames: ["logits", "candidate_ids"],
     outputNames: ["token_id"],
     source: """
-        uint lane = thread_index_in_simdgroup;
-        float best_value = float(logits[lane]);
-        uint best_id = uint(candidate_ids[lane]);
+        constexpr uint SIMD_SIZE       = 32;
+        constexpr uint THREADGROUP_SIZE = \(qwen35Top32K);
 
+        uint tid  = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg   = simdgroup_index_in_threadgroup;
+
+        float best_value = float(logits[tid]);
+        uint best_id = uint(candidate_ids[tid]);
+
+        // Level 1: reduce within each SIMD group.
         for (uint offset = 16; offset > 0; offset >>= 1) {
             float other_value = simd_shuffle_down(best_value, offset);
             uint other_id = simd_shuffle_down(best_id, offset);
@@ -2396,11 +2409,39 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
             }
         }
 
+        // Publish one winner per SIMD group, then reduce those in group 0.
+        constexpr uint NSIMD = THREADGROUP_SIZE / SIMD_SIZE;
+        threadgroup float tg_value[NSIMD];
+        threadgroup uint tg_id[NSIMD];
         if (lane == 0) {
-            token_id[0] = int(
-                best_id < PREFIX_COUNT
-                    ? best_id
-                    : best_id + CONTROL_OFFSET);
+            tg_value[sg] = best_value;
+            tg_id[sg] = best_id;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            if (lane < NSIMD) {
+                best_value = tg_value[lane];
+                best_id = tg_id[lane];
+            } else {
+                best_value = NAN;
+                best_id = 0xFFFFFFFFu;
+            }
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (lane < offset && qwen_draft_rerank_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
         }
     """,
     header: """
@@ -2422,9 +2463,9 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
 )
 
 // ---------------------------------------------------------------------------
-// PROPOSAL-SIDE TOP-32 SHORTLIST
+// PROPOSAL-SIDE TOP-K SHORTLIST
 //
-// Replaces `MLX.argPartition(coarse, kth: 98_298, axis: -1)[98_298...]`.
+// Replaces `MLX.argPartition(coarse, kth: 98_202, axis: -1)[98_202...]` (K=128).
 //
 // `ArgPartition::eval_gpu` in this vendored MLX is a stub -- its own comment
 // reads "We direct arg partition to sort for now" -- so it calls
@@ -2432,15 +2473,15 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
 // resolves to `multi_block_sort` (bn=512, tn=4, n_blocks=49): one block sort
 // + six merge levels x two kernels + one output copy = 14 dependent
 // dispatches and five device temporaries, to FULLY ARGSORT 98,330 elements
-// from which exactly 32 are ever read. This pair answers the same question
+// from which exactly K are ever read. This pair answers the same question
 // in two dispatches.
 //
 // EXACTNESS. MLX's merge sort is STABLE ASCENDING under `LessThan<T>`:
 // ThreadSort swaps only on strict less, merge_step takes from B only on
 // strict less, merge_partition advances into A on ties, and block_sort seeds
 // ascending global indices with an `idx < size_sorted_axis` write guard so
-// the padding slots never reach the output. Its tail-32 is therefore the
-// unique 32-element set maximal under (value asc, index asc) -- ties broken
+// the padding slots never reach the output. Its tail-K is therefore the
+// unique K-element set maximal under (value asc, index asc) -- ties broken
 // toward the HIGHER index, NaN ranking ABOVE every number because LessThan
 // returns (!an) & bn. `qwen_top32_ordinal` is a monotone map from float into
 // uint32 inducing exactly that order, including both corners: -0.0 folds
@@ -2451,12 +2492,12 @@ private let qwen35DraftRerankKernel = MLXFast.metalKernel(
 // removed `[0 ..< 98_330]` pre-slice did, so the six duplicated padding rows
 // stay unreachable even on a tie.
 //
-// Downstream, `qwen35DraftRerankKernel` reduces the 32 candidates under a
+// Downstream, `qwen35DraftRerankKernel` reduces the K candidates under a
 // strict total order on (value, id), which is order-independent -- so set
 // identity would suffice. Element-wise identity is a strictly stronger
 // property and makes the offline gate a plain array equality.
 private let qwen35Top32RealCount    = 98_330
-private let qwen35Top32K            = 32
+private let qwen35Top32K            = 128
 private let qwen35Top32TG           = 256
 private let qwen35Top32Tiles        = 64
 private let qwen35Top32Stride       = qwen35Top32Tiles * qwen35Top32TG
@@ -2474,8 +2515,8 @@ private let qwen35Top32Header = """
     }
     """
 
-// Stage 1: 64 threadgroups partition [0, REAL_COUNT); each emits its top 32
-// as (ordinal, index) pairs. 64 * 32 = 2,048 candidates.
+// Stage 1: 64 threadgroups partition [0, REAL_COUNT); each emits its top K
+// as (ordinal, index) pairs. 64 * K candidates.
 private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_top32_partial",
     inputNames: ["logits"],
@@ -2566,7 +2607,7 @@ private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// Stage 2: one threadgroup reduces the 2,048 candidates to the final 32,
+// Stage 2: one threadgroup reduces the 64 * K candidates to the final K,
 // written ASCENDING so the result is element-wise identical to
 // `argPartition(...)[kth...]`.
 private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
@@ -2653,11 +2694,11 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
 
-/// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
+/// Exact top-K of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
 private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
     // Mirrors the kernel static_asserts; see the bitmask note there.
     precondition(qwen35Top32PerThread <= 32 && qwen35Top32FinPerThread <= 32,
-                 "top-32 slot count exceeds the 32-bit selection bitmask")
+                 "top-K slot count exceeds the 32-bit selection bitmask")
     let partial = qwen35DraftTop32PartialKernel(
         [row],
         grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
@@ -2678,7 +2719,7 @@ private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
 /// the two selection kernels against `MLX.argPartition` on synthetic bf16 rows
 /// of the live width. Returns (checked, mismatches, firstBadTrial).
 /// Never called on a scored path.
-/// Isolated micro-benchmark: times the two-dispatch top-32 against
+/// Isolated micro-benchmark: times the two-dispatch top-K against
 /// `MLX.argPartition` on a real-width bf16 row. Never called on a scored path.
 public func qwen35BenchDraftTop32(iters: Int = 200) -> (Double, Double, Int, Int) {
     MLXRandom.seed(3)
@@ -2759,7 +2800,16 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    // Proposal-side rerank shortlist width. The coarse affine-2 readout picks
+    // these rows, then the incumbent affine-4 compact readout reranks them.
+    // 32 was the original design point; 128 is the widest the top-K kernels
+    // support under their 32-bit selection bitmasks (PER_THREAD <= 32 and
+    // PB <= 32, both exactly saturated at K=128 with TG=256, tiles=64). A
+    // wider shortlist strictly raises the proposal ceiling: if the target's
+    // argmax sits outside the coarse top-K, the head cannot propose it and
+    // the round must fail. The coarse readout cost is unchanged by K; the
+    // exact rerank grows from 32 to 128 rows of a 328 KB projection.
+    private static let draftRerankCandidateCount = 128
 
     /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
     /// AND `args.mtpNumHiddenLayers > 0`.
