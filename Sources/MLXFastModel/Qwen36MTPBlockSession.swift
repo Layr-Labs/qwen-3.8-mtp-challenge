@@ -447,7 +447,9 @@ public final class Qwen36MTPBlockSession {
         // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
         // forward) and dispatch the three fused-vector shapes the ranked
         // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // exactness-chunk pair qL=5 / qL=4. This slot also compiles the
+        // N=1025 / blocks=128 function-constant twin (crown 59b321e
+        // compiled N=1024 / blocks=64 only). Live `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
@@ -509,6 +511,39 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
+
+        // 128-block 2-pass. `sdpa_vector.h` binds `blocks` as function
+        // constant 26; `scaled_dot_product_attention.cpp` puts it in the
+        // kernel hash. On arch-suffix `s` (ranked M5 Max), N=1024 keeps
+        // blocks=64 and N>1024 with n_simds>4 rehashes to 128. Official
+        // last verifies write past 1024 (512 seed + 512 window plus the
+        // in-flight draft rows before trim). Crown 59b321e padded to 1024
+        // only. One extra dummy row, same qL list, no 64-layer forward.
+        // Distinct from rejected b4be5efa (qL=2/3 at N=1024) and from
+        // rejected #674 (real 510+256 head KV walk).
+        guard extK.dim(2) == 1024 else { return }
+        let kPad1 = MLXArray.zeros(
+            [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
+        let vPad1 = MLXArray.zeros(
+            [extV.dim(0), extV.dim(1), 1, extV.dim(3)], dtype: extV.dtype)
+        let extK128 = concatenated([extK, kPad1], axis: 2)
+        let extV128 = concatenated([extV, vPad1], axis: 2)
+        eval(extK128, extV128)
+        var outs128: [MLXArray] = []
+        for qL in [1, 5, 4] {
+            let q = MLXArray.zeros(
+                [extK128.dim(0), qHeads, qL, headDim], dtype: extK128.dtype)
+            outs128.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: q,
+                    keys: extK128,
+                    values: extV128,
+                    scale: scale,
+                    mask: .causal
+                )
+            )
+        }
+        eval(outs128)
     }
 
     // MARK: - begin
