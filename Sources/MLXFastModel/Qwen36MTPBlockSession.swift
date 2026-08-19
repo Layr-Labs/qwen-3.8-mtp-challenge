@@ -1553,17 +1553,35 @@ public final class Qwen36MTPBlockSession {
                 state.count = 2;
             }
         }
+
+        inline qwen_top2_state qwen_top2_simd_reduce(qwen_top2_state val) {
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float o_fv = simd_shuffle_down(val.first_value, offset);
+                float o_sv = simd_shuffle_down(val.second_value, offset);
+                uint  o_fi = simd_shuffle_down(val.first_id, offset);
+                uint  o_si = simd_shuffle_down(val.second_id, offset);
+                uint  o_c  = simd_shuffle_down(val.count, offset);
+                if (o_c > 0) {
+                    qwen_top2_insert(val, o_fv, o_fi);
+                }
+                if (o_c > 1) {
+                    qwen_top2_insert(val, o_sv, o_si);
+                }
+            }
+            return val;
+        }
     """
 
     /// Stage one: 32 threadgroups per row each reduce a disjoint vocabulary
-    /// stripe. This exposes enough work to occupy the GPU instead of making two
-    /// threadgroups serially scan almost a thousand logits per lane.
+    /// stripe using SIMD-shuffle first level reductions.
     private static let linearTopTwoPartialKernel = MLXFast.metalKernel(
         name: "qwen_mtp_linear_top2_partial",
         inputNames: ["logits"],
         outputNames: ["partial_ids", "partial_values"],
         source: """
             uint lane = thread_position_in_threadgroup.x;
+            uint simd_lane = thread_index_in_simdgroup;
+            uint simd_group = simdgroup_index_in_threadgroup;
             uint group_index = threadgroup_position_in_grid.x;
             uint row = group_index / 32;
             uint group = group_index % 32;
@@ -1578,31 +1596,25 @@ public final class Qwen36MTPBlockSession {
                 qwen_top2_insert(local, float(logits[offset]), index);
             }
 
-            threadgroup qwen_top2_state scratch[256];
-            scratch[lane] = local;
+            // SIMD-shuffle level 1: reduce 32 lanes to 1 inside each SIMD group
+            local = qwen_top2_simd_reduce(local);
+
+            threadgroup qwen_top2_state scratch[8];
+            if (simd_lane == 0) {
+                scratch[simd_group] = local;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint stride = 128; stride > 0; stride >>= 1) {
-                if (lane < stride) {
-                    qwen_top2_state merged = scratch[lane];
-                    qwen_top2_state other = scratch[lane + stride];
-                    if (other.count > 0) {
-                        qwen_top2_insert(merged, other.first_value, other.first_id);
-                    }
-                    if (other.count > 1) {
-                        qwen_top2_insert(merged, other.second_value, other.second_id);
-                    }
-                    scratch[lane] = merged;
+            if (simd_group == 0) {
+                qwen_top2_state s_val = (simd_lane < 8) ? scratch[simd_lane] : qwen_top2_empty();
+                s_val = qwen_top2_simd_reduce(s_val);
+                if (simd_lane == 0) {
+                    uint base = (row * 32 + group) * 2;
+                    partial_ids[base] = int(s_val.first_id);
+                    partial_ids[base + 1] = int(s_val.second_id);
+                    partial_values[base] = s_val.first_value;
+                    partial_values[base + 1] = s_val.second_value;
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            if (lane == 0) {
-                uint base = (row * 32 + group) * 2;
-                partial_ids[base] = int(scratch[0].first_id);
-                partial_ids[base + 1] = int(scratch[0].second_id);
-                partial_values[base] = scratch[0].first_value;
-                partial_values[base + 1] = scratch[0].second_value;
             }
         """,
         header: linearTopTwoHeader,
@@ -1623,27 +1635,14 @@ public final class Qwen36MTPBlockSession {
             qwen_top2_insert(
                 local, partial_values[base + 1], uint(partial_ids[base + 1]));
 
-            threadgroup qwen_top2_state scratch[32];
-            scratch[lane] = local;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            for (uint stride = 16; stride > 0; stride >>= 1) {
-                if (lane < stride) {
-                    qwen_top2_state merged = scratch[lane];
-                    qwen_top2_state other = scratch[lane + stride];
-                    qwen_top2_insert(merged, other.first_value, other.first_id);
-                    qwen_top2_insert(merged, other.second_value, other.second_id);
-                    scratch[lane] = merged;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
+            local = qwen_top2_simd_reduce(local);
 
             if (lane == 0) {
                 uint output_base = row * 2;
-                top_ids[output_base] = int(scratch[0].first_id);
-                top_ids[output_base + 1] = int(scratch[0].second_id);
-                top_values[output_base] = scratch[0].first_value;
-                top_values[output_base + 1] = scratch[0].second_value;
+                top_ids[output_base] = int(local.first_id);
+                top_ids[output_base + 1] = int(local.second_id);
+                top_values[output_base] = local.first_value;
+                top_values[output_base + 1] = local.second_value;
             }
         """,
         header: linearTopTwoHeader,
