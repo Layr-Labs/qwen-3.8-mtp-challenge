@@ -151,7 +151,9 @@ public final class Qwen36MTPBlockSession {
     /// token at t+1). Flushed as leading rows of the next draft forward.
     private var headHistoryBacklogHidden: [MLXArray] = []
     private var headHistoryBacklogTokens: [Int] = []
-    /// Seed rows retained for lazy priming; released at the first flush.
+    /// Post-norm seed rows 0..L-2 retained for lazy priming; released at the
+    /// first flush. Stored already-normed so the first draft does not repeat
+    /// the 511-row `applyFinalNorm` the untimed warm already compiled.
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
 
@@ -467,16 +469,29 @@ public final class Qwen36MTPBlockSession {
         _ = seedLogits
         pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
         let lastLogits = model.applyLMHead(pendingHidden!)
-        // Retain the full pre-norm seed hidden for lazy head-history priming.
-        // ~5 MB at 512x5120 bf16; released at the first drafting round. The
-        // eval below materialises it so no seed graph is kept alive.
-        seedHiddenForPriming = hidden
+        // Retain POST-norm seed rows 0..L-2 for lazy head-history priming.
+        // RMSNorm is row-local, so this equals applyFinalNorm(pre-norm[0..<L-1])
+        // bit-for-bit. The untimed seed-prefill warm already evals that 511-row
+        // norm; live begin previously eval'd pre-norm 512 and the first draft
+        // re-ran the 511-row norm inside the scored window. Aligning begin
+        // with the warm moves the only remaining first-touch of that graph
+        // out of the first drafting round.
         seedTokensForPriming = seedTokens
+        if seedTokens.count > 1 {
+            seedHiddenForPriming = model.applyFinalNorm(
+                hidden[0..., 0 ..< (seedTokens.count - 1), 0...])
+        } else {
+            seedHiddenForPriming = nil
+        }
         // One batched readout: the first primary and its tail-row top-2
-        // evidence come out of the same eval as the cache roots.
+        // evidence come out of the same eval as the cache roots and the
+        // already-normed prime block.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
-        eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+        var beginBundle: [MLXArray] = [tailIDs, tailValues, pendingHidden!]
+        if let primed = seedHiddenForPriming {
+            beginBundle.append(primed)
+        }
+        eval(cache.flatMap { $0.state } + beginBundle)
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
@@ -939,9 +954,8 @@ public final class Qwen36MTPBlockSession {
             {
                 // MTPLX priming layout: seed hidden rows 0..L-2 pair with seed
                 // tokens 1..L-1 (hidden at t predicts alongside token t+1).
-                let primeCount = seedTokensForPriming.count - 1
-                flushHidden.append(
-                    model.applyFinalNorm(seedHidden[0..., 0 ..< primeCount, 0...]))
+                // `seedHidden` is already post-norm from `begin`.
+                flushHidden.append(seedHidden)
                 flushTokens.append(contentsOf: seedTokensForPriming[1...])
             }
             seedHiddenForPriming = nil
