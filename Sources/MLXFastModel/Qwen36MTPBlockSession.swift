@@ -411,6 +411,42 @@ public final class Qwen36MTPBlockSession {
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
 
+        // Later-window proposal SDPA 2-pass compile (untimed, HOST KV-only).
+        //
+        // The 512-row + 2-row head warm above leaves historyWarmCache at
+        // N≈514. Scored first-round flush is the same family. Decode then
+        // grows the head KV toward seed+window ≈ 1023–1024. On M-series
+        // devices whose Metal arch ends in 's' or 'd' (the ranked M5 Max),
+        // MLX switches vector SDPA to `sdpa_vector_2pass` at kL >= 1024
+        // (scaled_dot_product_attention.cpp). That is a different kernel
+        // specialization — and on 's' the N>1024 / n_simds>4 path further
+        // rehashes at 128 blocks. Leaving either compile inside the last
+        // scored rounds is the same stall class the 512-prefix target warm
+        // already pulled out of prompt-5 (0.368 s one-off).
+        //
+        // Reuse `mtpHeadLastHiddenWithKVOnlyHistory`: leading rows only
+        // `appendHistoryKV` (K/V + RoPE, no Q/O/MLP). Dummy zeros, results
+        // discarded, cache is throwaway. Token-neutral: nothing here is
+        // observed by generation. 510 rows reach N=1024; the named 256-row
+        // walk then crosses N>1024 so the 128-block 2-pass hash is live
+        // before the clock.
+        func warmHeadLaterWindow(rows: Int) {
+            let laterHidden = MLXArray.zeros([1, rows, hDim], dtype: row.dtype)
+            let laterTokens = MLXArray(
+                Array(repeating: Int32(0), count: rows)).reshaped([1, rows])
+            let later = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: laterHidden, nextTokenIds: laterTokens,
+                cache: historyWarmCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: laterHidden, nextTokenIds: laterTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                later[0..., (later.dim(1) - 1) ..< later.dim(1), 0...]))
+        }
+        warmHeadLaterWindow(rows: 510)
+        warmHeadLaterWindow(rows: 256)
+        eval(historyWarmCache.flatMap { $0.state })
+
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
         // The phase trace measured
