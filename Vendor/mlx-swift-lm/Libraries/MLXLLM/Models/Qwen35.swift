@@ -753,6 +753,33 @@ final class Qwen35GatedDeltaNet: Module {
         return (q, k)
     }
 
+    // Same scale constants folded into a `[headKDim]` RMSNorm weight vector, so
+    // `scaleConst * rmsNorm(x, weight: none)` collapses to a single weighted
+    // `rmsNorm(x, weight: scaleVec)` launch. The stock rms kernel computes the
+    // (weight-independent) inverse RMS identically, then stores
+    // `bfloat(scale) * bfloat(x * invRMS)`; the eager form's separate bf16
+    // multiply rounds the same product the same way, so the bytes are identical
+    // — only the standalone multiply dispatch disappears. Cached like the
+    // scalar constants and never attached as a Module parameter.
+    private var _qScaleWeight: MLXArray?
+    private var _kScaleWeight: MLXArray?
+
+    fileprivate func normScaleWeights(_ dtype: DType) -> (MLXArray, MLXArray) {
+        if dtype == .bfloat16, let q = _qScaleWeight, let k = _kScaleWeight {
+            return (q, k)
+        }
+        let invScale = pow(Float(headKDim), -0.5)
+        let qValue = Float(pow(invScale, 2))
+        let kValue = Float(invScale)
+        let q = MLXArray(Array(repeating: qValue, count: headKDim)).asType(dtype)
+        let k = MLXArray(Array(repeating: kValue, count: headKDim)).asType(dtype)
+        if dtype == .bfloat16 {
+            _qScaleWeight = q
+            _kScaleWeight = k
+        }
+        return (q, k)
+    }
+
     private func processChunk(
         qkv: MLXArray,
         a: MLXArray,
@@ -775,13 +802,9 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let dtype = q.dtype
-        let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-        let qNormed =
-            qScaleConst
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            kScaleConst
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qScaleWeight, kScaleWeight) = normScaleWeights(dtype)
+        let qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight, eps: 1e-6)
+        let kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight, eps: 1e-6)
 
         let (out, newSsmState) = gatedDeltaUpdateMemoG(
             q: qNormed,
@@ -874,13 +897,9 @@ final class Qwen35GatedDeltaNet: Module {
             v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-            qNormed =
-                qScaleConst
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            kNormed =
-                kScaleConst
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let (qScaleWeight, kScaleWeight) = normScaleWeights(dtype)
+            qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight, eps: 1e-6)
+            kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight, eps: 1e-6)
 
             // Keep the recurrence and conv prologue wide. The promoted
             // compiled g/beta launch reduction feeds the same single
@@ -1064,13 +1083,9 @@ final class Qwen35GatedDeltaNet: Module {
             let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
             let dtype = q.dtype
-            let (qScaleConst, kScaleConst) = normScaleConstants(dtype)
-            let qNormed =
-                qScaleConst
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                kScaleConst
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let (qScaleWeight, kScaleWeight) = normScaleWeights(dtype)
+            let qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight, eps: 1e-6)
+            let kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight, eps: 1e-6)
 
             // Replicates gatedDeltaUpdate's fp32 prologue, fusing beta/g while
             // serving the gate's input-independent factor from the layer memo.
