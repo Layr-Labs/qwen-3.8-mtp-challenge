@@ -1880,8 +1880,18 @@ final class Qwen35Attention: Module {
         let hasArrayOffset = cache is CompilableRotatingKVCache
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
+        // No L cap. The kernel is strictly per-row: threadgroup `row` owns
+        // one (batch, head, sequence) tuple, `normalized[256]` is private,
+        // and `position = sequence + offset` is the same scalar the stock
+        // RoPE primitive uses. The previous `L <= 32` gate left the timed
+        // 512-token seed prefill (and any other S>32 full-attention call)
+        // on the four-dispatch stock path — qNorm, kNorm, two RoPEs, plus
+        // the [B,L,H,D]→[B,H,L,D] layout materialization the fused kernel
+        // writes directly. Decode/verify widths (S<=9) already took this
+        // path; extending it to prefill is the same arithmetic on more
+        // independent rows, not a new kernel. Array-offset caches still
+        // skip because the fused source takes a host scalar `offset`.
         if usesFusedQKPreparation,
-           L <= 32,
            !hasArrayOffset,
            queries.dtype == .bfloat16,
            keys.dtype == .bfloat16,
