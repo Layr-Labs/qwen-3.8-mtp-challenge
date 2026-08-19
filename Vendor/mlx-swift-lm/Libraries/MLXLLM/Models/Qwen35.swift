@@ -2168,10 +2168,17 @@ public class Qwen35TextModelInner: Module {
         // start on the early layers while the host is still building the
         // rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
-        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
+        // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step).
+        //
+        // Keep that host-overlap envelope. Do NOT flush at S=3...9: the
+        // median ranked prompts verify at width ~6–7 (draft 4.53 / 4.77),
+        // the GPU is already busy, and the promoted 512 MiB / 50-op
+        // command-buffer profile is supposed to hold a whole layer. The
+        // eight mid-forward asyncEval rungs force those buffers to commit
+        // early and fight the residency win. Prefill (S>=512) keeps its
+        // own ladder.
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = inputs.dim(1) <= 2 || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
