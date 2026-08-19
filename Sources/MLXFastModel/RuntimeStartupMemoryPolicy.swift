@@ -68,10 +68,11 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         let environment = ProcessInfo.processInfo.environment
         guard environment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"] != "0"
         else { return }
-        // Force-set: the ranked worker / parent may already have exported the
-        // stock 50 MiB MLX default. overwrite=0 left that in place and the
-        // 512 MiB post-wire budget never landed. overwrite=1 makes the
-        // promoted Laguna M5-Max command-buffer profile actually apply.
+        // overwrite=1: the stock MLX 50 MiB default (or a parent's export) is
+        // otherwise a silent no-op against cached-once statics — the exact
+        // failure the 3.2493 crown (ofou 0cd0a6b4) fixed. On the ranked
+        // 128 GiB box the 512 MiB post-wire budget is the point; the kill
+        // switch above still disables the install entirely.
         setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
         setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
     }
@@ -142,10 +143,10 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             cacheLimitBytes: 32 << 30,
             // The MLX M5 Max default commits a command buffer after
             // referencing 50 MiB. Many 4-bit projections individually exceed
-            // that, so 320 MiB groups adjacent kernels without long command
-            // buffers; decode's explicit async-eval groups remain the outer
-            // command-buffer boundary, and this referenced-buffer budget
-            // governs within them.
+            // that, so 512 MiB groups a full decode layer into one command
+            // buffer once the tower is wired (the promoted post-wire
+            // configuration; the full-profile scalars match the install so a
+            // later `apply()` cannot fight it back to a smaller budget).
             maxMegabytesPerCommandBuffer: 512,
             maxOperationsPerCommandBuffer: 50,
             clearAllocatorCacheAfterWarmup: false,

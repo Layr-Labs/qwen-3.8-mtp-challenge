@@ -42,8 +42,11 @@ public final class Qwen35RuntimeWeightCache {
         // plus free-buffer clear). That reset pins the boundary state only,
         // not a phase-long cap.
         if config.numHiddenLayers >= 16 {
-            // Do not clobber the 512 MiB Qwen-MTP full-profile budget with the
-            // older 128 MiB serial-path default. Keep the 32 GiB allocator cap.
+            // 512, not 128: the promoted post-wire command-buffer budget. A
+            // smaller clobber here would silently undo the
+            // installQwenMTPFullProfileCommandBufferDefaults install for any
+            // process that constructs this cache after first device access
+            // (the exact failure the 3.2493 crown fixed).
             setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
             Memory.cacheLimit = 32 << 30
         }
