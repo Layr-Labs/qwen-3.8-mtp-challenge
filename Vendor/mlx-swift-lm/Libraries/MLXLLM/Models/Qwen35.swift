@@ -671,23 +671,54 @@ final class Qwen35GatedDeltaNet: Module {
     /// Lazily build and apply the fused [qkv|z|b|a] projection. Returns nil
     /// until every input projection is a matching affine `QuantizedLinear`
     /// (bf16 trees fall back to the four separate calls).
+    /// Split the fused in-projection output `[B, S, keyDim*2 + valueDim*2 +
+    /// numVHeads*2]` into (qkv, z, b, a) exactly as `fusedInProjections`.
+    private func splitFusedInProjection(
+        _ y: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        let qkvEnd = keyDim * 2 + valueDim
+        let zEnd = qkvEnd + valueDim
+        let bEnd = zEnd + numVHeads
+        return (
+            y[.ellipsis, ..<qkvEnd],
+            y[.ellipsis, qkvEnd ..< zEnd],
+            y[.ellipsis, zEnd ..< bEnd],
+            y[.ellipsis, bEnd...]
+        )
+    }
+
+    /// The UNSPLIT fused in-projection output for `x` on the exact decode
+    /// path (the same `quantizedMM` the S <= 9 forward dispatches), or nil
+    /// when the fused weights are not available. Used by the layer-0
+    /// precomputed in-projection table (see `Qwen35TextModelInner`): the
+    /// table rows are produced by THIS function on the token embeddings, so
+    /// a gathered row is bit-identical to what the live forward computes.
+    func fusedInProjectionOutput(_ x: MLXArray) -> MLXArray? {
+        guard ensureFusedInProjectionWeights(), let w = _inW, let s = _inS,
+              let zp = _inZ
+        else { return nil }
+        return quantizedMM(
+            x, w, scales: s, biases: zp, transpose: true,
+            groupSize: _inGS, bits: _inBits, mode: _inMode)
+    }
+
     private func fusedInProjections(
         _ x: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
-        if let w = _inW, let s = _inS, let zp = _inZ {
-            let y = quantizedMM(
-                x, w, scales: s, biases: zp, transpose: true,
-                groupSize: _inGS, bits: _inBits, mode: _inMode)
-            let qkvEnd = keyDim * 2 + valueDim
-            let zEnd = qkvEnd + valueDim
-            let bEnd = zEnd + numVHeads
-            return (
-                y[.ellipsis, ..<qkvEnd],
-                y[.ellipsis, qkvEnd ..< zEnd],
-                y[.ellipsis, zEnd ..< bEnd],
-                y[.ellipsis, bEnd...]
-            )
-        }
+        guard ensureFusedInProjectionWeights(), let w = _inW, let s = _inS,
+              let zp = _inZ
+        else { return nil }
+        let y = quantizedMM(
+            x, w, scales: s, biases: zp, transpose: true,
+            groupSize: _inGS, bits: _inBits, mode: _inMode)
+        return splitFusedInProjection(y)
+    }
+
+    /// Materialise the concatenated in-projection weight/scale/bias triple
+    /// once (input-independent); false when the layer is not affine-quantized
+    /// uniformly and the fused path is unavailable.
+    private func ensureFusedInProjectionWeights() -> Bool {
+        if _inW != nil, _inS != nil, _inZ != nil { return true }
         guard let q = inProjQKV as? QuantizedLinear,
               let z = inProjZ as? QuantizedLinear,
               let b = inProjB as? QuantizedLinear,
@@ -699,7 +730,7 @@ final class Qwen35GatedDeltaNet: Module {
               q.mode == .affine,
               let qz = q.biases, let zz = z.biases, let bz = b.biases,
               let az = a.biases
-        else { return nil }
+        else { return false }
         _inW = concatenated([q.weight, z.weight, b.weight, a.weight], axis: 0)
             .contiguous()
         _inS = concatenated([q.scales, z.scales, b.scales, a.scales], axis: 0)
@@ -708,7 +739,7 @@ final class Qwen35GatedDeltaNet: Module {
         _inGS = q.groupSize
         _inBits = q.bits
         _inMode = q.mode
-        return fusedInProjections(x)
+        return true
     }
 
     // MARK: - _processChunk (MTP helper)
@@ -989,7 +1020,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        precomputedInProj: MLXArray? = nil
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
@@ -1000,7 +1032,18 @@ final class Qwen35GatedDeltaNet: Module {
         let z: MLXArray
         let b: MLXArray
         let a: MLXArray
-        if S <= 9, let fused = fusedInProjections(inputs) {
+        if S <= 9, let precomputed = precomputedInProj {
+            // Layer-0 precomputed in-projection: `precomputed` IS the fused
+            // `quantizedMM` output for these rows (built from the same
+            // weights, same kernel family, at load), so the split below is
+            // the only work left. `inputs` (the normed embedding) is dead
+            // and never evaluated.
+            let fused = splitFusedInProjection(precomputed)
+            qkv = fused.0
+            z = fused.1.reshaped(B, S, numVHeads, headVDim)
+            b = fused.2
+            a = fused.3
+        } else if S <= 9, let fused = fusedInProjections(inputs) {
             qkv = fused.0
             z = fused.1.reshaped(B, S, numVHeads, headVDim)
             b = fused.2
@@ -2078,7 +2121,8 @@ final class Qwen35DecoderLayer: Module {
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        precomputedInProj: MLXArray? = nil
     ) -> (base: MLXArray, delta: MLXArray) {
         let hIn: MLXArray
         let normedIn: MLXArray
@@ -2095,7 +2139,8 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 normedIn, mask: ssmMask, cache: cache as? MambaCache,
-                nConfirmed: nConfirmed)
+                nConfirmed: nConfirmed,
+                precomputedInProj: precomputedInProj)
         } else {
             r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
         }
@@ -2136,6 +2181,109 @@ public class Qwen35TextModelInner: Module {
         self.faIdx = args.fullAttentionInterval - 1
 
         super.init()
+    }
+
+    // MARK: - layer-0 precomputed in-projection table
+    //
+    // Layer 0 is a gated-delta (linear-attention) layer whose in-projection
+    // input is `input_layernorm(embed(token))` — a function of the token id
+    // ALONE (no mixing happens before it). Its fused in-projection
+    // (`in_proj_qkv|z|b|a`, 5120 -> 16480) is therefore a table indexed by
+    // token id: built once at load from the model's own weights with the
+    // SAME `quantizedMM` the decode forward dispatches (widths <= 9), so a
+    // gathered row is bit-identical to the live computation, and the
+    // decode-path forward replaces one 42 MB weight stream + RMSNorm + qmv
+    // per verify row with one 33 KB row gather. Input-independent
+    // (weights -> table, keyed on token id like the embedding table itself);
+    // never used at prefill widths (> 9), which keep the qmm dispatch they
+    // always had.
+    //
+    // `layer0TableRemap[id]` is the table row for token `id` or -1 when the
+    // table does not cover it (partial tables on small machines): rows for
+    // uncovered ids fall back to the ordinary computation, selected per row.
+    // A full-vocabulary table (the >= 96 GiB ranked profile) has no fallback
+    // and no per-row select.
+    var layer0Table: MLXArray?
+    var layer0TableRemap: MLXArray?
+    var layer0TableCoversAll = false
+
+    /// Layer-0 fused in-projection rows for `tokens` ([B, S] int) on the
+    /// decode path, or nil when no table is installed.
+    private func layer0PrecomputedInProj(
+        tokens: MLXArray, hiddenStates: MLXArray
+    ) -> MLXArray? {
+        guard let table = layer0Table, tokens.dim(1) <= 9,
+              layers.first?.isLinear == true
+        else { return nil }
+        let B = tokens.dim(0)
+        let S = tokens.dim(1)
+        let flat = tokens.reshaped([B * S])
+        if layer0TableCoversAll {
+            return MLX.take(table, flat, axis: 0).reshaped([B, S, table.dim(1)])
+        }
+        guard let remap = layer0TableRemap else { return nil }
+        let rows = MLX.take(remap, flat, axis: 0)
+        let gathered = MLX.take(table, MLX.maximum(rows, 0), axis: 0)
+            .reshaped([B, S, table.dim(1)])
+        // Partial table: rows the table does not cover take the ordinary
+        // computation (exact by construction); covered rows take the table.
+        guard let layer0 = layers.first?.linearAttn,
+              let computed = layer0.fusedInProjectionOutput(
+                layers[0].inputLayerNorm(hiddenStates))
+        else { return nil }
+        let covered = (rows .>= 0).reshaped([B, S, 1])
+        return MLX.where(covered, gathered, computed)
+    }
+
+    /// Build the layer-0 in-projection table for token ids `0 ..< rows`
+    /// (rows == vocabulary size for a full table). Runs the exact decode
+    /// path — `input_layernorm(embed(ids))` then the fused `quantizedMM` — in
+    /// batches of `batch` rows (<= 9, the decode qmv dispatch family), so
+    /// every table row is produced by the kernels the live forward uses.
+    /// Returns false (installing nothing) when the fused path is unavailable.
+    @discardableResult
+    func prepareLayer0InProjTable(rows: Int, batch: Int = 8) -> Bool {
+        guard rows > 0, batch >= 1, batch <= 9,
+              let layer0 = layers.first, layer0.isLinear,
+              let gdn = layer0.linearAttn
+        else { return false }
+        let vocab = embedTokens.weight.dim(0)
+        let rowCount = min(rows, vocab)
+        // Probe the fused path once (also materialises the fused weights).
+        let probeIds = MLXArray([Int32(0)]).reshaped([1, 1])
+        guard let probe = gdn.fusedInProjectionOutput(
+            layer0.inputLayerNorm(embedTokens(probeIds)))
+        else { return false }
+        let width = probe.dim(-1)
+        let table = MLXArray.zeros([rowCount, width], dtype: probe.dtype)
+        var start = 0
+        var pending = 0
+        while start < rowCount {
+            let end = min(start + batch, rowCount)
+            let ids = MLXArray((Int32(start) ..< Int32(end)).map { $0 })
+                .reshaped([1, end - start])
+            let normed = layer0.inputLayerNorm(embedTokens(ids))
+            guard let y = gdn.fusedInProjectionOutput(normed) else { return false }
+            table[start ..< end, 0...] = y.reshaped([end - start, width])
+            pending += 1
+            if pending >= 32 {
+                eval(table)
+                pending = 0
+            }
+            start = end
+        }
+        eval(table)
+        layer0Table = table
+        if rowCount == vocab {
+            layer0TableCoversAll = true
+            layer0TableRemap = nil
+        } else {
+            layer0TableCoversAll = false
+            var remap = [Int32](repeating: -1, count: vocab)
+            for i in 0 ..< rowCount { remap[i] = Int32(i) }
+            layer0TableRemap = MLXArray(remap)
+        }
+        return true
     }
 
     /// Returns the pre-norm hidden state from the final layer.
@@ -2181,6 +2329,8 @@ public class Qwen35TextModelInner: Module {
             // frontier, same overlap, no arithmetic change.
             var base = hiddenStates
             var delta: MLXArray? = nil
+            let layer0InProj = layer0PrecomputedInProj(
+                tokens: inputs, hiddenStates: hiddenStates)
             for (i, layer) in layers.enumerated() {
                 let mask = layer.isLinear ? ssmMask : nil
                 let attnMask =
@@ -2189,7 +2339,8 @@ public class Qwen35TextModelInner: Module {
                 let out = layer.boundaryFused(
                     base: base, delta: delta,
                     attentionMask: attnMask, ssmMask: mask,
-                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                    cache: cacheArray?[i], nConfirmed: nConfirmed,
+                    precomputedInProj: i == 0 ? layer0InProj : nil)
                 base = out.base
                 delta = out.delta
                 if ladderActive {
@@ -3262,6 +3413,64 @@ extension Qwen35TextModel: MTPCapable {
         guard let mtp else { return [] }
         return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
     }
+
+    /// Build (or skip) the layer-0 precomputed in-projection table. Policy:
+    /// `MLX_QWEN_L0_TABLE=off` disables; `MLX_QWEN_L0_TABLE=rows:<N>` builds
+    /// a partial table over ids `0 ..< N` (exact fallback for the rest —
+    /// small-machine testing); otherwise a FULL-vocabulary table (8.2 GB) is
+    /// built only when the machine has >= 96 GiB of unified memory (the
+    /// ranked profile) and skipped elsewhere. Runs untimed (warm/init).
+    /// Returns the number of rows installed (0 = not installed).
+    @discardableResult
+    public func prepareLayer0InProjTable() -> Int {
+        let env = ProcessInfo.processInfo.environment["MLX_QWEN_L0_TABLE"] ?? ""
+        if env == "off" { return 0 }
+        let vocab = model.embedTokens.weight.dim(0)
+        var rows = 0
+        if env.hasPrefix("rows:"), let n = Int(env.dropFirst(5)) {
+            rows = max(0, min(n, vocab))
+        } else if env == "full"
+            || ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
+        {
+            rows = vocab
+        }
+        guard rows > 0 else { return 0 }
+        guard model.prepareLayer0InProjTable(rows: rows) else { return 0 }
+        if ProcessInfo.processInfo.environment["MLX_QWEN_L0_TABLE_VERIFY"] == "1" {
+            verifyLayer0InProjTable(rows: rows)
+        }
+        return rows
+    }
+
+    /// Local diagnostic: compare table rows against the live decode-path
+    /// computation at every verify width 1...9 for a spread of token ids and
+    /// report to stderr. Exact equality is the bar (same kernels, same
+    /// arithmetic); anything else is a bug in the table, not a tolerance.
+    func verifyLayer0InProjTable(rows: Int) {
+        guard let table = model.layer0Table, let layer0 = model.layers.first,
+              let gdn = layer0.linearAttn
+        else { return }
+        var mismatches = 0
+        var checked = 0
+        for width in 1 ... 9 {
+            // Ids spread over the table, different phase per width.
+            let ids = (0 ..< width).map { j -> Int32 in
+                let stride = max(1, rows / 97)
+                return Int32((j * stride * 7 + width * 131 + 3) % rows)
+            }
+            let idsArray = MLXArray(ids).reshaped([1, width])
+            guard let live = gdn.fusedInProjectionOutput(
+                layer0.inputLayerNorm(model.embedTokens(idsArray)))
+            else { return }
+            let gathered = MLX.take(table, MLXArray(ids), axis: 0)
+                .reshaped([1, width, table.dim(1)])
+            let equal = MLX.arrayEqual(live, gathered).item(Bool.self)
+            checked += 1
+            if !equal { mismatches += 1 }
+        }
+        FileHandle.standardError.write(Data(
+            "mlxfast: layer0-table verify widths=1..9 checked=\(checked) mismatches=\(mismatches) rows=\(rows)\n".utf8))
+    }
 }
 
 extension Qwen35TextModel: LoRAModel {
@@ -3408,5 +3617,10 @@ extension Qwen35Model: MTPCapable {
 
     public func makeMTPCache() -> [any KVCache] {
         languageModel.makeMTPCache()
+    }
+
+    @discardableResult
+    public func prepareLayer0InProjTable() -> Int {
+        languageModel.prepareLayer0InProjTable()
     }
 }

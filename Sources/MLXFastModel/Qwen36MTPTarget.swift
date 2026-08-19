@@ -107,6 +107,12 @@ public protocol Qwen36MTPTarget: AnyObject {
     /// Fresh KV caches for the MTP head layers, one per draft round.
     func makeMTPCache() -> [any KVCache]
 
+    /// Build the layer-0 precomputed in-projection table (input-independent,
+    /// weights -> table keyed on token id) if the runtime policy allows it.
+    /// Untimed: called from the session's warm. Returns rows installed.
+    @discardableResult
+    func prepareLayer0InProjTable() -> Int
+
     /// INVARIANT #2. The backbone's final `model.norm`, applied to a hidden row.
     /// The MTP head's `pre_fc_norm_hidden` weights were trained on POST-norm
     /// input -- the vendored `MTPCapable.mtpForward` documentation says so

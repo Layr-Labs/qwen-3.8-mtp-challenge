@@ -278,12 +278,28 @@ public final class Qwen36MTPBlockSession {
         FileHandle.standardError.write(Data(line.utf8))
     }
 
+    nonisolated(unsafe) private static var layer0TablePrepared = false
+
     /// Input-independent shape warm, run OUTSIDE every scored window.
     ///
     /// Warms the two forward shapes a round dispatches — the batched verify at
     /// every legal width `1 ... maxDepth + 1`, and the head's single-token draft
     /// step — on throwaway cache state. Nothing here sees a seed.
     public func warmAllDepths(maxDepth: Int) throws {
+        // Layer-0 precomputed in-projection table: built from the model's own
+        // weights, keyed on token id, outside every scored window (this warm
+        // runs before the protocol serves). Idempotent; a no-op when the
+        // runtime policy declines (small machines, MLX_QWEN_L0_TABLE=off).
+        // Built BEFORE the shape warm and the residency wiring so the table
+        // is part of the live footprint the wired set is sized to.
+        if !Self.layer0TablePrepared {
+            Self.layer0TablePrepared = true
+            let rows = model.prepareLayer0InProjTable()
+            if rows > 0 {
+                FileHandle.standardError.write(Data(
+                    "mlxfast: layer0-table installed rows=\(rows)\n".utf8))
+            }
+        }
         // Keep the large shape-warm object graph in a separate call frame so
         // every throwaway cache and tensor is released before residency sizing.
         try warmAllDepthShapes(maxDepth: maxDepth)
