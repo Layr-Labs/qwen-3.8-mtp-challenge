@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:morgan/qwen38-27b-mtp-dev40-cut12-q4-g64-q2-rerank@c4fbd02963d4f6e6b9f44c40998d4846ffe90021",
+  "sha256": "1f207eb91faff87e8dcdc0175ebfff0b5b15b2fb0477e8e8ea143ac70e8b9335",
+  "bytes": 427742696,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "The selected Dev40 cut-12k proposal head uses the promoted 40-tensor Q4/group-64 ABI. Its affine-2 draft readout triple and Q/K/V precision-island index arrays are byte-exact copies of the incumbent; island values are exact gathers from the selected BF16 weights. Candidate code still uses the readout only for a 32-token shortlist, then exactly reranks those rows with the affine-4 compact target lm_head. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The public artifact is pinned to an immutable revision and the runner's single-file model.safetensors tree digest; no remote code is executed."
 }
