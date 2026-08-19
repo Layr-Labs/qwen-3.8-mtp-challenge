@@ -928,6 +928,7 @@ public final class Qwen36MTPBlockSession {
         let headCache: [any KVCache]
         var flushHidden: [MLXArray] = []
         var flushTokens: [Int] = []
+        flushTokens.reserveCapacity(headHistoryBacklogTokens.count + 1)
         if let existing = headHistoryCache {
             headCache = existing
         } else {
