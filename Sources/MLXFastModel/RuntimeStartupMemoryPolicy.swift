@@ -56,9 +56,12 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     /// The 512 MiB referenced-byte budget is the independently promoted
     /// post-residency setting from the Laguna M5-Max track. It admits a whole
     /// model layer per command buffer after the persistent weights have been
-    /// wired, while the stock 50-operation cap remains the outer safety wall.
-    /// Explicit user values win and a benchmark-forwarded kill switch supports
-    /// same-binary controls.
+    /// wired. The M5 Max hardware default is 50 ops / 50 MiB (1:1). ofou
+    /// scaled the byte cap 10.24x to 512 MiB and left ops at 50, so the
+    /// 50-op splitter still chops an 8-10 layer asyncEval segment. Matching
+    /// the ratio at the new byte budget (512 ops / 512 MiB) lets the byte
+    /// cap stay the memory safety wall. Explicit user values win and a
+    /// benchmark-forwarded kill switch supports same-binary controls.
     private static func installQwenMTPFullProfileCommandBufferDefaults(
         physicalMemoryBytes: UInt64,
         requestedProfile: String?
@@ -73,7 +76,7 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         // 512 MiB post-wire budget never landed. overwrite=1 makes the
         // promoted Laguna M5-Max command-buffer profile actually apply.
         setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
     }
 
     public static func resolve(
@@ -141,13 +144,13 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // and model weights stay active allocations outside it.
             cacheLimitBytes: 32 << 30,
             // The MLX M5 Max default commits a command buffer after
-            // referencing 50 MiB. Many 4-bit projections individually exceed
-            // that, so 320 MiB groups adjacent kernels without long command
-            // buffers; decode's explicit async-eval groups remain the outer
-            // command-buffer boundary, and this referenced-buffer budget
-            // governs within them.
+            // referencing 50 MiB or 50 kernels. Decode's explicit async-eval
+            // rungs remain the outer command-buffer boundary; this
+            // referenced-buffer budget governs within them. 512 ops matches
+            // the 512 MiB post-wire byte cap at the hardware 1:1 ratio so
+            // a 10-layer rung segment is not chopped by the old 50-op wall.
             maxMegabytesPerCommandBuffer: 512,
-            maxOperationsPerCommandBuffer: 50,
+            maxOperationsPerCommandBuffer: 512,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )
