@@ -1165,7 +1165,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(M >= 3 && M <= 9, "wide multi-row QMV dispatch covers M in [3, 9]");
+  static_assert(M >= 2 && M <= 9, "wide multi-row QMV dispatch covers M in [2, 9]");
   static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
   constexpr int TAIL = M % IPG;
   const int first_m = int(tid.x) * IPG;

@@ -56,20 +56,6 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        // The backbone's decoder layer has fused this residual+norm boundary
-        // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
-        // the eager pair. Same kernel, same bf16/5120 guard, same
-        // bf16-round-before-square argument, so the values are bit-identical to
-        // `h = x + r; postAttentionLayerNorm(h)` — one launch and one host graph
-        // node instead of two, paid once per PROPOSED token (draftCount times a
-        // round) rather than once per layer.
-        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
-            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
-                x: x, r: r,
-                weight: postAttentionLayerNorm.weight,
-                eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
-        }
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
@@ -129,7 +115,9 @@ final class Qwen35MTPModule: Module {
         let embeds = embedTokens(nextTokenIds)
         let e = preFcNormEmbedding(embeds)
         let h = preFcNormHidden(hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = replaceExactFCRows(
+            fc(concatenated([e, h], axis: -1)),
+            input: concatenated([e, h], axis: -1))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -163,7 +151,9 @@ final class Qwen35MTPModule: Module {
         let embeds = embedTokens(nextTokenIds)
         let e = preFcNormEmbedding(embeds)
         let h = preFcNormHidden(hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused = replaceExactFCRows(
+            fc(concatenated([e, h], axis: -1)),
+            input: concatenated([e, h], axis: -1))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
@@ -172,6 +162,32 @@ final class Qwen35MTPModule: Module {
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
         return norm(layers[0](current, mask: mask, cache: cache[0]))
+    }
+
+    // MARK: - proposal-only precision islands (fc rows)
+
+    private var _exactFCWeight: MLXArray?
+    private var _exactFCIndices: MLXArray?
+
+    private func replaceExactFCRows(
+        _ base: MLXArray, input: MLXArray
+    ) -> MLXArray {
+        guard let weight = _exactFCWeight, let indices = _exactFCIndices
+        else { return base }
+        let exact = matmul(input, weight.transposed(1, 0))
+        let indexShape = Array(repeating: 1, count: max(0, base.ndim - 1)) + [-1]
+        return putAlong(
+            base, indices.reshaped(indexShape), values: exact, axis: -1)
+    }
+
+    func installExactFCRows(fcWeight: MLXArray, fcIndices: MLXArray) {
+        precondition(
+            fcWeight.dim(0) == fcIndices.dim(0),
+            "Qwen MTP precision-island fc weights and indices must have equal row counts")
+        let idx = fcIndices.asType(.int32).contiguous()
+        eval(fcWeight, idx)
+        _exactFCWeight = fcWeight
+        _exactFCIndices = idx
     }
 
 }
