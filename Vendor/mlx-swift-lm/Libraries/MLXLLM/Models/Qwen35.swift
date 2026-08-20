@@ -215,6 +215,126 @@ private func qwen35GatedDeltaPrepared(
         state: preparedState, mask: mask)
 }
 
+// Prefix repair consumes only the recurrent boundary state.  The ordinary
+// gated-delta kernel also forms q . state for every value row and writes the
+// resulting BF16 activation, even though replayPrefix immediately discards
+// that output.  This state-only twin keeps the state-mutating arithmetic in
+// the same statement order and removes only the dead q reduction and y store.
+private let qwen35GatedDeltaReplayStateKernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // k: [B, T, Hk, Dk]; v: [B, T, Hv, Dv]
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            // g, beta: [B, T, Hv]
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              float kv_mem = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_[hv_idx];
+                kv_mem += state[i] * k_[s_idx];
+              }
+              kv_mem = simd_sum(kv_mem);
+
+              auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + k_[s_idx] * delta;
+              }
+
+              // Increment data pointers to the next time step.  q/y are
+              // intentionally absent: neither can affect the recurrent state.
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gated_delta_replay_state",
+        inputNames: ["k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["state_out"],
+        source: source)
+}()
+
+/// Exact production-geometry dispatch for the state-only prefix replay.
+/// Every guard miss falls through to the promoted full recurrence below.
+private func qwen35GatedDeltaReplayState(
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray?
+) -> MLXArray? {
+    guard let kernel = qwen35GatedDeltaReplayStateKernel,
+          k.ndim == 4, v.ndim == 4, g.ndim == 3, beta.ndim == 3
+    else { return nil }
+
+    let B = k.dim(0)
+    let T = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var preparedState = state
+        ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if preparedState.dtype != .float32 {
+        preparedState = preparedState.asType(.float32)
+    }
+
+    guard B == 1, T >= 1, T <= 8,
+          Hk == 16, Dk == 128, Hv == 48, Dv == 128,
+          k.dtype == .bfloat16, v.dtype == .bfloat16,
+          g.dtype == .float32, beta.dtype == .float32,
+          k.shape == [B, T, Hk, Dk],
+          v.shape == [B, T, Hv, Dv],
+          g.shape == [B, T, Hv], beta.shape == [B, T, Hv],
+          preparedState.shape == [B, Hv, Dv, Dk]
+    else { return nil }
+
+    return kernel(
+        [k, v, g, beta, preparedState, MLXArray(T)],
+        template: [
+            ("StT", preparedState.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [preparedState.shape],
+        outputDTypes: [preparedState.dtype]
+    )[0]
+}
+
 /// Fuse the precise fp32 SiLU gate and product after the existing RMS norm.
 /// The explicit casts mirror `Qwen3NextRMSNormGated` and keep the RMS reduction
 /// itself on the unchanged MLXFast path.
@@ -949,29 +1069,42 @@ final class Qwen35GatedDeltaNet: Module {
               let tape = cache.prefixReplayTape
         else { return false }
         let rows = 0 ..< committedRows
-        let recurrence: (MLXArray, MLXArray)
-        if MLXHardwareInfo.isCompiledDecodeSupported {
-            recurrence = qwen35GatedDeltaPrepared(
-                q: tape.q[0..., rows, 0...],
+        let boundarySsm: MLXArray
+        if MLXHardwareInfo.isCompiledDecodeSupported,
+           tape.mask == nil,
+           let replayState = qwen35GatedDeltaReplayState(
                 k: tape.k[0..., rows, 0...],
                 v: tape.v[0..., rows, 0...],
                 g: tape.g[0..., rows],
                 beta: tape.beta[0..., rows],
-                state: tape.ssmPre,
-                mask: tape.mask.map { $0[0..., rows] })
+                state: tape.ssmPre)
+        {
+            boundarySsm = replayState
         } else {
-            recurrence = gatedDeltaUpdate(
-                q: tape.q[0..., rows, 0...],
-                k: tape.k[0..., rows, 0...],
-                v: tape.v[0..., rows, 0...],
-                a: tape.a[0..., rows, 0...],
-                b: tape.b[0..., rows, 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: tape.ssmPre,
-                mask: tape.mask.map { $0[0..., rows] })
+            let recurrence: (MLXArray, MLXArray)
+            if MLXHardwareInfo.isCompiledDecodeSupported {
+                recurrence = qwen35GatedDeltaPrepared(
+                    q: tape.q[0..., rows, 0...],
+                    k: tape.k[0..., rows, 0...],
+                    v: tape.v[0..., rows, 0...],
+                    g: tape.g[0..., rows],
+                    beta: tape.beta[0..., rows],
+                    state: tape.ssmPre,
+                    mask: tape.mask.map { $0[0..., rows] })
+            } else {
+                recurrence = gatedDeltaUpdate(
+                    q: tape.q[0..., rows, 0...],
+                    k: tape.k[0..., rows, 0...],
+                    v: tape.v[0..., rows, 0...],
+                    a: tape.a[0..., rows, 0...],
+                    b: tape.b[0..., rows, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: tape.ssmPre,
+                    mask: tape.mask.map { $0[0..., rows] })
+            }
+            boundarySsm = recurrence.1
         }
-        let boundarySsm = recurrence.1
         cache[0] = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
