@@ -1850,6 +1850,140 @@ func qwen35DualRMSNormConcat(
     return outputs[0]
 }
 
+/// Quantized-embedding twin of the fused MTP pre-FC input kernel. It
+/// reproduces affine-4/group-64 dequantization at BF16 before the unchanged
+/// RMSNorm reduction, removing gather + dequantized embedding materialization.
+private let qwen35QuantizedEmbeddingDualRMSNormConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_q4_embedding_dual_rms_norm_concat_bf16_v1",
+    inputNames: [
+        "token_ids", "embedding_weight", "embedding_scales",
+        "embedding_biases", "hidden", "embedding_norm_weight",
+        "hidden_norm_weight", "eps",
+    ],
+    outputNames: ["concat_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(hidden_shape[hidden_ndim - 1]);
+        uint hidden_rows = 1;
+        for (uint i = 0; i + 1 < hidden_ndim; ++i) {
+            hidden_rows *= uint(hidden_shape[i]);
+        }
+        bool is_embedding = row < hidden_rows;
+        uint local_row = is_embedding ? row : row - hidden_rows;
+        long token = is_embedding ? long(token_ids[local_row]) : 0;
+        ulong hidden_off = ulong(local_row) * ulong(axis_size);
+        ulong packed_off = ulong(token) * ulong(embedding_weight_shape[1]);
+        ulong scale_off = ulong(token) * ulong(embedding_scales_shape[1]);
+        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
+            + (is_embedding ? 0 : ulong(axis_size));
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint index = elem + i;
+                if (index < axis_size) {
+                    float xi;
+                    if (is_embedding) {
+                        uint packed = embedding_weight[
+                            packed_off + ulong(index / 8)];
+                        uint q = (packed >> (4 * (index & 7))) & 0x0f;
+                        bfloat dequantized = bfloat(q)
+                            * embedding_scales[scale_off + ulong(index / 64)]
+                            + embedding_biases[scale_off + ulong(index / 64)];
+                        xi = float(dequantized);
+                    } else {
+                        xi = float(hidden[hidden_off + ulong(index)]);
+                    }
+                    acc += xi * xi;
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint index = elem + i;
+                if (index < axis_size) {
+                    float xi;
+                    if (is_embedding) {
+                        uint packed = embedding_weight[
+                            packed_off + ulong(index / 8)];
+                        uint q = (packed >> (4 * (index & 7))) & 0x0f;
+                        bfloat dequantized = bfloat(q)
+                            * embedding_scales[scale_off + ulong(index / 64)]
+                            + embedding_biases[scale_off + ulong(index / 64)];
+                        xi = float(dequantized);
+                    } else {
+                        xi = float(hidden[hidden_off + ulong(index)]);
+                    }
+                    bfloat wi = is_embedding
+                        ? embedding_norm_weight[index]
+                        : hidden_norm_weight[index];
+                    concat_out[out_off + ulong(index)] =
+                        wi * bfloat(xi * inv_mean);
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35QuantizedEmbeddingDualRMSNormConcat(
+    tokenIds: MLXArray,
+    embeddingWeight: MLXArray,
+    embeddingScales: MLXArray,
+    embeddingBiases: MLXArray,
+    hidden: MLXArray,
+    embeddingNormWeight: MLXArray,
+    hiddenNormWeight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    let nRows = hidden.size / hidden.dim(-1)
+    var outShape = hidden.shape
+    outShape[outShape.count - 1] = 2 * hidden.dim(-1)
+    return qwen35QuantizedEmbeddingDualRMSNormConcatKernel(
+        [
+            tokenIds, embeddingWeight, embeddingScales, embeddingBiases,
+            hidden, embeddingNormWeight, hiddenNormWeight, MLXArray(eps),
+        ],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
