@@ -49,29 +49,34 @@ final class Qwen35MTPDecoderLayer: Module {
         super.init()
     }
 
+    /// Unmerged `(h, mlpOut)` so the module can fuse `norm(h + mlpOut)` with
+    /// the same residual+RMSNorm kernel already on the post-attn boundary.
+    /// `callAsFunction` still returns the merged sum for any other caller.
+    func forwardUnmerged(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (base: MLXArray, delta: MLXArray) {
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
+            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return (h, (mlp as! UnaryLayer)(postAttnNorm))
+        }
+        let h = x + r
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
-        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        // The backbone's decoder layer has fused this residual+norm boundary
-        // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
-        // the eager pair. Same kernel, same bf16/5120 guard, same
-        // bf16-round-before-square argument, so the values are bit-identical to
-        // `h = x + r; postAttentionLayerNorm(h)` — one launch and one host graph
-        // node instead of two, paid once per PROPOSED token (draftCount times a
-        // round) rather than once per layer.
-        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
-            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
-                x: x, r: r,
-                weight: postAttentionLayerNorm.weight,
-                eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
-        }
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        let (h, delta) = forwardUnmerged(x, mask: mask, cache: cache)
+        return h + delta
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -137,6 +142,18 @@ final class Qwen35MTPModule: Module {
             [preFcNormEmbedding(embeds), preFcNormHidden(hidden)], axis: -1)
     }
 
+    /// `norm(h + mlpOut)` as one residual+RMSNorm launch. Same kernel and
+    /// BF16-round-before-square argument as the post-attn fuse already on
+    /// this layer; only the residual pair and the weight change. Proposal-only.
+    private func fusedExitNorm(_ h: MLXArray, _ delta: MLXArray) -> MLXArray {
+        if h.dtype == .bfloat16, delta.dtype == .bfloat16, h.dim(-1) == 5120 {
+            return qwen35FusedResidualRMSNorm(
+                x: h, r: delta, weight: norm.weight, eps: norm.eps
+            ).normed
+        }
+        return norm(h + delta)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -152,13 +169,20 @@ final class Qwen35MTPModule: Module {
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
+        // 3. Run each MTPDecoderLayer. The last layer stays unmerged so the
+        //    module-level `norm(h + mlp)` is one fused residual+RMSNorm
+        //    launch instead of an add plus a standalone RMSNorm. Ranked
+        //    heads declare mtp_num_hidden_layers = 1; extra layers still
+        //    merge before the next layer's input RMSNorm.
+        let last = layers.count - 1
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
+            if i == last {
+                let (h, delta) = layer.forwardUnmerged(fused, mask: mask, cache: c)
+                return fusedExitNorm(h, delta)
+            }
             fused = layer(fused, mask: mask, cache: c)
         }
-
-        // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
     }
 
@@ -186,7 +210,9 @@ final class Qwen35MTPModule: Module {
 
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
-        return norm(layers[0](current, mask: mask, cache: cache[0]))
+        let (h, delta) = layers[0].forwardUnmerged(
+            current, mask: mask, cache: cache[0])
+        return fusedExitNorm(h, delta)
     }
 
 }
