@@ -509,10 +509,33 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
+        // Live FA Q is `qNorm(...).transposed(0, 2, 1, 3)`: shape
+        // `[B, qHeads, qL, D]` with strides the vector kernel accepts
+        // without a contiguous copy, so `sdpa_vector` hashes
+        // `query_transposed=true` (`_qt`). The zeros warm above is
+        // row-contiguous (`_qnt`). Compile the live `_qt` hash at the
+        // same kL=1024 (64-block 2-pass) for qL={1,5,4} only.
+        var outsQt: [MLXArray] = []
+        for qL in [1, 5, 4] {
+            let q = MLXArray.zeros(
+                [extK.dim(0), qL, qHeads, headDim], dtype: extK.dtype
+            ).transposed(0, 2, 1, 3)
+            outsQt.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: q,
+                    keys: extK,
+                    values: extV,
+                    scale: scale,
+                    mask: .causal
+                )
+            )
+        }
+        eval(outsQt)
         // Scored decode walks N past 1024 (512 seed + 512 decode).
         // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
         // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
+        // 128-block family at kL=1025 for the same qL={1,5,4} only, both
+        // `_qnt` (zeros) and live `_qt` (transposed dummy).
         if extK.dim(2) == 1024 {
             let kPad1 = MLXArray.zeros(
                 [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
@@ -535,6 +558,22 @@ public final class Qwen36MTPBlockSession {
                 )
             }
             eval(outs1025)
+            var outs1025Qt: [MLXArray] = []
+            for qL in [1, 5, 4] {
+                let q = MLXArray.zeros(
+                    [k1025.dim(0), qL, qHeads, headDim], dtype: k1025.dtype
+                ).transposed(0, 2, 1, 3)
+                outs1025Qt.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: q,
+                        keys: k1025,
+                        values: v1025,
+                        scale: scale,
+                        mask: .causal
+                    )
+                )
+            }
+            eval(outs1025Qt)
         }
     }
 
