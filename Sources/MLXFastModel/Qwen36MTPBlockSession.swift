@@ -509,33 +509,6 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
-        // Scored decode walks N past 1024 (512 seed + 512 decode).
-        // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
-        // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
-        if extK.dim(2) == 1024 {
-            let kPad1 = MLXArray.zeros(
-                [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
-            let vPad1 = MLXArray.zeros(
-                [extV.dim(0), extV.dim(1), 1, extV.dim(3)], dtype: extV.dtype)
-            let k1025 = concatenated([extK, kPad1], axis: 2)
-            let v1025 = concatenated([extV, vPad1], axis: 2)
-            var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
-                let q = MLXArray.zeros(
-                    [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
-                outs1025.append(
-                    MLXFast.scaledDotProductAttention(
-                        queries: q,
-                        keys: k1025,
-                        values: v1025,
-                        scale: scale,
-                        mask: .causal
-                    )
-                )
-            }
-            eval(outs1025)
-        }
     }
 
     // MARK: - begin
@@ -695,6 +668,20 @@ public final class Qwen36MTPBlockSession {
     /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
     /// forced-depth arms after every head-variant change.
     ///
+    /// FIFTH FIT — re-measured on the CURRENT stack (4-bit rerank head +
+    /// affine-2 coarse readout + direct-nibble wide kernels), which the 0.18
+    /// literal predates by two head generations. Cool-box phase trace at the
+    /// ranked geometry: eval_wall 41.1 / 46.3 / 50.9 ms at widths 6 / 7 / 8
+    /// — a ~5.2 ms marginal per extra draft (≈4 ms verify widening + ≈1.2 ms
+    /// head step, the chain now hidden behind the 21 ms verify build)
+    /// against a ~40 ms width-2 round base: h ≈ 0.125. The 0.18 literal was
+    /// honest for the 10-16 ms/step bf16 era; on this stack it overprices
+    /// every draft ~45% and under-drafts exactly the mid-acceptance prompts
+    /// that set the published median. 0.125 is the measured marginal, not a
+    /// reopening of the old 0.12 probe (that arm ran the bf16 head, where
+    /// the true h was ~0.3 and 0.12 underpriced drafts catastrophically;
+    /// the sign of the error has since inverted).
+    ///
     /// FOURTH FIT — and the resolution of the 0.20-vs-0.43 dispute. The
     /// capped-regime phase trace measured ~10.75 ms marginal per draft on a
     /// ~27 ms base (0.20) in the fully-accepted case. MTPLX ships a
@@ -706,7 +693,7 @@ public final class Qwen36MTPBlockSession {
     /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
     /// reject does keep (the drafted head steps past the break) is already
     /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
+    private static let headStepCostRatio = 0.125
 
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
