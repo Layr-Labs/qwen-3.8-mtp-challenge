@@ -752,7 +752,7 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
+    private static let sdpaWidthWallDepthCap = 6
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
@@ -817,7 +817,27 @@ public final class Qwen36MTPBlockSession {
         // per-position acceptance EMAs and collapses on a cold stretch by
         // itself. Widths 6..8 are bit-exact per position against the serial
         // trajectory through the sdpa exactness chunk, so 7 is policy.
-        let widthCap = Self.segmentedVerifyDepthCap
+        // RESTORING a floor of 6 under the ceiling of 7. This exact schedule
+        // was promoted as `ead84bba` at 3.30221 (trunk `3e2530a`) and then
+        // dropped: the archive that took the crown after it was built on the
+        // PREVIOUS tip `96f20f8` and replaced the editable paths wholesale, so
+        // its schedule reverted to ceiling 7 with no gate. Its own gain is a
+        // Metal kernel and is orthogonal to this; the two compose.
+        //
+        // Receipt for this half, from our two ranked runs of the same tree:
+        //
+        //   ceiling 7, no gate   x4 dlen 4.38  0.012191   median 3.25592
+        //   + floor 6            x4 dlen 4.33  0.011998   median 3.30221
+        //
+        // The floor restrains a round after a reject, which is what holds x4 —
+        // always the median-setting slot — near its 4.25 optimum instead of
+        // letting it drift deeper. Six rather than the old five because a
+        // single reject dropping the cap from 7 to 5 is what truncated
+        // `00142a44`. Widths 6..8 are bit-exact per position through the sdpa
+        // exactness chunk, so both constants are policy, not correctness.
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
