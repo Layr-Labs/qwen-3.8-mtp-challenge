@@ -385,7 +385,12 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
-    public var step = 256
+    // Ranked Qwen-MTP window is 512 seed + 512 decode. step=256 reallocs the
+    // 16 FA caches twice inside that decode (512→768, 768→1024). step=1024
+    // sizes the first seed update to cover the whole window, so scored decode
+    // stays in-place. Token-neutral: offset slicing and returned `..<offset`
+    // views are unchanged.
+    public var step = 1024
 
     public override init() {
         super.init()
