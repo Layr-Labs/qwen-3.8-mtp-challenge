@@ -606,6 +606,17 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// Last row of a hidden block. After the flush, every head step is
+    /// one row in / one row out, and `lastHiddenWithKVOnlyHistory` already
+    /// returns only that row — so a trailing-row slice on `dim(1) == 1` is
+    /// an identity op (host node + device slice) per proposed token.
+    @inline(__always)
+    private static func lastHiddenRow(_ block: MLXArray) -> MLXArray {
+        let rows = block.dim(1)
+        guard rows > 1 else { return block }
+        return block[0..., (rows - 1) ..< rows, 0...]
+    }
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -1054,8 +1065,7 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        var draftHidden = Self.lastHiddenRow(headHidden)
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -1067,8 +1077,7 @@ public final class Qwen36MTPBlockSession {
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
@@ -1710,7 +1719,12 @@ public final class Qwen36MTPBlockSession {
     /// it collapses ACCEPTANCE. Any validation of this path has to read the accept
     /// rate, not just the match verdict.
     private func hiddenRow(_ hidden: MLXArray, _ index: Int) -> MLXArray {
-        let row = hidden[0..., index ..< (index + 1), 0...]
+        let row: MLXArray
+        if hidden.dim(1) == 1, index == 0 {
+            row = hidden
+        } else {
+            row = hidden[0..., index ..< (index + 1), 0...]
+        }
         return postNorm ? model.applyFinalNorm(row) : row
     }
 
