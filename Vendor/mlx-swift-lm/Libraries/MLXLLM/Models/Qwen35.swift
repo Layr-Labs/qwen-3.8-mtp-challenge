@@ -2722,6 +2722,36 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
     return (trials, bad, firstBad)
 }
 
+/// Fuse the three `take(..., candidateIDs, axis: 0)` gathers that pull
+/// affine-4 compact-head rows for the 32-candidate draft rerank.
+/// Same takes, same axis, same ids — bit-identical gathered rows; only the
+/// three separate launches collapse into one compiled graph. Proposal-only:
+/// the trusted parent still exact-token-matches every emitted token.
+/// NOT shapeless: Take output rank depends on `ids.dim(0)`, which is the
+/// constant 32 of `draftRerankCandidateCount`, and shapeless Take is the
+/// same infer-shapes class that killed shapeless SwiGLU (`Slice cannot
+/// infer output shapes`). The untimed `draftTokenID` warm traces the only
+/// geometry. Custom Metal top-32 / rerank kernels and `quantizedMM` stay
+/// outside this graph (same split as the quantized-attention compiled
+/// softmax core).
+private let qwen35CompiledDraftRerankTakes:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray) =
+{
+    let body: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (
+        MLXArray, MLXArray, MLXArray
+    ) = { ids, weight, scales, biases in
+        (
+            MLX.take(weight, ids, axis: 0),
+            MLX.take(scales, ids, axis: 0),
+            MLX.take(biases, ids, axis: 0)
+        )
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(body)
+    }
+    return body
+}()
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -3184,9 +3214,8 @@ extension Qwen35TextModel: MTPCapable {
             )[.ellipsis, (kth)...].reshaped([candidateCount])
         }
 
-        let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
-        let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
-        let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
+        let (exactWeight, exactScales, exactZeroPoints) = qwen35CompiledDraftRerankTakes(
+            candidateIDs, exact.weight, exact.scales, exactBiases)
         let exactLogits = quantizedMM(
             x, exactWeight, scales: exactScales, biases: exactZeroPoints,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
