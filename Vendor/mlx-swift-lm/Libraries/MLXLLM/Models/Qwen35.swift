@@ -1653,6 +1653,12 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    // True when the K and V islands are IN-ORDER arange over every output
+    // row: the packed-quantized K/V results would be fully overwritten, so
+    // the forward paths skip that dead work and read K/V straight off the
+    // exact rows. Bit-identical: same exact matmul, same row order.
+    private var _exactKVFull = false
+    private var _exactKRowCount = 0
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1711,6 +1717,21 @@ final class Qwen35Attention: Module {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            if _exactKVFull, let exactWeight = _exactQKVWeight,
+               let qkvIndices = _exactQKVIndices
+            {
+                // Pack carries Q rows only; K/V come straight from the exact
+                // rows the replace would install anyway.
+                let exact = matmul(x, exactWeight.transposed(1, 0))
+                let indexShape = Array(repeating: 1, count: max(0, y.ndim - 1)) + [-1]
+                y = putAlong(
+                    y, qkvIndices[..<_exactQRowCount].reshaped(indexShape),
+                    values: exact[.ellipsis, ..<_exactQRowCount], axis: -1)
+                let kv = exact[.ellipsis, _exactQRowCount...]
+                return (
+                    y, kv[.ellipsis, ..<_exactKRowCount],
+                    kv[.ellipsis, _exactKRowCount...])
+            }
             y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
@@ -1730,9 +1751,17 @@ final class Qwen35Attention: Module {
            q.mode == k.mode, q.mode == .affine,
            let qz = q.biases, let kz = k.biases, let vz = v.biases
         {
-            _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
-            _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
-            _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            if _exactKVFull {
+                // K/V outputs are fully island-covered; packing their
+                // quantized rows would be dead compute every call.
+                _qkvW = q.weight.contiguous()
+                _qkvS = q.scales.contiguous()
+                _qkvZ = qz.contiguous()
+            } else {
+                _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
+                _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
+                _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            }
             _qkvGS = q.groupSize
             _qkvBits = q.bits
             _qkvMode = q.mode
@@ -1757,6 +1786,15 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if _exactKVFull, let exactWeight = _exactQKVWeight {
+            // Every K/V row is an exact island; the quantized pack's output
+            // would be 100% replaced. Read the exact rows directly.
+            let y = matmul(
+                x, exactWeight[_exactQRowCount...].transposed(1, 0))
+            return (
+                y[.ellipsis, ..<_exactKRowCount],
+                y[.ellipsis, _exactKRowCount...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -1826,13 +1864,32 @@ final class Qwen35Attention: Module {
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
             "Qwen MTP precision-island weights and indices must have equal row counts")
-        let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
+        // K/V islands that are a complete permutation of every output row are
+        // normalized into row order here (one-time, load path) so the forward
+        // paths can slice K/V straight from the exact rows. Bit-neutral for
+        // the scatter paths: putAlong with unique indices is order-independent.
+        let kvDim = kvHeads * headDim
+        func rowOrdered(_ w: MLXArray, _ idx: MLXArray, count: Int)
+            -> (MLXArray, MLXArray, Bool)
+        {
+            guard idx.dim(0) == count else { return (w, idx, false) }
+            let idx32 = idx.asType(.int32)
+            let expected = MLXArray((0 ..< Int32(count)).map { $0 })
+            guard all(sorted(idx32) .== expected).item(Bool.self) else {
+                return (w, idx, false)
+            }
+            return (w.take(argSort(idx32), axis: 0), expected, true)
+        }
+        let (kW, kIdx, kFull) = rowOrdered(kWeight, kIndices, count: kOutputCount)
+        let (vW, vIdx, vFull) = rowOrdered(vWeight, vIndices, count: kvDim)
+
+        let weight = concatenated([qWeight, kW, vW], axis: 0).contiguous()
         let qkvIndices = concatenated(
-            [qIndices, kIndices + qOutputCount,
-             vIndices + qOutputCount + kOutputCount], axis: 0)
+            [qIndices, kIdx + qOutputCount,
+             vIdx + qOutputCount + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
         let kvIndices = concatenated(
-            [kIndices, vIndices + kOutputCount], axis: 0)
+            [kIdx, vIdx + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
         eval(weight, qkvIndices, kvIndices)
 
@@ -1840,6 +1897,18 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+
+        _exactKRowCount = kW.dim(0)
+        _exactKVFull = kFull && vFull && kOutputCount == kvDim
+        if _exactKVFull {
+            // Force lazy packs to rebuild without the dead K/V rows.
+            _qkvW = nil
+            _qkvS = nil
+            _qkvZ = nil
+            _kvW = nil
+            _kvS = nil
+            _kvZ = nil
+        }
     }
 
     /// Append rows to an attention cache without producing query outputs.
@@ -2172,6 +2241,26 @@ public class Qwen35TextModelInner: Module {
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        // Wide verify rounds (M >= 4) idle the GPU across the coarse 8-layer
+        // gap between rungs 1 and 9; add denser early rungs so more layer evals
+        // overlap the host draft-build/commit window. S <= 2 (serial / width-2
+        // verify), width-3, and prefill keep the original schedule byte-for-byte
+        // — asyncEval is enqueue-timing only, so the emitted stream is unchanged
+        // regardless of which rungs fire.
+        let wideVerify = !prefillLadder && inputs.dim(1) >= 4
+        func ladderFires(_ i: Int) -> Bool {
+            if prefillLadder { return i == 0 || i % 3 == 2 }
+            if wideVerify {
+                switch i {
+                case 0, 1, 3, 5, 7, 9, 19, 29, 39, 49, 57: return true
+                default: return false
+                }
+            }
+            switch i {
+            case 0, 1, 9, 19, 29, 39, 49, 57: return true
+            default: return false
+            }
+        }
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
@@ -2192,19 +2281,8 @@ public class Qwen35TextModelInner: Module {
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
                 base = out.base
                 delta = out.delta
-                if ladderActive {
-                    if prefillLadder {
-                        if i == 0 || i % 3 == 2 {
-                            asyncEval(base, out.delta)
-                        }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(base, out.delta)
-                        default:
-                            break
-                        }
-                    }
+                if ladderActive && ladderFires(i) {
+                    asyncEval(base, out.delta)
                 }
             }
             hiddenStates = delta.map { base + $0 } ?? base
@@ -2217,19 +2295,8 @@ public class Qwen35TextModelInner: Module {
                 hiddenStates = layer(
                     hiddenStates, attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
-                if ladderActive {
-                    if prefillLadder {
-                        if i == 0 || i % 3 == 2 {
-                            asyncEval(hiddenStates)
-                        }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(hiddenStates)
-                        default:
-                            break
-                        }
-                    }
+                if ladderActive && ladderFires(i) {
+                    asyncEval(hiddenStates)
                 }
             }
         }
