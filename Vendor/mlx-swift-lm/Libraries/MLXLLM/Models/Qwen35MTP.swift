@@ -56,8 +56,23 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        // Reuse the backbone's fused residual+RMSNorm on the exit boundary,
+        // collapsing the plain `x + r` add and the `postAttentionLayerNorm`
+        // launch into one kernel (mirrors Qwen35DecoderLayer.callAsFunction).
+        // Head side is proposal-only; the fused kernel is bit-exact with the
+        // eager `h = x + r; postAttentionLayerNorm(h)` sequence anyway.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
+        }
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
 
     /// Populate this layer's K/V history without computing a dead layer
