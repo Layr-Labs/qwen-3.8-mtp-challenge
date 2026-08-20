@@ -113,6 +113,20 @@ public final class Qwen36MTPBlockSession {
     private let postNorm: Bool
 
     private var cache: [any KVCache] = []
+
+    /// Per-width compiled verify functions, lazily traced at first use.
+    private var compiledVerifyEntries: [Int: CompiledVerifyEntry] = [:]
+    /// True once the full-attention caches have been promoted to
+    /// `CompilableKVCache` (set at the end of `begin`). The compiled verify
+    /// path is only reachable after the promotion.
+    private var compiledVerifyAvailable = false
+    /// True once `warmCompiledVerify` has traced every legal width on this
+    /// session's cache objects. `begin` then runs the real seed prefill on a
+    /// fresh cache and transplants the state into the warmed objects, so the
+    /// timed window contains zero graph traces (and zero first-use kernel
+    /// compilations) — the trace rounds that used to fire inside the window
+    /// are a stall-guardrail hazard on the ranked box.
+    private var compiledWarmed = false
     /// Next round's primary token, read out of the previous round's single
     /// batched eval (the row argmax the old code re-fetched with a fresh
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
@@ -288,6 +302,45 @@ public final class Qwen36MTPBlockSession {
         // every throwaway cache and tensor is released before residency sizing.
         try warmAllDepthShapes(maxDepth: maxDepth)
         Self.wireResidentWeightsIfEnabled()
+        try warmCompiledVerify(maxDepth: maxDepth)
+    }
+
+    /// Trace every legal verify width into the compiled path OUTSIDE the
+    /// timed window, on this session's own cache objects. `begin` later runs
+    /// the real seed prefill on a fresh cache and transplants the state into
+    /// these objects (the objects the compiled graphs are bound to), so the
+    /// timed rounds apply the traced graphs against real prefill state with
+    /// identical shapes and the window contains no first-use traces.
+    ///
+    /// Any failure here only disables the compiled path: the promotion may
+    /// fail (geometry surprise) or a width's trace may throw — the entry is
+    /// dropped and every round runs the eager reference forward, exactly as
+    /// before the compiled verify existed.
+    private func warmCompiledVerify(maxDepth: Int) throws {
+        guard !compiledWarmed, cache.isEmpty else { return }
+        cache = model.newCache(parameters: nil)
+        // Seed the throwaway cache at the track's real 512-token prefix so
+        // the traced graphs see the same state shapes as the timed rounds.
+        let seed = Array(repeating: 0, count: 512)
+        _ = model.callWithHidden(
+            input: LMInput.Text(
+                tokens: MLXArray(seed).reshaped([1, seed.count])),
+            cache: cache, nConfirmed: 0)
+        eval(cache.flatMap { $0.state })
+        promoteFullAttentionCaches()
+        guard compiledVerifyAvailable else { return }
+        for width in 1 ... (maxDepth + 1) {
+            let tokens = MLXArray(
+                Array(repeating: Int32(0), count: width)).reshaped([1, width])
+            if let out = try? compiledVerifyForward(width: width, tokens: tokens) {
+                // Force the apply: this both validates the traced graph and
+                // pre-compiles the Metal kernels the timed rounds will reuse.
+                eval([out.0, out.1])
+            } else {
+                compiledVerifyEntries[width] = nil
+            }
+        }
+        compiledWarmed = true
     }
 
     private func warmAllDepthShapes(maxDepth: Int) throws {
@@ -538,6 +591,256 @@ public final class Qwen36MTPBlockSession {
         }
     }
 
+    // MARK: - compiled verify forward (per width)
+
+    /// One lazily-built compiled verify per verify width, plus the per-cache
+    /// layout of the trace-time proposal-verify structures.
+    private struct CompiledVerifyEntry {
+        let fn: @Sendable ([MLXArray]) -> [MLXArray]
+        /// Per-cache tape/checkpoint array counts in cache order, captured
+        /// from the trace-time structures after the first apply.
+        var layout: [VerifyTapeLayout]
+        var hasLayout: Bool
+    }
+
+    /// Layout of one cache's proposal-verify structure inside the compiled
+    /// function's returned array list.
+    private struct VerifyTapeLayout {
+        var count: Int
+        var hasSsmPre: Bool
+        var hasMask: Bool
+        var rowCount: Int
+        var convStateRows: Int
+    }
+
+    /// The verify forward with a per-width compiled graph.
+    ///
+    /// The full-attention caches are promoted to `CompilableKVCache`
+    /// (fixed-size buffers + an MLXArray offset, both compile-traceable), so
+    /// the tracer captures the ENTIRE 64-layer verify — attention KV writes
+    /// included — ONCE per width at the first round that uses it. Later
+    /// rounds apply the same traced graph with positional state binding; the
+    /// ~40 ms/round host-side graph construction disappears. The GDN layers
+    /// already use replacement semantics and the FA layers' fixed buffers
+    /// make every state shape width-stable, so no re-trace fires inside the
+    /// window (kL grows only inside the fixed buffer).
+    ///
+    /// The proposal-verify structures (`prefixReplayTape` /
+    /// `rollbackCheckpoints`) are NOT part of `innerState`, so the trace-time
+    /// values are tracers. The closure therefore returns every structure's
+    /// arrays after the three head outputs, and the caller re-binds them into
+    /// fresh values after each apply using the layout captured at trace time.
+    /// Any failure — compile unsupported, trace error, shape surprise, count
+    /// mismatch — falls back to the eager reference call, so the compiled
+    /// path can never change the emitted stream.
+    private func compiledVerifyForward(
+        width: Int, tokens: MLXArray
+    ) throws -> (MLXArray, MLXArray, MLXArray?) {
+        guard compiledVerifyAvailable else {
+            return model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: tokens), cache: cache, nConfirmed: 1)
+        }
+        var entry: CompiledVerifyEntry
+        if let existing = compiledVerifyEntries[width] {
+            entry = existing
+        } else {
+            let model = self.model
+            let cache = self.cache
+            let updatable: [any Updatable] = cache.map { $0 as any Updatable }
+            let fn = compile(
+                inputs: updatable, outputs: updatable, shapeless: false
+            ) { args in
+                let input = LMInput.Text(tokens: args[0])
+                let (logits, hidden, normed) = model.callWithHiddenAndNormed(
+                    input: input, cache: cache, nConfirmed: 1)
+                var out: [MLXArray] = [logits, hidden]
+                out.append(normed ?? MLXArray(0))
+                for item in cache {
+                    guard let arrays = item as? ArraysCache else { continue }
+                    if let tape = arrays.prefixReplayTape {
+                        out.append(tape.convInput)
+                        out.append(tape.q)
+                        out.append(tape.k)
+                        out.append(tape.v)
+                        out.append(tape.a)
+                        out.append(tape.b)
+                        out.append(tape.g)
+                        out.append(tape.beta)
+                        out.append(contentsOf: tape.ssmPre.map { [$0] } ?? [])
+                        out.append(contentsOf: tape.mask.map { [$0] } ?? [])
+                    } else if !arrays.rollbackCheckpoints.isEmpty {
+                        let cp = arrays.rollbackCheckpoints[0]
+                        out.append(cp.0)
+                        out.append(cp.1)
+                    }
+                }
+                return out
+            }
+            entry = CompiledVerifyEntry(fn: fn, layout: [], hasLayout: false)
+            compiledVerifyEntries[width] = entry
+        }
+
+        // The trace runs the closure with real state; the decode ladder's
+        // asyncEval calls are not allowed inside a graph transformation, and
+        // they are pure enqueue-timing (bit-identical), so suppress them for
+        // the compiled closure. The eager paths keep the ladder. The defer
+        // guarantees the flag is restored even when the compiled apply
+        // throws.
+        Qwen35TextModelInner.suppressDecodeLadder = true
+        defer { Qwen35TextModelInner.suppressDecodeLadder = false }
+        let out = entry.fn([tokens])
+        guard out.count >= 3 else {
+            // MLX error inside the compiled apply: drop the entry and retry
+            // the round eagerly.
+            compiledVerifyEntries[width] = nil
+            return model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: tokens), cache: cache, nConfirmed: 1)
+        }
+        if !entry.hasLayout {
+            // First apply: capture the layout from the trace-time structures
+            // (the closure ran during this call; the properties still hold
+            // the trace-time tapes/checkpoints) and store it.
+            entry.layout = cache.map { item in
+                guard let arrays = item as? ArraysCache else {
+                    return VerifyTapeLayout(
+                        count: 0, hasSsmPre: false, hasMask: false,
+                        rowCount: 0, convStateRows: 0)
+                }
+                if let tape = arrays.prefixReplayTape {
+                    let count = 8
+                        + (tape.ssmPre == nil ? 0 : 1)
+                        + (tape.mask == nil ? 0 : 1)
+                    return VerifyTapeLayout(
+                        count: count,
+                        hasSsmPre: tape.ssmPre != nil,
+                        hasMask: tape.mask != nil,
+                        rowCount: tape.rowCount,
+                        convStateRows: tape.convStateRows)
+                }
+                if !arrays.rollbackCheckpoints.isEmpty {
+                    return VerifyTapeLayout(
+                        count: 2, hasSsmPre: false, hasMask: false,
+                        rowCount: 0, convStateRows: 0)
+                }
+                return VerifyTapeLayout(
+                    count: 0, hasSsmPre: false, hasMask: false,
+                    rowCount: 0, convStateRows: 0)
+            }
+            entry.hasLayout = true
+            compiledVerifyEntries[width] = entry
+        }
+        guard rebindVerifyStructures(out: out, layout: entry.layout) else {
+            // Layout surprise: the apply's structure diverged from the trace.
+            // Re-run the round eagerly and drop the entry so the next round
+            // re-traces.
+            compiledVerifyEntries[width] = nil
+            return model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: tokens), cache: cache, nConfirmed: 1)
+        }
+        let normed: MLXArray? = out[2].size > 0 ? out[2] : nil
+        return (out[0], out[1], normed)
+    }
+
+    /// Re-bind every ArraysCache's proposal-verify structure from the
+    /// compiled apply's returned arrays. Returns false when the total count
+    /// does not match the layout (leaves the properties untouched).
+    @discardableResult
+    private func rebindVerifyStructures(
+        out: [MLXArray], layout: [VerifyTapeLayout]
+    ) -> Bool {
+        guard layout.count == cache.count else { return false }
+        var offset = 3
+        for (index, item) in cache.enumerated() {
+            let l = layout[index]
+            guard l.count > 0, let arrays = item as? ArraysCache else {
+                continue
+            }
+            guard offset + l.count <= out.count else { return false }
+            if l.count >= 8 {
+                // Proposal-verify tape (width >= 3 verifies).
+                var next = offset
+                let convInput = out[next]; next += 1
+                let q = out[next]; next += 1
+                let k = out[next]; next += 1
+                let v = out[next]; next += 1
+                let a = out[next]; next += 1
+                let b = out[next]; next += 1
+                let g = out[next]; next += 1
+                let beta = out[next]; next += 1
+                let ssmPre: MLXArray? = l.hasSsmPre ? out[next] : nil
+                if l.hasSsmPre { next += 1 }
+                let mask: MLXArray? = l.hasMask ? out[next] : nil
+                if l.hasMask { next += 1 }
+                offset = next
+                arrays.prefixReplayTape = ArraysCache.PrefixReplayTape(
+                    convInput: convInput, q: q, k: k, v: v, a: a, b: b,
+                    g: g, beta: beta, ssmPre: ssmPre, mask: mask,
+                    rowCount: l.rowCount, convStateRows: l.convStateRows)
+                arrays.rollbackState = nil
+                arrays.rollbackCheckpoints = []
+            } else {
+                // Width-2 rollback checkpoint pair.
+                let cp0 = out[offset]
+                let cp1 = out[offset + 1]
+                offset += 2
+                arrays.rollbackState = (cp0, cp1)
+                arrays.rollbackCheckpoints = [(cp0, cp1)]
+                arrays.prefixReplayTape = nil
+            }
+        }
+        return offset == out.count
+    }
+
+    /// Promote the 16 full-attention caches to `CompilableKVCache`
+    /// (fixed-size buffers + an MLXArray offset) so the verify forward's KV
+    /// writes become compile-traceable. Called at the end of `begin` (the
+    /// non-warmed path) and during the untimed compiled warm; idempotent —
+    /// already-promoted caches are counted, not re-promoted. In the warmed
+    /// path the promotion happened in `warmCompiledVerify` BEFORE the real
+    /// seed prefill, so `begin` must not touch the promoted objects.
+    /// `maxLength` covers the 512-token decode window plus the widest verify
+    /// block (kL <= 512 + 512 + 8 = 1032), so the traced graphs never hit
+    /// the growth branch. Wrong geometry is a no-op that disables the
+    /// compiled verify (the eager path remains).
+    private func promoteFullAttentionCaches() {
+        var promoted = 0
+        for (index, entry) in cache.enumerated() {
+            if let simple = entry as? KVCacheSimple {
+                cache[index] = CompilableKVCache(from: simple, maxLength: 1040)
+                promoted += 1
+            } else if entry is CompilableKVCache {
+                promoted += 1
+            }
+        }
+        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN.
+        compiledVerifyAvailable = (promoted == 16)
+    }
+
+    /// Copy a fresh prefill's state into this session's warmed cache objects
+    /// — the objects the compiled verify graphs are bound to. The
+    /// full-attention buffers take the fresh rows and offset; the GDN caches
+    /// adopt the fresh slot arrays (same shapes as the warm traced with).
+    private func transplantCacheState(
+        from fresh: [any KVCache], seedLength: Int
+    ) {
+        for (warm, freshItem) in zip(cache, fresh) {
+            if let c = warm as? CompilableKVCache,
+               let simple = freshItem as? KVCacheSimple
+            {
+                let st = simple.state
+                if st.count >= 2, let keys = c.keys, let values = c.values {
+                    keys[0..., 0..., 0 ..< seedLength, 0...] = st[0]
+                    values[0..., 0..., 0 ..< seedLength, 0...] = st[1]
+                    c.offsetArray = MLXArray([Int32(seedLength)])
+                }
+            } else if let arrays = warm as? ArraysCache,
+                      let freshArrays = freshItem as? ArraysCache
+            {
+                arrays.adoptState(from: freshArrays)
+            }
+        }
+    }
+
     // MARK: - begin
 
     /// Bulk-forward the seed and return the argmax of its last row — the first
@@ -549,11 +852,31 @@ public final class Qwen36MTPBlockSession {
         guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
         guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
         let tBegin0 = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
-        cache = model.newCache(parameters: nil)
-        let (seedLogits, hidden) = model.callWithHidden(
-            input: LMInput.Text(
-                tokens: MLXArray(seedTokens).reshaped([1, seedTokens.count])),
-            cache: cache, nConfirmed: 0)
+        let (seedLogits, hidden): (MLXArray, MLXArray)
+        if compiledWarmed {
+            // The compiled verify graphs were traced on this session's warmed
+            // cache objects during the untimed warm. The real seed prefill
+            // runs on a FRESH cache (the bit-exact KVCacheSimple path), and
+            // its state is then transplanted into the warmed objects, so the
+            // timed rounds apply the traced graphs against the real prefill
+            // state with identical shapes.
+            let fresh = model.newCache(parameters: nil)
+            let (freshLogits, freshHidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(seedTokens).reshaped(
+                        [1, seedTokens.count])),
+                cache: fresh, nConfirmed: 0)
+            eval(fresh.flatMap { $0.state })
+            transplantCacheState(from: fresh, seedLength: seedTokens.count)
+            (seedLogits, hidden) = (freshLogits, freshHidden)
+        } else {
+            cache = model.newCache(parameters: nil)
+            (seedLogits, hidden) = model.callWithHidden(
+                input: LMInput.Text(
+                    tokens: MLXArray(seedTokens).reshaped(
+                        [1, seedTokens.count])),
+                cache: cache, nConfirmed: 0)
+        }
         let tBeginBuilt = Self.traceRounds ? DispatchTime.now().uptimeNanoseconds : 0
         // Seed vocabulary trim: `seedLogits` projects lm_head over all 512
         // seed rows but only the last row is ever used. It is deliberately
@@ -589,6 +912,9 @@ public final class Qwen36MTPBlockSession {
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
+        // Promote the FA caches for the compiled verify path AFTER the seed
+        // prefill so the seed itself stays on the original eager path.
+        promoteFullAttentionCaches()
         began = true
         return pendingPrimary!
     }
@@ -1127,10 +1453,18 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: verifyTokens),
-                cache: cache, nConfirmed: 1)
+        let (verifyLogits, verifyHidden, verifyNormed): (MLXArray, MLXArray, MLXArray?)
+        if let compiled = try? compiledVerifyForward(
+            width: 1 + draftCount, tokens: verifyTokens)
+        {
+            (verifyLogits, verifyHidden, verifyNormed) = compiled
+        } else {
+            // Eager fallback: the reference call, exactly as before.
+            (verifyLogits, verifyHidden, verifyNormed) =
+                model.callWithHiddenAndNormed(
+                    input: LMInput.Text(tokens: verifyTokens),
+                    cache: cache, nConfirmed: 1)
+        }
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
