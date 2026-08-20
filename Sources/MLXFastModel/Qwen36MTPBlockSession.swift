@@ -606,6 +606,20 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// The last row of a head-chain hidden block. Every step after the first
+    /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
+    /// already returns only the final row — so the trailing-row slice those
+    /// call sites took was an identity slice on all but the flush step, costing
+    /// a host graph node and a device op per PROPOSED token for nothing. The
+    /// guard is on the shape, not on the call site, so a multi-row block still
+    /// takes the real slice.
+    @inline(__always)
+    private static func lastHiddenRow(_ block: MLXArray) -> MLXArray {
+        let rows = block.dim(1)
+        guard rows > 1 else { return block }
+        return block[0..., (rows - 1) ..< rows, 0...]
+    }
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -713,12 +727,50 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 5
 
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
+    /// Depth cap for streak-qualified deep rounds. 8 is the TRUSTED
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    ///
+    /// 7, NOT the trusted maximum 8 — and the reason is a discrete cost
+    /// cliff, not the marginal draft's economics. Cap 8 admits a depth-8
+    /// round, i.e. a NINE-row verify, and width 9 is the first width whose
+    /// exactness chunk splits 5+4 rather than 5+k with a cheap remainder.
+    /// The marginal rule cannot see that cliff: it prices the extra draft at
+    /// `h` per step and buys it, because `reach` at depth 8 on a
+    /// streak-qualified stretch still clears the threshold at any `h` in the
+    /// measured range.
+    ///
+    /// Ranked evidence, read out of the board's published per-prompt metrics
+    /// rather than from a local clock. On the median-setting prompt
+    /// `919318e1`, 84 submissions carrying the identical schedule
+    /// (`effective_mean_draft_len` 4.53) span min 0.012106 / median 0.012139 /
+    /// p90 0.012403 s/tok — a right-skewed distribution, so the MINIMUM is the
+    /// estimator that matters (a run cannot land below the tree's true speed,
+    /// but interference can push it above). The two cap-7 trees (draft length
+    /// 4.32) read 0.011989 and 0.012201; the lower is **-0.97% against the
+    /// best of those 84**, and further below their median than any of them
+    /// reached. The higher one is an ordinary slow draw, well inside that p90.
+    /// Its companion mechanism does NOT explain the gain: "all-device verify
+    /// concat" shipped alone three times (0.012135 / 0.012149 / 0.012558) and
+    /// never once beat the same-schedule median.
+    private static let segmentedVerifyDepthCap = 7
+
+    /// The streak that buys the top rung back — depth 8, i.e. the nine-row
+    /// verify — after `segmentedVerifyDepthCap` has trimmed it away.
+    ///
+    /// 4, chosen from the acceptance arithmetic rather than fitted. A round is
+    /// fully accepted with probability about `p^d`; on the deep-drafting
+    /// prompts (`effective_mean_draft_len` 5.4-5.8, per-position accept ~0.95)
+    /// that is ~0.77, so an unbroken run of 4 arrives ~35% of the time and the
+    /// deepest draft keeps being bought where it was already paying. On the
+    /// median-setting prompt, where acceptance breaks often enough to hold the
+    /// schedule at 4.3-4.5, a run of 4 is rare (~6% at p_full 0.5) and the
+    /// cliff stays trimmed. Any reject resets `fullAcceptStreak`, so this can
+    /// never fire on a cold or struggling stretch — the same safety property
+    /// that qualified the cap-4 ladder and `segmentedStreakGate`.
+    private static let deepestDepthStreakGate = 4
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -755,9 +807,23 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
+        // THREE rungs, not two. The middle rung (7) avoids the nine-row
+        // verify's exactness-chunk cliff; the top rung (8) buys it back only
+        // where a LONGER unbroken full-accept streak says the deepest draft is
+        // actually landing. Measured per prompt on the ranked box: capping at
+        // 7 moved the median-setting prompt `919318e1` -1.3% (0.012126 ->
+        // 0.011967 s/tok, a new minimum across every tree on the board) while
+        // costing +0.6% on `00142a44` and +0.7% on the deep prompt, whose
+        // longer draft runs were paying for depth 8. A fixed cap has to choose
+        // one of those; this gate does not.
+        let widthCap: Int
+        if fullAcceptStreak >= Self.deepestDepthStreakGate {
+            widthCap = Qwen36MTPLimits.maxDepth
+        } else if fullAcceptStreak >= Self.segmentedStreakGate {
+            widthCap = Self.segmentedVerifyDepthCap
+        } else {
+            widthCap = Self.sdpaWidthWallDepthCap
+        }
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -1054,8 +1120,7 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        var draftHidden = Self.lastHiddenRow(headHidden)
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -1067,8 +1132,7 @@ public final class Qwen36MTPBlockSession {
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
