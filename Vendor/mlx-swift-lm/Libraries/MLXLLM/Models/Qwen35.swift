@@ -528,6 +528,137 @@ private let qwen35GatedDeltaMidKernel: MLXFast.MLXFastKernel? = {
     )
 }()
 
+// MARK: - GatedDelta state-only replay kernel
+
+/// Clone of the vendored `gated_delta_step` kernel (GatedDelta.swift) with the
+/// `y` output REMOVED. `replayPrefix` reconstructs the recurrent state at a
+/// committed verify boundary and reads `recurrence.1` only; the `[1, T, 48,
+/// 128]` output tensor the vendored kernel also produces has no consumer, and
+/// it is produced on every partial accept in all 48 GDN layers. Removing it
+/// removes, per work item per timestep, the `out` accumulation, its
+/// `simd_sum`, the `y` store, and the `q` pointer that exists only to feed
+/// them, plus the output allocation itself.
+///
+/// The five state statements are copied verbatim from the vendored body and
+/// keep their order, so the fp32 recurrence carried in registers across the
+/// t-loop is the same sequence of operations on the same values. Only reads of
+/// `state[i]` disappear. `InT` is dropped from the template because the `y`
+/// cast was its only use and M5 gen-17 JIT builds reject an unused template
+/// parameter. The mask branch is dropped with it: a replay tape is only ever
+/// stashed on the `mask == nil` path (`:1033`), and the wrapper re-checks.
+///
+/// Same dispatch geometry as the vendored kernel: grid `(32, Dv, B * Hv)`,
+/// threadgroup `(32, 4, 1)`.
+private let qwen35GatedDeltaReplayStateKernel: MLXFast.MLXFastKernel? = {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // k: [B, T, Hk, Dk]
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            // v: [B, T, Hv, Dv]
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            // g: [B, T, Hv]
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              float kv_mem = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_[hv_idx];
+                kv_mem += state[i] * k_[s_idx];
+              }
+              kv_mem = simd_sum(kv_mem);
+
+              auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + k_[s_idx] * delta;
+              }
+              // Increment data pointers to next time step
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+        """
+    return MLXFast.metalKernel(
+        name: "qwen35_gated_delta_replay_state",
+        inputNames: ["k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["state_out"],
+        source: source
+    )
+}()
+
+/// Boundary recurrent state after `T` replayed rows, without the dead output.
+/// Returns nil for any shape or dtype the clone was not proved against, which
+/// keeps the caller on the vendored two-output kernel.
+private func qwen35GatedDeltaReplayState(
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray?
+) -> MLXArray? {
+    guard let kernel = qwen35GatedDeltaReplayStateKernel,
+          k.ndim == 4, v.ndim == 4,
+          k.dim(0) == 1, v.dim(0) == 1,
+          k.dim(1) >= 1, k.dim(1) <= 8, v.dim(1) == k.dim(1),
+          k.dim(2) == 16, k.dim(3) == 128,
+          v.dim(2) == 48, v.dim(3) == 128,
+          k.dtype == .bfloat16, v.dtype == .bfloat16,
+          g.dtype == .float32, beta.dtype == .float32
+    else { return nil }
+
+    // Same fp32 state preparation as `qwen35GatedDeltaPrepared`.
+    var preparedState = state ?? MLXArray.zeros([1, 48, 128, 128], dtype: .float32)
+    if preparedState.dtype != .float32 {
+        preparedState = preparedState.asType(.float32)
+    }
+    guard preparedState.shape == [1, 48, 128, 128] else { return nil }
+
+    let T = k.dim(1)
+    let outputs = kernel(
+        [k, v, g, beta, preparedState, MLXArray(T)],
+        template: [
+            ("StT", DType.float32),
+            ("Dk", 128),
+            ("Dv", 128),
+            ("Hk", 16),
+            ("Hv", 48),
+        ],
+        grid: (32, 128, 48),
+        threadGroup: (32, 4, 1),
+        outputShapes: [preparedState.shape],
+        outputDTypes: [DType.float32]
+    )
+    return outputs[0]
+}
+
 // MARK: - GatedDeltaNet
 
 final class Qwen35GatedDeltaNet: Module {
@@ -949,18 +1080,28 @@ final class Qwen35GatedDeltaNet: Module {
               let tape = cache.prefixReplayTape
         else { return false }
         let rows = 0 ..< committedRows
-        let recurrence: (MLXArray, MLXArray)
+        let boundarySsm: MLXArray
         if MLXHardwareInfo.isCompiledDecodeSupported {
-            recurrence = qwen35GatedDeltaPrepared(
-                q: tape.q[0..., rows, 0...],
-                k: tape.k[0..., rows, 0...],
-                v: tape.v[0..., rows, 0...],
-                g: tape.g[0..., rows],
-                beta: tape.beta[0..., rows],
-                state: tape.ssmPre,
-                mask: tape.mask.map { $0[0..., rows] })
+            let k = tape.k[0..., rows, 0...]
+            let v = tape.v[0..., rows, 0...]
+            let g = tape.g[0..., rows]
+            let beta = tape.beta[0..., rows]
+            let mask = tape.mask.map { $0[0..., rows] }
+            // Only the boundary state is read here, so ask for only that.
+            if mask == nil,
+               let stateOnly = qwen35GatedDeltaReplayState(
+                k: k, v: v, g: g, beta: beta, state: tape.ssmPre)
+            {
+                boundarySsm = stateOnly
+            } else {
+                boundarySsm = qwen35GatedDeltaPrepared(
+                    q: tape.q[0..., rows, 0...],
+                    k: k, v: v, g: g, beta: beta,
+                    state: tape.ssmPre,
+                    mask: mask).1
+            }
         } else {
-            recurrence = gatedDeltaUpdate(
+            boundarySsm = gatedDeltaUpdate(
                 q: tape.q[0..., rows, 0...],
                 k: tape.k[0..., rows, 0...],
                 v: tape.v[0..., rows, 0...],
@@ -969,9 +1110,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: tape.ssmPre,
-                mask: tape.mask.map { $0[0..., rows] })
+                mask: tape.mask.map { $0[0..., rows] }).1
         }
-        let boundarySsm = recurrence.1
         cache[0] = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
@@ -1907,6 +2047,24 @@ final class Qwen35Attention: Module {
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
 
+    // COMPLETE island coverage of K and V, detected at install time. When the
+    // declared artifact carries one BF16 island row for EVERY K output row and
+    // EVERY V output row, the affine-4 pack over those 2048 rows is computed
+    // and then overwritten in full, and the scatter that overwrites it is a
+    // permutation. Both are then dead work: the same values come out of one
+    // BF16 matmul against the island rows put back in natural output order.
+    // Nil keeps the generic scatter path, which is the only correct form for a
+    // partial island set. `installExactQKVRows` is the only writer.
+    private var _exactKVDenseW: MLXArray?
+    private var _exactKVDenseKOut = 0
+    // `sanitize` installs the islands BEFORE `quantize(model:)` wires the
+    // projections, so whether the pack this replaces would even have run is
+    // not knowable at install time. Resolved once, on first use.
+    private var _islandFastPathReady: Bool?
+    private var _qOnlyW: MLXArray?
+    private var _qOnlyS: MLXArray?
+    private var _qOnlyZ: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -1960,6 +2118,32 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        // Complete K/V island coverage: narrow the affine-4 pack to the q+gate
+        // rows and read K and V straight out of the BF16 island rows. Every
+        // quantized K/V value the old form produced was overwritten before any
+        // consumer saw it, and 2048 of the 3072 scattered rows were a plain
+        // permutation of the output range.
+        if let kvExact = _exactKVDenseW, islandFastPathReady() {
+            if let w = _qOnlyW, let s = _qOnlyS, let z = _qOnlyZ {
+                var q = quantizedMM(
+                    x, w, scales: s, biases: z, transpose: true,
+                    groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+                q = replaceExactRows(q, input: x, kvOnly: false)
+                let kvRows = matmul(x, kvExact.transposed(1, 0))
+                let kEnd = _exactKVDenseKOut
+                return (q, kvRows[.ellipsis, ..<kEnd], kvRows[.ellipsis, kEnd...])
+            }
+            if let q = qProj as? QuantizedLinear, let qz = q.biases {
+                _qOnlyW = q.weight
+                _qOnlyS = q.scales
+                _qOnlyZ = qz
+                _qkvGS = q.groupSize
+                _qkvBits = q.bits
+                _qkvMode = q.mode
+                _qOut = q.shape.0
+                return qkv(x)
+            }
+        }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2010,6 +2194,13 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        // Complete K/V island coverage: the whole affine-4 K/V pack this used
+        // to run was overwritten row for row. One BF16 matmul is the result.
+        if let kvExact = _exactKVDenseW, islandFastPathReady() {
+            let y = matmul(x, kvExact.transposed(1, 0))
+            let kEnd = _exactKVDenseKOut
+            return (y[.ellipsis, ..<kEnd], y[.ellipsis, kEnd...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2069,16 +2260,77 @@ final class Qwen35Attention: Module {
             base, indices.reshaped(indexShape), values: exact, axis: -1)
     }
 
+    /// Is `indices` a complete permutation of `0 ..< count`? A true answer
+    /// means a scatter through it overwrites every output row, so the values it
+    /// overwrites never need to be computed. Read on the host once, at install.
+    private static func isCompletePermutation(
+        _ indices: MLXArray, count: Int
+    ) -> Bool {
+        guard count > 0, indices.ndim == 1, indices.dim(0) == count else {
+            return false
+        }
+        var seen = [Bool](repeating: false, count: count)
+        for value in indices.asType(.int32).asArray(Int32.self) {
+            let row = Int(value)
+            guard row >= 0, row < count, !seen[row] else { return false }
+            seen[row] = true
+        }
+        return true
+    }
+
+    /// Would the affine-4 pack that the island rows overwrite actually run?
+    /// Mirrors the conditions the lazy `_qkvW` / `_kvW` builders require, so a
+    /// dense or non-affine head keeps exactly its current behaviour.
+    private func islandFastPathReady() -> Bool {
+        if let ready = _islandFastPathReady { return ready }
+        var ready = false
+        if let q = qProj as? QuantizedLinear,
+           let k = kProj as? QuantizedLinear,
+           let v = vProj as? QuantizedLinear,
+           q.groupSize == k.groupSize, k.groupSize == v.groupSize,
+           q.bits == k.bits, k.bits == v.bits,
+           q.mode == .affine, k.mode == .affine, v.mode == .affine,
+           q.biases != nil, k.biases != nil, v.biases != nil
+        {
+            ready = true
+        }
+        _islandFastPathReady = ready
+        return ready
+    }
+
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
-        vWeight: MLXArray, vIndices: MLXArray
+        vWeight: MLXArray, vIndices: MLXArray, vOutputCount: Int
     ) {
         precondition(
             qWeight.dim(0) == qIndices.dim(0)
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
             "Qwen MTP precision-island weights and indices must have equal row counts")
+        if Self.isCompletePermutation(kIndices, count: kOutputCount),
+           Self.isCompletePermutation(vIndices, count: vOutputCount)
+        {
+            // Put the island rows back in output order once, so K and V need no
+            // scatter at all. `argSort` of a permutation is its inverse.
+            let kNatural = take(
+                kWeight, argSort(kIndices.asType(.int32)), axis: 0)
+            let vNatural = take(
+                vWeight, argSort(vIndices.asType(.int32)), axis: 0)
+            let kvNatural = concatenated([kNatural, vNatural], axis: 0)
+                .contiguous()
+            let qOnlyWeight = qWeight.contiguous()
+            let qOnlyIndices = qIndices.asType(.int32).contiguous()
+            eval(kvNatural, qOnlyWeight, qOnlyIndices)
+
+            _exactKVDenseW = kvNatural
+            _exactKVDenseKOut = kOutputCount
+            _exactQKVWeight = qOnlyWeight
+            _exactQKVIndices = qOnlyIndices
+            _exactKVIndices = nil
+            _exactQRowCount = qWeight.dim(0)
+            return
+        }
         let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
         let qkvIndices = concatenated(
             [qIndices, kIndices + qOutputCount,
@@ -2362,6 +2614,28 @@ final class Qwen35DecoderLayer: Module {
 
 // MARK: - Text Model
 
+/// Layer indices at which the decode ladder fires `asyncEval`.
+///
+/// `MLX_QWEN_MTP_LADDER` overrides the shipped schedule for attribution runs:
+/// `off`, `front`, `dense`, or an explicit comma-separated index list. Read
+/// once, so a scored run with the variable unset pays one set lookup per layer
+/// and behaves exactly as before.
+let qwen35DecodeLadderRungs: Set<Int> = {
+    let shipped: Set<Int> = [0, 1, 9, 19, 29, 39, 49, 57]
+    guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_LADDER"],
+          !raw.isEmpty
+    else { return shipped }
+    switch raw {
+    case "default": return shipped
+    case "off": return []
+    case "front": return [0, 1]
+    case "dense": return Set(stride(from: 0, to: 64, by: 4)).union([1])
+    default:
+        let parsed = Set(raw.split(separator: ",").compactMap { Int($0) })
+        return parsed.isEmpty ? shipped : parsed
+    }
+}()
+
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
@@ -2415,14 +2689,15 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
+        // Decode-width asyncEval ladder: at S <= 9 (serial step and every MTP
+        // verify width) the host builds a ~64-layer graph before anything
+        // reaches the GPU. Firing asyncEval at a few layer boundaries lets the
+        // GPU start on the early layers while the host is still building the
         // rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
+        // schedule scaled from 40 to 64 layers, front rungs kept). The rung
+        // set is overridable via MLX_QWEN_MTP_LADDER for schedule research.
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
@@ -2450,13 +2725,8 @@ public class Qwen35TextModelInner: Module {
                         if i == 0 || i % 3 == 2 {
                             asyncEval(base, out.delta)
                         }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(base, out.delta)
-                        default:
-                            break
-                        }
+                    } else if qwen35DecodeLadderRungs.contains(i) {
+                        asyncEval(base, out.delta)
                     }
                 }
             }
@@ -2475,13 +2745,8 @@ public class Qwen35TextModelInner: Module {
                         if i == 0 || i % 3 == 2 {
                             asyncEval(hiddenStates)
                         }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(hiddenStates)
-                        default:
-                            break
-                        }
+                    } else if qwen35DecodeLadderRungs.contains(i) {
+                        asyncEval(hiddenStates)
                     }
                 }
             }
@@ -3125,7 +3390,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 layer.selfAttn.installExactQKVRows(
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
                     kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
-                    vWeight: vWeight, vIndices: vIndices)
+                    vWeight: vWeight, vIndices: vIndices, vOutputCount: 1_024)
             }
         }
 
