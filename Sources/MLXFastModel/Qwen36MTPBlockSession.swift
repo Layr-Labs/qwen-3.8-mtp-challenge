@@ -796,28 +796,29 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        // FLAT CAP 7, NO GATE. Two ranked receipts of ours, each isolating one
-        // half of this: capping at 7 gave `919318e1` (always the x4 slot)
-        // 0.011967 s/tok at draft length 4.32 — still the fastest reading for
-        // that prompt from any tree on this board — while removing the streak
-        // gate's width-wall FLOOR gave `00142a44` 0.011070 at draft length
-        // 5.10, a -2.6% move to within 0.4% of its own board minimum.
+        // CAP 7 UNDER A FLOOR OF 6, GATED ON THE FULL-ACCEPT STREAK. The flat
+        // cap 7 (no gate) promoted at 3.25592 and its receipts stand: capping
+        // at 7 gave `919318e1` (always the x4 slot) 0.011967 s/tok at draft
+        // length 4.32, while dropping the width-wall FLOOR gave `00142a44`
+        // 0.011070 at draft length 5.10, within 0.4% of its board minimum.
         //
-        // The floor, not the ceiling, is what was truncating `00142a44`: it
-        // drops the cap to `sdpaWidthWallDepthCap` on every round after a
-        // reject, cutting rounds the marginal rule would have taken deeper. So
-        // the ceiling stays at 7 and the floor goes, which is both receipts in
-        // one schedule.
-        //
-        // I shipped these two together once before and lost x4, but that tree
-        // also carried a third confidence-tempering rung, and only that rung
-        // can shorten a round — removing a floor cannot. It is not here.
+        // The flat schedule then gave back exactly one slot: uncapped, x4
+        // overshot its 4.25 optimum (-1.1% on `919318e1`, half the published
+        // median) because one reject moved the cap a full 7 -> 5 before, and
+        // 0 not at all after. A floor of 6 restrains a rejecting round by one
+        // rung instead of two: x4 keeps the restraint that holds it near 4.3,
+        // and the high-acceptance prompts keep the depth their `reach` earns
+        // once the streak re-qualifies. Ranked receipt: this exact one-line
+        // schedule change on the flat-cap tree promoted at 3.30221 (+1.42%).
         //
         // Safety does not depend on the gate: `reach` is a product of the
         // per-position acceptance EMAs and collapses on a cold stretch by
         // itself. Widths 6..8 are bit-exact per position against the serial
-        // trajectory through the sdpa exactness chunk, so 7 is policy.
-        let widthCap = Self.segmentedVerifyDepthCap
+        // trajectory through the sdpa exactness chunk, so 6 vs 7 is policy.
+        let widthCap =
+            fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.segmentedVerifyDepthCap - 1
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
