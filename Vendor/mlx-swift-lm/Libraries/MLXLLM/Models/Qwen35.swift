@@ -2171,7 +2171,13 @@ public class Qwen35TextModelInner: Module {
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        // Serial control is S==1 and nConfirmed==0. Eight asyncEval rungs
+        // on that 1-row graph are extra command buffers on the score
+        // denominator (serial = 1.0). Candidate verify always passes
+        // nConfirmed: 1, even at K=1 (verify width 2). Prefill S>=512
+        // keeps its rungs — dropping them lost (#765, 3.239).
+        let serialControl = inputs.dim(1) == 1 && nConfirmed == 0
+        let ladderActive = !serialControl && (inputs.dim(1) <= 9 || prefillLadder)
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
