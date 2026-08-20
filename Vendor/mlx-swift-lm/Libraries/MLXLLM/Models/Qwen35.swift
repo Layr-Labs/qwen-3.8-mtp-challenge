@@ -1231,6 +1231,177 @@ private let qwen35CompiledFusedSwiGLU:
     return body
 }()
 
+// Target-tower decode/verify twin of the proposal-head K2 experiment in
+// public PR #252.  The proposal kernel proved that paired gate/up output rows
+// can finish `silu(g) * u` before either half reaches device memory.  This
+// version preserves the promoted target kernel's multi-input-row contract:
+// one weight tile is shared across the same compile-time IPG schedule as
+// `qmv_fast_crossrow_affine4_g64_m`, and gate/up phases run sequentially so
+// their accumulator banks are never simultaneously live.  That last point is
+// load-bearing: the all-register stacked layout is exactly the register/
+// occupancy failure mode seen in the GPUG Cholesky v760/v766 study.
+//
+// M is deliberately limited to 3...9.  Those are the scored target verify
+// widths, and all use the frontier's DIRECT_NIBBLES arithmetic.  Serial M=1,
+// width-2, prefill, dense/BF16 linears, and every other quantization envelope
+// stay on the existing path verbatim.
+private let qwen35TargetGateUpActEnabled =
+    ProcessInfo.processInfo.environment[
+        "MLXFAST_QWEN_TARGET_GATE_UP_EPILOGUE"] != "0"
+
+private let qwen35TargetGateUpActHeader = """
+    // Keep this identical to MLX's compiled Sigmoid functor.  The 0xC0DB ->
+    // 0x3A8B exception above is intentionally limited to qwen35_prework_beta:
+    // it reconciles a custom kernel with a *standalone graph sigmoid*.  The
+    // stock MLP instead calls compiledSilu, whose in-kernel Sigmoid uses this
+    // expression, and the existing GDN kernel likewise leaves its SiLU path
+    // uncorrected.  Applying the beta exception here would change the stock
+    // compiled-SiLU contract at exactly that input.
+    inline bfloat16_t qwen35_target_sigmoid(bfloat16_t x) {
+      auto y = 1 / (1 + metal::exp(metal::abs(x)));
+      return (x < 0) ? y : 1 - y;
+    }
+
+    template <int NA, bool STORE_GATE, int K, int N>
+    inline void qwen35_target_gate_up_phase(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        device bfloat16_t* act,
+        threadgroup bfloat16_t* gate_values,
+        int first_m,
+        int out_row,
+        uint simd_gid,
+        uint simd_lid) {
+      typedef vec<float, NA> VF;
+      constexpr int rows_per_simd = 4;
+      constexpr int values_per_thread = 16;
+      constexpr int block_size = values_per_thread * 32;
+      constexpr int bytes_per_lane = 8;
+      const int in_vec_size_w = K / 2;
+      const int in_vec_size_g = K / 64;
+      const int matrix_row = out_row + (STORE_GATE ? 0 : N);
+
+      VF acc[rows_per_simd];
+      for (int r = 0; r < rows_per_simd; r++) {
+        acc[r] = VF(0.0f);
+      }
+
+      for (int k = 0; k < K; k += block_size) {
+        thread uint16_t packed[rows_per_simd][4];
+        thread float scale_local[rows_per_simd];
+        thread float bias_local[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; r++) {
+          const int row = matrix_row + r;
+          const device uint16_t* ws =
+              reinterpret_cast<const device uint16_t*>(
+                  reinterpret_cast<const device uint8_t*>(w)
+                  + row * in_vec_size_w + k / 2
+                  + simd_lid * bytes_per_lane);
+          for (int i = 0; i < 4; i++) {
+            packed[r][i] = ws[i];
+          }
+          const int group_index =
+              row * in_vec_size_g + k / 64 + simd_lid / 4;
+          scale_local[r] = scales[group_index];
+          bias_local[r] = biases[group_index];
+        }
+
+        VF sums = VF(0.0f);
+        VF partial[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; r++) {
+          partial[r] = VF(0.0f);
+        }
+        for (int i = 0; i < 4; i++) {
+          VF a0, a1, a2, a3;
+          for (int m = 0; m < NA; m++) {
+            const device bfloat16_t* xm =
+                x + (first_m + m) * K + k
+                + simd_lid * values_per_thread + 4 * i;
+            // Preserve the incumbent BF16 expression tree for the affine
+            // bias correction.  The four converted values below feed only
+            // the DIRECT_NIBBLES dot-product expression.
+            sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+            a0[m] = static_cast<float>(xm[0]);
+            a1[m] = static_cast<float>(xm[1]);
+            a2[m] = static_cast<float>(xm[2]);
+            a3[m] = static_cast<float>(xm[3]);
+          }
+          for (int r = 0; r < rows_per_simd; r++) {
+            partial[r] +=
+                (a0 * (packed[r][i] & 0x000f)
+                 + a1 * ((packed[r][i] >> 4) & 0x000f)
+                 + a2 * ((packed[r][i] >> 8) & 0x000f)
+                 + a3 * ((packed[r][i] >> 12) & 0x000f));
+          }
+        }
+        for (int r = 0; r < rows_per_simd; r++) {
+          acc[r] +=
+              scale_local[r] * partial[r] + sums * bias_local[r];
+        }
+      }
+
+      for (int r = 0; r < rows_per_simd; r++) {
+        for (int m = 0; m < NA; m++) {
+          const float reduced = simd_sum(acc[r][m]);
+          if (simd_lid == 0) {
+            const bfloat16_t value = static_cast<bfloat16_t>(reduced);
+            const int local_row = int(simd_gid) * rows_per_simd + r;
+            if (STORE_GATE) {
+              gate_values[m * 8 + local_row] = value;
+            } else {
+              const bfloat16_t gate = gate_values[m * 8 + local_row];
+              // compiled.cpp materializes each primitive tape node at the
+              // array dtype.  Spell both BF16 temporaries out so Metal cannot
+              // reassociate the compiled-SiLU rounding boundaries.
+              const bfloat16_t sigmoid = qwen35_target_sigmoid(gate);
+              const bfloat16_t silu = gate * sigmoid;
+              act[(first_m + m) * N + out_row + r] =
+                  silu * value;
+            }
+          }
+        }
+      }
+    }
+    """
+
+private let qwen35TargetGateUpActKernel = MLXFast.metalKernel(
+    name: "qwen35_target_gate_up_act_direct_v1",
+    inputNames: ["x", "w", "scales", "biases"],
+    outputNames: ["act"],
+    source: """
+        const int first_m = int(threadgroup_position_in_grid.x) * IPG;
+        const int out_row =
+            int(threadgroup_position_in_grid.y) * 8
+            + int(simdgroup_index_in_threadgroup) * 4;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        constexpr int TAIL = M % IPG;
+        threadgroup bfloat16_t gate_values[8 * IPG];
+
+        if (TAIL == 0 || M - first_m >= IPG) {
+          qwen35_target_gate_up_phase<IPG, true, IN_K, N_GATE>(
+              w, scales, biases, x, act, gate_values,
+              first_m, out_row, simd_gid, simd_lid);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          qwen35_target_gate_up_phase<IPG, false, IN_K, N_GATE>(
+              w, scales, biases, x, act, gate_values,
+              first_m, out_row, simd_gid, simd_lid);
+        } else {
+          qwen35_target_gate_up_phase<
+              (TAIL >= 2 ? TAIL : 2), true, IN_K, N_GATE>(
+              w, scales, biases, x, act, gate_values,
+              first_m, out_row, simd_gid, simd_lid);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          qwen35_target_gate_up_phase<
+              (TAIL >= 2 ? TAIL : 2), false, IN_K, N_GATE>(
+              w, scales, biases, x, act, gate_values,
+              first_m, out_row, simd_gid, simd_lid);
+        }
+        """,
+    header: qwen35TargetGateUpActHeader)
+
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -1251,6 +1422,26 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
+    private func buildQuantizedGateUpPack() -> Bool {
+        if _fqW != nil || _fqS != nil || _fqZ != nil {
+            return _fqW != nil && _fqS != nil && _fqZ != nil
+        }
+        guard let g = gateProj as? QuantizedLinear,
+              let u = upProj as? QuantizedLinear,
+              g.groupSize == u.groupSize, g.bits == u.bits,
+              g.mode == u.mode, g.mode == .affine,
+              let gz = g.biases, let uz = u.biases
+        else { return false }
+        _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
+        _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
+        _fqZ = concatenated([gz, uz], axis: 0).contiguous()
+        _fqGS = g.groupSize
+        _fqBits = g.bits
+        _fqMode = g.mode
+        _gateOut = g.shape.0
+        return true
+    }
+
     private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
             return quantizedMM(
@@ -1260,19 +1451,7 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         if let w = _fbfW {
             return matmul(x, w.T)
         }
-        if let g = gateProj as? QuantizedLinear,
-           let u = upProj as? QuantizedLinear,
-           g.groupSize == u.groupSize, g.bits == u.bits,
-           g.mode == u.mode, g.mode == .affine,
-           let gz = g.biases, let uz = u.biases
-        {
-            _fqW = concatenated([g.weight, u.weight], axis: 0).contiguous()
-            _fqS = concatenated([g.scales, u.scales], axis: 0).contiguous()
-            _fqZ = concatenated([gz, uz], axis: 0).contiguous()
-            _fqGS = g.groupSize
-            _fqBits = g.bits
-            _fqMode = g.mode
-            _gateOut = g.shape.0
+        if buildQuantizedGateUpPack() {
             return fusedGateUp(x)
         }
         if !(gateProj is QuantizedLinear), !(upProj is QuantizedLinear) {
@@ -1284,11 +1463,59 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return nil
     }
 
+    /// Multi-row target gate/up QMV with an in-threadgroup SwiGLU epilogue.
+    /// The IPG table is byte-for-byte the live N>=4096 direct-nibble table;
+    /// keeping it here beside the shape gate makes dispatch reachability
+    /// reviewable without relying on a stale source comment in quantized.h.
+    private func fusedTargetGateUpActivation(_ x: MLXArray) -> MLXArray? {
+        let m = x.dim(-2)
+        let ipg: Int
+        switch m {
+        case 3: ipg = 3
+        case 4: ipg = 4
+        case 5: ipg = 3
+        case 6: ipg = 3
+        case 7: ipg = 4
+        case 8: ipg = 4
+        case 9: ipg = 3
+        default: return nil
+        }
+        guard qwen35TargetGateUpActEnabled,
+              MLXHardwareInfo.isCompiledDecodeSupported,
+              x.ndim == 3, x.dim(0) == 1, x.dim(-1) == 5120,
+              x.dtype == .bfloat16,
+              buildQuantizedGateUpPack(),
+              _fqGS == 64, _fqBits == 4, _fqMode == .affine,
+              _gateOut == 17_408,
+              let w = _fqW, let s = _fqS, let z = _fqZ,
+              w.dtype == .uint32,
+              s.dtype == .bfloat16, z.dtype == .bfloat16,
+              w.shape == [2 * _gateOut, 5120 / 8],
+              s.shape == [2 * _gateOut, 5120 / 64],
+              z.shape == s.shape
+        else { return nil }
+        let inputGroups = (m + ipg - 1) / ipg
+        return qwen35TargetGateUpActKernel(
+            [x, w, s, z],
+            template: [
+                ("M", m), ("IPG", ipg),
+                ("IN_K", 5120), ("N_GATE", _gateOut),
+            ],
+            grid: (inputGroups * 64, _gateOut / 8, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1, m, _gateOut]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // The fused path is only taken when the gate/up split is provably
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
+        if let activation = fusedTargetGateUpActivation(x) {
+            return downProj(activation)
+        }
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
             return downProj(qwen35CompiledFusedSwiGLU(y))
         }
