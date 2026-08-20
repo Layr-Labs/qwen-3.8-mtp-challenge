@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:Frosty40/qwen38-mtp-head-4bit-g64-v1@ffa415a48acefdc5f89b90dc431a8f60c983f3ab",
+  "sha256": "c2bbb6bf38b138756f3d06f24042176977e38ca5bb507fc742ca3f508741dc80",
+  "bytes": 553612248,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "4-bit g64 coarse draft readout: draft_lm_head re-quantized from 2-bit to 4-bit (packed [98336,320] -> [98336,640] uint32, scales/biases unchanged 98336x80 bf16), sourced from the exact 4-bit lm_head compact rows (EigenLabs/Qwen3.8-27B-4bit). Recall proxy: 0.8906 (2-bit) -> 0.9844 (3-bit) -> 1.0000 (4-bit, self-reference). 4-bit readout == exact 4-bit lm_head ranking, so the top-32 shortlist always contains the true top-1; the exact rerank becomes a no-op confirmation. Readout traffic +126 MB/draft (~157 -> ~283 MB); measured share of MTP decode time is tiny (readout ~0.28% of decode). sha256 is the runner's single-file staged-tree digest."
 }
