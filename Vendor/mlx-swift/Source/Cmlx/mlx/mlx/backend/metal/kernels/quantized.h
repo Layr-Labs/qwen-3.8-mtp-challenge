@@ -1065,6 +1065,138 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
+// Apply one NA-row chunk to already-loaded packed weights. Used by the
+// one-stream M=5/6 path so both chunks share one weight load per K-block.
+template <typename T, int NA, bool DIRECT_NIBBLES>
+METAL_FUNC void affine4_g64_accumulate_rows(
+    const thread uint16_t packed[4][4],
+    const thread float scale_local[4],
+    const thread float bias_local[4],
+    const device T* x,
+    int first_m,
+    int k,
+    int in_vec_size,
+    uint simd_lid,
+    thread vec<float, NA>* acc) {
+  static_assert(NA >= 2 && NA <= 3, "one-stream tails are NA=2 or NA=3");
+  typedef vec<float, NA> VF;
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  VF sums = VF(0.0f);
+  VF partial[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    partial[r] = VF(0.0f);
+  }
+  for (int i = 0; i < 4; i++) {
+    VF a0, a1, a2, a3;
+    for (int m = 0; m < NA; m++) {
+      const device T* xm = x + (first_m + m) * in_vec_size + k +
+          simd_lid * values_per_thread + 4 * i;
+      thread float xc[4];
+      if (DIRECT_NIBBLES) {
+        xc[0] = static_cast<float>(xm[0]);
+        xc[1] = static_cast<float>(xm[1]);
+        xc[2] = static_cast<float>(xm[2]);
+        xc[3] = static_cast<float>(xm[3]);
+        sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+      } else {
+        sums[m] += load_vector<T, float, 4, 4>(xm, xc);
+      }
+      a0[m] = xc[0];
+      a1[m] = xc[1];
+      a2[m] = xc[2];
+      a3[m] = xc[3];
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      if (DIRECT_NIBBLES) {
+        partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                       a1 * ((packed[r][i] >> 4) & 0x000f) +
+                       a2 * ((packed[r][i] >> 8) & 0x000f) +
+                       a3 * ((packed[r][i] >> 12) & 0x000f));
+      } else {
+        partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                       a1 * (packed[r][i] & 0x00f0) +
+                       a2 * (packed[r][i] & 0x0f00) +
+                       a3 * (packed[r][i] & 0xf000));
+      }
+    }
+  }
+  for (int r = 0; r < rows_per_simd; r++) {
+    acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
+  }
+}
+
+// M=5 (3+2) and M=6 (3+3) currently run TWO x-groups, each re-reading the
+// same 8-output-row weight tile. tid.x==0 now owns every input row and
+// loads that tile once per K-block. Frozen host still launches M groups;
+// the rest return. Opposite of the M=8 IPG-3 miss (that ADDED a stream).
+template <typename T, int M, bool DIRECT_NIBBLES>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_onestream(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M == 5 || M == 6, "one-stream merge is M=5 or M=6");
+  if (int(tid.x) != 0) {
+    return;
+  }
+  constexpr int NA1 = M - 3;
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  vec<float, 3> acc0[rows_per_simd];
+  vec<float, NA1> acc1[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    acc0[r] = vec<float, 3>(0.0f);
+    acc1[r] = vec<float, NA1>(0.0f);
+  }
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+    affine4_g64_accumulate_rows<T, 3, DIRECT_NIBBLES>(
+        packed, scale_local, bias_local, x, 0, k, in_vec_size, simd_lid, acc0);
+    affine4_g64_accumulate_rows<T, NA1, DIRECT_NIBBLES>(
+        packed, scale_local, bias_local, x, 3, k, in_vec_size, simd_lid, acc1);
+  }
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < 3; m++) {
+      const float reduced = simd_sum(acc0[r][m]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+    for (int m = 0; m < NA1; m++) {
+      const float reduced = simd_sum(acc1[r][m]);
+      if (simd_lid == 0) {
+        y[(3 + m) * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
 // Single-row (M == 1) affine2/g64 fast QMV for the coarse compact draft
 // readout (out_vec_size == 98_336, bits == 2) of the promoted draft-rerank
 // scheme, at 32 values per lane: each lane loads ONE uint64 (32 packed
@@ -1936,12 +2068,12 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+          qmv_fast_crossrow_affine4_g64_onestream<T, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
+          qmv_fast_crossrow_affine4_g64_onestream<T, 6, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
