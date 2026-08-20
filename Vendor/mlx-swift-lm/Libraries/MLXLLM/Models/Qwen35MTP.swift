@@ -74,6 +74,26 @@ final class Qwen35MTPDecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
+    /// Same layer, but returning the exit residual UNMERGED as `(h, mlpOut)`
+    /// so the caller can fold this layer's exit add into whatever normalises
+    /// it next. The merged form is exactly `h + mlpOut`.
+    func boundaryExit(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (base: MLXArray, delta: MLXArray) {
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
+            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return (h, (mlp as! UnaryLayer)(postAttnNorm))
+        }
+        let h = x + r
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
+    }
+
     /// Populate this layer's K/V history without computing a dead layer
     /// output. Only valid when no later MTP layer consumes that output.
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
@@ -121,6 +141,30 @@ final class Qwen35MTPModule: Module {
     /// One launch for the two independent pre-fc RMSNorms. Same arithmetic
     /// as the eager pair when both sides are bf16 / 5120; otherwise the
     /// stock `RMSNorm` path. Proposal-only.
+    /// The pre-fc pair as ONE `[..., 2 * hidden]` buffer, ready for `fc`.
+    /// The split form is immediately re-glued by `concatenated(...)` at every
+    /// call site — a real copy of 10240 bf16 elements plus a host graph node,
+    /// paid once per PROPOSED token. Emitting the concatenation from the same
+    /// kernel removes both. Bit-identical to
+    /// `concatenated(preFcNorms(...), axis: -1)`: same reads, same
+    /// accumulation, same `wi * bfloat(xi * inv_mean)`, only a different
+    /// destination offset. Falls back to the split path on any other shape.
+    private func preFcConcat(embeds: MLXArray, hidden: MLXArray) -> MLXArray {
+        if embeds.dtype == .bfloat16, hidden.dtype == .bfloat16,
+           embeds.dim(-1) == 5120, hidden.dim(-1) == 5120,
+           embeds.shape == hidden.shape,
+           preFcNormEmbedding.eps == preFcNormHidden.eps
+        {
+            return qwen35DualRMSNormConcat(
+                a: embeds, b: hidden,
+                aWeight: preFcNormEmbedding.weight,
+                bWeight: preFcNormHidden.weight,
+                eps: preFcNormEmbedding.eps)
+        }
+        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
+        return concatenated([e, h], axis: -1)
+    }
+
     private func preFcNorms(embeds: MLXArray, hidden: MLXArray) -> (MLXArray, MLXArray) {
         if embeds.dtype == .bfloat16, hidden.dtype == .bfloat16,
            embeds.dim(-1) == 5120, hidden.dim(-1) == 5120,
@@ -145,14 +189,34 @@ final class Qwen35MTPModule: Module {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)
-        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
-        var fused = fc(concatenated([e, h], axis: -1))
+        var fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
         // 3. Run each MTPDecoderLayer.
+        //
+        // The single-layer head — which is every Qwen 3.8 head, `layers.count`
+        // is 1 — exits on `h + mlpOut` and is immediately followed by `norm`.
+        // That add-then-norm is the pair `qwen35FusedResidualRMSNorm` exists to
+        // collapse, and it is the same fold already applied at this layer's
+        // post-attention boundary. Taking the exit unmerged lets the two become
+        // one launch and one host graph node, paid once per PROPOSED token.
+        // Bit-identical: the kernel computes `bf16(h + mlpOut)` and then the
+        // same weighted RMS over it that `norm` would.
+        if layers.count == 1, cache.count >= 1,
+           fused.dtype == .bfloat16, fused.dim(-1) == 5120
+        {
+            let (base, delta) = layers[0].boundaryExit(
+                fused, mask: mask, cache: cache[0])
+            if delta.dtype == .bfloat16 {
+                let (_, normed) = qwen35FusedResidualRMSNorm(
+                    x: base, r: delta, weight: norm.weight, eps: norm.eps)
+                return normed
+            }
+            return norm(base + delta)
+        }
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
             fused = layer(fused, mask: mask, cache: c)
@@ -178,8 +242,7 @@ final class Qwen35MTPModule: Module {
         else { return nil }
 
         let embeds = embedTokens(nextTokenIds)
-        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
-        let fused = fc(concatenated([e, h], axis: -1))
+        let fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
