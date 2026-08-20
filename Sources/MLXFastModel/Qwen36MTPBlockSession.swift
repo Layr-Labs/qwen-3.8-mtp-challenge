@@ -836,8 +836,25 @@ public final class Qwen36MTPBlockSession {
         // 4.3, while the high-acceptance prompts keep the depth they earned.
         // Widths 6..8 are bit-exact per position through the sdpa exactness
         // chunk, so both constants are policy, not correctness.
+        // Streak-qualified rounds go to the trusted maximum 8 rather than 7.
+        // The floor of 6 is what does the work on this tree and it stays; this
+        // only lifts the ceiling for stretches the head has already proved.
+        //
+        // Read from the promoted tree's own per-prompt receipt: x4 `919318e1`
+        // is now within **0.26%** of its board minimum (0.011998 vs 0.011967)
+        // and is effectively maxed, while x5 has moved back to `00142a44` at
+        // **+0.80%** (0.011063 vs 0.010975) — and that prompt's own optimum sits
+        // at draft length ~5.75 while this tree holds it at 5.10. It is not
+        // floor-bound there (5.10 < 6), so the remaining depth has to come from
+        // the ceiling.
+        //
+        // The risk is symmetric and worth stating: a ceiling of 8 also lets x4
+        // drift deeper — trunk's old ceiling-8 tree ran it at 4.53 — and x4 is
+        // half the median with no headroom left. So this is a probe, not an
+        // improvement I can argue for from the receipts alone: if x4 drifts more
+        // than x5 gains, it loses, and the crown simply stands.
         let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
+            ? Qwen36MTPLimits.maxDepth
             : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
