@@ -1185,6 +1185,256 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+// One-stream M=5 and M=6. Frozen host still launches grid (M, N/8).
+// Today M=5 is IPG 3 (3+2) and M=6 is IPG 3 (3+3): TWO x-groups each
+// re-read the same 8-output-row weight tile. tid.x==0 now owns every
+// input row and loads that tile once per K-block; other x-groups
+// return. Opposite of the M=8 IPG-3 miss, which ADDED a stream.
+//
+// Previous ticket ac2dc651 JIT-died because affine4_g64_accumulate_rows
+// took thread array / thread-pointer parameters. This rewrite has NO
+// helper: both chunks are fully inlined, use only float3/float2, and
+// keep packed/scale/bias as local arrays. DIRECT_NIBBLES expression,
+// bias-correction sums, K-block size 512, and simd_sum along K within
+// a row are copied from qmv_fast_crossrow_affine4_g64_wide<T,NA,true>.
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_onestream_m5(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  if (int(tid.x) != 0) {
+    return;
+  }
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float3 acc0[rows_per_simd];
+  float2 acc1[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    acc0[r] = float3(0.0f);
+    acc1[r] = float2(0.0f);
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      packed[r][0] = ws[0];
+      packed[r][1] = ws[1];
+      packed[r][2] = ws[2];
+      packed[r][3] = ws[3];
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    float3 sums0 = float3(0.0f);
+    float3 partial0[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      partial0[r] = float3(0.0f);
+    }
+    for (int i = 0; i < 4; i++) {
+      float3 a0, a1, a2, a3;
+      for (int m = 0; m < 3; m++) {
+        const device T* xm = x + m * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        a0[m] = static_cast<float>(xm[0]);
+        a1[m] = static_cast<float>(xm[1]);
+        a2[m] = static_cast<float>(xm[2]);
+        a3[m] = static_cast<float>(xm[3]);
+        sums0[m] += xm[0] + xm[1] + xm[2] + xm[3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial0[r] += (a0 * (packed[r][i] & 0x000f) +
+                        a1 * ((packed[r][i] >> 4) & 0x000f) +
+                        a2 * ((packed[r][i] >> 8) & 0x000f) +
+                        a3 * ((packed[r][i] >> 12) & 0x000f));
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      acc0[r] += scale_local[r] * partial0[r] + sums0 * bias_local[r];
+    }
+
+    float2 sums1 = float2(0.0f);
+    float2 partial1[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      partial1[r] = float2(0.0f);
+    }
+    for (int i = 0; i < 4; i++) {
+      float2 b0, b1, b2, b3;
+      for (int m = 0; m < 2; m++) {
+        const device T* xm = x + (3 + m) * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        b0[m] = static_cast<float>(xm[0]);
+        b1[m] = static_cast<float>(xm[1]);
+        b2[m] = static_cast<float>(xm[2]);
+        b3[m] = static_cast<float>(xm[3]);
+        sums1[m] += xm[0] + xm[1] + xm[2] + xm[3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial1[r] += (b0 * (packed[r][i] & 0x000f) +
+                        b1 * ((packed[r][i] >> 4) & 0x000f) +
+                        b2 * ((packed[r][i] >> 8) & 0x000f) +
+                        b3 * ((packed[r][i] >> 12) & 0x000f));
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      acc1[r] += scale_local[r] * partial1[r] + sums1 * bias_local[r];
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < 3; m++) {
+      const float reduced = simd_sum(acc0[r][m]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+    for (int m = 0; m < 2; m++) {
+      const float reduced = simd_sum(acc1[r][m]);
+      if (simd_lid == 0) {
+        y[(3 + m) * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_onestream_m6(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  if (int(tid.x) != 0) {
+    return;
+  }
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float3 acc0[rows_per_simd];
+  float3 acc1[rows_per_simd];
+  for (int r = 0; r < rows_per_simd; r++) {
+    acc0[r] = float3(0.0f);
+    acc1[r] = float3(0.0f);
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      packed[r][0] = ws[0];
+      packed[r][1] = ws[1];
+      packed[r][2] = ws[2];
+      packed[r][3] = ws[3];
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    float3 sums0 = float3(0.0f);
+    float3 partial0[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      partial0[r] = float3(0.0f);
+    }
+    for (int i = 0; i < 4; i++) {
+      float3 a0, a1, a2, a3;
+      for (int m = 0; m < 3; m++) {
+        const device T* xm = x + m * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        a0[m] = static_cast<float>(xm[0]);
+        a1[m] = static_cast<float>(xm[1]);
+        a2[m] = static_cast<float>(xm[2]);
+        a3[m] = static_cast<float>(xm[3]);
+        sums0[m] += xm[0] + xm[1] + xm[2] + xm[3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial0[r] += (a0 * (packed[r][i] & 0x000f) +
+                        a1 * ((packed[r][i] >> 4) & 0x000f) +
+                        a2 * ((packed[r][i] >> 8) & 0x000f) +
+                        a3 * ((packed[r][i] >> 12) & 0x000f));
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      acc0[r] += scale_local[r] * partial0[r] + sums0 * bias_local[r];
+    }
+
+    float3 sums1 = float3(0.0f);
+    float3 partial1[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      partial1[r] = float3(0.0f);
+    }
+    for (int i = 0; i < 4; i++) {
+      float3 b0, b1, b2, b3;
+      for (int m = 0; m < 3; m++) {
+        const device T* xm = x + (3 + m) * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        b0[m] = static_cast<float>(xm[0]);
+        b1[m] = static_cast<float>(xm[1]);
+        b2[m] = static_cast<float>(xm[2]);
+        b3[m] = static_cast<float>(xm[3]);
+        sums1[m] += xm[0] + xm[1] + xm[2] + xm[3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial1[r] += (b0 * (packed[r][i] & 0x000f) +
+                        b1 * ((packed[r][i] >> 4) & 0x000f) +
+                        b2 * ((packed[r][i] >> 8) & 0x000f) +
+                        b3 * ((packed[r][i] >> 12) & 0x000f));
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      acc1[r] += scale_local[r] * partial1[r] + sums1 * bias_local[r];
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < 3; m++) {
+      const float reduced = simd_sum(acc0[r][m]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+    for (int m = 0; m < 3; m++) {
+      const float reduced = simd_sum(acc1[r][m]);
+      if (simd_lid == 0) {
+        y[(3 + m) * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1936,12 +2186,12 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+          qmv_fast_crossrow_affine4_g64_onestream_m5<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
         case 6:
-          qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
+          qmv_fast_crossrow_affine4_g64_onestream_m6<T>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
