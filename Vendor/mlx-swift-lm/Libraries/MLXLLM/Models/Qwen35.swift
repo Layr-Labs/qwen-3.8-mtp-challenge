@@ -1850,6 +1850,128 @@ func qwen35DualRMSNormConcat(
     return outputs[0]
 }
 
+/// Embedding-row gather folded into the concat dual-RMSNorm. `is_a` rows
+/// read `embed_weight[ids[local_row]]` instead of a materialized gather;
+/// `is_b` rows still read `b`. Same reduction and concat store as
+/// `qwen35_dual_rms_norm_concat_bf16_v1`. Proposal-only.
+private let qwen35EmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_embed_dual_rms_norm_concat_bf16_v1",
+    inputNames: ["ids", "embed_weight", "b", "a_weight", "b_weight", "eps"],
+    outputNames: ["concat_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(b_shape[b_ndim - 1]);
+        uint a_rows = 1;
+        for (uint i = 0; i + 1 < b_ndim; ++i) {
+            a_rows *= uint(b_shape[i]);
+        }
+        bool is_a = row < a_rows;
+        uint local_row = is_a ? row : row - a_rows;
+        ulong in_off = ulong(local_row) * ulong(axis_size);
+        ulong embed_off = ulong(uint(ids[local_row])) * ulong(axis_size);
+        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
+            + (is_a ? 0 : ulong(axis_size));
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = is_a
+                        ? float(embed_weight[embed_off + elem + i])
+                        : float(b[in_off + elem + i]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = is_a
+                            ? float(embed_weight[embed_off + elem + i])
+                            : float(b[in_off + elem + i]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = is_a
+                        ? float(embed_weight[embed_off + elem + i])
+                        : float(b[in_off + elem + i]);
+                    bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
+                    concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = is_a
+                            ? float(embed_weight[embed_off + elem + i])
+                            : float(b[in_off + elem + i]);
+                        bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
+                        concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35EmbedDualRMSNormConcat(
+    ids: MLXArray,
+    embedWeight: MLXArray,
+    b: MLXArray,
+    aWeight: MLXArray,
+    bWeight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    let nRows = b.size / b.dim(-1)
+    var outShape = b.shape
+    outShape[outShape.count - 1] = b.dim(-1) * 2
+    return qwen35EmbedDualRMSNormConcatKernel(
+        [ids, embedWeight, b, aWeight, bWeight, MLXArray(eps)],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
