@@ -1072,7 +1072,14 @@ public final class Qwen36MTPBlockSession {
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        // K=1: draftIdArrays.last IS draftId, already submitted above.
+        // A second asyncEval of the same array is a duplicate candidate
+        // command buffer, not overlap. K>=2: last step is a different
+        // tensor; keep that submit so the GPU can finish the chain while
+        // the host builds the 64-layer verify graph.
+        if draftCount > 1 {
+            asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        }
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
