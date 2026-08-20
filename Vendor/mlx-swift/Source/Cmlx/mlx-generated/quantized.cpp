@@ -1964,10 +1964,19 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
+          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split
+          // (IPG 4) needs two simultaneous vec<float,4> accumulators in every
+          // active worker. The public cross-row study timed that cliff at
+          // 319 / 437 / 216 us for M = 7 / 8 / 9: M = 9 with IPG 3 (three
+          // vec<float,3> groups) is cheaper than M = 8 with IPG 4 despite
+          // more rows, so the cost is the four-wide register file, not work.
+          // IPG 3 is legal: 8 % 3 == 2 (no one-row tail), NA in {3,3,2}
+          // all inside the wide helper's [2,4], and each lane is an
+          // independent input row (simd_sum reduces along K within a row),
+          // so moving a row from lane 3 of a four-wide vector to lane 0 of
+          // a two-wide one cannot reorder its scalar chain. Ranked JIT
+          // source is this file; keep the AOT twin in lockstep.
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
