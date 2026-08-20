@@ -1730,126 +1730,6 @@ func qwen35DualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
-/// Dual RMSNorm that writes the concatenated `[e | h]` layout the MTP
-/// `fc` already consumes. Same per-row arithmetic as `qwen35DualRMSNorm`;
-/// the concat copy after that launch is dead.
-private let qwen35DualRMSNormConcatKernel = MLXFast.metalKernel(
-    name: "qwen35_dual_rms_norm_concat_bf16_v1",
-    inputNames: ["a", "b", "a_weight", "b_weight", "eps"],
-    outputNames: ["concat_out"],
-    source: """
-        constexpr uint n_reads = 4;
-        constexpr uint simd_size = 32;
-        constexpr uint lsize = 1024;
-
-        uint row = threadgroup_position_in_grid.x;
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_thread = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-
-        uint axis_size = uint(a_shape[a_ndim - 1]);
-        uint a_rows = 1;
-        for (uint i = 0; i + 1 < a_ndim; ++i) {
-            a_rows *= uint(a_shape[i]);
-        }
-        bool is_a = row < a_rows;
-        uint local_row = is_a ? row : row - a_rows;
-        ulong in_off = ulong(local_row) * ulong(axis_size);
-        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
-            + (is_a ? 0 : ulong(axis_size));
-
-        threadgroup float local_inv_mean[1];
-        threadgroup float local_sums[simd_size];
-
-        float acc = 0.0f;
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[in_off + elem + i])
-                        : float(b[in_off + elem + i]);
-                    acc += xi * xi;
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? float(a[in_off + elem + i])
-                            : float(b[in_off + elem + i]);
-                        acc += xi * xi;
-                    }
-                }
-            }
-        }
-
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_thread == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_thread]);
-            if (simd_thread == 0) {
-                local_inv_mean[0] = metal::precise::rsqrt(
-                    acc / float(axis_size) + eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_mean = local_inv_mean[0];
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[in_off + elem + i])
-                        : float(b[in_off + elem + i]);
-                    bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                    concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? float(a[in_off + elem + i])
-                            : float(b[in_off + elem + i]);
-                        bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                        concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
-                    }
-                }
-            }
-        }
-    """,
-    ensureRowContiguous: false
-)
-
-func qwen35DualRMSNormConcat(
-    a: MLXArray,
-    b: MLXArray,
-    aWeight: MLXArray,
-    bWeight: MLXArray,
-    eps: Float
-) -> MLXArray {
-    let nRows = a.size / a.dim(-1)
-    var outShape = a.shape
-    outShape[outShape.count - 1] = a.dim(-1) + b.dim(-1)
-    let outputs = qwen35DualRMSNormConcatKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
-        grid: (2 * nRows * 1024, 1, 1),
-        threadGroup: (1024, 1, 1),
-        outputShapes: [outShape],
-        outputDTypes: [.bfloat16]
-    )
-    return outputs[0]
-}
-
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -1906,6 +1786,12 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    // True when the K and V islands are IN-ORDER arange over every output
+    // row: the packed-quantized K/V results would be fully overwritten, so
+    // the forward paths skip that dead work and read K/V straight off the
+    // exact rows. Bit-identical: same exact matmul, same row order.
+    private var _exactKVFull = false
+    private var _exactKRowCount = 0
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1964,6 +1850,21 @@ final class Qwen35Attention: Module {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            if _exactKVFull, let exactWeight = _exactQKVWeight,
+               let qkvIndices = _exactQKVIndices
+            {
+                // Pack carries Q rows only; K/V come straight from the exact
+                // rows the replace would install anyway.
+                let exact = matmul(x, exactWeight.transposed(1, 0))
+                let indexShape = Array(repeating: 1, count: max(0, y.ndim - 1)) + [-1]
+                y = putAlong(
+                    y, qkvIndices[..<_exactQRowCount].reshaped(indexShape),
+                    values: exact[.ellipsis, ..<_exactQRowCount], axis: -1)
+                let kv = exact[.ellipsis, _exactQRowCount...]
+                return (
+                    y, kv[.ellipsis, ..<_exactKRowCount],
+                    kv[.ellipsis, _exactKRowCount...])
+            }
             y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
@@ -1983,9 +1884,17 @@ final class Qwen35Attention: Module {
            q.mode == k.mode, q.mode == .affine,
            let qz = q.biases, let kz = k.biases, let vz = v.biases
         {
-            _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
-            _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
-            _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            if _exactKVFull {
+                // K/V outputs are fully island-covered; packing their
+                // quantized rows would be dead compute every call.
+                _qkvW = q.weight.contiguous()
+                _qkvS = q.scales.contiguous()
+                _qkvZ = qz.contiguous()
+            } else {
+                _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
+                _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
+                _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            }
             _qkvGS = q.groupSize
             _qkvBits = q.bits
             _qkvMode = q.mode
@@ -2010,6 +1919,15 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if _exactKVFull, let exactWeight = _exactQKVWeight {
+            // Every K/V row is an exact island; the quantized pack's output
+            // would be 100% replaced. Read the exact rows directly.
+            let y = matmul(
+                x, exactWeight[_exactQRowCount...].transposed(1, 0))
+            return (
+                y[.ellipsis, ..<_exactKRowCount],
+                y[.ellipsis, _exactKRowCount...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2079,13 +1997,32 @@ final class Qwen35Attention: Module {
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
             "Qwen MTP precision-island weights and indices must have equal row counts")
-        let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
+        // K/V islands that are a complete permutation of every output row are
+        // normalized into row order here (one-time, load path) so the forward
+        // paths can slice K/V straight from the exact rows. Bit-neutral for
+        // the scatter paths: putAlong with unique indices is order-independent.
+        let kvDim = kvHeads * headDim
+        func rowOrdered(_ w: MLXArray, _ idx: MLXArray, count: Int)
+            -> (MLXArray, MLXArray, Bool)
+        {
+            guard idx.dim(0) == count else { return (w, idx, false) }
+            let idx32 = idx.asType(.int32)
+            let expected = MLXArray((0 ..< Int32(count)).map { $0 })
+            guard all(sorted(idx32) .== expected).item(Bool.self) else {
+                return (w, idx, false)
+            }
+            return (w.take(argSort(idx32), axis: 0), expected, true)
+        }
+        let (kW, kIdx, kFull) = rowOrdered(kWeight, kIndices, count: kOutputCount)
+        let (vW, vIdx, vFull) = rowOrdered(vWeight, vIndices, count: kvDim)
+
+        let weight = concatenated([qWeight, kW, vW], axis: 0).contiguous()
         let qkvIndices = concatenated(
-            [qIndices, kIndices + qOutputCount,
-             vIndices + qOutputCount + kOutputCount], axis: 0)
+            [qIndices, kIdx + qOutputCount,
+             vIdx + qOutputCount + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
         let kvIndices = concatenated(
-            [kIndices, vIndices + kOutputCount], axis: 0)
+            [kIdx, vIdx + kOutputCount], axis: 0)
             .asType(.int32).contiguous()
         eval(weight, qkvIndices, kvIndices)
 
@@ -2093,6 +2030,18 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+
+        _exactKRowCount = kW.dim(0)
+        _exactKVFull = kFull && vFull && kOutputCount == kvDim
+        if _exactKVFull {
+            // Force lazy packs to rebuild without the dead K/V rows.
+            _qkvW = nil
+            _qkvS = nil
+            _qkvZ = nil
+            _kvW = nil
+            _kvS = nil
+            _kvZ = nil
+        }
     }
 
     /// Append rows to an attention cache without producing query outputs.
