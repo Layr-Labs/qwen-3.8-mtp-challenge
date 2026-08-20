@@ -1599,18 +1599,21 @@ func qwen35FusedResidualRMSNorm(
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
 
-/// Two independent RMSNorms in one dispatch. Same looped reduction as
+/// Two independent RMSNorms written directly into their final concatenated
+/// carrier in one dispatch. Same looped reduction as
 /// `qwen35_fused_residual_rms_norm` / `rms_looped` (simd_sum → barrier →
 /// rsqrt), but no residual add — each row is already the value being
 /// normalised. Bit-identical to two eager `RMSNorm` launches when both
-/// inputs are BF16 with a contiguous last dim of 5120.
+/// inputs are BF16 with a contiguous last dim of 5120. Writing A and B into
+/// the two halves of one output removes the immediately-following concatenate
+/// without moving either RMS reduction or BF16 rounding boundary.
 ///
 /// Used only on the MTP pre-fc pair (`pre_fc_norm_embedding` +
 /// `pre_fc_norm_hidden`). Proposal-only; the target never calls this.
-private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
-    name: "qwen35_dual_rms_norm_bf16_v1",
+private let qwen35DualRMSNormConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_dual_rms_norm_concat_bf16_v1",
     inputNames: ["a", "b", "a_weight", "b_weight", "eps"],
-    outputNames: ["a_out", "b_out"],
+    outputNames: ["fused_out"],
     source: """
         constexpr uint n_reads = 4;
         constexpr uint simd_size = 32;
@@ -1629,6 +1632,9 @@ private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
         bool is_a = row < a_rows;
         uint local_row = is_a ? row : row - a_rows;
         ulong offset = ulong(local_row) * ulong(axis_size);
+        ulong output_offset =
+            ulong(local_row) * ulong(2 * axis_size)
+            + (is_a ? 0 : ulong(axis_size));
 
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
@@ -1685,11 +1691,7 @@ private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
                         : float(b[offset + elem + i]);
                     bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                     bfloat yo = wi * bfloat(xi * inv_mean);
-                    if (is_a) {
-                        a_out[offset + elem + i] = yo;
-                    } else {
-                        b_out[offset + elem + i] = yo;
-                    }
+                    fused_out[output_offset + elem + i] = yo;
                 }
             } else {
                 for (uint i = 0; i < n_reads; ++i) {
@@ -1699,11 +1701,7 @@ private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
                             : float(b[offset + elem + i]);
                         bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                         bfloat yo = wi * bfloat(xi * inv_mean);
-                        if (is_a) {
-                            a_out[offset + elem + i] = yo;
-                        } else {
-                            b_out[offset + elem + i] = yo;
-                        }
+                        fused_out[output_offset + elem + i] = yo;
                     }
                 }
             }
@@ -1712,22 +1710,23 @@ private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-func qwen35DualRMSNorm(
+func qwen35DualRMSNormConcat(
     a: MLXArray,
     b: MLXArray,
     aWeight: MLXArray,
     bWeight: MLXArray,
     eps: Float
-) -> (MLXArray, MLXArray) {
+) -> MLXArray {
     let nRows = a.size / a.dim(-1)
-    let outputs = qwen35DualRMSNormKernel(
+    var outputShape = a.shape
+    outputShape[outputShape.count - 1] *= 2
+    return qwen35DualRMSNormConcatKernel(
         [a, b, aWeight, bWeight, MLXArray(eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
-        outputShapes: [a.shape, b.shape],
-        outputDTypes: [.bfloat16, .bfloat16]
-    )
-    return (outputs[0], outputs[1])
+        outputShapes: [outputShape],
+        outputDTypes: [.bfloat16]
+    )[0]
 }
 
 // MARK: - Attention
