@@ -456,6 +456,26 @@ public final class Qwen36MTPBlockSession {
     /// first decode step past the 512-row seed does not first-touch those
     /// pipeline variants inside the scored window.
     private static func warmTargetLaterWindowSDPA(_ cache: [KVCache]) {
+        // (A) qL completion. fkiene's crown warmed qL={1,5,4} at kL=1024
+        // (blocks=64 on arch `s`). Extend to {1,2,3,4,5}: qL=2,3 cover
+        // chunk-B of widths 7,8 and the median-setting prompts spend most of
+        // the window at verify qL=2,3. Each qL is a distinct
+        // `sdpa_vector_2pass` PSO (pass-1 threadgroup (32, gqa=6, qL)).
+        warmTargetLaterWindowSDPA(cache, targetKL: 1024, qLs: [1, 2, 3, 4, 5])
+        // (B) 128-block rehash warm. `sdpa_vector_2pass` on arch `s` keeps
+        // blocks=64 at N<=1024 but bumps to 128 when N>1024 && n_simds>4
+        // (gqa=6 ⇒ n_simds=6·qL > 4 for every qL in {1..5}). fkiene pads to
+        // EXACTLY kL=1024 (blocks=64); scored decode walks N=512+committed+
+        // width past 1024 near the window's end, so the 128-block PSO
+        // family can first-touch inside the scored window. Warm it just
+        // past the bump (kL=1025) on throwaway caches. Token-neutral: dummy
+        // zeros discarded, live caches untouched.
+        warmTargetLaterWindowSDPA(cache, targetKL: 1025, qLs: [1, 2, 3, 4, 5])
+    }
+
+    private static func warmTargetLaterWindowSDPA(
+        _ cache: [KVCache], targetKL: Int, qLs: [Int]
+    ) {
         var extended: [MLXArray] = []
         var firstKV: (MLXArray, MLXArray)?
         var faCount = 0
@@ -468,7 +488,7 @@ public final class Qwen36MTPBlockSession {
             guard k.ndim == 4, v.ndim == 4, k.dim(2) > 0, v.dim(2) == k.dim(2)
             else { continue }
             faCount += 1
-            let pad = max(0, 1024 - k.dim(2))
+            let pad = max(0, targetKL - k.dim(2))
             let extK: MLXArray
             let extV: MLXArray
             if pad > 0 {
@@ -486,7 +506,7 @@ public final class Qwen36MTPBlockSession {
             if firstKV == nil { firstKV = (extK, extV) }
         }
         // Pinned Qwen 3.8 tower: 16 FA + 48 GDN. Wrong geometry → no-op.
-        guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= 1024
+        guard faCount == 16, let (extK, extV) = firstKV, extK.dim(2) >= targetKL
         else { return }
         eval(extended)
         // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
@@ -495,7 +515,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        for qL in qLs {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -545,8 +565,17 @@ public final class Qwen36MTPBlockSession {
         // One batched readout: the first primary and its tail-row top-2
         // evidence come out of the same eval as the cache roots.
         let (tailIDs, tailValues) = Self.linearTopTwoRows(lastLogits)
+        // (C) begin eval-list trim. The full 512-row pre-norm `hidden` is no
+        // longer an eval target: `pendingHidden!` (the last-row slice) already
+        // forces the seed forward to complete, and `seedHiddenForPriming`
+        // retains the full hidden for the first drafting round's flush — which
+        // still runs `applyFinalNorm` exactly as ofou does. Dropping the full
+        // tensor from the eval list removes one materialize (the counterweight
+        // to the extra warm dispatches' residency cost). Bit-identical: the
+        // seed forward is computed either way; only the explicit full-tensor
+        // eval target is gone.
         eval(cache.flatMap { $0.state } + [tailIDs, tailValues,
-                                           pendingHidden!, hidden])
+                                           pendingHidden!])
         if Self.traceRounds {
             let tBeginDone = DispatchTime.now().uptimeNanoseconds
             Self.traceWrite("mtp-trace: begin seed=\(seedTokens.count) "
