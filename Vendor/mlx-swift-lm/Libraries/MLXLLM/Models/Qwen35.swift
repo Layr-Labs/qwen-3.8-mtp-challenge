@@ -2475,17 +2475,19 @@ private let qwen35Top32Header = """
     """
 
 // Stage 1: 64 threadgroups partition [0, REAL_COUNT); each emits its top 32
-// as (ordinal, index) pairs. 64 * 32 = 2,048 candidates.
+// as (ordinal, index) pairs. 64 * 32 = 2,048 candidates. Both planes share
+// one output allocation because they have identical lifetimes and indexing.
 private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_top32_partial",
     inputNames: ["logits"],
-    outputNames: ["cand_ord", "cand_idx"],
+    outputNames: ["candidates"],
     source: """
         constexpr uint REAL_COUNT = \(qwen35Top32RealCount);
         constexpr uint TG_SIZE    = \(qwen35Top32TG);
         constexpr uint STRIDE     = \(qwen35Top32Stride);
         constexpr uint PER_THREAD = \(qwen35Top32PerThread);
         constexpr uint TOPK       = \(qwen35Top32K);
+        constexpr uint CANDS      = \(qwen35Top32Cands);
         constexpr uint SIMD_SIZE  = 32;
         constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
         constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
@@ -2556,8 +2558,9 @@ private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
                     tk2 |= (1u << bs);
                 }
                 if (lane == 0) {
-                    cand_ord[tile * TOPK + r] = mo;
-                    cand_idx[tile * TOPK + r] = mi;
+                    const uint out = tile * TOPK + r;
+                    candidates[out] = mo;
+                    candidates[CANDS + out] = mi;
                 }
             }
         }
@@ -2571,12 +2574,13 @@ private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
 // `argPartition(...)[kth...]`.
 private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
     name: "qwen_mtp_draft_top32_finalize",
-    inputNames: ["cand_ord", "cand_idx"],
+    inputNames: ["candidates"],
     outputNames: ["token_ids"],
     source: """
         constexpr uint TG_SIZE    = \(qwen35Top32TG);
         constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
         constexpr uint TOPK       = \(qwen35Top32K);
+        constexpr uint CANDS      = \(qwen35Top32Cands);
         constexpr uint SIMD_SIZE  = 32;
         constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
         constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
@@ -2591,8 +2595,8 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
         uint idx[PER_THREAD];
         for (uint t = 0; t < PER_THREAD; ++t) {
             uint p = t * TG_SIZE + tid;
-            ord[t] = cand_ord[p];
-            idx[t] = cand_idx[p];
+            ord[t] = candidates[p];
+            idx[t] = candidates[CANDS + p];
         }
 
         threadgroup uint sc_ord[NSIMD * TOPK];
@@ -2662,11 +2666,11 @@ private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
         [row],
         grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
-        outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
-        outputDTypes: [.uint32, .uint32]
+        outputShapes: [[2 * qwen35Top32Cands]],
+        outputDTypes: [.uint32]
     )
     return qwen35DraftTop32FinalizeKernel(
-        [partial[0], partial[1]],
+        [partial[0]],
         grid: (qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
         outputShapes: [[qwen35Top32K]],
