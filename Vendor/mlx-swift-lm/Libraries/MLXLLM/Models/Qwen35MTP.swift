@@ -56,6 +56,18 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        // Same fused residual+RMSNorm the backbone decoder already uses on
+        // BF16/5120. Documented bit-exact with eager
+        // `h = x + r; postAttentionLayerNorm(h)` (bf16-round-before-square).
+        // One launch instead of add+norm, paid once per proposed token.
+        // Fail closed: unexpected dtype/width keeps the eager pair.
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return h + (mlp as! UnaryLayer)(postAttnNorm)
+        }
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
