@@ -72,8 +72,27 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         // stock 50 MiB MLX default. overwrite=0 left that in place and the
         // 512 MiB post-wire budget never landed. overwrite=1 makes the
         // promoted Laguna M5-Max command-buffer profile actually apply.
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
+        // GEOMETRY MOVED 50/512 -> 160/1024, and BOTH knobs move together on
+        // purpose. `CommandEncoder::needs_commit` (device.cpp:484-487) is
+        // `(buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)` over a
+        // counter both rules share and both reset (`:528-529`), so raising
+        // `ops` alone plateaus at 14 buffers/forward when the MB rule wakes up
+        // -- `120/512` and `160/512` are the SAME geometry, and any
+        // single-knob sweep reports that plateau as if it were physics.
+        //
+        // Why move at all: at the shipped 50/512 a scored forward issues ~20
+        // command buffers, of which **11 are heuristic commits against
+        // `MAX_ACTIVE_TASKS = 10`** -- i.e. the promoted constant sits exactly
+        // ON the throttle line, where whether `wait_for_one()` stalls the host
+        // each forward depends on completion timing. At 160/1024 the ladder
+        // becomes the sole authority: 9 buffers/forward, **0 heuristic
+        // commits**, no throttle exposure.
+        //
+        // Numerically inert: command-buffer boundaries reassociate no
+        // reduction, change no kernel and reorder no dispatch. Every emitted
+        // token is still the pinned target's argmax.
+        setenv("MLX_MAX_MB_PER_BUFFER", "1024", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "160", 1)
     }
 
     public static func resolve(
