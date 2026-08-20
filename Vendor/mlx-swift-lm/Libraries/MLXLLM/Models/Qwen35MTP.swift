@@ -56,20 +56,6 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        // The backbone's decoder layer has fused this residual+norm boundary
-        // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
-        // the eager pair. Same kernel, same bf16/5120 guard, same
-        // bf16-round-before-square argument, so the values are bit-identical to
-        // `h = x + r; postAttentionLayerNorm(h)` — one launch and one host graph
-        // node instead of two, paid once per PROPOSED token (draftCount times a
-        // round) rather than once per layer.
-        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
-            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
-                x: x, r: r,
-                weight: postAttentionLayerNorm.weight,
-                eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
-        }
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
@@ -118,24 +104,6 @@ final class Qwen35MTPModule: Module {
         super.init()
     }
 
-    /// One launch for the two independent pre-fc RMSNorms. Same arithmetic
-    /// as the eager pair when both sides are bf16 / 5120; otherwise the
-    /// stock `RMSNorm` path. Proposal-only.
-    private func preFcNorms(embeds: MLXArray, hidden: MLXArray) -> (MLXArray, MLXArray) {
-        if embeds.dtype == .bfloat16, hidden.dtype == .bfloat16,
-           embeds.dim(-1) == 5120, hidden.dim(-1) == 5120,
-           embeds.shape == hidden.shape,
-           preFcNormEmbedding.eps == preFcNormHidden.eps
-        {
-            return qwen35DualRMSNorm(
-                a: embeds, b: hidden,
-                aWeight: preFcNormEmbedding.weight,
-                bWeight: preFcNormHidden.weight,
-                eps: preFcNormEmbedding.eps)
-        }
-        return (preFcNormEmbedding(embeds), preFcNormHidden(hidden))
-    }
-
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -145,7 +113,8 @@ final class Qwen35MTPModule: Module {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
         let embeds = embedTokens(nextTokenIds)
-        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
         var fused = fc(concatenated([e, h], axis: -1))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
@@ -178,7 +147,8 @@ final class Qwen35MTPModule: Module {
         else { return nil }
 
         let embeds = embedTokens(nextTokenIds)
-        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
         let fused = fc(concatenated([e, h], axis: -1))
         let historyCount = fused.dim(1) - 1
 
