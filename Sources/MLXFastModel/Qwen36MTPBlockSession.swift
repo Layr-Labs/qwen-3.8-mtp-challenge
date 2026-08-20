@@ -154,6 +154,15 @@ public final class Qwen36MTPBlockSession {
     /// Seed rows retained for lazy priming; released at the first flush.
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
+    /// Deferred head-cache trim (T7). A drafting round's speculative deeper
+    /// rows must be discarded before the NEXT draft reads `draftBase`, but the
+    /// discard need not sit on the commit critical path: it is queued here and
+    /// executed at the head of the next drafting round while the GPU is idle
+    /// building that round's graph. Nothing reads the head cache between rounds,
+    /// so trimming there is byte-identical to trimming at commit time. The head
+    /// history cache is separate from the trimmable verify cache, so this never
+    /// touches the round-top `cacheOffsetInvariant`.
+    private var pendingHeadTrimOffset: Int?
 
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
@@ -495,7 +504,14 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // T8 later-window coverage. Serial (qL=1) and chunk-A (qL=5) plus every
+        // chunk-B width the segmented SDPA (qL 6...9) dispatches: a width-(qL)
+        // verify splits at row 5 into a qL=5 chunk and a qL=(qL-5) chunk, so at
+        // maxDepth 8 (verify widths up to 9) chunk B ranges over 1...4. The old
+        // {1,4,5} left qL=2 (from verify width 7) and qL=3 (width 8) to
+        // cold-JIT at the later window inside a scored round. Throwaway K/V,
+        // token-neutral, pre-hello — bit-exact and off every scored path.
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -509,33 +525,6 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
-        // Scored decode walks N past 1024 (512 seed + 512 decode).
-        // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
-        // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
-        if extK.dim(2) == 1024 {
-            let kPad1 = MLXArray.zeros(
-                [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
-            let vPad1 = MLXArray.zeros(
-                [extV.dim(0), extV.dim(1), 1, extV.dim(3)], dtype: extV.dtype)
-            let k1025 = concatenated([extK, kPad1], axis: 2)
-            let v1025 = concatenated([extV, vPad1], axis: 2)
-            var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
-                let q = MLXArray.zeros(
-                    [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
-                outs1025.append(
-                    MLXFast.scaledDotProductAttention(
-                        queries: q,
-                        keys: k1025,
-                        values: v1025,
-                        scale: scale,
-                        mask: .causal
-                    )
-                )
-            }
-            eval(outs1025)
-        }
     }
 
     // MARK: - begin
@@ -632,20 +621,6 @@ public final class Qwen36MTPBlockSession {
     /// telemetry counter; the cost-model schedule below reads the per-position
     /// EMAs, not this.
     private var fullAcceptStreak = 0
-
-    /// The last row of a head-chain hidden block. Every step after the first
-    /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
-    /// already returns only the final row — so the trailing-row slice those
-    /// call sites took was an identity slice on all but the flush step, costing
-    /// a host graph node and a device op per PROPOSED token for nothing. The
-    /// guard is on the shape, not on the call site, so a multi-row block still
-    /// takes the real slice.
-    @inline(__always)
-    private static func lastHiddenRow(_ block: MLXArray) -> MLXArray {
-        let rows = block.dim(1)
-        guard rows > 1 else { return block }
-        return block[0..., (rows - 1) ..< rows, 0...]
-    }
 
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
@@ -759,7 +734,7 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -796,28 +771,9 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        // FLAT CAP 7, NO GATE. Two ranked receipts of ours, each isolating one
-        // half of this: capping at 7 gave `919318e1` (always the x4 slot)
-        // 0.011967 s/tok at draft length 4.32 — still the fastest reading for
-        // that prompt from any tree on this board — while removing the streak
-        // gate's width-wall FLOOR gave `00142a44` 0.011070 at draft length
-        // 5.10, a -2.6% move to within 0.4% of its own board minimum.
-        //
-        // The floor, not the ceiling, is what was truncating `00142a44`: it
-        // drops the cap to `sdpaWidthWallDepthCap` on every round after a
-        // reject, cutting rounds the marginal rule would have taken deeper. So
-        // the ceiling stays at 7 and the floor goes, which is both receipts in
-        // one schedule.
-        //
-        // I shipped these two together once before and lost x4, but that tree
-        // also carried a third confidence-tempering rung, and only that rung
-        // can shorten a round — removing a floor cannot. It is not here.
-        //
-        // Safety does not depend on the gate: `reach` is a product of the
-        // per-position acceptance EMAs and collapses on a cold stretch by
-        // itself. Widths 6..8 are bit-exact per position against the serial
-        // trajectory through the sdpa exactness chunk, so 7 is policy.
-        let widthCap = Self.segmentedVerifyDepthCap
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -1060,6 +1016,13 @@ public final class Qwen36MTPBlockSession {
         var flushTokens: [Int] = []
         if let existing = headHistoryCache {
             headCache = existing
+            // T7 deferred trim: discard the previous drafting round's
+            // speculative rows now, before `draftBase` is read below. Off the
+            // commit critical path, byte-identical to trimming at commit.
+            if let pending = pendingHeadTrimOffset {
+                Self.trimTrimmable(headCache, to: pending)
+                pendingHeadTrimOffset = nil
+            }
         } else {
             let fresh = model.makeMTPCache()
             headHistoryCache = fresh
@@ -1114,7 +1077,8 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = Self.lastHiddenRow(headHidden)
+        var draftHidden = headHidden[
+            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -1126,7 +1090,8 @@ public final class Qwen36MTPBlockSession {
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = Self.lastHiddenRow(headHidden)
+            draftHidden = headHidden[
+                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
@@ -1286,7 +1251,9 @@ public final class Qwen36MTPBlockSession {
         // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
         // committed pair. The rejecting round queues nothing — the next
         // round's own (pendingHidden, primary) row covers that transition.
-        Self.trimTrimmable(headCache, to: validHistoryOffset)
+        // T7 deferred trim: queue the speculative-row discard for the next
+        // drafting round's build phase instead of paying it on the commit tail.
+        pendingHeadTrimOffset = validHistoryOffset
         if acceptedCount > 0 {
             // Keep accepted post-norm rows as one contiguous block. The backlog
             // already supports multi-row blocks (seed priming uses one), while
@@ -1496,9 +1463,17 @@ public final class Qwen36MTPBlockSession {
     private static func clearRecurrentRollback(_ cache: [any KVCache]) {
         for entry in cache {
             if let arrays = entry as? ArraysCache {
-                arrays.rollbackState = nil
-                arrays.rollbackCheckpoints = []
-                arrays.prefixReplayTape = nil
+                // T7 guarded clear: on the full-accept path the checkpoint and
+                // replay-tape slots are already empty (only the K=1 / replay
+                // forwards populate them), so skip the redundant empty-array and
+                // nil assignments and touch only what is actually set. Final
+                // state is identical (all nil/empty), so this is bookkeeping
+                // only — no cache VALUES change, bit-exact by construction.
+                if arrays.rollbackState != nil { arrays.rollbackState = nil }
+                if !arrays.rollbackCheckpoints.isEmpty {
+                    arrays.rollbackCheckpoints = []
+                }
+                if arrays.prefixReplayTape != nil { arrays.prefixReplayTape = nil }
             }
         }
     }

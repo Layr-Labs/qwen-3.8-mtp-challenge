@@ -56,22 +56,23 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        // The backbone's decoder layer has fused this residual+norm boundary
-        // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
-        // the eager pair. Same kernel, same bf16/5120 guard, same
-        // bf16-round-before-square argument, so the values are bit-identical to
-        // `h = x + r; postAttentionLayerNorm(h)` — one launch and one host graph
-        // node instead of two, paid once per PROPOSED token (draftCount times a
-        // round) rather than once per layer.
-        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
-            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+        // Reuse the backbone's fused residual+RMSNorm on the exit boundary,
+        // collapsing the plain `x + r` add and the `postAttentionLayerNorm`
+        // launch into one kernel (mirrors Qwen35DecoderLayer.callAsFunction).
+        // Head side is proposal-only; the fused kernel is bit-exact with the
+        // eager `h = x + r; postAttentionLayerNorm(h)` sequence anyway.
+        let h: MLXArray
+        let postAttnNorm: MLXArray
+        if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
+            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
+        } else {
+            h = x + r
+            postAttnNorm = postAttentionLayerNorm(h)
         }
-        let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
 
     /// Populate this layer's K/V history without computing a dead layer
