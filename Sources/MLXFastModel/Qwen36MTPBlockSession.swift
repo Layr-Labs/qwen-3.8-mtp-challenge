@@ -752,7 +752,7 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
+    private static let sdpaWidthWallDepthCap = 6
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
@@ -817,7 +817,15 @@ public final class Qwen36MTPBlockSession {
         // per-position acceptance EMAs and collapses on a cold stretch by
         // itself. Widths 6..8 are bit-exact per position against the serial
         // trajectory through the sdpa exactness chunk, so 7 is policy.
-        let widthCap = Self.segmentedVerifyDepthCap
+        //
+        // `#846` dual-RMSNorm overlay restored this file from a pre-`#843`
+        // archive and dropped the floor=6 gate. `#843` scored 3.302 with
+        // wall=6 + streak gate under ceiling 7: x4 stays near 4.3 after a
+        // reject, high-accept prompts keep the depth they earned. Put the
+        // gate back on top of dual-RMSNorm. Not `#851`'s ceiling=8.
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
