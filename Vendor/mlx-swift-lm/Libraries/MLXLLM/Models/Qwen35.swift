@@ -2162,16 +2162,21 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
-        // rest. Pure enqueue-timing change — no op is added, no reduction
+        // Decode-width asyncEval ladder only. At S <= 9 (serial step / narrow
+        // MTP verify) the host builds a ~64-layer graph before anything
+        // reaches the GPU. Firing asyncEval at a few layer boundaries lets
+        // the GPU start on the early layers while the host is still building
+        // the rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
-        let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        //
+        // Prefill S>=512 rungs (i==0 || i%3==2) are REMOVED. They enqueue
+        // extra GPU work on the untimed prefill path. Extra untimed GPU has
+        // polluted the scored decode heap (#707/#715 FA-warm; #734/#746
+        // extra/missing graphs). Decode rungs stay exactly
+        // {0,1,9,19,29,39,49,57} — not #737's S<=2 shrink.
+        let ladderActive = inputs.dim(1) <= 9
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
@@ -2193,17 +2198,11 @@ public class Qwen35TextModelInner: Module {
                 base = out.base
                 delta = out.delta
                 if ladderActive {
-                    if prefillLadder {
-                        if i == 0 || i % 3 == 2 {
-                            asyncEval(base, out.delta)
-                        }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(base, out.delta)
-                        default:
-                            break
-                        }
+                    switch i {
+                    case 0, 1, 9, 19, 29, 39, 49, 57:
+                        asyncEval(base, out.delta)
+                    default:
+                        break
                     }
                 }
             }
@@ -2218,17 +2217,11 @@ public class Qwen35TextModelInner: Module {
                     hiddenStates, attentionMask: attnMask, ssmMask: mask,
                     cache: cacheArray?[i], nConfirmed: nConfirmed)
                 if ladderActive {
-                    if prefillLadder {
-                        if i == 0 || i % 3 == 2 {
-                            asyncEval(hiddenStates)
-                        }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(hiddenStates)
-                        default:
-                            break
-                        }
+                    switch i {
+                    case 0, 1, 9, 19, 29, 39, 49, 57:
+                        asyncEval(hiddenStates)
+                    default:
+                        break
                     }
                 }
             }
