@@ -2866,8 +2866,16 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     "Qwen MTP precision-island artifact is incomplete; expected "
                         + "Q/K/V weight+indices tensors")
             }
+            // Install is opt-in (was opt-out): on held-out decode-distribution
+            // rollouts the exact rows move chained accept by under 0.1%, while
+            // replaceExactRows re-reads ~31 MB of BF16 per proposal forward
+            // (~200 MB per round across the draft chain and history append)
+            // and overwrites quantized outputs that were already computed.
+            // The tensors still ride in the declared artifact and are still
+            // side-channeled out of the strict Module update above; they are
+            // simply not installed unless explicitly requested.
             if ProcessInfo.processInfo.environment[
-                "MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] != "0"
+                "MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "1"
             {
                 layer.selfAttn.installExactQKVRows(
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
