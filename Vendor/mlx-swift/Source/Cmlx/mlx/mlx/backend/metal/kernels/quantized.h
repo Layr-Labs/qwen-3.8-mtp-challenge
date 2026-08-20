@@ -965,7 +965,11 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
 // footprint stays near the two-input kernel's. load_vector, the qdot
 // expression, the K accumulation order and simd_sum are unchanged for every
 // output element.
-template <typename T, int NA, bool DIRECT_NIBBLES = false>
+template <
+    typename T,
+    int NA,
+    bool DIRECT_NIBBLES = false,
+    int ROWS_PER_SIMD = 4>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     const device uint32_t* w,
     const device T* scales,
@@ -978,8 +982,11 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     int out_row,
     uint simd_lid) {
   static_assert(NA >= 2 && NA <= 4, "wide multi-row QMV supports NA in [2, 4]");
+  static_assert(
+      ROWS_PER_SIMD >= 1 && ROWS_PER_SIMD <= 4,
+      "wide multi-row QMV supports one to four outputs per SIMD group");
   typedef vec<float, NA> VF;
-  constexpr int rows_per_simd = 4;
+  constexpr int rows_per_simd = ROWS_PER_SIMD;
   constexpr int values_per_thread = 16;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_lane = 8;
@@ -1180,6 +1187,50 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   } else {
     qmv_fast_crossrow_affine4_g64_wide<
         T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  }
+}
+
+// The host QMV launch is frozen at M x (N / 8) threadgroups. At N == 1024,
+// the ordinary wide helper would idle too many x-groups to keep the GPU fed.
+// Spend pairs of those already-launched x-groups on the lower and upper 512
+// outputs instead: tid.x / 2 selects the shared input-row group, while
+// tid.x % 2 selects an output half. Two outputs per SIMD group then cover four
+// outputs per threadgroup, so the two x-groups together reproduce the host's
+// original eight-output tile without changing any per-output K reduction.
+template <typename T, int M, int IPG>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_n1024_m(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M >= 3 && M <= 9, "narrow multi-row QMV covers M in [3, 9]");
+  static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
+  constexpr int TAIL = M % IPG;
+  constexpr int rows_per_simd = 2;
+  constexpr int output_rows_per_threadgroup = 2 * rows_per_simd;
+  constexpr int output_rows_per_half = 512;
+  const int first_m = (int(tid.x) / 2) * IPG;
+  if (first_m >= M) {
+    return;
+  }
+  const int out_row = (int(tid.x) & 1) * output_rows_per_half +
+      int(tid.y) * output_rows_per_threadgroup +
+      int(simd_gid) * rows_per_simd;
+  if (TAIL == 0 || M - first_m >= IPG) {
+    qmv_fast_crossrow_affine4_g64_wide<T, IPG, true, rows_per_simd>(
+        w, scales, biases, x, y, in_vec_size, out_vec_size,
+        first_m, out_row, simd_lid);
+  } else {
+    qmv_fast_crossrow_affine4_g64_wide<
+        T, (TAIL >= 2 ? TAIL : 2), true, rows_per_simd>(
         w, scales, biases, x, y, in_vec_size, out_vec_size,
         first_m, out_row, simd_lid);
   }
@@ -1970,6 +2021,54 @@ template <typename T, int group_size, int bits, bool batched>
           return;
         case 9:
           qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        default:
+          break;
+      }
+    } else if (out_vec_size == 1024) {
+      // The fixed host grid has 128 y-groups at N == 1024. Pair adjacent
+      // x-groups as output halves so the wider 3/4-input sharing keeps at least
+      // as many useful threadgroups as the incumbent two-input kernel.
+      switch (ntg.x) {
+        case 2:
+          qmv_fast_crossrow_affine4_g64<T, 2>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 3:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 3, 3>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 4:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 4, 4>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 5:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 5, 3>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 6:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 6, 3>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 7:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 7, 4>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 8:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 8, 4>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
+        case 9:
+          qmv_fast_crossrow_affine4_g64_n1024_m<T, 9, 3>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
