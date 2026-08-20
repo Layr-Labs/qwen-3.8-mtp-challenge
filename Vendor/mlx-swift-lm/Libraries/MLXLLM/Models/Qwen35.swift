@@ -2110,6 +2110,12 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
+    /// Suppresses the decode-width asyncEval ladder while a compiled verify
+    /// closure is being traced: `async_eval` is not allowed inside a graph
+    /// transformation, and the ladder is a pure enqueue-timing change
+    /// (bit-identical). Set around the compiled closure's forward only; the
+    /// eager paths keep the ladder.
+    public static nonisolated(unsafe) var suppressDecodeLadder = false
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
@@ -2171,7 +2177,8 @@ public class Qwen35TextModelInner: Module {
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = (inputs.dim(1) <= 9 || prefillLadder)
+            && !Self.suppressDecodeLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one

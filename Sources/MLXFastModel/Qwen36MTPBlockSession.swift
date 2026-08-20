@@ -113,6 +113,13 @@ public final class Qwen36MTPBlockSession {
     private let postNorm: Bool
 
     private var cache: [any KVCache] = []
+
+    /// Per-width compiled verify functions, lazily traced at first use.
+    private var compiledVerifyEntries: [Int: CompiledVerifyEntry] = [:]
+    /// True once the full-attention caches have been promoted to
+    /// `CompilableKVCache` (set at the end of `begin`). The compiled verify
+    /// path is only reachable after the promotion.
+    private var compiledVerifyAvailable = false
     /// Next round's primary token, read out of the previous round's single
     /// batched eval (the row argmax the old code re-fetched with a fresh
     /// `.item()` sync at every round top). Same tensor, same `argMax` op —
@@ -509,33 +516,224 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
-        // Scored decode walks N past 1024 (512 seed + 512 decode).
-        // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
-        // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
-        if extK.dim(2) == 1024 {
-            let kPad1 = MLXArray.zeros(
-                [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
-            let vPad1 = MLXArray.zeros(
-                [extV.dim(0), extV.dim(1), 1, extV.dim(3)], dtype: extV.dtype)
-            let k1025 = concatenated([extK, kPad1], axis: 2)
-            let v1025 = concatenated([extV, vPad1], axis: 2)
-            var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
-                let q = MLXArray.zeros(
-                    [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
-                outs1025.append(
-                    MLXFast.scaledDotProductAttention(
-                        queries: q,
-                        keys: k1025,
-                        values: v1025,
-                        scale: scale,
-                        mask: .causal
-                    )
-                )
-            }
-            eval(outs1025)
+    }
+
+    // MARK: - compiled verify forward (per width)
+
+    /// One lazily-built compiled verify per verify width, plus the per-cache
+    /// layout of the trace-time proposal-verify structures.
+    private struct CompiledVerifyEntry {
+        let fn: @Sendable ([MLXArray]) -> [MLXArray]
+        /// Per-cache tape/checkpoint array counts in cache order, captured
+        /// from the trace-time structures after the first apply.
+        var layout: [VerifyTapeLayout]
+        var hasLayout: Bool
+    }
+
+    /// Layout of one cache's proposal-verify structure inside the compiled
+    /// function's returned array list.
+    private struct VerifyTapeLayout {
+        var count: Int
+        var hasSsmPre: Bool
+        var hasMask: Bool
+        var rowCount: Int
+        var convStateRows: Int
+    }
+
+    /// The verify forward with a per-width compiled graph.
+    ///
+    /// The full-attention caches are promoted to `CompilableKVCache`
+    /// (fixed-size buffers + an MLXArray offset, both compile-traceable), so
+    /// the tracer captures the ENTIRE 64-layer verify — attention KV writes
+    /// included — ONCE per width at the first round that uses it. Later
+    /// rounds apply the same traced graph with positional state binding; the
+    /// ~40 ms/round host-side graph construction disappears. The GDN layers
+    /// already use replacement semantics and the FA layers' fixed buffers
+    /// make every state shape width-stable, so no re-trace fires inside the
+    /// window (kL grows only inside the fixed buffer).
+    ///
+    /// The proposal-verify structures (`prefixReplayTape` /
+    /// `rollbackCheckpoints`) are NOT part of `innerState`, so the trace-time
+    /// values are tracers. The closure therefore returns every structure's
+    /// arrays after the three head outputs, and the caller re-binds them into
+    /// fresh values after each apply using the layout captured at trace time.
+    /// Any failure — compile unsupported, trace error, shape surprise, count
+    /// mismatch — falls back to the eager reference call, so the compiled
+    /// path can never change the emitted stream.
+    private func compiledVerifyForward(
+        width: Int, tokens: MLXArray
+    ) throws -> (MLXArray, MLXArray, MLXArray?) {
+        guard compiledVerifyAvailable else {
+            return model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: tokens), cache: cache, nConfirmed: 1)
         }
+        var entry: CompiledVerifyEntry
+        if let existing = compiledVerifyEntries[width] {
+            entry = existing
+        } else {
+            let model = self.model
+            let cache = self.cache
+            let updatable: [any Updatable] = cache.map { $0 as any Updatable }
+            let fn = compile(
+                inputs: updatable, outputs: updatable, shapeless: false
+            ) { args in
+                let input = LMInput.Text(tokens: args[0])
+                let (logits, hidden, normed) = model.callWithHiddenAndNormed(
+                    input: input, cache: cache, nConfirmed: 1)
+                var out: [MLXArray] = [logits, hidden]
+                out.append(normed ?? MLXArray(0))
+                for item in cache {
+                    guard let arrays = item as? ArraysCache else { continue }
+                    if let tape = arrays.prefixReplayTape {
+                        out.append(tape.convInput)
+                        out.append(tape.q)
+                        out.append(tape.k)
+                        out.append(tape.v)
+                        out.append(tape.a)
+                        out.append(tape.b)
+                        out.append(tape.g)
+                        out.append(tape.beta)
+                        out.append(contentsOf: tape.ssmPre.map { [$0] } ?? [])
+                        out.append(contentsOf: tape.mask.map { [$0] } ?? [])
+                    } else if !arrays.rollbackCheckpoints.isEmpty {
+                        let cp = arrays.rollbackCheckpoints[0]
+                        out.append(cp.0)
+                        out.append(cp.1)
+                    }
+                }
+                return out
+            }
+            entry = CompiledVerifyEntry(fn: fn, layout: [], hasLayout: false)
+            compiledVerifyEntries[width] = entry
+        }
+
+        // The trace runs the closure with real state; the decode ladder's
+        // asyncEval calls are not allowed inside a graph transformation, and
+        // they are pure enqueue-timing (bit-identical), so suppress them for
+        // the compiled closure. The eager paths keep the ladder.
+        Qwen35TextModelInner.suppressDecodeLadder = true
+        let out = entry.fn([tokens])
+        Qwen35TextModelInner.suppressDecodeLadder = false
+        guard out.count >= 3 else {
+            // MLX error inside the compiled apply: drop the entry and retry
+            // the round eagerly.
+            compiledVerifyEntries[width] = nil
+            return model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: tokens), cache: cache, nConfirmed: 1)
+        }
+        if !entry.hasLayout {
+            // First apply: capture the layout from the trace-time structures
+            // (the closure ran during this call; the properties still hold
+            // the trace-time tapes/checkpoints) and store it.
+            entry.layout = cache.map { item in
+                guard let arrays = item as? ArraysCache else {
+                    return VerifyTapeLayout(
+                        count: 0, hasSsmPre: false, hasMask: false,
+                        rowCount: 0, convStateRows: 0)
+                }
+                if let tape = arrays.prefixReplayTape {
+                    let count = 8
+                        + (tape.ssmPre == nil ? 0 : 1)
+                        + (tape.mask == nil ? 0 : 1)
+                    return VerifyTapeLayout(
+                        count: count,
+                        hasSsmPre: tape.ssmPre != nil,
+                        hasMask: tape.mask != nil,
+                        rowCount: tape.rowCount,
+                        convStateRows: tape.convStateRows)
+                }
+                if !arrays.rollbackCheckpoints.isEmpty {
+                    return VerifyTapeLayout(
+                        count: 2, hasSsmPre: false, hasMask: false,
+                        rowCount: 0, convStateRows: 0)
+                }
+                return VerifyTapeLayout(
+                    count: 0, hasSsmPre: false, hasMask: false,
+                    rowCount: 0, convStateRows: 0)
+            }
+            entry.hasLayout = true
+            compiledVerifyEntries[width] = entry
+        }
+        guard rebindVerifyStructures(out: out, layout: entry.layout) else {
+            // Layout surprise: the apply's structure diverged from the trace.
+            // Re-run the round eagerly and drop the entry so the next round
+            // re-traces.
+            compiledVerifyEntries[width] = nil
+            return model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: tokens), cache: cache, nConfirmed: 1)
+        }
+        let normed: MLXArray? = out[2].size > 0 ? out[2] : nil
+        return (out[0], out[1], normed)
+    }
+
+    /// Re-bind every ArraysCache's proposal-verify structure from the
+    /// compiled apply's returned arrays. Returns false when the total count
+    /// does not match the layout (leaves the properties untouched).
+    @discardableResult
+    private func rebindVerifyStructures(
+        out: [MLXArray], layout: [VerifyTapeLayout]
+    ) -> Bool {
+        guard layout.count == cache.count else { return false }
+        var offset = 3
+        for (index, item) in cache.enumerated() {
+            let l = layout[index]
+            guard l.count > 0, let arrays = item as? ArraysCache else {
+                continue
+            }
+            guard offset + l.count <= out.count else { return false }
+            if l.count >= 8 {
+                // Proposal-verify tape (width >= 3 verifies).
+                var next = offset
+                let convInput = out[next]; next += 1
+                let q = out[next]; next += 1
+                let k = out[next]; next += 1
+                let v = out[next]; next += 1
+                let a = out[next]; next += 1
+                let b = out[next]; next += 1
+                let g = out[next]; next += 1
+                let beta = out[next]; next += 1
+                let ssmPre: MLXArray? = l.hasSsmPre ? out[next] : nil
+                if l.hasSsmPre { next += 1 }
+                let mask: MLXArray? = l.hasMask ? out[next] : nil
+                if l.hasMask { next += 1 }
+                offset = next
+                arrays.prefixReplayTape = ArraysCache.PrefixReplayTape(
+                    convInput: convInput, q: q, k: k, v: v, a: a, b: b,
+                    g: g, beta: beta, ssmPre: ssmPre, mask: mask,
+                    rowCount: l.rowCount, convStateRows: l.convStateRows)
+                arrays.rollbackState = nil
+                arrays.rollbackCheckpoints = []
+            } else {
+                // Width-2 rollback checkpoint pair.
+                let cp0 = out[offset]
+                let cp1 = out[offset + 1]
+                offset += 2
+                arrays.rollbackState = (cp0, cp1)
+                arrays.rollbackCheckpoints = [(cp0, cp1)]
+                arrays.prefixReplayTape = nil
+            }
+        }
+        return offset == out.count
+    }
+
+    /// Promote the 16 full-attention caches to `CompilableKVCache`
+    /// (fixed-size buffers + an MLXArray offset) so the verify forward's KV
+    /// writes become compile-traceable. Called once at the end of `begin`,
+    /// AFTER the seed prefill — the seed stays on the original eager path.
+    /// `maxLength` covers the 512-token decode window plus the widest verify
+    /// block (kL <= 512 + 512 + 8 = 1032), so the traced graphs never hit
+    /// the growth branch. Wrong geometry is a no-op that disables the
+    /// compiled verify (the eager path remains).
+    private func promoteFullAttentionCaches() {
+        var promoted = 0
+        for (index, entry) in cache.enumerated() {
+            if let simple = entry as? KVCacheSimple {
+                cache[index] = CompilableKVCache(from: simple, maxLength: 1040)
+                promoted += 1
+            }
+        }
+        // Pinned Qwen 3.8 tower: 16 FA + 48 GDN.
+        compiledVerifyAvailable = (promoted == 16)
     }
 
     // MARK: - begin
@@ -589,6 +787,9 @@ public final class Qwen36MTPBlockSession {
         pendingTop2 = readTail
         seedTokenCount = seedTokens.count
         committedTokenCount = 0
+        // Promote the FA caches for the compiled verify path AFTER the seed
+        // prefill so the seed itself stays on the original eager path.
+        promoteFullAttentionCaches()
         began = true
         return pendingPrimary!
     }
@@ -1127,10 +1328,18 @@ public final class Qwen36MTPBlockSession {
         // accepted head-history rows do not each repeat the same row-local
         // RMSNorm through applyFinalNorm. Conformers that return nil retain the
         // old path through the guarded hiddenRow overload below.
-        let (verifyLogits, verifyHidden, verifyNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: verifyTokens),
-                cache: cache, nConfirmed: 1)
+        let (verifyLogits, verifyHidden, verifyNormed): (MLXArray, MLXArray, MLXArray?)
+        if let compiled = try? compiledVerifyForward(
+            width: 1 + draftCount, tokens: verifyTokens)
+        {
+            (verifyLogits, verifyHidden, verifyNormed) = compiled
+        } else {
+            // Eager fallback: the reference call, exactly as before.
+            (verifyLogits, verifyHidden, verifyNormed) =
+                model.callWithHiddenAndNormed(
+                    input: LMInput.Text(tokens: verifyTokens),
+                    cache: cache, nConfirmed: 1)
+        }
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
