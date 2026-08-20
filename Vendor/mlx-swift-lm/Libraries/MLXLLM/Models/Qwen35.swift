@@ -1848,11 +1848,38 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
         var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, kvHeads, -1)
         values = values.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        // Live attention already fuses kNorm + partial RoPE for L<=32.
+        // History still paid the eager pair (norm, transpose, RoPE) even
+        // though no query is consumed. Same kernel, K slots only: both
+        // input views are the K tensor and q_out is discarded. One launch
+        // writes the cache-ready [B,H,L,D] layout. Proposal-only.
+        let hasArrayOffset = cache is CompilableRotatingKVCache
+            || cache is CompilableKVCache
+            || cache is BatchPositionedKVCache
+        if usesFusedQKPreparation,
+           L <= 32,
+           !hasArrayOffset,
+           keys.dtype == .bfloat16,
+           kNorm.weight.dtype == .bfloat16,
+           keys.shape == [B, L, kvHeads, headDim],
+           kNorm.weight.shape == [headDim]
+        {
+            keys = qwen35AttentionQKRMSRoPE(
+                queries: keys,
+                keys: keys,
+                qWeight: kNorm.weight,
+                kWeight: kNorm.weight,
+                eps: kNorm.eps,
+                offset: cache.offset,
+                log2Base: ropeLog2Base
+            ).keys
+        } else {
+            keys = kNorm(keys).transposed(0, 2, 1, 3)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
         _ = cache.update(keys: keys, values: values)
     }
 
