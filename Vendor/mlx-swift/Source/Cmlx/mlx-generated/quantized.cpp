@@ -990,7 +990,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     int first_m,
     int out_row,
     uint simd_lid) {
-  static_assert(NA >= 2 && NA <= 4, "wide multi-row QMV supports NA in [2, 4]");
+  static_assert(NA >= 2 && NA <= 5, "wide multi-row QMV supports NA in [2, 5]");
   typedef vec<float, NA> VF;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -1972,7 +1972,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 9:
-          qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
+          qmv_fast_crossrow_affine4_g64_m<T, 9, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;

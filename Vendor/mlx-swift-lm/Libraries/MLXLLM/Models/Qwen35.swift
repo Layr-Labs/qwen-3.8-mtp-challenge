@@ -2109,6 +2109,28 @@ final class Qwen35DecoderLayer: Module {
 
 // MARK: - Text Model
 
+/// Layer indices at which the decode ladder fires `asyncEval`.
+///
+/// `MLX_QWEN_MTP_LADDER` overrides the shipped schedule for attribution runs:
+/// `off`, `front`, `dense`, or an explicit comma-separated index list. Read
+/// once, so a scored run with the variable unset pays one set lookup per layer
+/// and behaves exactly as before.
+let qwen35DecodeLadderRungs: Set<Int> = {
+    let shipped: Set<Int> = [0, 1, 9, 19, 29, 39, 49, 57]
+    guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_LADDER"],
+          !raw.isEmpty
+    else { return shipped }
+    switch raw {
+    case "default": return shipped
+    case "off": return []
+    case "front": return [0, 1]
+    case "dense": return Set(stride(from: 0, to: 64, by: 4)).union([1])
+    default:
+        let parsed = Set(raw.split(separator: ",").compactMap { Int($0) })
+        return parsed.isEmpty ? shipped : parsed
+    }
+}()
+
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
@@ -2162,14 +2184,15 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
-        // Decode-width asyncEval ladder: at S <= 2 (serial step / width-2 MTP
-        // verify) the host builds a ~64-layer graph before anything reaches
-        // the GPU. Firing asyncEval at a few layer boundaries lets the GPU
-        // start on the early layers while the host is still building the
+        // Decode-width asyncEval ladder: at S <= 9 (serial step and every MTP
+        // verify width) the host builds a ~64-layer graph before anything
+        // reaches the GPU. Firing asyncEval at a few layer boundaries lets the
+        // GPU start on the early layers while the host is still building the
         // rest. Pure enqueue-timing change — no op is added, no reduction
         // order moves, so the emitted stream is bit-identical (Laguna receipt
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
-        // schedule scaled from 40 to 64 layers, front rungs kept).
+        // schedule scaled from 40 to 64 layers, front rungs kept). The rung
+        // set is overridable via MLX_QWEN_MTP_LADDER for schedule research.
         let prefillLadder = inputs.dim(1) >= 512
         let ladderActive = inputs.dim(1) <= 9 || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
@@ -2197,13 +2220,8 @@ public class Qwen35TextModelInner: Module {
                         if i == 0 || i % 3 == 2 {
                             asyncEval(base, out.delta)
                         }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(base, out.delta)
-                        default:
-                            break
-                        }
+                    } else if qwen35DecodeLadderRungs.contains(i) {
+                        asyncEval(base, out.delta)
                     }
                 }
             }
@@ -2222,13 +2240,8 @@ public class Qwen35TextModelInner: Module {
                         if i == 0 || i % 3 == 2 {
                             asyncEval(hiddenStates)
                         }
-                    } else {
-                        switch i {
-                        case 0, 1, 9, 19, 29, 39, 49, 57:
-                            asyncEval(hiddenStates)
-                        default:
-                            break
-                        }
+                    } else if qwen35DecodeLadderRungs.contains(i) {
+                        asyncEval(hiddenStates)
                     }
                 }
             }
