@@ -154,6 +154,12 @@ public final class Qwen36MTPBlockSession {
     /// Seed rows retained for lazy priming; released at the first flush.
     private var seedHiddenForPriming: MLXArray?
     private var seedTokensForPriming: [Int] = []
+    /// Deferred head-cache trim. Speculative deeper-draft rows must be
+    /// discarded before the next draft reads `draftBase`, but nothing reads
+    /// the head cache between rounds, so the trim can wait until the next
+    /// drafting round's graph-build instead of sitting on the commit tail.
+    /// Byte-identical to trimming at commit. Does not touch the verify cache.
+    private var pendingHeadTrimOffset: Int?
 
     public private(set) var seedTokenCount = 0
     public private(set) var committedTokenCount = 0
@@ -1027,6 +1033,10 @@ public final class Qwen36MTPBlockSession {
         var flushTokens: [Int] = []
         if let existing = headHistoryCache {
             headCache = existing
+            if let pending = pendingHeadTrimOffset {
+                Self.trimTrimmable(headCache, to: pending)
+                pendingHeadTrimOffset = nil
+            }
         } else {
             let fresh = model.makeMTPCache()
             headHistoryCache = fresh
@@ -1249,13 +1259,10 @@ public final class Qwen36MTPBlockSession {
 
         if Self.traceRounds { tCommitDone = DispatchTime.now().uptimeNanoseconds }
 
-        // Head-history upkeep. Trim the speculative deeper-draft rows back to
-        // the valid prefix, then queue the ACCEPTED transitions for the next
-        // drafting round's flush: row i of the verify output is the trunk
-        // hidden at draft i's position, so (hiddenRow(i), drafts[i]) is the
-        // committed pair. The rejecting round queues nothing — the next
-        // round's own (pendingHidden, primary) row covers that transition.
-        Self.trimTrimmable(headCache, to: validHistoryOffset)
+        // Head-history upkeep. Queue the speculative-row discard for the next
+        // drafting round's build instead of paying trim on the commit tail.
+        // The next draft applies it before `draftBase` is read. Same bytes.
+        pendingHeadTrimOffset = validHistoryOffset
         if acceptedCount > 0 {
             // Keep accepted post-norm rows as one contiguous block. The backlog
             // already supports multi-row blocks (seed priming uses one), while
