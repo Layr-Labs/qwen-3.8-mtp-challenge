@@ -137,6 +137,35 @@ final class Qwen35MTPModule: Module {
             [preFcNormEmbedding(embeds), preFcNormHidden(hidden)], axis: -1)
     }
 
+    /// Embed gather folded into the concat-write kernel. Same arithmetic as
+    /// `embedTokens` + `preFcConcat`; the gather launch is gone.
+    private func preFcConcatFromIds(
+        nextTokenIds: MLXArray,
+        hidden: MLXArray,
+        embedTokens: Embedding
+    ) -> MLXArray {
+        let ew = embedTokens.weight
+        if nextTokenIds.dtype == .int32,
+           hidden.dtype == .bfloat16,
+           hidden.dim(-1) == 5120,
+           ew.dtype == .bfloat16,
+           ew.ndim == 2,
+           ew.dim(1) == 5120,
+           nextTokenIds.size == hidden.size / hidden.dim(-1),
+           preFcNormEmbedding.eps == preFcNormHidden.eps
+        {
+            return qwen35EmbedDualRMSNormConcat(
+                ids: nextTokenIds,
+                embedWeight: ew,
+                b: hidden,
+                aWeight: preFcNormEmbedding.weight,
+                bWeight: preFcNormHidden.weight,
+                eps: preFcNormEmbedding.eps)
+        }
+        let embeds = embedTokens(nextTokenIds)
+        return preFcConcat(embeds: embeds, hidden: hidden)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -145,8 +174,8 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        var fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        var fused = fc(preFcConcatFromIds(
+            nextTokenIds: nextTokenIds, hidden: hidden, embedTokens: embedTokens))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -177,8 +206,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        let fused = fc(preFcConcatFromIds(
+            nextTokenIds: nextTokenIds, hidden: hidden, embedTokens: embedTokens))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
