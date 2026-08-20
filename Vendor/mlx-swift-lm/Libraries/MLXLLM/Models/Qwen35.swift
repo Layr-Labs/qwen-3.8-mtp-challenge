@@ -1597,259 +1597,6 @@ func qwen35FusedResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
-// MARK: - Dual independent RMSNorm (proposal-side pre-fc)
-
-/// Two independent RMSNorms in one dispatch. Same looped reduction as
-/// `qwen35_fused_residual_rms_norm` / `rms_looped` (simd_sum → barrier →
-/// rsqrt), but no residual add — each row is already the value being
-/// normalised. Bit-identical to two eager `RMSNorm` launches when both
-/// inputs are BF16 with a contiguous last dim of 5120.
-///
-/// Used only on the MTP pre-fc pair (`pre_fc_norm_embedding` +
-/// `pre_fc_norm_hidden`). Proposal-only; the target never calls this.
-private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
-    name: "qwen35_dual_rms_norm_bf16_v1",
-    inputNames: ["a", "b", "a_weight", "b_weight", "eps"],
-    outputNames: ["a_out", "b_out"],
-    source: """
-        constexpr uint n_reads = 4;
-        constexpr uint simd_size = 32;
-        constexpr uint lsize = 1024;
-
-        uint row = threadgroup_position_in_grid.x;
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_thread = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-
-        uint axis_size = uint(a_shape[a_ndim - 1]);
-        uint a_rows = 1;
-        for (uint i = 0; i + 1 < a_ndim; ++i) {
-            a_rows *= uint(a_shape[i]);
-        }
-        bool is_a = row < a_rows;
-        uint local_row = is_a ? row : row - a_rows;
-        ulong offset = ulong(local_row) * ulong(axis_size);
-
-        threadgroup float local_inv_mean[1];
-        threadgroup float local_sums[simd_size];
-
-        float acc = 0.0f;
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[offset + elem + i])
-                        : float(b[offset + elem + i]);
-                    acc += xi * xi;
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? float(a[offset + elem + i])
-                            : float(b[offset + elem + i]);
-                        acc += xi * xi;
-                    }
-                }
-            }
-        }
-
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_thread == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_thread]);
-            if (simd_thread == 0) {
-                local_inv_mean[0] = metal::precise::rsqrt(
-                    acc / float(axis_size) + eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_mean = local_inv_mean[0];
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[offset + elem + i])
-                        : float(b[offset + elem + i]);
-                    bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                    bfloat yo = wi * bfloat(xi * inv_mean);
-                    if (is_a) {
-                        a_out[offset + elem + i] = yo;
-                    } else {
-                        b_out[offset + elem + i] = yo;
-                    }
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? float(a[offset + elem + i])
-                            : float(b[offset + elem + i]);
-                        bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                        bfloat yo = wi * bfloat(xi * inv_mean);
-                        if (is_a) {
-                            a_out[offset + elem + i] = yo;
-                        } else {
-                            b_out[offset + elem + i] = yo;
-                        }
-                    }
-                }
-            }
-        }
-    """,
-    ensureRowContiguous: false
-)
-
-func qwen35DualRMSNorm(
-    a: MLXArray,
-    b: MLXArray,
-    aWeight: MLXArray,
-    bWeight: MLXArray,
-    eps: Float
-) -> (MLXArray, MLXArray) {
-    let nRows = a.size / a.dim(-1)
-    let outputs = qwen35DualRMSNormKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
-        grid: (2 * nRows * 1024, 1, 1),
-        threadGroup: (1024, 1, 1),
-        outputShapes: [a.shape, b.shape],
-        outputDTypes: [.bfloat16, .bfloat16]
-    )
-    return (outputs[0], outputs[1])
-}
-
-/// Dual RMSNorm that writes the concatenated `[e | h]` layout the MTP
-/// `fc` already consumes. Same per-row arithmetic as `qwen35DualRMSNorm`;
-/// the concat copy after that launch is dead.
-private let qwen35DualRMSNormConcatKernel = MLXFast.metalKernel(
-    name: "qwen35_dual_rms_norm_concat_bf16_v1",
-    inputNames: ["a", "b", "a_weight", "b_weight", "eps"],
-    outputNames: ["concat_out"],
-    source: """
-        constexpr uint n_reads = 4;
-        constexpr uint simd_size = 32;
-        constexpr uint lsize = 1024;
-
-        uint row = threadgroup_position_in_grid.x;
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_thread = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-
-        uint axis_size = uint(a_shape[a_ndim - 1]);
-        uint a_rows = 1;
-        for (uint i = 0; i + 1 < a_ndim; ++i) {
-            a_rows *= uint(a_shape[i]);
-        }
-        bool is_a = row < a_rows;
-        uint local_row = is_a ? row : row - a_rows;
-        ulong in_off = ulong(local_row) * ulong(axis_size);
-        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
-            + (is_a ? 0 : ulong(axis_size));
-
-        threadgroup float local_inv_mean[1];
-        threadgroup float local_sums[simd_size];
-
-        float acc = 0.0f;
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[in_off + elem + i])
-                        : float(b[in_off + elem + i]);
-                    acc += xi * xi;
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? float(a[in_off + elem + i])
-                            : float(b[in_off + elem + i]);
-                        acc += xi * xi;
-                    }
-                }
-            }
-        }
-
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_thread == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_thread]);
-            if (simd_thread == 0) {
-                local_inv_mean[0] = metal::precise::rsqrt(
-                    acc / float(axis_size) + eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_mean = local_inv_mean[0];
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[in_off + elem + i])
-                        : float(b[in_off + elem + i]);
-                    bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                    concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
-                        float xi = is_a
-                            ? float(a[in_off + elem + i])
-                            : float(b[in_off + elem + i]);
-                        bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                        concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
-                    }
-                }
-            }
-        }
-    """,
-    ensureRowContiguous: false
-)
-
-func qwen35DualRMSNormConcat(
-    a: MLXArray,
-    b: MLXArray,
-    aWeight: MLXArray,
-    bWeight: MLXArray,
-    eps: Float
-) -> MLXArray {
-    let nRows = a.size / a.dim(-1)
-    var outShape = a.shape
-    outShape[outShape.count - 1] = a.dim(-1) + b.dim(-1)
-    let outputs = qwen35DualRMSNormConcatKernel(
-        [a, b, aWeight, bWeight, MLXArray(eps)],
-        grid: (2 * nRows * 1024, 1, 1),
-        threadGroup: (1024, 1, 1),
-        outputShapes: [outShape],
-        outputDTypes: [.bfloat16]
-    )
-    return outputs[0]
-}
-
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -2363,6 +2110,12 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
+    /// Suppresses the decode-width asyncEval ladder while a compiled verify
+    /// closure is being traced: `async_eval` is not allowed inside a graph
+    /// transformation, and the ladder is a pure enqueue-timing change
+    /// (bit-identical). Set around the compiled closure's forward only; the
+    /// eager paths keep the ladder.
+    public static nonisolated(unsafe) var suppressDecodeLadder = false
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
@@ -2424,7 +2177,8 @@ public class Qwen35TextModelInner: Module {
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        let ladderActive = (inputs.dim(1) <= 9 || prefillLadder)
+            && !Self.suppressDecodeLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
@@ -2489,6 +2243,223 @@ public class Qwen35TextModelInner: Module {
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
+    }
+
+    /// LOCAL-ONLY HYBRID PARITY EXPERIMENT (head-eval --shadow-hybrid).
+    /// Runs every GDN triplet `[4k, 4k+3)` below `islandEnd` through its OWN
+    /// compiled graph, with the eager full-attention layer `4k+3` between the
+    /// islands, and the remainder eager. islandEnd is a multiple of 4.
+    /// Removed before any submission.
+    private struct HybridIslandEntry {
+        let fn: @Sendable ([MLXArray]) -> [MLXArray]
+        /// Per island cache: [extraCount, rowCount, convStateRows] captured at
+        /// first apply.
+        var layout: [[Int]]
+        var hasLayout: Bool
+    }
+    /// Keyed by "\(islandStart):<first-cache-identity>" so every session's own
+    /// cache objects get their own compiled functions (the compile state is
+    /// bound to the captured cache objects).
+    private var hybridIslandEntries: [String: HybridIslandEntry] = [:]
+
+    private func rebindIslandStructures(
+        out: [MLXArray], layout: [[Int]], islandCaches: [KVCache]
+    ) -> Bool {
+        var offset = 2
+        for (j, cache) in islandCaches.enumerated() {
+            guard let arrays = cache as? ArraysCache, j < layout.count else { continue }
+            let l = layout[j]
+            let count = l[0]
+            guard offset + count <= out.count else { return false }
+            if count >= 8 {
+                // PrefixReplayTape (the S>=3 verify path).
+                let convInput = out[offset]; let q = out[offset + 1]
+                let k = out[offset + 2]; let v = out[offset + 3]
+                let a = out[offset + 4]; let b = out[offset + 5]
+                let g = out[offset + 6]; let beta = out[offset + 7]
+                var next = offset + 8
+                let ssmPre: MLXArray? = count >= 9 ? out[next] : nil
+                if count >= 9 { next += 1 }
+                let mask: MLXArray? = count >= 10 ? out[next] : nil
+                arrays.prefixReplayTape = ArraysCache.PrefixReplayTape(
+                    convInput: convInput, q: q, k: k, v: v, a: a, b: b,
+                    g: g, beta: beta, ssmPre: ssmPre, mask: mask,
+                    rowCount: l[1], convStateRows: l[2])
+                arrays.rollbackState = nil
+                arrays.rollbackCheckpoints = []
+                offset = next + (count >= 10 ? 1 : 0)
+            } else if count == 2 {
+                // Width-2 rollback checkpoint pair.
+                let cp0 = out[offset]; let cp1 = out[offset + 1]
+                offset += 2
+                arrays.rollbackState = (cp0, cp1)
+                arrays.rollbackCheckpoints = [(cp0, cp1)]
+                arrays.prefixReplayTape = nil
+            } else {
+                arrays.prefixReplayTape = nil
+                arrays.rollbackState = nil
+                arrays.rollbackCheckpoints = []
+            }
+        }
+        return true
+    }
+
+    private func islandEntry(
+        islandStart: Int, nConfirmed: Int, ssmMask: MLXArray?, cacheArray: [KVCache?]
+    ) -> HybridIslandEntry {
+        let cacheKey = "\(islandStart):\(ObjectIdentifier(cacheArray[islandStart]! as AnyObject))"
+        if let existing = hybridIslandEntries[cacheKey] { return existing }
+        let islandLayers = Array(layers[islandStart ..< (islandStart + 3)])
+        let islandCaches: [KVCache] =
+            Array(cacheArray[islandStart ..< (islandStart + 3)]).compactMap { $0 }
+        let updatable: [any Updatable] = islandCaches.map { $0 as any Updatable }
+        let hasMask = ssmMask != nil
+        let firstIsland = islandStart == 0
+        let fn = compile(
+            inputs: updatable, outputs: updatable, shapeless: false
+        ) { (args: [MLXArray]) -> [MLXArray] in
+            var base = args[0]
+            // Island 0's first layer takes delta=nil (the embed output);
+            // later islands consume the previous FA layer's delta.
+            var delta: MLXArray? = firstIsland ? nil : args[1]
+            var extra: [MLXArray] = []
+            for (j, layer) in islandLayers.enumerated() {
+                let out = layer.boundaryFused(
+                    base: base, delta: delta,
+                    attentionMask: .none,
+                    ssmMask: hasMask ? args[hasMask ? (firstIsland ? 1 : 2) : 0] : nil,
+                    cache: islandCaches[j], nConfirmed: nConfirmed)
+                base = out.base
+                delta = out.delta
+                if let arrays = islandCaches[j] as? ArraysCache {
+                    if let tape = arrays.prefixReplayTape {
+                        extra.append(contentsOf: [
+                            tape.convInput, tape.q, tape.k, tape.v,
+                            tape.a, tape.b, tape.g, tape.beta])
+                        if let ssmPre = tape.ssmPre { extra.append(ssmPre) }
+                        if let mask = tape.mask { extra.append(mask) }
+                    } else if !arrays.rollbackCheckpoints.isEmpty {
+                        let cp = arrays.rollbackCheckpoints[0]
+                        extra.append(cp.0)
+                        extra.append(cp.1)
+                    }
+                }
+            }
+            return [base, delta!] + extra
+        }
+        let entry = HybridIslandEntry(fn: fn, layout: [], hasLayout: false)
+        hybridIslandEntries[cacheKey] = entry
+        return entry
+    }
+
+    /// Apply the compiled island at `islandStart`, re-binding the GDN
+    /// tape/checkpoint structures. Returns the (base, delta) after the island.
+    private func applyIsland(
+        _ entry: HybridIslandEntry, islandStart: Int,
+        baseIn: MLXArray, deltaIn: MLXArray?,
+        hasMask: Bool, ssmMask: MLXArray?,
+        cacheArray: [KVCache?], nConfirmed: Int
+    ) -> (base: MLXArray, delta: MLXArray?) {
+        var entry = entry
+        let cacheKey = "\(islandStart):\(ObjectIdentifier(cacheArray[islandStart]! as AnyObject))"
+        let islandCaches: [KVCache] =
+            Array(cacheArray[islandStart ..< (islandStart + 3)]).compactMap { $0 }
+        var args: [MLXArray] = [baseIn]
+        if islandStart != 0 { args.append(deltaIn!) }
+        if hasMask { args.append(ssmMask!) }
+        let out = entry.fn(args)
+        if !entry.hasLayout {
+            var layout: [[Int]] = []
+            for cacheItem in islandCaches {
+                guard let arrays = cacheItem as? ArraysCache else {
+                    layout.append([0, 0, 0]); continue
+                }
+                if let tape = arrays.prefixReplayTape {
+                    layout.append([8 + (tape.ssmPre == nil ? 0 : 1)
+                                       + (tape.mask == nil ? 0 : 1),
+                                   tape.rowCount, tape.convStateRows])
+                } else if !arrays.rollbackCheckpoints.isEmpty {
+                    layout.append([2, 0, 0])
+                } else {
+                    layout.append([0, 0, 0])
+                }
+            }
+            hybridIslandEntries[cacheKey] = HybridIslandEntry(
+                fn: entry.fn, layout: layout, hasLayout: true)
+            entry = hybridIslandEntries[cacheKey]!
+        }
+        guard rebindIslandStructures(
+            out: out, layout: entry.layout, islandCaches: islandCaches)
+        else {
+            // Layout surprise: drop the entry and fall back to eager below.
+            hybridIslandEntries[cacheKey] = nil
+            var b = baseIn
+            var d = deltaIn
+            for j in 0 ..< 3 {
+                let layer = layers[islandStart + j]
+                let r = layer.boundaryFused(
+                    base: b, delta: d, attentionMask: .none,
+                    ssmMask: ssmMask, cache: cacheArray[islandStart + j],
+                    nConfirmed: nConfirmed)
+                b = r.base
+                d = r.delta
+            }
+            return (b, d)
+        }
+        return (out[0], out[1])
+    }
+
+    func callAsFunctionHybrid(
+        _ inputs: MLXArray, cache: [KVCache?]?, nConfirmed: Int, islandEnd: Int
+    ) -> MLXArray {
+        var hiddenStates = embedTokens(inputs)
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        Self.suppressDecodeLadder = true
+        defer { Self.suppressDecodeLadder = false }
+
+        var base = hiddenStates
+        var delta: MLXArray? = nil
+        let hybridPrefix = Swift.max(0, islandEnd / 4)
+        var k = 0
+        while k < hybridPrefix {
+            let islandStart = 4 * k
+            let entry = islandEntry(
+                islandStart: islandStart, nConfirmed: nConfirmed,
+                ssmMask: ssmMask, cacheArray: cacheArray!)
+            let (b2, d2) = applyIsland(
+                entry, islandStart: islandStart, baseIn: base, deltaIn: delta,
+                hasMask: ssmMask != nil, ssmMask: ssmMask,
+                cacheArray: cacheArray!, nConfirmed: nConfirmed)
+            base = b2
+            delta = d2
+            // Eager full-attention layer 4k+3.
+            let faLayerIdx = islandStart + 3
+            let out = layers[faLayerIdx].boundaryFused(
+                base: base, delta: delta, attentionMask: faMask,
+                ssmMask: nil, cache: cacheArray?[faLayerIdx],
+                nConfirmed: nConfirmed)
+            base = out.base
+            delta = out.delta
+            k += 1
+        }
+        for i in (hybridPrefix * 4) ..< layers.count {
+            let mask = layers[i].isLinear ? ssmMask : nil
+            let attnMask =
+                layers[i].isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            let out = layers[i].boundaryFused(
+                base: base, delta: delta,
+                attentionMask: attnMask, ssmMask: mask,
+                cache: cacheArray?[i], nConfirmed: nConfirmed)
+            base = out.base
+            delta = out.delta
+        }
+        return delta.map { base + $0 } ?? base
     }
 
     /// Atomically rebuild every linear-attention layer at the same committed
@@ -3202,6 +3173,26 @@ extension Qwen35TextModel: MTPCapable {
     ) -> (MLXArray, MLXArray, MLXArray?) {
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden, normed)
+    }
+
+    /// LOCAL-ONLY HYBRID PARITY EXPERIMENT: the tower forward with layers
+    /// `[0, islandEnd)` compiled as one GDN-island graph. islandEnd 0 = the
+    /// plain eager path. Removed before any submission.
+    public func callWithHiddenAndNormedHybrid(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int, islandEnd: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model.callAsFunctionHybrid(
+            input.tokens, cache: cacheOpt, nConfirmed: nConfirmed,
+            islandEnd: islandEnd)
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {

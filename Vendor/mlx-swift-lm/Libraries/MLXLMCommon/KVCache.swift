@@ -1322,6 +1322,22 @@ public class ArraysCache: BaseKVCache {
         }
     }
 
+    /// Replace this cache's slot state with another cache's (fresh-instance
+    /// transplant). Used by the compiled-verify warm path: the verify graphs
+    /// are traced on this object's slots, then `begin` runs the real seed
+    /// prefill on a fresh cache and transplants the resulting state here, so
+    /// the traced graphs apply against the real prefill state with identical
+    /// shapes.
+    public func adoptState(from other: ArraysCache) {
+        cache = other.cache
+        offset = other.offset
+        lengths = other.lengths
+        leftPadding = other.leftPadding
+        rollbackState = nil
+        rollbackCheckpoints = []
+        prefixReplayTape = nil
+    }
+
     public override func copy() -> any KVCache {
         let new = ArraysCache(size: cache.count)
         let s = self.state

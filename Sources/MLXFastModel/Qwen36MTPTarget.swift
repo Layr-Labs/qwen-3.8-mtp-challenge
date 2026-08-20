@@ -59,6 +59,13 @@ public protocol Qwen36MTPTarget: AnyObject {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?)
 
+    /// LOCAL-ONLY HYBRID PARITY EXPERIMENT: the tower forward with layers
+    /// `[0, islandEnd)` compiled as one GDN-island graph; islandEnd 0 = the
+    /// plain eager path. Removed before any submission.
+    func callWithHiddenAndNormedHybrid(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int, islandEnd: Int
+    ) -> (MLXArray, MLXArray, MLXArray?)
+
     /// Rebuild every recurrent layer after the committed prefix of a fused
     /// multi-draft verify. Returns false without mutation when the replay tape
     /// is incomplete, allowing the session to use its generic repair path.
@@ -124,6 +131,15 @@ extension Qwen36MTPTarget {
         let (logits, hidden) = callWithHidden(
             input: input, cache: cache, nConfirmed: nConfirmed)
         return (logits, hidden, nil)
+    }
+
+    /// LOCAL-ONLY HYBRID default: islandEnd 0 is the plain eager path.
+    public func callWithHiddenAndNormedHybrid(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int, islandEnd: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        precondition(islandEnd == 0, "hybrid forward requires a conformer that implements it")
+        return callWithHiddenAndNormed(
+            input: input, cache: cache, nConfirmed: nConfirmed)
     }
 }
 

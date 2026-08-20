@@ -140,6 +140,33 @@ public func attentionWithCacheUpdate(
             )
             return concatenated([outA, outB], axis: 2)
         }
+        // Fixed-buffer variant (CompilableKVCache): the cache returns the
+        // FULL pre-allocated buffer, so the mask is an explicit array that
+        // marks the valid positions. The chunk's windows are identical; the
+        // slices carry their mask slices along.
+        if queries.dim(0) == 1, qL >= 6, qL <= 9, kL >= qL,
+           case .array(let fullMask) = mask,
+           fullMask.ndim == 4, fullMask.dim(2) == qL, fullMask.dim(3) == kL
+        {
+            let split = 5
+            let kSplit = kL - (qL - split)
+            let outA = MLXFast.scaledDotProductAttention(
+                queries: queries[0..., 0..., 0 ..< split, 0...],
+                keys: cachedKeys[0..., 0..., 0 ..< kSplit, 0...],
+                values: cachedValues[0..., 0..., 0 ..< kSplit, 0...],
+                scale: scale,
+                mask: .array(
+                    fullMask[0..., 0..., 0 ..< split, 0 ..< kSplit])
+            )
+            let outB = MLXFast.scaledDotProductAttention(
+                queries: queries[0..., 0..., split..., 0...],
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: .array(fullMask[0..., 0..., split..., 0...])
+            )
+            return concatenated([outA, outB], axis: 2)
+        }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: cachedKeys,
