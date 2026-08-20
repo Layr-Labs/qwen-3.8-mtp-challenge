@@ -1042,11 +1042,11 @@ public final class Qwen36MTPBlockSession {
         // no host readback between the head forward and the verify forward
         // (MTPLX batched_decode: the draft id is an mx.array stacked into the
         // verify block; the ledger reads the values from the round's single
-        // batched eval afterwards). `asyncEval` submits the head chain so the
-        // GPU works while the host builds the 64-layer verify graph.
-        // (Per-step asyncEval was tried here and measured NEUTRAL — the
-        // ~2.4 ms/step is host graph BUILD, not GPU work to overlap; see
-        // idea.md V6 journal. Single submission after the loop, as before.)
+        // batched eval afterwards). Per-step asyncEval of the head chain
+        // was measured NEUTRAL — the ~2.4 ms/step is host graph BUILD, not
+        // GPU work to overlap (idea.md V6 journal). Extra asyncEval
+        // submits of the same draft ids are omitted; the round eval below
+        // already lists them.
         var draftIdArrays: [MLXArray] = []
         var headHidden = model.mtpHeadLastHiddenWithKVOnlyHistory(
             hidden: draftInputHidden, nextTokenIds: draftInputTokens,
@@ -1058,12 +1058,12 @@ public final class Qwen36MTPBlockSession {
             0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
-        // Early submission of the FIRST head step: its graph exists ~2.4 ms
-        // before the rest of the chain is built, and unlike the per-step
-        // variant (measured neutral — nothing but build time between steps)
-        // the first step carries the history flush, which IS real GPU work
-        // the device can start while the host builds steps 2..d.
-        asyncEval(draftId)
+        // No early asyncEval of draft ids. Per-step asyncEval here was
+        // measured NEUTRAL (host graph build, not GPU idle). Extra
+        // drafting-path command buffers have been the pollution
+        // signature this cycle. The round's single blocking eval
+        // already includes draftIdArrays, so the same tensors still
+        // launch — once, with the verify bundle, not as extra submits.
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
@@ -1072,7 +1072,6 @@ public final class Qwen36MTPBlockSession {
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
-        asyncEval(draftIdArrays[draftIdArrays.count - 1])
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
