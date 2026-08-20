@@ -633,6 +633,20 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// The last row of a head-chain hidden block. Every step after the first
+    /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
+    /// already returns only the final row — so the trailing-row slice those
+    /// call sites took was an identity slice on all but the flush step, costing
+    /// a host graph node and a device op per PROPOSED token for nothing. The
+    /// guard is on the shape, not on the call site, so a multi-row block still
+    /// takes the real slice.
+    @inline(__always)
+    private static func lastHiddenRow(_ block: MLXArray) -> MLXArray {
+        let rows = block.dim(1)
+        guard rows > 1 else { return block }
+        return block[0..., (rows - 1) ..< rows, 0...]
+    }
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -745,7 +759,7 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    private static let segmentedVerifyDepthCap = 7
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -782,9 +796,28 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
+        // FLAT CAP 7, NO GATE. Two ranked receipts of ours, each isolating one
+        // half of this: capping at 7 gave `919318e1` (always the x4 slot)
+        // 0.011967 s/tok at draft length 4.32 — still the fastest reading for
+        // that prompt from any tree on this board — while removing the streak
+        // gate's width-wall FLOOR gave `00142a44` 0.011070 at draft length
+        // 5.10, a -2.6% move to within 0.4% of its own board minimum.
+        //
+        // The floor, not the ceiling, is what was truncating `00142a44`: it
+        // drops the cap to `sdpaWidthWallDepthCap` on every round after a
+        // reject, cutting rounds the marginal rule would have taken deeper. So
+        // the ceiling stays at 7 and the floor goes, which is both receipts in
+        // one schedule.
+        //
+        // I shipped these two together once before and lost x4, but that tree
+        // also carried a third confidence-tempering rung, and only that rung
+        // can shorten a round — removing a floor cannot. It is not here.
+        //
+        // Safety does not depend on the gate: `reach` is a product of the
+        // per-position acceptance EMAs and collapses on a cold stretch by
+        // itself. Widths 6..8 are bit-exact per position against the serial
+        // trajectory through the sdpa exactness chunk, so 7 is policy.
+        let widthCap = Self.segmentedVerifyDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -1081,8 +1114,7 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        var draftHidden = Self.lastHiddenRow(headHidden)
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -1094,8 +1126,7 @@ public final class Qwen36MTPBlockSession {
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
