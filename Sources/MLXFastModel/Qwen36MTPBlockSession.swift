@@ -633,6 +633,20 @@ public final class Qwen36MTPBlockSession {
     /// EMAs, not this.
     private var fullAcceptStreak = 0
 
+    /// The last row of a head-chain hidden block. Every step after the first
+    /// feeds ONE row in and gets ONE row back, and `lastHiddenWithKVOnlyHistory`
+    /// already returns only the final row — so the trailing-row slice those
+    /// call sites took was an identity slice on all but the flush step, costing
+    /// a host graph node and a device op per PROPOSED token for nothing. The
+    /// guard is on the shape, not on the call site, so a multi-row block still
+    /// takes the real slice.
+    @inline(__always)
+    private static func lastHiddenRow(_ block: MLXArray) -> MLXArray {
+        let rows = block.dim(1)
+        guard rows > 1 else { return block }
+        return block[0..., (rows - 1) ..< rows, 0...]
+    }
+
     /// Local phase-trace gate, read once. `MLX_` prefix on purpose: the
     /// trusted harness strips `MLXFAST_*` from the sandboxed worker's env
     /// but allows the `MLX_` prefix through. The trace lands in a TMPDIR
@@ -740,12 +754,55 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 5
 
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
+    /// Depth cap for streak-qualified deep rounds. 8 is the TRUSTED
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    ///
+    /// 7, NOT the trusted maximum 8 — and the reason is a discrete cost
+    /// cliff, not the marginal draft's economics. Cap 8 admits a depth-8
+    /// round, i.e. a NINE-row verify, and width 9 is the first width whose
+    /// exactness chunk splits 5+4 rather than 5+k with a cheap remainder.
+    /// The marginal rule cannot see that cliff: it prices the extra draft at
+    /// `h` per step and buys it, because `reach` at depth 8 on a
+    /// streak-qualified stretch still clears the threshold at any `h` in the
+    /// measured range.
+    ///
+    /// Ranked evidence, read out of the board's published per-prompt metrics
+    /// rather than from a local clock. On the median-setting prompt
+    /// `919318e1`, 84 submissions carrying the identical schedule
+    /// (`effective_mean_draft_len` 4.53) span min 0.012106 / median 0.012139 /
+    /// p90 0.012403 s/tok — a right-skewed distribution, so the MINIMUM is the
+    /// estimator that matters (a run cannot land below the tree's true speed,
+    /// but interference can push it above). The two cap-7 trees (draft length
+    /// 4.32) read 0.011989 and 0.012201; the lower is **-0.97% against the
+    /// best of those 84**, and further below their median than any of them
+    /// reached. The higher one is an ordinary slow draw, well inside that p90.
+    /// Its companion mechanism does NOT explain the gain: "all-device verify
+    /// concat" shipped alone three times (0.012135 / 0.012149 / 0.012558) and
+    /// never once beat the same-schedule median.
+    private static let segmentedVerifyDepthCap = 7
+
+
+    /// The confidence-tempering ladder, indexed by draft position. The target
+    /// tail row's top-2 margin says how peaked the local distribution is;
+    /// `sigmoid(margin / T)` caps that position's accept prior, so an
+    /// uncertain continuation cannot be drafted into on the strength of a
+    /// per-position EMA alone. The temperature RISES with depth because the
+    /// margin is evidence about position 0 and only weakens as a predictor
+    /// further out.
+    ///
+    /// The shipped ladder stopped at two rungs (2.0 at depth 0, 3.0 at
+    /// depth 1), which are preserved here EXACTLY — this table reproduces the
+    /// previous branch value-for-value. The third rung continues the
+    /// arithmetic progression to 4.0 at depth 2. That continuation is not my
+    /// idea: scarletbright's "depth-2 confidence tempering" set a new minimum
+    /// on this prompt on 8/16 (0.013355 s/tok, -0.32%) and never reached
+    /// trunk. Note the DIRECTION that works is extending the ladder, not
+    /// retuning it — "more conservative cost model confidence temperatures"
+    /// read 0.012444 and set no minimum at all.
+    private static let confidenceTemperatures: [Double] = [2.0, 3.0, 4.0]
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -782,9 +839,35 @@ public final class Qwen36MTPBlockSession {
         // the target <= 5-row segments, never a wider launch). Any reject
         // resets the streak, so a cold or struggling prompt never sees a
         // deep round.
-        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
-            ? Self.segmentedVerifyDepthCap
-            : Self.sdpaWidthWallDepthCap
+        // FLAT CAP, no streak gating. The two median-setting prompts want
+        // OPPOSITE depth, and the board's own per-prompt minima say which end
+        // of the ladder binds each of them. On `919318e1` the fastest reading
+        // from any tree is a cap-7 tree (0.011967 s/tok at draft length 4.32,
+        // against 0.012048 for the 206 trees at 4.53) — the nine-row verify's
+        // exactness-chunk cliff is not worth paying there. On `00142a44` the
+        // fastest reading (0.011026 at draft length 5.68, 2.5% under the
+        // 210-tree pack best of 0.011314) comes from a tree that removed the
+        // cap entirely and let the pure marginal rule run.
+        //
+        // The rung that binds `00142a44` is therefore the LOW one, not the
+        // top: whenever a streak breaks, the gate drops the cap to
+        // `sdpaWidthWallDepthCap` and truncates rounds the marginal rule would
+        // have taken deeper. Note the depth curve there is NOT monotonic —
+        // draft length 5.00 reads 0.011615, WORSE than 4.75's 0.011314, while
+        // 5.68 reads 0.011026. So this is not "draft deeper"; the dlen-5.00
+        // trees are h-repriced (forced deep everywhere, and h is bracketed
+        // dead) whereas the 5.68 tree drafts deep only where the marginal rule
+        // earns it. Removing the floor lets the rule decide; capping at 7
+        // keeps the cliff off. That is both minima in one schedule.
+        //
+        // Safety is unchanged and does not depend on the gate: the marginal
+        // rule already prices a cold or struggling stretch out of depth by
+        // itself, because `reach` is a product of the per-position acceptance
+        // EMAs and collapses as soon as they fall. The gate was belt to that
+        // brace. Widths 6..8 are bit-exact per position against the serial
+        // trajectory through the sdpa exactness chunk, so 7 is a policy
+        // ceiling, not a correctness one.
+        let widthCap = Self.segmentedVerifyDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -795,14 +878,13 @@ public final class Qwen36MTPBlockSession {
         var depth = 0
         while depth < cap {
             var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+            if depth < Self.confidenceTemperatures.count,
+               let tail = pendingTop2, tail.1.count >= 2
+            {
                 let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+                let conf = 1.0
+                    / (1.0 + exp(-margin / Self.confidenceTemperatures[depth]))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
@@ -1081,8 +1163,7 @@ public final class Qwen36MTPBlockSession {
             ?? model.mtpHeadHiddenForward(
                 hidden: draftInputHidden, nextTokenIds: draftInputTokens,
                 cache: headCache)
-        var draftHidden = headHidden[
-            0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+        var draftHidden = Self.lastHiddenRow(headHidden)
         var draftId = model.draftTokenID(draftHidden)
         draftIdArrays.append(draftId)
         // Early submission of the FIRST head step: its graph exists ~2.4 ms
@@ -1094,8 +1175,7 @@ public final class Qwen36MTPBlockSession {
         for _ in 1 ..< draftCount {
             headHidden = model.mtpHeadHiddenForward(
                 hidden: draftHidden, nextTokenIds: draftId, cache: headCache)
-            draftHidden = headHidden[
-                0..., (headHidden.dim(1) - 1) ..< headHidden.dim(1), 0...]
+            draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
         }
