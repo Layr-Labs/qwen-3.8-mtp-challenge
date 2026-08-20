@@ -2171,7 +2171,11 @@ public class Qwen35TextModelInner: Module {
         // for the same schedule shape: off 10.37 ms vs ladder 9.45 ms/step;
         // schedule scaled from 40 to 64 layers, front rungs kept).
         let prefillLadder = inputs.dim(1) >= 512
-        let ladderActive = inputs.dim(1) <= 9 || prefillLadder
+        // 1-row graphs: host build of the 64-layer chain is already cheap,
+        // so the 8-rung asyncEval ladder is extra command buffers with
+        // nothing useful to overlap. Keep rungs for S=2..9 (multi-row)
+        // and the M=512 prefill ladder. Gated on sequence length only.
+        let ladderActive = (inputs.dim(1) >= 2 && inputs.dim(1) <= 9) || prefillLadder
         if hiddenStates.dtype == .bfloat16 && hiddenStates.dim(-1) == 5120 {
             // Boundary-fused chain: the residual boundary flows as an
             // UNMERGED (base, delta) pair, so each interior layer pays one
