@@ -1132,7 +1132,12 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
       const int group_index =
           row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
       scale_local[r] = scales[group_index];
-      bias_local[r] = biases[group_index];
+      // The declared coarse affine-2 head stores bias = -2 * scale for all
+      // but 1,593 of 7,866,880 groups.  This readout only chooses the shortlist;
+      // the incumbent affine-4 rerank and target still decide the proposal and
+      // emitted token.  Reconstruct the dominant BF16 zero point from the
+      // scale and avoid streaming the 15 MiB bias plane on every draft step.
+      bias_local[r] = -2.0f * scale_local[r];
     }
 
     thread float x0[values_per_thread];
