@@ -1850,6 +1850,164 @@ func qwen35DualRMSNormConcat(
     return outputs[0]
 }
 
+/// `qwen35DualRMSNormConcat` with the embedding side's WHOLE producer folded
+/// in: the token-id gather, the packed affine-4/g64 row, and the dequant that
+/// `QuantizedEmbedding.callAsFunction` performs as three gather launches plus
+/// `affine_dequantize` all become in-kernel reads. One launch replaces four,
+/// per head step and per flush row. Proposal-only (the head side proposes;
+/// the target decides every emitted token), and the decode mirrors
+/// `affine_dequantize`'s bits=4 expression (`scale * d + bias` in bf16
+/// arithmetic, `d = (word >> 4*(i%8)) & 0xf`) so the embeds are bit-identical
+/// to the materialized path and head behaviour is unchanged.
+private let qwen35DualRMSNormEmbedConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_dual_rms_norm_embed_concat_bf16_v1",
+    inputNames: [
+        "token_ids", "b", "embed_w", "embed_scales", "embed_biases",
+        "a_weight", "b_weight", "eps",
+    ],
+    outputNames: ["concat_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+        constexpr uint hidden_size = 5120;
+        constexpr uint words_per_row = hidden_size / 8;
+        constexpr uint groups_per_row = hidden_size / 64;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint total_rows = 1;
+        for (uint i = 0; i + 1 < b_ndim; ++i) {
+            total_rows *= uint(b_shape[i]);
+        }
+        bool is_a = row < total_rows;
+        uint local_row = is_a ? row : row - total_rows;
+
+        uint tok = uint(token_ids[local_row]);
+        const device uint32_t* wrow =
+            embed_w + ulong(tok) * ulong(words_per_row);
+        const device bfloat* srow =
+            embed_scales + ulong(tok) * ulong(groups_per_row);
+        const device bfloat* zrow =
+            embed_biases + ulong(tok) * ulong(groups_per_row);
+        ulong b_off = ulong(local_row) * ulong(hidden_size);
+        ulong out_off = ulong(local_row) * ulong(hidden_size * 2)
+            + (is_a ? 0 : ulong(hidden_size));
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < hidden_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= hidden_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    float xi = is_a
+                        ? float(bfloat(float(srow[e >> 6])
+                              * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                              + float(zrow[e >> 6])))
+                        : float(b[b_off + e]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    if (e < hidden_size) {
+                        float xi = is_a
+                            ? float(bfloat(float(srow[e >> 6])
+                                  * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                                  + float(zrow[e >> 6])))
+                            : float(b[b_off + e]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(hidden_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < hidden_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= hidden_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    float xi = is_a
+                        ? float(bfloat(float(srow[e >> 6])
+                              * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                              + float(zrow[e >> 6])))
+                        : float(b[b_off + e]);
+                    bfloat wi = is_a ? a_weight[e] : b_weight[e];
+                    concat_out[out_off + e] = wi * bfloat(xi * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    if (e < hidden_size) {
+                        float xi = is_a
+                            ? float(bfloat(float(srow[e >> 6])
+                                  * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                                  + float(zrow[e >> 6])))
+                            : float(b[b_off + e]);
+                        bfloat wi = is_a ? a_weight[e] : b_weight[e];
+                        concat_out[out_off + e] = wi * bfloat(xi * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35DualRMSNormEmbedConcat(
+    tokenIds: MLXArray,
+    b: MLXArray,
+    aWeight: MLXArray,
+    bWeight: MLXArray,
+    eps: Float,
+    embedWeight: MLXArray,
+    embedScales: MLXArray,
+    embedBiases: MLXArray
+) -> MLXArray {
+    let axis = b.dim(-1)
+    let nRows = b.size / axis
+    var outShape = b.shape
+    outShape[outShape.count - 1] = axis * 2
+    let outputs = qwen35DualRMSNormEmbedConcatKernel(
+        [
+            tokenIds, b, embedWeight, embedScales, embedBiases,
+            aWeight, bWeight, MLXArray(eps),
+        ],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
