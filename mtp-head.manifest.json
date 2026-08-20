@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:kumahada/qwen38-mtp-head-q4-fcbf16@cf2b8d9b0cb9940c0cf0d4f7d006a428d886b107",
+  "sha256": "b77893778383eb9eca7bcb03e1977a6629a637819831f6a26b52331af126e044",
+  "bytes": 503108438,
   "max_bytes": 2147483648,
-  "note": "The promoted 4-bit/group-64 precision-island proposal head is preserved tensor-for-tensor and extended with a public affine-2 compact draft readout. Candidate code uses that readout only to form a 32-token shortlist, then exactly reranks those rows with the existing affine-4 compact target lm_head before selecting the proposal token. The target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, and trusted serial replay are unchanged. The artifact is immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed. [resample ticket #3 - this string is the only diff vs frontier 9e1ff9ec; see submission note]"
+  "note": "Mixed-precision proposal head: the promoted q2-q4-rerank artifact with fc carried as plain bf16 (weight only, no scales/biases). The stock per-path quantize walk therefore loads fc as an unquantized Linear and every other tensor exactly as before - no code change. fc is where the Q4 accept gap actually lives (+0.37% chained accept on decode-distribution holdout; q/k/v are covered by the inherited islands, which are kept verbatim as are draft_lm_head.* and all other tensors). Weights are bit-identical to quantize/dequantize lineage of the pinned bf16 head; the target forward, exact top-2, emitted-token decision and trusted replay are unchanged."
 }
