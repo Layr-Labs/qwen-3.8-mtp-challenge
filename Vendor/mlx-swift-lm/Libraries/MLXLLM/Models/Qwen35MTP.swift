@@ -136,6 +136,41 @@ final class Qwen35MTPModule: Module {
         return (preFcNormEmbedding(embeds), preFcNormHidden(hidden))
     }
 
+    /// Fuse the embedding row gather into the dual pre-fc RMSNorm dispatch:
+    /// one launch (and one host graph node) for what was the embedding gather
+    /// plus the two independent pre-fc norms. The gather is an exact row copy
+    /// and the reduction is the verified dual-norm tree, so the values are
+    /// bit-identical to `embedTokens(nextTokenIds)` + `preFcNorms` when the
+    /// guard fires. Proposal-only. Falls back to the frontier path otherwise.
+    private func embedDualNorms(
+        nextTokenIds: MLXArray,
+        hidden: MLXArray,
+        embedTokens: Embedding
+    ) -> (MLXArray, MLXArray) {
+        let ew = embedTokens.weight
+        if nextTokenIds.dtype == .int32,
+           nextTokenIds.ndim == 2,
+           nextTokenIds.dim(1) == hidden.dim(1),
+           hidden.ndim == 3,
+           hidden.dtype == .bfloat16,
+           hidden.dim(-1) == 5120,
+           ew.dtype == .bfloat16,
+           ew.ndim == 2,
+           ew.dim(1) == 5120,
+           preFcNormEmbedding.eps == preFcNormHidden.eps
+        {
+            return qwen35EmbedDualRMSNorm(
+                ids: nextTokenIds,
+                embedWeight: ew,
+                b: hidden,
+                aWeight: preFcNormEmbedding.weight,
+                bWeight: preFcNormHidden.weight,
+                eps: preFcNormEmbedding.eps)
+        }
+        let embeds = embedTokens(nextTokenIds)
+        return preFcNorms(embeds: embeds, hidden: hidden)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -144,8 +179,8 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
+        let (e, h) = embedDualNorms(
+            nextTokenIds: nextTokenIds, hidden: hidden, embedTokens: embedTokens)
         var fused = fc(concatenated([e, h], axis: -1))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
@@ -177,8 +212,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let (e, h) = preFcNorms(embeds: embeds, hidden: hidden)
+        let (e, h) = embedDualNorms(
+            nextTokenIds: nextTokenIds, hidden: hidden, embedTokens: embedTokens)
         let fused = fc(concatenated([e, h], axis: -1))
         let historyCount = fused.dim(1) - 1
 
