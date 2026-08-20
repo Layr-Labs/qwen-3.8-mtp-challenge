@@ -56,6 +56,17 @@ final class Qwen35MTPDecoderLayer: Module {
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        // Backbone already fuses this residual+norm boundary. The head layer
+        // was left on the eager pair. Same kernel, same bf16/5120 guard —
+        // bit-identical to `h = x + r; postAttentionLayerNorm(h)`, one launch
+        // per proposed token. Proposal-only; target exactness unchanged.
+        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
+            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return h + (mlp as! UnaryLayer)(postAttnNorm)
+        }
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
