@@ -68,12 +68,23 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         let environment = ProcessInfo.processInfo.environment
         guard environment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"] != "0"
         else { return }
-        // Force-set: the ranked worker / parent may already have exported the
-        // stock 50 MiB MLX default. overwrite=0 left that in place and the
-        // 512 MiB post-wire budget never landed. overwrite=1 makes the
-        // promoted Laguna M5-Max command-buffer profile actually apply.
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
+        // Force-set: the ranked MTP worker calls resolve() then returns
+        // early on the 128 GiB box (it never apply()s the 320/128 struct
+        // fields). overwrite=1 is the only hook that actually lands.
+        //
+        // 50/512 is the promoted ofou geometry. CommandEncoder::needs_commit
+        // is `(buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)`
+        // over a counter both rules share and both reset, so raising ops
+        // alone plateaus when the MB rule wakes. Both knobs move together.
+        //
+        // eval_impl always gpu::finalize()s open streams after asyncEval, so
+        // the decode-width ladder (layers 0,1,9,...,57) still splits the
+        // 64-layer verify; only heuristic mid-rung commits go away. Those
+        // extra committed buffers compete with MAX_ACTIVE_TASKS=10 in
+        // transforms.cpp and can stall the host in wait_for_one(). Serial
+        // is the pinned BASELINE_WS tree and does not inherit this env.
+        setenv("MLX_MAX_MB_PER_BUFFER", "1024", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "160", 1)
     }
 
     public static func resolve(
