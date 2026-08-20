@@ -65,8 +65,6 @@ public struct Qwen36MTPRoundResult {
     public let perRowTop2Logits: [[Double]]
     /// Trimmable-cache offset after the round: `seedTokenCount + committedTotal`.
     public let targetCacheOffset: Int
-    /// True when a stop token was committed this round; the parent stops asking.
-    public let reachedStopToken: Bool
 }
 
 /// Errors the session raises. Every one of these is a broken invariant, not a
@@ -162,7 +160,6 @@ public final class Qwen36MTPBlockSession {
     public private(set) var rejectedDraftTotal = 0
     public private(set) var rollbackRoundCount = 0
     public private(set) var began = false
-    public private(set) var reachedStopToken = false
 
     public init(
         model: any Qwen36MTPTarget,
@@ -359,6 +356,44 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
+        // VERIFY-CONCAT JIT WARM. Scored rounds assemble verifyTokens as
+        // concatenated([host primary] + device draftIds) over int32 [1, 1]
+        // arrays. The width loop below feeds callWithHidden a single host
+        // [1, width] tensor, so it never compiles that multi-input concat.
+        // MLX JIT-specializes copy/concat by dtype and input count
+        // (ml-explore/mlx metal JIT; first launch pays Metal library
+        // compile — see Kernel Management / JIT Compilation). Those
+        // copyint32int32 kernels otherwise land inside scored round 1.
+        // Values are zeros / already-eval'd draft IDs and the result is
+        // discarded: shape + dtype + host/device mix select the kernels.
+        // Warm every legal extra-count 0...maxDepth so an adaptive
+        // draftPolicy that returns 0..8 does not hit a cold width later.
+        //
+        // PROVENANCE, and why this block keeps disappearing. Authored by
+        // fkiene and PROMOTED at 1cb1f43a7246d57af8b96dad468583364779aa73,
+        // scoring 3.24417896624589 against the 3.24326223889754 base
+        // (+0.0283 %). The very next promotion (ofou, ef42e0432727, now
+        // upstream/main) branched from a commit PREDATING fkiene and submitted;
+        // because `yukon submit` REPLACES whole files rather than merging,
+        // `git diff 1cb1f43a upstream/main` on this file is 0 insertions and
+        // 19 deletions -- exactly these lines, deleted by an author who never
+        // opened the file. It is therefore absent from the live tip AND from
+        // every tree descended from that base, including ours. Restored here
+        // with its receipt so the next whole-file overlay has to argue with
+        // the number instead of silently dropping it again.
+        //
+        // Placement is load-bearing: this sits in `warmAllDepthShapes`, i.e.
+        // in the warm-up path OUTSIDE the timed window, so the JIT cost it
+        // moves is paid before measurement starts. The comment 12 lines above
+        // records the same hazard biting a previous candidate that warmed the
+        // wrong expression: first MTP block 0.941 s vs 0.402 s.
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra {
+                parts.append(primedDraftID)
+            }
+            eval(concatenated(parts, axis: 1))
+        }
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
@@ -509,33 +544,6 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
-        // Scored decode walks N past 1024 (512 seed + 512 decode).
-        // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
-        // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
-        if extK.dim(2) == 1024 {
-            let kPad1 = MLXArray.zeros(
-                [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
-            let vPad1 = MLXArray.zeros(
-                [extV.dim(0), extV.dim(1), 1, extV.dim(3)], dtype: extV.dtype)
-            let k1025 = concatenated([extK, kPad1], axis: 2)
-            let v1025 = concatenated([extV, vPad1], axis: 2)
-            var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
-                let q = MLXArray.zeros(
-                    [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
-                outs1025.append(
-                    MLXFast.scaledDotProductAttention(
-                        queries: q,
-                        keys: k1025,
-                        values: v1025,
-                        scale: scale,
-                        mask: .causal
-                    )
-                )
-            }
-            eval(outs1025)
-        }
     }
 
     // MARK: - begin
@@ -640,11 +648,32 @@ public final class Qwen36MTPBlockSession {
     /// stderr to the wrapper's log.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
+    /// Attribution probe only. `verify_build_us` measures the window in which
+    /// the host builds the verify graph WHILE the asynchronously submitted head
+    /// chain runs on the GPU, so a head-chain stall is indistinguishable from
+    /// host build cost there. Draining the chain before the window moves that
+    /// GPU time into `draft_build_us` and leaves `verify_build_us` as pure host
+    /// graph construction. Never enable on a timed candidate: it destroys the
+    /// head/verify overlap the round is designed around.
+    private static let traceSyncHeadChain =
+        ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE_SYNC_HEAD"] == "1"
+    /// Opened O_APPEND so the reference, verify and timed workers can each
+    /// write the same file without a later process truncating an earlier
+    /// one's rounds. Falls back to stderr when no path is configured, which
+    /// the `mtp-timed` parent discards: `runtimeWorkerOptions` is called
+    /// there without `forwardsWorkerStderr`, so it defaults to false and the
+    /// drain installs a swallowing emitter.
+    private static let traceSink: FileHandle = {
+        guard let path = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_TRACE_PATH"], !path.isEmpty
+        else { return FileHandle.standardError }
+        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return FileHandle.standardError }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+    }()
+
     private static func traceWrite(_ line: String) {
-        // stderr: the worker sandbox denies file-write*, and the parent's
-        // drain forwards stderr lines when MLX_QWEN_MTP_TRACE=1 flips
-        // `forwardsWorkerStderr` on the local mtp-timed verb.
-        FileHandle.standardError.write(Data(line.utf8))
+        traceSink.write(Data(line.utf8))
     }
 
     /// Exact-value row dump for the LOCAL width-wall gate: hexfloat (`%a`)
@@ -788,6 +817,11 @@ public final class Qwen36MTPBlockSession {
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
+        // Snapshot BEFORE the walk and before any drafting: by the time the
+        // round's trace line is emitted, the EMAs, the streak and `pendingTop2`
+        // have all been advanced by this round's own outcome, so reading them
+        // there would describe the next round's inputs, not this one's.
+        if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
         let h = Self.headStepCostRatio
         var reach = 1.0
@@ -806,11 +840,39 @@ public final class Qwen36MTPBlockSession {
             }
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            if Self.traceRounds {
+                scheduleTrace += String(
+                    format: "%d:%.6f/%.6f/%.6f;", depth, p, reach, threshold)
+            }
             guard reach > threshold else { break }
             expected += reach
             depth += 1
         }
         return depth
+    }
+
+    /// Trace-gated record of the schedule's inputs and its extension walk.
+    /// Written only when the phase trace is on, so the scored schedule runs
+    /// byte-identical arithmetic without it.
+    private var scheduleTrace = ""
+
+    /// Every scalar the schedule may legally read BEFORE it proposes anything:
+    /// the pending primary's target top-2 margin, the per-position EMAs, the
+    /// full-accept streak and the width cap in force. Recorded so an offline
+    /// fit can ask which of these separates a round that accepts its whole
+    /// chain from one that accepts nothing, without spending a second run.
+    private func snapshotScheduleSignal(widthCap: Int) {
+        let margin: Double
+        if let tail = pendingTop2, tail.1.count >= 2 {
+            margin = tail.1[0] - tail.1[1]
+        } else {
+            margin = Double.nan
+        }
+        let emas = positionAcceptEMA
+            .map { String(format: "%.6f", $0) }.joined(separator: ",")
+        scheduleTrace = String(
+            format: "m=%.6f streak=%d cap=%d ema=",
+            margin, fullAcceptStreak, widthCap) + emas + " sched="
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
@@ -877,7 +939,7 @@ public final class Qwen36MTPBlockSession {
     /// round from the last round's accept run.
     public func generateRound(depth: Int) throws -> Qwen36MTPRoundResult {
         guard began, let primaryPending = pendingPrimary,
-              let tailPending = pendingTop2, let hidden = pendingHidden
+              pendingTop2 != nil, let hidden = pendingHidden
         else { throw Qwen36MTPSessionError.notBegun }
         guard depth >= Qwen36MTPLimits.serialControlDepth,
               depth <= Qwen36MTPLimits.maxDepth
@@ -922,31 +984,14 @@ public final class Qwen36MTPBlockSession {
             "draftPolicy returned \(draftCount) for an offer of \(depth); a "
                 + "round may propose 0 ... min(offer, maxDepth) drafts")
 
-        // A stop token as the primary ends the run BEFORE any drafting: there is
-        // nothing after it to predict, and drafting past it would charge the
-        // measurement for work no decoder performs. The round still declares its
-        // single target tail row (the row that produced this primary's successor
-        // candidate is the one already spent), so the ledger stays closed.
-        if stopTokens.contains(primary) {
-            reachedStopToken = true
-            // The tail row to declare is the row that produced this primary —
-            // its top-2 was read out of the previous round's batched eval.
-            let (tailTokens, tailLogits) = tailPending
-            pendingPrimary = nil
-            pendingTop2 = nil
-            pendingHidden = nil
-            return Qwen36MTPRoundResult(
-                tokens: committed,
-                declaredRows: 1,
-                draftTokens: [],
-                acceptedDraftCount: 0,
-                rejectedDraftCount: 0,
-                perRowTop2Tokens: [tailTokens],
-                perRowTop2Logits: [tailLogits],
-                targetCacheOffset: seedTokenCount + committedTokenCount,
-                reachedStopToken: true
-            )
-        }
+        // A STOP TOKEN IS COMMITTED LIKE ANY OTHER TOKEN, and this round keeps
+        // drafting past it. The parent owns the decode window: its loop runs to
+        // the configured total and it checks every emitted index against the
+        // serial trajectory (`QwenRuntimeMTPDriver.swift` :121, :216-226), which
+        // the shipped 1024-token golden continues for 722 tokens past its first
+        // `248044`. Ending the round here instead nilled the pendings and killed
+        // the session for good -- the next round threw `.notBegun` -- which
+        // capped both legs of every local window at 301 tokens.
 
         // NO DRAFTS THIS ROUND. Two ways to get here and they are not the same
         // thing. Depth 0 is THE TRUE SERIAL CONTROL -- the parent offered
@@ -1009,8 +1054,7 @@ public final class Qwen36MTPBlockSession {
                 rejectedDraftCount: 0,
                 perRowTop2Tokens: [tailTokens],
                 perRowTop2Logits: [tailLogits],
-                targetCacheOffset: seedTokenCount + committedTokenCount,
-                reachedStopToken: false
+                targetCacheOffset: seedTokenCount + committedTokenCount
             )
         }
 
@@ -1100,6 +1144,9 @@ public final class Qwen36MTPBlockSession {
             draftIdArrays.append(draftId)
         }
         asyncEval(draftIdArrays[draftIdArrays.count - 1])
+        if Self.traceSyncHeadChain {
+            eval(draftIdArrays[draftIdArrays.count - 1])
+        }
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1306,7 +1353,8 @@ public final class Qwen36MTPBlockSession {
                 + "readout_us=\((tReadDone - tEvalDone) / 1000) "
                 + "commit_us=\((tCommitDone - tReadDone) / 1000) "
                 + "upkeep_us=\((tTailDone - tCommitDone) / 1000) "
-                + "round_us=\((tTailDone - tRound0) / 1000)\n"
+                + "round_us=\((tTailDone - tRound0) / 1000) "
+                + scheduleTrace + "\n"
             Self.traceWrite(line)
         }
         // No trailing eval: every host-read value was materialised by the
@@ -1314,15 +1362,6 @@ public final class Qwen36MTPBlockSession {
         // installs lazy recurrent roots; only the next GPU graph consumes
         // them. The rare generic-repair path ran its own second eval.
         // `pendingHidden` is likewise device-only until the next round.
-
-        // Truncate after the first committed stop token, keeping the stop token
-        // itself — the same rule the serial reference applies.
-        if let stopIndex = committed.firstIndex(where: { stopTokens.contains($0) }) {
-            let dropped = committed.count - (stopIndex + 1)
-            committed = Array(committed.prefix(stopIndex + 1))
-            committedTokenCount -= dropped
-            reachedStopToken = true
-        }
 
         return Qwen36MTPRoundResult(
             tokens: committed,
@@ -1332,8 +1371,7 @@ public final class Qwen36MTPBlockSession {
             rejectedDraftCount: drafts.count - acceptedCount,
             perRowTop2Tokens: perRowTop2Tokens,
             perRowTop2Logits: perRowTop2Logits,
-            targetCacheOffset: seedTokenCount + committedTokenCount,
-            reachedStopToken: reachedStopToken
+            targetCacheOffset: seedTokenCount + committedTokenCount
         )
     }
 
