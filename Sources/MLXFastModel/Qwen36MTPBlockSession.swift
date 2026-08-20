@@ -445,9 +445,10 @@ public final class Qwen36MTPBlockSession {
         // the 16 FA caches sit at kL=512; scored decode walks that prefix to
         // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
         // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // forward) and dispatch every fused-vector shape the ranked path
+        // fires at kL>=1024: qL=1..5. qL=5 is chunk-A for widths 6..9 and the
+        // width-5 single call; qL=1..4 are serial plus chunk-B of widths 6..9
+        // and the single-call widths 2..5. Live `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
@@ -495,7 +496,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
