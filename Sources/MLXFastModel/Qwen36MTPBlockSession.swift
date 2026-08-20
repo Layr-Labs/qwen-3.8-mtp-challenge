@@ -493,7 +493,7 @@ public final class Qwen36MTPBlockSession {
         // (config pins 256). Scale matches Qwen35Attention.
         let qHeads = extK.dim(1) * 6
         let headDim = extK.dim(3)
-        let scale = 1 / Float(headDim).squareRoot()
+        let scale = 1.0 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
         for qL in [1, 5, 4] {
             let q = MLXArray.zeros(
