@@ -1597,6 +1597,139 @@ func qwen35FusedResidualRMSNorm(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - Dual independent RMSNorm (proposal-side pre-fc)
+
+/// Two independent RMSNorms in one dispatch. Same looped reduction as
+/// `qwen35_fused_residual_rms_norm` / `rms_looped` (simd_sum → barrier →
+/// rsqrt), but no residual add — each row is already the value being
+/// normalised. Bit-identical to two eager `RMSNorm` launches when both
+/// inputs are BF16 with a contiguous last dim of 5120.
+///
+/// Used only on the MTP pre-fc pair (`pre_fc_norm_embedding` +
+/// `pre_fc_norm_hidden`). Proposal-only; the target never calls this.
+private let qwen35DualRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_dual_rms_norm_bf16_v1",
+    inputNames: ["a", "b", "a_weight", "b_weight", "eps"],
+    outputNames: ["a_out", "b_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(a_shape[a_ndim - 1]);
+        uint a_rows = 1;
+        for (uint i = 0; i + 1 < a_ndim; ++i) {
+            a_rows *= uint(a_shape[i]);
+        }
+        bool is_a = row < a_rows;
+        uint local_row = is_a ? row : row - a_rows;
+        ulong offset = ulong(local_row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = is_a
+                        ? float(a[offset + elem + i])
+                        : float(b[offset + elem + i]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = is_a
+                            ? float(a[offset + elem + i])
+                            : float(b[offset + elem + i]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = is_a
+                        ? float(a[offset + elem + i])
+                        : float(b[offset + elem + i]);
+                    bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
+                    bfloat yo = wi * bfloat(xi * inv_mean);
+                    if (is_a) {
+                        a_out[offset + elem + i] = yo;
+                    } else {
+                        b_out[offset + elem + i] = yo;
+                    }
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = is_a
+                            ? float(a[offset + elem + i])
+                            : float(b[offset + elem + i]);
+                        bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
+                        bfloat yo = wi * bfloat(xi * inv_mean);
+                        if (is_a) {
+                            a_out[offset + elem + i] = yo;
+                        } else {
+                            b_out[offset + elem + i] = yo;
+                        }
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35DualRMSNorm(
+    a: MLXArray,
+    b: MLXArray,
+    aWeight: MLXArray,
+    bWeight: MLXArray,
+    eps: Float
+) -> (MLXArray, MLXArray) {
+    let nRows = a.size / a.dim(-1)
+    let outputs = qwen35DualRMSNormKernel(
+        [a, b, aWeight, bWeight, MLXArray(eps)],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [a.shape, b.shape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
