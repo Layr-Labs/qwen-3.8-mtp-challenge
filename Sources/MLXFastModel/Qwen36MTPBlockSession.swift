@@ -177,23 +177,22 @@ public final class Qwen36MTPBlockSession {
         // that maximizes expected committed tokens per unit round time under
         // the round's measured economics:
         //
-        //   T(d) = V + d·H        one width-(d+1) verify + d head steps
+        //   T(d) = C_d            measured total round cost at depth d
         //   E[tokens](d) = 1 + Σ_{k=1..d} Π_{i<k} p_i
         //
         // where p_i is the EMA-estimated acceptance of draft position i GIVEN
-        // the prefix before it was accepted, and h = H/V is the head step's
-        // cost relative to the weight-stream-bound verify forward (near-flat
-        // in width up to the qmv limit). Greedy marginal rule: extend to
-        // position k+1 exactly while
+        // the prefix before it was accepted, and C_d is the forced-depth round
+        // cost relative to serial. Greedy marginal rule: extend from d to d+1
+        // exactly while
         //
-        //   Π_{i<=k+1} p_i  >  h · (1 + S_k) / (1 + k·h)
+        //   reach_(d+1) > (C_(d+1)-C_d) · (1 + S_d) / C_d
         //
-        // which is f(k+1) > f(k) rearranged. On hot prose (p→0.9) this runs
+        // which is f(d+1) > f(d) rearranged. On hot prose (p→0.9) this runs
         // straight to the offer; on cold prompts it collapses to 1, and to a
         // free adaptive skip (0) only when even the first draft's odds are
-        // below h. The streak ladder's behavior is the degenerate one-EMA
-        // version of this; the per-position EMAs let depth 5-8 pay where the
-        // ladder's cap of 4 left committed tokens on the table.
+        // below its measured marginal cost. The per-position EMAs let depth
+        // 5-8 pay where the ladder's cap of 4 left committed tokens on the
+        // table without pretending every extra row has the same cost.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
             return self.costModelDepth(offeredDepth: offeredDepth)
@@ -677,37 +676,20 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
-    /// h = (one head draft step) / (one batched verify forward), the only
-    /// constant the marginal rule needs. Derivation from the campaign's
-    /// measured budgets: the verify forward is weight-stream bound on the
-    /// ~14.1 GiB 4-bit backbone and near-flat in width; a head step streams
-    /// the head layer plus the full lm_head readout (~0.65 GiB 4-bit) and
-    /// carries the chained-launch overhead of the committed-history path.
-    /// h HISTORY, because it was mispriced twice. 0.12 (arm 1) and 0.09
-    /// (arm 2) both divided total window time by rounds WITHOUT subtracting
-    /// the ~0.9 s seed prologue charged inside the local window — a prologue
-    /// artifact that made depth look nearly free. Steady-state regression on
-    /// the phase-traced receipts (draft_build ≈ 2.4 ms/step CPU, eval_wall
-    /// 79→89→106 ms for widths 7→8→9) puts the TRUE marginal cost of an
-    /// extra draft at ~10-16 ms against a ~24-40 ms round base: h ≈ 0.6 on
-    /// the bf16-head (pinned) stack. Underpricing h over-drafts d=6-8 on
-    /// hard hidden prompts — invisible on degenerate local prose at accept
-    /// ≈ 1.0, and worth up to -20% on a per-pair tail. Re-fit from
-    /// forced-depth arms after every head-variant change.
-    ///
-    /// FOURTH FIT — and the resolution of the 0.20-vs-0.43 dispute. The
-    /// capped-regime phase trace measured ~10.75 ms marginal per draft on a
-    /// ~27 ms base (0.20) in the fully-accepted case. MTPLX ships a
-    /// break-even of ~0.43 — but their reject pays a REPAIR FORWARD, while
-    /// this stack's per-row GDN checkpoints make a prefix reject nearly
-    /// free (restoreAfterPrefixReject, no repair at any depth). Their
-    /// constant prices a cost this stack deleted; 0.40 measured -4.5% on
-    /// the easy-prose receipt (held d2-3 where d4 pays). h = 0.20 is the
-    /// honest fit FOR THIS ROLLBACK MECHANISM; the wasted-work term a
-    /// reject does keep (the drafted head steps past the break) is already
-    /// inside the marginal the rule prices.
-    private static let headStepCostRatio = 0.18
-
+    /// Forced-depth calibration on this exact checkpoint and machine, expressed
+    /// as total round cost relative to depth zero. Unlike a single `h`, this
+    /// preserves the measured width-dependent verify cost.
+    private static let measuredRoundCostRatios: [Double] = [
+        1.0,
+        65.896 / 56.842,
+        69.142 / 56.842,
+        82.201 / 56.842,
+        100.031 / 56.842,
+        113.415 / 56.842,
+        129.223 / 56.842,
+        145.304 / 56.842,
+        168.137 / 56.842,
+    ]
     /// HARD DEPTH CAP 4 — WIDTHS ABOVE 5 ARE STRUCTURALLY CLOSED on this
     /// stack, by bitwise measurement (hexfloat row gate, two attempts):
     /// verify widths 6-9 drift from the serial trajectory in top-2 VALUES
@@ -789,7 +771,6 @@ public final class Qwen36MTPBlockSession {
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
         guard cap > 0 else { return 0 }
-        let h = Self.headStepCostRatio
         var reach = 1.0
         var expected = 0.0
         var depth = 0
@@ -805,7 +786,11 @@ public final class Qwen36MTPBlockSession {
                 p = Swift.min(p, conf2)
             }
             reach *= p
-            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            let currentCost = Self.measuredRoundCostRatios[depth] - 1.0
+            let nextCost = Self.measuredRoundCostRatios[depth + 1] - 1.0
+            let marginalCost = nextCost - currentCost
+            let threshold = marginalCost * (1.0 + expected)
+                / (1.0 + currentCost)
             guard reach > threshold else { break }
             expected += reach
             depth += 1
