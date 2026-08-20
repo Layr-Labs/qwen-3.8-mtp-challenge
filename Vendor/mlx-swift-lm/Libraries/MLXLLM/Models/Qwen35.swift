@@ -1469,6 +1469,139 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+/// History-only twin of `qwen35AttentionQKRMSRoPE`. `appendHistoryKV` never
+/// consumes a query, so the Q+K kernel's query rows and `q_out` store are
+/// dead work. Same K-side statement order, same RMS+partial-RoPE arithmetic,
+/// keys-only grid.
+private let qwen35AttentionKRMSRoPEKernel = MLXFast.metalKernel(
+    name: "qwen35_attention_k_rms_rope_bf16_v1",
+    inputNames: ["k", "k_weight", "eps", "offset", "log2_base"],
+    outputNames: ["k_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint rotary_dimensions = 64;
+        constexpr uint rotary_pairs = rotary_dimensions / 2;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint batch_size = uint(k_shape[0]);
+        uint sequence_length = uint(k_shape[1]);
+        uint key_heads = uint(k_shape[2]);
+        uint axis_size = uint(k_shape[3]);
+        uint batch = row / (key_heads * sequence_length);
+        uint head_sequence = row % (key_heads * sequence_length);
+        uint head = head_sequence / sequence_length;
+        uint sequence = head_sequence % sequence_length;
+
+        ulong input_base = ulong(batch) * ulong(k_strides[0])
+            + ulong(sequence) * ulong(k_strides[1])
+            + ulong(head) * ulong(k_strides[2]);
+        ulong input_axis_stride = ulong(k_strides[3]);
+        ulong weight_stride = ulong(k_weight_strides[0]);
+        ulong output_base = ulong(row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+        threadgroup bfloat normalized[256];
+
+        float acc = 0.0f;
+        uint first = thread_id * n_reads;
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = input_base + ulong(element) * input_axis_stride;
+                float value = float(k[index]);
+                acc += value * value;
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = input_base + ulong(element) * input_axis_stride;
+                bfloat input_value = k[index];
+                bfloat rms_value = bfloat(float(input_value) * inv_mean);
+                bfloat weight = k_weight[ulong(element) * weight_stride];
+                normalized[element] = weight * rms_value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element >= rotary_dimensions && element < axis_size) {
+                k_out[output_base + ulong(element)] = normalized[element];
+            }
+        }
+
+        if (thread_id < rotary_pairs / n_reads) {
+            for (uint i = 0; i < n_reads; ++i) {
+                uint pair = first + i;
+                float d = float(pair) / float(rotary_pairs);
+                float inv_freq = metal::exp2(-d * float(log2_base));
+                float position = float(int(sequence) + int(offset));
+                float theta = position * inv_freq;
+                float costheta = metal::fast::cos(theta);
+                float sintheta = metal::fast::sin(theta);
+                float x1 = float(normalized[pair]);
+                float x2 = float(normalized[pair + rotary_pairs]);
+                bfloat rx1 = bfloat(x1 * costheta - x2 * sintheta);
+                bfloat rx2 = bfloat(x1 * sintheta + x2 * costheta);
+                k_out[output_base + ulong(pair)] = rx1;
+                k_out[output_base + ulong(pair + rotary_pairs)] = rx2;
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35AttentionKRMSRoPE(
+    keys: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    offset: Int,
+    log2Base: Float
+) -> MLXArray {
+    let B = keys.dim(0)
+    let L = keys.dim(1)
+    let keyHeads = keys.dim(2)
+    let D = keys.dim(3)
+    let totalRows = B * L * keyHeads
+    let outputs = qwen35AttentionKRMSRoPEKernel(
+        [keys, kWeight, eps, offset, log2Base],
+        grid: (totalRows * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[B, keyHeads, L, D]],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 // MARK: - Fused residual + RMS norm (PR #250 mechanism, receipt 2.9083)
 
 /// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
@@ -1848,11 +1981,34 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
         var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, kvHeads, -1)
         values = values.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        // History never consumes Q. The live Q+K fuse would still dispatch
+        // query rows and write a discarded q_out. Keys-only twin keeps the
+        // K-side RMS+RoPE statement order and drops the dead query half.
+        let hasArrayOffset = cache is CompilableRotatingKVCache
+            || cache is CompilableKVCache
+            || cache is BatchPositionedKVCache
+        if usesFusedQKPreparation,
+           L <= 32,
+           !hasArrayOffset,
+           keys.dtype == .bfloat16,
+           kNorm.weight.dtype == .bfloat16,
+           keys.shape == [B, L, kvHeads, headDim],
+           kNorm.weight.shape == [headDim]
+        {
+            keys = qwen35AttentionKRMSRoPE(
+                keys: keys,
+                kWeight: kNorm.weight,
+                eps: kNorm.eps,
+                offset: cache.offset,
+                log2Base: ropeLog2Base
+            )
+        } else {
+            keys = kNorm(keys).transposed(0, 2, 1, 3)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
         _ = cache.update(keys: keys, values: values)
     }
 
