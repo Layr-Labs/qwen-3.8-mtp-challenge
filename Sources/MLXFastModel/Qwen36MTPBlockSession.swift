@@ -1131,6 +1131,7 @@ public final class Qwen36MTPBlockSession {
             model.callWithHiddenAndNormed(
                 input: LMInput.Text(tokens: verifyTokens),
                 cache: cache, nConfirmed: 1)
+        let verifyNormedHidden = verifyNormed
         if Self.traceRounds { tVerifyBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // THE ROUND'S SINGLE BLOCKING EVAL. Everything the host needs to read
@@ -1143,6 +1144,7 @@ public final class Qwen36MTPBlockSession {
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
         bundle.append(contentsOf: draftIdArrays)
+        if let normed = verifyNormedHidden { bundle.append(normed) }
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
@@ -1201,13 +1203,21 @@ public final class Qwen36MTPBlockSession {
             committedTokenCount += acceptedCount
 
             // K=1 rejection: the target already computed the primary's exact
-            // logits and hidden row. Restore the recurrent checkpoint written
-            // immediately after that primary, trim just the rejected draft from
-            // attention caches, and carry row 0 forward. The trusted tail row is
-            // the same post-primary distribution, so reuse its already-recorded
-            // top-2 evidence rather than running the target again.
+            // logits and hidden row. Reuse the already-evaluated verify outputs
+            // instead of paying a second repair forward. The post-normed hidden
+            // row was materialised alongside the top-2 bundle above; when it is
+            // available, use it directly. Otherwise fall back to the on-demand
+            // post-norm path, which is the pre-existing behaviour.
             let committedOffset = base + committed.count
-            if Self.restoreAfterPrefixReject(
+            if draftCount == 1, let normed = verifyNormedHidden {
+                pendingPrimary = verifyArgmax[acceptedCount]
+                pendingHidden = hiddenRow(verifyHidden, normed, acceptedCount)
+                pendingTop2 = (
+                    perRowTop2Tokens[acceptedCount],
+                    perRowTop2Logits[acceptedCount])
+                perRowTop2Tokens.append(perRowTop2Tokens[acceptedCount])
+                perRowTop2Logits.append(perRowTop2Logits[acceptedCount])
+            } else if Self.restoreAfterPrefixReject(
                 model, cache,
                 acceptedCount: acceptedCount, draftCount: draftCount,
                 to: committedOffset)
