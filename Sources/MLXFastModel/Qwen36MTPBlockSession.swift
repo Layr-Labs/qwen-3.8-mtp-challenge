@@ -718,7 +718,16 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 8
+    /// Capped at 7 (verify width 8), not 8 (width 9), by the crossrow-QMV
+    /// dispatch table rather than by a fitted constant: qmv_fast_crossrow_affine4_g64_m
+    /// instantiates M=8 with IPG=4 (two weight-stream groups) but M=9 with IPG=3
+    /// (three). Width 9 therefore re-streams the whole quantized weight set a
+    /// third time to gain one draft row: 50%% more weight traffic for 12.5%%
+    /// more rows. Measured on M4 at the 256-token window: the marginal cost of
+    /// width 9 is +28.1 ms against +9.4 ms for width 8, and forced depth 8
+    /// decodes at 0.02689 s/token versus 0.02436 at depth 7 - 10%% worse. The
+    /// dispatch table is vendored source, so the structure is not box-specific.
+    private static let segmentedVerifyDepthCap = 7
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
