@@ -1178,7 +1178,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(M >= 3 && M <= 9, "wide multi-row QMV dispatch covers M in [3, 9]");
+  static_assert(M >= 2 && M <= 9, "wide multi-row QMV dispatch covers M in [2, 9]");
   static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
   constexpr int TAIL = M % IPG;
   const int first_m = int(tid.x) * IPG;
@@ -1934,7 +1934,13 @@ template <typename T, int group_size, int bits, bool batched>
       // promoted pair kernel is kept there byte-for-byte.
       switch (ntg.x) {
         case 2:
-          qmv_fast_crossrow_affine4_g64<T, 2>(
+          // 2+0: the wide DIRECT_NIBBLES body (same grouping as the pair
+          // kernel — first_m = tid.x * 2, one pair per group — but raw
+          // nibble masks instead of load_vector's place-value divides).
+          // M=3..9 already run this body through the accepted exactness
+          // envelope; M=2 is the hottest draft-1 verify width and the last
+          // holdout on the old pair body.
+          qmv_fast_crossrow_affine4_g64_m<T, 2, 2, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
