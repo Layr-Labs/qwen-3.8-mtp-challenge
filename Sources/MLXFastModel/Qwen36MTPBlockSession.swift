@@ -495,7 +495,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        for qL in [1, 5, 4, 3, 2] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -521,7 +521,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
+            for qL in [1, 5, 4, 3, 2] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
