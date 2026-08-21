@@ -881,7 +881,21 @@ public final class Qwen36MTPBlockSession {
             // at 0.95: transferred optimism is inference, not observation,
             // and deep positions never merit a certainty estimate
             // without treating that inference as a real observation.
-            if positionAcceptEMA[acceptedCount] < 0.95 {
+            //
+            // GATED ON THE SECOND CONSECUTIVE FULL ACCEPT (streak >= 2, the
+            // counter is updated just before this fold). The cap-8 receipt
+            // (807eb5ac) localized the depth damage: extra rungs fire on the
+            // two MEDIAN prompts and bill them (-0.8%/-1.0% with deeper
+            // drafts) while helping only prompts the median cannot see. On
+            // mid-acceptance prompts a SINGLE full accept is common and was
+            // enough to seed the next position with 0.95 inference; two in a
+            // row is much rarer there, so this gate removes most of the
+            // over-qualification exactly where it bills the score, while hot
+            // prompts (long streaks) reach depth one round later at most.
+            // One-round transfer delay on a truly hot stretch costs one
+            // marginal rung once; a wrongly seeded 0.95 on a mid prompt
+            // costs a rejecting deep round repeatedly.
+            if fullAcceptStreak >= 2, positionAcceptEMA[acceptedCount] < 0.95 {
                 positionAcceptEMA[acceptedCount] +=
                     alpha * (0.95 - positionAcceptEMA[acceptedCount])
             }
