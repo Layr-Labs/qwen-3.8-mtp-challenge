@@ -445,9 +445,10 @@ public final class Qwen36MTPBlockSession {
         // the 16 FA caches sit at kL=512; scored decode walks that prefix to
         // kL~1024. The width ladder above only compiled kL≈512+width. HOST-
         // extend throwaway FA K/V to kL>=1024 (dummy concat, no 64-layer
-        // forward) and dispatch the three fused-vector shapes the ranked
-        // path actually fires: qL=1 (serial / chunk-B of width 6) plus the
-        // exactness-chunk pair qL=5 / qL=4. Live `begin()` caches untouched.
+        // forward) and dispatch the fused-vector shapes the ranked path
+        // actually fires: qL=1 (serial / chunk-B of width 6), qL=5 / qL=4
+        // (exactness-chunk pair), and qL=2 / qL=3 (chunk-B of width 7 / 8).
+        // Live `begin()` caches untouched.
         Self.warmTargetLaterWindowSDPA(seedWarmCache)
     }
 
@@ -495,7 +496,16 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // qL={2,3} restored onto the audreyt island crown's {1,5,4}: the
+        // exactness chunk splits a width-7/8/9 verify into a qL=5 chunk A
+        // plus a qL={2,3,4} chunk B, so deep rounds dispatch the qL=2 and
+        // qL=3 pipeline states too. Leaving them out first-touches those
+        // PSOs inside the scored window. Ranked receipts for exactly this
+        // extension on the pre-jump frontier: qL{1,4,5} 3.2355 -> qL{1..5}
+        // 3.2414, best draw 3.2452. jonathan308 #895 / `6ebbff9` landed it;
+        // audreyt #914 / `b40c28e` deleted it while skipping dead island
+        // GEMM. Same untimed throwaway FA caches, token-neutral.
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -512,7 +522,7 @@ public final class Qwen36MTPBlockSession {
         // Scored decode walks N past 1024 (512 seed + 512 decode).
         // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
         // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
+        // 128-block family at kL=1025 for the same qL={1,2,3,4,5} set.
         if extK.dim(2) == 1024 {
             let kPad1 = MLXArray.zeros(
                 [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
@@ -521,7 +531,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
+            for qL in [1, 2, 3, 4, 5] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
