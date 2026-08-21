@@ -74,6 +74,27 @@ final class Qwen35MTPDecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
+    /// Same forward as `callAsFunction`, but returns the residual input and the
+    /// MLP branch separately so the caller can fuse the final `h + mlpOut` add
+    /// with its own following RMSNorm. Values are unchanged: the sum is simply
+    /// deferred to the caller's fused kernel.
+    func outputParts(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (residual: MLXArray, mlpOut: MLXArray) {
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
+            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: x, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return (h, (mlp as! UnaryLayer)(postAttnNorm))
+        }
+        let h = x + r
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
+    }
+
     /// Populate this layer's K/V history without computing a dead layer
     /// output. Only valid when no later MTP layer consumes that output.
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
@@ -152,13 +173,28 @@ final class Qwen35MTPModule: Module {
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
+        // 3/4. Run the decoder layer(s), then the pre-lm_head norm. For the
+        // 1-layer bf16/5120 head the layer's final `h + mlpOut` add and the
+        // module norm collapse into one `qwen35FusedResidualRMSNorm` launch —
+        // the un-normed sum has no other consumer on this path, and the fused
+        // kernel is the same shipped, value-identical residual+norm used at
+        // the post-attention boundary.
+        if layers.count == 1, fused.dtype == .bfloat16, fused.dim(-1) == 5120,
+           norm.weight.dtype == .bfloat16
+        {
+            let parts = layers[0].outputParts(fused, mask: mask, cache: cache.first)
+            if parts.residual.dtype == .bfloat16, parts.mlpOut.dtype == .bfloat16 {
+                return qwen35FusedResidualRMSNorm(
+                    x: parts.residual, r: parts.mlpOut,
+                    weight: norm.weight, eps: norm.eps
+                ).normed
+            }
+            return norm(parts.residual + parts.mlpOut)
+        }
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
             fused = layer(fused, mask: mask, cache: c)
         }
-
-        // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
     }
 
