@@ -166,6 +166,315 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     }
 }
 
+// MARK: - exact target affine-4 bias metadata
+
+/// The MLX affine quantizer stores one BF16 scale and one BF16 bias per
+/// 64-value q4 group.  Its source construction chooses an integer q0, replaces
+/// the scale by `edge / q0`, then stores `bias = edge`.  Consequently the
+/// supplied bias is exactly reconstructible from the supplied scale, a four-bit
+/// zero point, and at most a one-ordinal BF16 correction.  The runtime packer
+/// below proves that relation for every supplied group before any custom route
+/// is installed; arbitrary tensors retain their ordinary dense-bias linears.
+private let qwen35TargetBias6Enabled =
+    ProcessInfo.processInfo.environment[
+        "MLXFAST_QWEN_TARGET_ALL_BIAS6"] != "0"
+
+private let qwen35TargetBias6BaseHeader = """
+    inline uint16_t qwen35_target_bias6_base_bits(
+        bfloat16_t scale,
+        uint z) {
+      const bfloat16_t base = static_cast<bfloat16_t>(
+          -static_cast<float>(z) * static_cast<float>(scale));
+      return as_type<uint16_t>(base);
+    }
+    """
+
+/// One thread validates and emits four adjacent logical six-bit codes.  The
+/// live layout deliberately uses a full byte per code: naturally addressed
+/// loads are the lower-risk M5 tradeoff, while still halving bias traffic.
+private let qwen35PackTargetBias6Kernel = MLXFast.metalKernel(
+    name: "qwen35_pack_target_all_bias6_v1",
+    inputNames: ["scales", "biases"],
+    outputNames: ["codes", "validity"],
+    source: """
+        const uint block = thread_position_in_grid.x;
+        bool block_valid = true;
+
+        #pragma clang loop unroll(full)
+        for (uint slot = 0; slot < 4; ++slot) {
+          const uint group = block * 4 + slot;
+          const bfloat16_t scale = scales[group];
+          const uint16_t bias_bits = as_type<uint16_t>(biases[group]);
+          uint matched_code = 0;
+          uint matches = 0;
+
+          #pragma clang loop unroll(disable)
+          for (uint z = 0; z < 16; ++z) {
+            const int correction =
+                int(bias_bits) - int(qwen35_target_bias6_base_bits(scale, z));
+            if (correction >= -1 && correction <= 1) {
+              matched_code = z | (uint(correction + 1) << 4);
+              matches += 1;
+            }
+          }
+
+          const uint z = matched_code & 0x0fu;
+          const int correction = int(matched_code >> 4) - 1;
+          const uint16_t reconstructed = uint16_t(
+              int(qwen35_target_bias6_base_bits(scale, z)) + correction);
+          if (matches != 1 || reconstructed != bias_bits) {
+            block_valid = false;
+          }
+          codes[group] = uint8_t(matched_code);
+        }
+        validity[block] = uint8_t(block_valid ? 1 : 0);
+        """,
+    header: qwen35TargetBias6BaseHeader,
+    ensureRowContiguous: true
+)
+
+private struct Qwen35TargetBias6Pack {
+    let codes: MLXArray
+    let valid: MLXArray
+}
+
+/// A target projection reached through the live module tree after the loader
+/// has installed quantized children and updated their parameters.
+fileprivate struct Qwen35TargetBias6Operand {
+    let key: String
+    let linear: Linear
+}
+
+/// Build a lazy pack graph from the supplied runtime operands.  No code array
+/// is attached to a target module until the parent model reduces every
+/// `valid` scalar together and observes one global true value.
+private func qwen35PackTargetBias6(
+    scales: MLXArray, biases: MLXArray
+) -> Qwen35TargetBias6Pack? {
+    guard scales.dtype == .bfloat16,
+          biases.dtype == .bfloat16,
+          scales.shape == biases.shape,
+          scales.size > 0,
+          scales.size % 4 == 0
+    else { return nil }
+    let blockCount = scales.size / 4
+    let outputs = qwen35PackTargetBias6Kernel(
+        [scales, biases],
+        grid: (blockCount, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[scales.size], [blockCount]],
+        outputDTypes: [.uint8, .uint8]
+    )
+    let valid = MLX.all(MLX.equal(
+        outputs[1], MLXArray(1).asType(.uint8)))
+    return Qwen35TargetBias6Pack(codes: outputs[0], valid: valid)
+}
+
+private let qwen35TargetBias6QMVHeader = qwen35TargetBias6BaseHeader + """
+    inline float qwen35_target_bias6_value(
+        bfloat16_t scale,
+        const device uint8_t* codes,
+        uint group) {
+      const uint code = uint(codes[group]);
+      const uint z = code & 0x0fu;
+      const int correction = int(code >> 4) - 1;
+      const uint16_t reconstructed = uint16_t(
+          int(qwen35_target_bias6_base_bits(scale, z)) + correction);
+      return static_cast<float>(as_type<bfloat16_t>(reconstructed));
+    }
+
+    template <int NA, int K, int N>
+    inline void qwen35_target_bias6_qmv(
+        const device bfloat16_t* x,
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device uint8_t* bias_codes,
+        device bfloat16_t* y,
+        int first_m,
+        int out_row,
+        uint simd_lid) {
+      typedef vec<float, NA> VF;
+      constexpr int rows_per_simd = 4;
+      constexpr int values_per_thread = 16;
+      constexpr int block_size = values_per_thread * 32;
+      constexpr int bytes_per_lane = 8;
+      constexpr int in_vec_size_w = K / 2;
+      constexpr int in_vec_size_g = K / 64;
+
+      VF acc[rows_per_simd];
+      for (int r = 0; r < rows_per_simd; ++r) {
+        acc[r] = VF(0.0f);
+      }
+
+      for (int k = 0; k < K; k += block_size) {
+        thread uint16_t packed[rows_per_simd][4];
+        thread float scale_local[rows_per_simd];
+        thread float bias_local[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; ++r) {
+          const int row = out_row + r;
+          const device uint16_t* ws =
+              reinterpret_cast<const device uint16_t*>(
+                  reinterpret_cast<const device uint8_t*>(w)
+                  + row * in_vec_size_w + k / 2
+                  + simd_lid * bytes_per_lane);
+          for (int i = 0; i < 4; ++i) {
+            packed[r][i] = ws[i];
+          }
+          const uint group = uint(
+              row * in_vec_size_g + k / 64 + simd_lid / 4);
+          const bfloat16_t scale = scales[group];
+          scale_local[r] = static_cast<float>(scale);
+          bias_local[r] = qwen35_target_bias6_value(
+              scale, bias_codes, group);
+        }
+
+        VF sums = VF(0.0f);
+        VF partial[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; ++r) {
+          partial[r] = VF(0.0f);
+        }
+        for (int i = 0; i < 4; ++i) {
+          VF a0, a1, a2, a3;
+          for (int m = 0; m < NA; ++m) {
+            const device bfloat16_t* xm =
+                x + (first_m + m) * K + k
+                + simd_lid * values_per_thread + 4 * i;
+            // Identical to the promoted DIRECT_NIBBLES expression: the bias
+            // sum retains BF16 additions and nibble products widen separately.
+            sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+            a0[m] = static_cast<float>(xm[0]);
+            a1[m] = static_cast<float>(xm[1]);
+            a2[m] = static_cast<float>(xm[2]);
+            a3[m] = static_cast<float>(xm[3]);
+          }
+          for (int r = 0; r < rows_per_simd; ++r) {
+            partial[r] +=
+                (a0 * (packed[r][i] & 0x000f)
+                 + a1 * ((packed[r][i] >> 4) & 0x000f)
+                 + a2 * ((packed[r][i] >> 8) & 0x000f)
+                 + a3 * ((packed[r][i] >> 12) & 0x000f));
+          }
+        }
+        for (int r = 0; r < rows_per_simd; ++r) {
+          acc[r] +=
+              scale_local[r] * partial[r] + sums * bias_local[r];
+        }
+      }
+
+      for (int r = 0; r < rows_per_simd; ++r) {
+        for (int m = 0; m < NA; ++m) {
+          const float reduced = simd_sum(acc[r][m]);
+          if (simd_lid == 0) {
+            y[(first_m + m) * N + out_row + r] =
+                static_cast<bfloat16_t>(reduced);
+          }
+        }
+      }
+    }
+    """
+
+/// Exact clone of the current wide q4/g64 direct-nibble row-sharing dispatch,
+/// with only the dense BF16 bias load replaced by raw-exact reconstruction.
+private let qwen35TargetBias6QMVKernel = MLXFast.metalKernel(
+    name: "qwen35_target_all_bias6_qmv_v1",
+    inputNames: ["x", "w", "scales", "bias_codes"],
+    outputNames: ["y"],
+    source: """
+        const int first_m = int(threadgroup_position_in_grid.x) * IPG;
+        const int out_row =
+            int(threadgroup_position_in_grid.y) * 8
+            + int(simdgroup_index_in_threadgroup) * 4;
+        const uint simd_lid = thread_index_in_simdgroup;
+        constexpr int TAIL = M % IPG;
+
+        if (TAIL == 0 || M - first_m >= IPG) {
+          qwen35_target_bias6_qmv<IPG, IN_K, OUT_N>(
+              x, w, scales, bias_codes, y,
+              first_m, out_row, simd_lid);
+        } else {
+          qwen35_target_bias6_qmv<
+              (TAIL >= 2 ? TAIL : 2), IN_K, OUT_N>(
+              x, w, scales, bias_codes, y,
+              first_m, out_row, simd_lid);
+        }
+        """,
+    header: qwen35TargetBias6QMVHeader,
+    ensureRowContiguous: true
+)
+
+/// Route only the ranked target's wide verify shapes.  Every failed guard
+/// returns nil so its caller literally executes the incumbent Linear/
+/// quantizedMM expression.  M=1, M=2 and prefill are intentionally untouched.
+private func qwen35TargetBias6QMV(
+    _ x: MLXArray,
+    weight: MLXArray,
+    scales: MLXArray,
+    codes: MLXArray
+) -> MLXArray? {
+    guard MLXHardwareInfo.isCompiledDecodeSupported,
+          x.ndim == 3,
+          x.dim(0) == 1,
+          x.dtype == .bfloat16,
+          weight.dtype == .uint32,
+          weight.ndim == 2,
+          scales.dtype == .bfloat16,
+          scales.ndim == 2,
+          codes.dtype == .uint8,
+          codes.ndim == 1
+    else { return nil }
+    let m = x.dim(1)
+    let k = x.dim(2)
+    let n = weight.dim(0)
+    guard m >= 3 && m <= 9,
+          k >= 512 && k % 512 == 0,
+          n >= 4096 && n % 8 == 0,
+          weight.shape == [n, k / 8],
+          scales.shape == [n, k / 64],
+          codes.shape == [n * (k / 64)]
+    else { return nil }
+    let ipg: Int
+    switch m {
+    case 3: ipg = 3
+    case 4: ipg = 4
+    case 5: ipg = 3
+    case 6: ipg = 3
+    case 7: ipg = 4
+    case 8: ipg = 4
+    case 9: ipg = 3
+    default: return nil
+    }
+    let inputGroups = (m + ipg - 1) / ipg
+    return qwen35TargetBias6QMVKernel(
+        [x, weight, scales, codes],
+        template: [
+            ("M", m), ("IPG", ipg), ("IN_K", k), ("OUT_N", n),
+        ],
+        grid: (inputGroups * 64, n / 8, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[1, m, n]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private func qwen35TargetBias6Linear(
+    _ x: MLXArray, linear: Linear, codes: MLXArray?
+) -> MLXArray {
+    if let codes,
+       let quantized = linear as? QuantizedLinear,
+       quantized.groupSize == 64,
+       quantized.bits == 4,
+       quantized.mode == .affine,
+       quantized.bias == nil,
+       quantized.biases != nil,
+       let y = qwen35TargetBias6QMV(
+           x, weight: quantized.weight,
+           scales: quantized.scales, codes: codes)
+    {
+        return y
+    }
+    return linear(x)
+}
+
 // MARK: - GatedDelta verify helpers
 
 /// Fuse the ordinary elementwise primitives that form the recurrence's fp32
@@ -569,6 +878,8 @@ final class Qwen35GatedDeltaNet: Module {
     private var _inGS = 64
     private var _inBits = 4
     private var _inMode = QuantizationMode.affine
+    private var _inBias6Codes: MLXArray?
+    private var _outBias6Codes: MLXArray?
 
     // Input-independent per-layer memo of `-exp(A_log)` in fp32 — the only
     // input-independent factor of the decay gate `g = exp(-exp(A_log) *
@@ -668,6 +979,44 @@ final class Qwen35GatedDeltaNet: Module {
         super.init()
     }
 
+    fileprivate func targetBias6Keys(prefix: String) -> [String] {
+        [
+            "\(prefix).in_proj_qkv",
+            "\(prefix).in_proj_z",
+            "\(prefix).in_proj_b",
+            "\(prefix).in_proj_a",
+            "\(prefix).out_proj",
+        ]
+    }
+
+    fileprivate func targetBias6Operands(
+        prefix: String
+    ) -> [Qwen35TargetBias6Operand] {
+        zip(
+            targetBias6Keys(prefix: prefix),
+            [inProjQKV, inProjZ, inProjB, inProjA, outProj]
+        ).map { Qwen35TargetBias6Operand(key: $0.0, linear: $0.1) }
+    }
+
+    fileprivate func installTargetBias6(
+        _ codes: [String: MLXArray], prefix: String
+    ) {
+        let keys = targetBias6Keys(prefix: prefix)
+        precondition(keys.allSatisfy { codes[$0] != nil })
+        _inBias6Codes = concatenated(keys[..<4].map { codes[$0]! })
+            .contiguous()
+        _outBias6Codes = codes[keys[4]]
+    }
+
+    fileprivate func clearTargetBias6() {
+        _inBias6Codes = nil
+        _outBias6Codes = nil
+        _inW = nil
+        _inS = nil
+        _inZ = nil
+        _negExpALog = nil
+    }
+
     /// Lazily build and apply the fused [qkv|z|b|a] projection. Returns nil
     /// until every input projection is a matching affine `QuantizedLinear`
     /// (bf16 trees fall back to the four separate calls).
@@ -675,7 +1024,9 @@ final class Qwen35GatedDeltaNet: Module {
         _ x: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
         if let w = _inW, let s = _inS, let zp = _inZ {
-            let y = quantizedMM(
+            let y = _inBias6Codes.flatMap {
+                qwen35TargetBias6QMV(x, weight: w, scales: s, codes: $0)
+            } ?? quantizedMM(
                 x, w, scales: s, biases: zp, transpose: true,
                 groupSize: _inGS, bits: _inBits, mode: _inMode)
             let qkvEnd = keyDim * 2 + valueDim
@@ -1179,7 +1530,10 @@ final class Qwen35GatedDeltaNet: Module {
         } else {
             normedOut = norm(out, gate: z)
         }
-        return outProj(normedOut.reshaped(B, S, -1))
+        return qwen35TargetBias6Linear(
+            normedOut.reshaped(B, S, -1),
+            linear: outProj,
+            codes: _outBias6Codes)
     }
 }
 
@@ -1244,6 +1598,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fqMode = QuantizationMode.affine
     private var _fbfW: MLXArray?
     private var _gateOut = 0
+    private var _fqBias6Codes: MLXArray?
+    private var _downBias6Codes: MLXArray?
 
     init(dimensions: Int, hiddenDimensions: Int) {
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1251,9 +1607,48 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
+    fileprivate func targetBias6Keys(prefix: String) -> [String] {
+        [
+            "\(prefix).gate_proj",
+            "\(prefix).up_proj",
+            "\(prefix).down_proj",
+        ]
+    }
+
+    fileprivate func targetBias6Operands(
+        prefix: String
+    ) -> [Qwen35TargetBias6Operand] {
+        zip(
+            targetBias6Keys(prefix: prefix),
+            [gateProj, upProj, downProj]
+        ).map { Qwen35TargetBias6Operand(key: $0.0, linear: $0.1) }
+    }
+
+    fileprivate func installTargetBias6(
+        _ codes: [String: MLXArray], prefix: String
+    ) {
+        let keys = targetBias6Keys(prefix: prefix)
+        precondition(keys.allSatisfy { codes[$0] != nil })
+        _fqBias6Codes = concatenated(keys[..<2].map { codes[$0]! })
+            .contiguous()
+        _downBias6Codes = codes[keys[2]]
+    }
+
+    fileprivate func clearTargetBias6() {
+        _fqBias6Codes = nil
+        _downBias6Codes = nil
+        _fqW = nil
+        _fqS = nil
+        _fqZ = nil
+        _fbfW = nil
+        _gateOut = 0
+    }
+
     private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            return quantizedMM(
+            return _fqBias6Codes.flatMap {
+                qwen35TargetBias6QMV(x, weight: w, scales: s, codes: $0)
+            } ?? quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
         }
@@ -1290,7 +1685,10 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return downProj(qwen35CompiledFusedSwiGLU(y))
+            return qwen35TargetBias6Linear(
+                qwen35CompiledFusedSwiGLU(y),
+                linear: downProj,
+                codes: _downBias6Codes)
         }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
@@ -1880,6 +2278,8 @@ final class Qwen35Attention: Module {
     private var _qkvMode = QuantizationMode.affine
     private var _qOut = 0
     private var _kOut = 0
+    private var _qkvBias6Codes: MLXArray?
+    private var _oBias6Codes: MLXArray?
     // Dense (bf16) Q/K/V pack for the MTP head layers, same concat-on-N
     // argument as the quantized pack above: rows are independent, so one
     // GEMM over concatenated weights is bit-exact with three separate
@@ -1956,12 +2356,58 @@ final class Qwen35Attention: Module {
         super.init()
     }
 
+    fileprivate func targetBias6Keys(prefix: String) -> [String] {
+        [
+            "\(prefix).q_proj",
+            "\(prefix).k_proj",
+            "\(prefix).v_proj",
+            "\(prefix).o_proj",
+        ]
+    }
+
+    fileprivate func targetBias6Operands(
+        prefix: String
+    ) -> [Qwen35TargetBias6Operand] {
+        zip(
+            targetBias6Keys(prefix: prefix),
+            [qProj, kProj, vProj, oProj]
+        ).map { Qwen35TargetBias6Operand(key: $0.0, linear: $0.1) }
+    }
+
+    fileprivate func installTargetBias6(
+        _ codes: [String: MLXArray], prefix: String
+    ) {
+        let keys = targetBias6Keys(prefix: prefix)
+        precondition(keys.allSatisfy { codes[$0] != nil })
+        _qkvBias6Codes = concatenated(keys[..<3].map { codes[$0]! })
+            .contiguous()
+        _oBias6Codes = codes[keys[3]]
+    }
+
+    fileprivate func clearTargetBias6() {
+        _qkvBias6Codes = nil
+        _oBias6Codes = nil
+        _qkvW = nil
+        _qkvS = nil
+        _qkvZ = nil
+        _qOut = 0
+        _kOut = 0
+        _qkvDenseW = nil
+        _kvW = nil
+        _kvS = nil
+        _kvZ = nil
+        _kvOut = 0
+        _kvDenseW = nil
+    }
+
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
-            var y = quantizedMM(
+            var y = _qkvBias6Codes.flatMap {
+                qwen35TargetBias6QMV(x, weight: w, scales: s, codes: $0)
+            } ?? quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
             y = replaceExactRows(y, input: x, kvOnly: false)
@@ -2178,8 +2624,10 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
-        return oProj(
-            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+        return qwen35TargetBias6Linear(
+            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1),
+            linear: oProj,
+            codes: _oBias6Codes)
     }
 }
 
@@ -2278,6 +2726,63 @@ final class Qwen35DecoderLayer: Module {
         )
 
         super.init()
+    }
+
+    fileprivate func targetBias6Keys(prefix: String) -> [String] {
+        var keys: [String]
+        if isLinear {
+            keys = linearAttn!.targetBias6Keys(
+                prefix: "\(prefix).linear_attn")
+        } else {
+            keys = selfAttn!.targetBias6Keys(
+                prefix: "\(prefix).self_attn")
+        }
+        if let denseMLP = mlp as? Qwen35FusedMLP {
+            keys.append(contentsOf: denseMLP.targetBias6Keys(
+                prefix: "\(prefix).mlp"))
+        }
+        return keys
+    }
+
+    fileprivate func targetBias6Operands(
+        prefix: String
+    ) -> [Qwen35TargetBias6Operand] {
+        var operands: [Qwen35TargetBias6Operand]
+        if isLinear {
+            operands = linearAttn!.targetBias6Operands(
+                prefix: "\(prefix).linear_attn")
+        } else {
+            operands = selfAttn!.targetBias6Operands(
+                prefix: "\(prefix).self_attn")
+        }
+        if let denseMLP = mlp as? Qwen35FusedMLP {
+            operands.append(contentsOf: denseMLP.targetBias6Operands(
+                prefix: "\(prefix).mlp"))
+        }
+        return operands
+    }
+
+    fileprivate func installTargetBias6(
+        _ codes: [String: MLXArray], prefix: String
+    ) {
+        if isLinear {
+            linearAttn!.installTargetBias6(
+                codes, prefix: "\(prefix).linear_attn")
+        } else {
+            selfAttn!.installTargetBias6(
+                codes, prefix: "\(prefix).self_attn")
+        }
+        (mlp as? Qwen35FusedMLP)?.installTargetBias6(
+            codes, prefix: "\(prefix).mlp")
+    }
+
+    fileprivate func clearTargetBias6() {
+        if isLinear {
+            linearAttn!.clearTargetBias6()
+        } else {
+            selfAttn!.clearTargetBias6()
+        }
+        (mlp as? Qwen35FusedMLP)?.clearTargetBias6()
     }
 
     func callAsFunction(
@@ -2389,6 +2894,31 @@ public class Qwen35TextModelInner: Module {
         self.faIdx = args.fullAttentionInterval - 1
 
         super.init()
+    }
+
+    fileprivate func targetBias6Keys() -> [String] {
+        layers.enumerated().flatMap { index, layer in
+            layer.targetBias6Keys(prefix: "model.layers.\(index)")
+        }
+    }
+
+    fileprivate func targetBias6Operands() -> [Qwen35TargetBias6Operand] {
+        layers.enumerated().flatMap { index, layer in
+            layer.targetBias6Operands(prefix: "model.layers.\(index)")
+        }
+    }
+
+    fileprivate func installTargetBias6(_ codes: [String: MLXArray]) {
+        for (index, layer) in layers.enumerated() {
+            layer.installTargetBias6(
+                codes, prefix: "model.layers.\(index)")
+        }
+    }
+
+    fileprivate func clearTargetBias6() {
+        for layer in layers {
+            layer.clearTargetBias6()
+        }
     }
 
     /// Returns the pre-norm hidden state from the final layer.
@@ -2983,6 +3513,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    private var _targetLMHeadBias6Codes: MLXArray?
+    private var _targetBias6PreparationAttempted = false
 
     // Declared DRAFT-ONLY vocabulary projection, carried by the declared MTP
     // head tree as `draft_lm_head.{weight,scales,biases}` (merged under the
@@ -3036,13 +3568,100 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Reset at the start of every load, including repeated sanitization of an
+    /// existing instance.  No early return from the next preparation attempt
+    /// can leave metadata derived from older operands installed.
+    private func resetTargetBias6Preparation() {
+        model.clearTargetBias6()
+        _targetLMHeadBias6Codes = nil
+        _targetBias6PreparationAttempted = false
+    }
+
+    /// Derive and validate metadata from the actual post-update module tree.
+    /// The first ordinary target warm calls this after `loadWeights` has wired
+    /// every QuantizedLinear and strictly installed its parameters. Installation
+    /// is all-or-nothing across the entire tower: a missing, malformed,
+    /// unmatched, or ambiguous group leaves every call on its incumbent path.
+    private func prepareTargetBias6IfNeeded() {
+        guard !_targetBias6PreparationAttempted else { return }
+        _targetBias6PreparationAttempted = true
+
+        guard qwen35TargetBias6Enabled,
+              MLXHardwareInfo.isCompiledDecodeSupported,
+              configuration.hiddenSize == 5_120,
+              configuration.hiddenLayers == 64,
+              configuration.intermediateSize == 17_408,
+              configuration.vocabularySize == 248_320,
+              configuration.fullAttentionInterval == 4,
+              configuration.linearNumValueHeads == 48,
+              configuration.linearNumKeyHeads == 16,
+              configuration.linearKeyHeadDim == 128,
+              configuration.linearValueHeadDim == 128,
+              !configuration.tieWordEmbeddings
+        else { return }
+
+        let expected = model.targetBias6Keys() + ["lm_head"]
+        // 48 GDN layers x 8 tensors + 16 full-attention layers x 7 tensors,
+        // plus lm_head. Embedding metadata and every mtp.* tensor are excluded.
+        guard expected.count == 497, Set(expected).count == expected.count else {
+            return
+        }
+        guard let lmHead else { return }
+        let operands = model.targetBias6Operands()
+            + [Qwen35TargetBias6Operand(key: "lm_head", linear: lmHead)]
+        guard operands.count == expected.count,
+              Set(operands.map(\.key)) == Set(expected)
+        else {
+            return
+        }
+
+        var codes: [String: MLXArray] = [:]
+        var validScalars: [MLXArray] = []
+        codes.reserveCapacity(expected.count)
+        validScalars.reserveCapacity(expected.count)
+        for operand in operands {
+            guard let quantized = operand.linear as? QuantizedLinear,
+                  quantized.groupSize == 64,
+                  quantized.bits == 4,
+                  quantized.mode == .affine,
+                  quantized.bias == nil,
+                  let biases = quantized.biases,
+                  quantized.scales.dtype == .bfloat16,
+                  biases.dtype == .bfloat16,
+                  quantized.weight.dtype == .uint32,
+                  quantized.weight.ndim == 2,
+                  quantized.scales.ndim == 2,
+                  biases.shape == quantized.scales.shape,
+                  quantized.scales.dim(0) == quantized.weight.dim(0),
+                  quantized.weight.dim(1) % 8 == 0,
+                  quantized.scales.dim(1) == quantized.weight.dim(1) / 8,
+                  let pack = qwen35PackTargetBias6(
+                      scales: quantized.scales, biases: biases)
+            else { return }
+            codes[operand.key] = pack.codes
+            validScalars.append(pack.valid.reshaped([1]))
+        }
+        let globallyValid = MLX.all(concatenated(validScalars, axis: 0))
+        eval(Array(codes.values) + [globallyValid])
+        guard globallyValid.item(Bool.self) else { return }
+
+        model.installTargetBias6(codes)
+        _targetLMHeadBias6Codes = codes["lm_head"]
+    }
+
+    private func applyTargetLMHead(_ x: MLXArray, head: Linear) -> MLXArray {
+        qwen35TargetBias6Linear(
+            x, linear: head, codes: _targetLMHeadBias6Codes)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        prepareTargetBias6IfNeeded()
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
         let hidden = model(inputs, cache: cache)
         var out = model.norm(hidden)
         if let lmHead {
-            out = lmHead(out)
+            out = applyTargetLMHead(out, head: lmHead)
         } else {
             out = model.embedTokens.asLinear(out)
         }
@@ -3160,6 +3779,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
+        // Actual target projection objects do not exist until the loader's
+        // quantize wiring and strict parameter update after this sanitizer.
+        // Clear old metadata now; the first untimed target warm prepares it.
+        resetTargetBias6Preparation()
+
         return weights
     }
 }
@@ -3180,12 +3804,13 @@ extension Qwen35TextModel: MTPCapable {
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
+        prepareTargetBias6IfNeeded()
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(normed)
+            logits = applyTargetLMHead(normed, head: lmHead)
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
@@ -3200,12 +3825,13 @@ extension Qwen35TextModel: MTPCapable {
     public func callWithHiddenAndNormed(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
+        prepareTargetBias6IfNeeded()
         let cacheOpt: [KVCache?] = cache.map { Optional($0) }
         let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(normed)
+            logits = applyTargetLMHead(normed, head: lmHead)
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
