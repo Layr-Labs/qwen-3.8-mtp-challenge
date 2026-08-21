@@ -54,7 +54,23 @@ final class Qwen35MTPDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
-        // omlx: MTPDecoderLayer.__call__
+        // omlx: MTPDecoderLayer.__call__ — attention runs exactly once, inside
+        // `forwardTail`; this wrapper only materialises the final residual add
+        // for callers that do not fuse it with a following norm.
+        let (h, mlpOut) = forwardTail(x, mask: mask, cache: cache)
+        return h + mlpOut
+    }
+
+    /// The layer up to — but not including — its final residual add: returns
+    /// `(h, mlpOut)` where the layer output is `h + mlpOut`. The module fuses
+    /// that add with its own final RMSNorm (one launch, same kernel and same
+    /// bf16-round-before-square arithmetic as the post-attention boundary
+    /// below), so the add is never materialised on its own.
+    func forwardTail(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (MLXArray, MLXArray) {
         let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         // The backbone's decoder layer has fused this residual+norm boundary
         // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
@@ -68,10 +84,10 @@ final class Qwen35MTPDecoderLayer: Module {
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
+            return (h, (mlp as! UnaryLayer)(postAttnNorm))
         }
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return (h, (mlp as! UnaryLayer)(postAttentionLayerNorm(h)))
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -118,6 +134,43 @@ final class Qwen35MTPModule: Module {
         super.init()
     }
 
+    /// `fc`'s input `[normE(embed(ids)) | normH(hidden)]` in ONE launch when the
+    /// embedding is the 4-bit/group-64 affine table this checkpoint ships: the
+    /// kernel reads each token's packed row and dequantises in-register with
+    /// MLX's own `affine_dequantize` expression, so the three gathers and the
+    /// dequantize launch (four per proposed token) disappear along with the
+    /// two norms and the concat. Falls back to the eager embedding lookup plus
+    /// `preFcConcat` when the table or shapes do not qualify. Proposal-only.
+    private func preFcInput(
+        nextTokenIds: MLXArray, embedTokens: Embedding, hidden: MLXArray
+    ) -> MLXArray {
+        if let quantized = embedTokens as? QuantizedEmbedding,
+           hidden.dtype == .bfloat16, hidden.dim(-1) == 5120,
+           preFcNormEmbedding.eps == preFcNormHidden.eps,
+           let fused = qwen35QEmbedDualRMSNormConcat(
+               tokenIds: nextTokenIds,
+               embedding: quantized,
+               hidden: hidden,
+               eWeight: preFcNormEmbedding.weight,
+               hWeight: preFcNormHidden.weight,
+               eps: preFcNormEmbedding.eps)
+        {
+            return fused
+        }
+        return preFcConcat(embeds: embedTokens(nextTokenIds), hidden: hidden)
+    }
+
+    /// `norm(h + mlpOut)` as one fused residual+RMSNorm launch (the backbone's
+    /// boundary kernel, bit-identical arithmetic) when the shapes qualify; the
+    /// eager pair otherwise. Proposal-only.
+    private func finalNormed(h: MLXArray, mlpOut: MLXArray) -> MLXArray {
+        if h.dtype == .bfloat16, mlpOut.dtype == .bfloat16, h.dim(-1) == 5120 {
+            return qwen35FusedResidualRMSNorm(
+                x: h, r: mlpOut, weight: norm.weight, eps: norm.eps).normed
+        }
+        return norm(h + mlpOut)
+    }
+
     /// Dual RMSNorm written straight into the `[e | h]` layout `fc` consumes.
     /// Same arithmetic as `qwen35DualRMSNorm` + `concatenated([e, h], -1)`;
     /// the extra concat launch is gone. Proposal-only.
@@ -145,21 +198,27 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        var fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        var fused = fc(preFcInput(
+            nextTokenIds: nextTokenIds, embedTokens: embedTokens, hidden: hidden))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
-        for (i, layer) in layers.enumerated() {
+        // 3. Run each MTPDecoderLayer; the LAST layer's residual add is fused
+        //    into the module norm below.
+        guard let lastLayer = layers.last else { return norm(fused) }
+        for (i, layer) in layers.dropLast().enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
             fused = layer(fused, mask: mask, cache: c)
         }
+        let lastIndex = layers.count - 1
+        let lastCache: (any KVCache)? =
+            lastIndex < cache.count ? cache[lastIndex] : nil
+        let (h, mlpOut) = lastLayer.forwardTail(fused, mask: mask, cache: lastCache)
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
-        return norm(fused)
+        return finalNormed(h: h, mlpOut: mlpOut)
     }
 
     /// Run one proposal flush while omitting leading-row outputs that have no
@@ -177,8 +236,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        let fused = fc(preFcInput(
+            nextTokenIds: nextTokenIds, embedTokens: embedTokens, hidden: hidden))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
@@ -186,7 +245,8 @@ final class Qwen35MTPModule: Module {
 
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
-        return norm(layers[0](current, mask: mask, cache: cache[0]))
+        let (h, mlpOut) = layers[0].forwardTail(current, mask: mask, cache: cache[0])
+        return finalNormed(h: h, mlpOut: mlpOut)
     }
 
 }

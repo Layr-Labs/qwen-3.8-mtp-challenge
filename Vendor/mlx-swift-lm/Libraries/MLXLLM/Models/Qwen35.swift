@@ -1830,6 +1830,157 @@ private let qwen35DualRMSNormConcatKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// MARK: - Quantized-embedding gather + dual RMSNorm + concat (proposal side)
+//
+// PROPOSAL SIDE ONLY. `QuantizedEmbedding(ids)` is three gathers (packed
+// weight rows, scales, biases) plus one `affine_dequantize` launch — four
+// launches per proposed token — whose only consumer is the pre-fc norm. This
+// kernel reads the packed 4-bit/group-64 row for each token id directly and
+// dequantises in-register with the SAME expression and SAME native `bfloat`
+// types as MLX's `affine_dequantize` (`scale * d + bias`, low nibble first,
+// bytes in order), so the normed values are bit-identical to the eager path;
+// it then normalises that row and the trunk hidden row and writes both into
+// the concatenated `[rows, 2*axis]` layout `fc` consumes. Seven launches
+// (4 gather/dequant + 2 norms + 1 concat) become one.
+private let qwen35QEmbedDualRMSNormConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_qembed_dual_rms_norm_concat_bf16_v1",
+    inputNames: ["tok", "qw", "sc", "bi", "hidden", "e_weight", "h_weight", "eps"],
+    outputNames: ["cat_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+        constexpr uint group_size = 64;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(hidden_shape[hidden_ndim - 1]);
+        uint h_rows = 1;
+        for (uint i = 0; i + 1 < hidden_ndim; ++i) {
+            h_rows *= uint(hidden_shape[i]);
+        }
+        bool is_e = row < h_rows;
+        uint local_row = is_e ? row : row - h_rows;
+        ulong h_offset = ulong(local_row) * ulong(axis_size);
+        ulong out_offset = ulong(local_row) * ulong(2 * axis_size)
+            + (is_e ? 0 : ulong(axis_size));
+
+        // Embedding row: packed 4-bit nibbles, two per byte, low nibble first;
+        // one (scale, bias) pair per 64 columns.
+        const device uint8_t* wb = (const device uint8_t*)qw;
+        uint tok_id = is_e ? uint(tok[local_row]) : 0u;
+        ulong w_base = ulong(tok_id) * ulong(axis_size / 2);
+        ulong g_base = ulong(tok_id) * ulong(axis_size / group_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint col = elem + i;
+                if (col < axis_size) {
+                    float xi;
+                    if (is_e) {
+                        uint8_t byte = wb[w_base + (col >> 1)];
+                        uint8_t d = (byte >> (4 * (col & 1))) & 0x0f;
+                        bfloat scale = sc[g_base + (col / group_size)];
+                        bfloat bias = bi[g_base + (col / group_size)];
+                        bfloat v = scale * d + bias;
+                        xi = float(v);
+                    } else {
+                        xi = float(hidden[h_offset + col]);
+                    }
+                    acc += xi * xi;
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint col = elem + i;
+                if (col < axis_size) {
+                    float xi;
+                    if (is_e) {
+                        uint8_t byte = wb[w_base + (col >> 1)];
+                        uint8_t d = (byte >> (4 * (col & 1))) & 0x0f;
+                        bfloat scale = sc[g_base + (col / group_size)];
+                        bfloat bias = bi[g_base + (col / group_size)];
+                        bfloat v = scale * d + bias;
+                        xi = float(v);
+                    } else {
+                        xi = float(hidden[h_offset + col]);
+                    }
+                    bfloat wi = is_e ? e_weight[col] : h_weight[col];
+                    cat_out[out_offset + col] = wi * bfloat(xi * inv_mean);
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// `concatenated([normE(embed(tok)), normH(hidden)], axis: -1)` in one
+/// launch for a 4-bit / group-64 affine `QuantizedEmbedding`. Returns nil
+/// when the embedding or shapes do not qualify, so the caller falls back.
+func qwen35QEmbedDualRMSNormConcat(
+    tokenIds: MLXArray,
+    embedding: QuantizedEmbedding,
+    hidden: MLXArray,
+    eWeight: MLXArray,
+    hWeight: MLXArray,
+    eps: Float
+) -> MLXArray? {
+    guard embedding.bits == 4, embedding.groupSize == 64,
+          embedding.mode == .affine,
+          let biases = embedding.biases,
+          embedding.weight.dtype == .uint32,
+          embedding.scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+          hidden.dtype == .bfloat16,
+          tokenIds.dtype == .int32 || tokenIds.dtype == .uint32,
+          hidden.dim(-1) == embedding.scales.dim(-1) * 64
+    else { return nil }
+    let nRows = hidden.size / hidden.dim(-1)
+    guard tokenIds.size == nRows else { return nil }
+    var shape = hidden.shape
+    shape[shape.count - 1] = 2 * hidden.dim(-1)
+    let outputs = qwen35QEmbedDualRMSNormConcatKernel(
+        [tokenIds.flattened().asType(.int32), embedding.weight,
+         embedding.scales, biases, hidden, eWeight, hWeight, MLXArray(eps)],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 func qwen35DualRMSNormConcat(
     a: MLXArray,
     b: MLXArray,
