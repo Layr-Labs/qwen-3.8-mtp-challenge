@@ -1850,6 +1850,140 @@ func qwen35DualRMSNormConcat(
     return outputs[0]
 }
 
+/// Quantized-embedding twin of the fused MTP pre-FC input kernel. It
+/// reproduces affine-4/group-64 dequantization at BF16 before the unchanged
+/// RMSNorm reduction, removing gather + dequantized embedding materialization.
+private let qwen35QuantizedEmbeddingDualRMSNormConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_q4_embedding_dual_rms_norm_concat_bf16_v1",
+    inputNames: [
+        "token_ids", "embedding_weight", "embedding_scales",
+        "embedding_biases", "hidden", "embedding_norm_weight",
+        "hidden_norm_weight", "eps",
+    ],
+    outputNames: ["concat_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(hidden_shape[hidden_ndim - 1]);
+        uint hidden_rows = 1;
+        for (uint i = 0; i + 1 < hidden_ndim; ++i) {
+            hidden_rows *= uint(hidden_shape[i]);
+        }
+        bool is_embedding = row < hidden_rows;
+        uint local_row = is_embedding ? row : row - hidden_rows;
+        long token = is_embedding ? long(token_ids[local_row]) : 0;
+        ulong hidden_off = ulong(local_row) * ulong(axis_size);
+        ulong packed_off = ulong(token) * ulong(embedding_weight_shape[1]);
+        ulong scale_off = ulong(token) * ulong(embedding_scales_shape[1]);
+        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
+            + (is_embedding ? 0 : ulong(axis_size));
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint index = elem + i;
+                if (index < axis_size) {
+                    float xi;
+                    if (is_embedding) {
+                        uint packed = embedding_weight[
+                            packed_off + ulong(index / 8)];
+                        uint q = (packed >> (4 * (index & 7))) & 0x0f;
+                        bfloat dequantized = bfloat(q)
+                            * embedding_scales[scale_off + ulong(index / 64)]
+                            + embedding_biases[scale_off + ulong(index / 64)];
+                        xi = float(dequantized);
+                    } else {
+                        xi = float(hidden[hidden_off + ulong(index)]);
+                    }
+                    acc += xi * xi;
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint index = elem + i;
+                if (index < axis_size) {
+                    float xi;
+                    if (is_embedding) {
+                        uint packed = embedding_weight[
+                            packed_off + ulong(index / 8)];
+                        uint q = (packed >> (4 * (index & 7))) & 0x0f;
+                        bfloat dequantized = bfloat(q)
+                            * embedding_scales[scale_off + ulong(index / 64)]
+                            + embedding_biases[scale_off + ulong(index / 64)];
+                        xi = float(dequantized);
+                    } else {
+                        xi = float(hidden[hidden_off + ulong(index)]);
+                    }
+                    bfloat wi = is_embedding
+                        ? embedding_norm_weight[index]
+                        : hidden_norm_weight[index];
+                    concat_out[out_off + ulong(index)] =
+                        wi * bfloat(xi * inv_mean);
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35QuantizedEmbeddingDualRMSNormConcat(
+    tokenIds: MLXArray,
+    embeddingWeight: MLXArray,
+    embeddingScales: MLXArray,
+    embeddingBiases: MLXArray,
+    hidden: MLXArray,
+    embeddingNormWeight: MLXArray,
+    hiddenNormWeight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    let nRows = hidden.size / hidden.dim(-1)
+    var outShape = hidden.shape
+    outShape[outShape.count - 1] = 2 * hidden.dim(-1)
+    return qwen35QuantizedEmbeddingDualRMSNormConcatKernel(
+        [
+            tokenIds, embeddingWeight, embeddingScales, embeddingBiases,
+            hidden, embeddingNormWeight, hiddenNormWeight, MLXArray(eps),
+        ],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -2902,29 +3036,207 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+// Finalize the 2,048 coarse candidates, evaluate the selected affine-4 rows
+// in place, and reduce their exact BF16 scores without materializing the
+// 32-id shortlist or any gathered weight/scales/bias tensors.
+private let qwen35DraftTop32FusedRerankKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_top32_fused_rerank_affine4_g64_v1",
+    inputNames: ["cand_ord", "cand_idx", "x", "weight", "scales", "biases"],
+    outputNames: ["token_id"],
+    source: """
+        constexpr uint TG_SIZE    = \(qwen35Top32TG);
+        constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
+        constexpr uint TOPK       = \(qwen35Top32K);
+        constexpr uint SIMD_SIZE  = 32;
+        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+        constexpr uint K          = 5120;
+        constexpr uint K_WORDS    = 640;
+        constexpr uint K_GROUPS   = 80;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint BLOCK      = 512;
+        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds selection mask");
+        static_assert(PB <= 32, "PB exceeds selection mask");
+        static_assert(NSIMD * 4 == TOPK, "one four-row dot tile per SIMDgroup");
+
+        uint tid  = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg   = simdgroup_index_in_threadgroup;
+
+        uint ord[PER_THREAD];
+        uint idx[PER_THREAD];
+        for (uint t = 0; t < PER_THREAD; ++t) {
+            uint p = t * TG_SIZE + tid;
+            ord[t] = cand_ord[p];
+            idx[t] = cand_idx[p];
+        }
+
+        threadgroup uint sc_ord[NSIMD * TOPK];
+        threadgroup uint sc_idx[NSIMD * TOPK];
+        uint taken = 0u;
+        for (uint r = 0; r < TOPK; ++r) {
+            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+            for (uint t = 0; t < PER_THREAD; ++t) {
+                if ((taken & (1u << t)) != 0u) { continue; }
+                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+                    bo = ord[t]; bi = idx[t]; bs = t;
+                }
+            }
+            uint mo = simd_max(bo);
+            uint mi = simd_max((bo == mo) ? bi : 0u);
+            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                taken |= (1u << bs);
+            }
+            if (lane == 0) {
+                sc_ord[sg * TOPK + r] = mo;
+                sc_idx[sg * TOPK + r] = mi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup uint final_ids[TOPK];
+        if (sg == 0) {
+            uint o2[PB];
+            uint i2[PB];
+            for (uint t = 0; t < PB; ++t) {
+                uint p = t * SIMD_SIZE + lane;
+                o2[t] = sc_ord[p];
+                i2[t] = sc_idx[p];
+            }
+            uint tk2 = 0u;
+            for (uint r = 0; r < TOPK; ++r) {
+                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                for (uint t = 0; t < PB; ++t) {
+                    if ((tk2 & (1u << t)) != 0u) { continue; }
+                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+                        bo = o2[t]; bi = i2[t]; bs = t;
+                    }
+                }
+                uint mo = simd_max(bo);
+                uint mi = simd_max((bo == mo) ? bi : 0u);
+                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                    tk2 |= (1u << bs);
+                }
+                if (lane == 0) { final_ids[TOPK - 1u - r] = mi; }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint candidate_base = sg * 4;
+        float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (uint k = 0; k < K; k += BLOCK) {
+            float xv[VALUES_PER_LANE];
+            uint x_base = k + lane * VALUES_PER_LANE;
+            float sum = 0.0f;
+            for (uint i = 0; i < VALUES_PER_LANE; i += 4) {
+                sum += x[x_base + i] + x[x_base + i + 1]
+                    + x[x_base + i + 2] + x[x_base + i + 3];
+                xv[i] = x[x_base + i];
+                xv[i + 1] = x[x_base + i + 1] / 16.0f;
+                xv[i + 2] = x[x_base + i + 2] / 256.0f;
+                xv[i + 3] = x[x_base + i + 3] / 4096.0f;
+            }
+            for (uint r = 0; r < 4; ++r) {
+                uint row = final_ids[candidate_base + r];
+                uint word_base = row * K_WORDS + k / 8 + lane * 2;
+                uint p0 = weight[word_base];
+                uint p1 = weight[word_base + 1];
+                ushort packed[4] = {
+                    ushort(p0 & 0xffffu), ushort(p0 >> 16),
+                    ushort(p1 & 0xffffu), ushort(p1 >> 16)
+                };
+                uint group_index = row * K_GROUPS + k / 64 + lane / 4;
+                float scale = scales[group_index];
+                float bias = biases[group_index];
+                float accum = 0.0f;
+                for (uint i = 0; i < 4; ++i) {
+                    accum +=
+                        xv[4 * i] * (packed[i] & 0x000f) +
+                        xv[4 * i + 1] * (packed[i] & 0x00f0) +
+                        xv[4 * i + 2] * (packed[i] & 0x0f00) +
+                        xv[4 * i + 3] * (packed[i] & 0xf000);
+                }
+                result[r] += scale * accum + sum * bias;
+            }
+        }
+
+        threadgroup float exact_scores[TOPK];
+        for (uint r = 0; r < 4; ++r) {
+            float reduced = simd_sum(result[r]);
+            if (lane == 0) {
+                exact_scores[candidate_base + r] = float(InT(reduced));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            float best_value = exact_scores[lane];
+            uint best_id = final_ids[lane];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_value = simd_shuffle_down(best_value, offset);
+                uint other_id = simd_shuffle_down(best_id, offset);
+                if (lane < offset && qwen_draft_top32_fused_better(
+                        other_value, other_id, best_value, best_id)) {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+            if (lane == 0) {
+                token_id[0] = int(
+                    best_id < PREFIX_COUNT
+                        ? best_id
+                        : best_id + CONTROL_OFFSET);
+            }
+        }
+    """,
+    header: """
+        typedef bfloat16_t InT;
+        inline bool qwen_draft_top32_fused_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
 
 /// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
-private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
-    // Mirrors the kernel static_asserts; see the bitmask note there.
+private func qwen35DraftTop32Partial(_ row: MLXArray) -> [MLXArray] {
     precondition(qwen35Top32PerThread <= 32 && qwen35Top32FinPerThread <= 32,
                  "top-32 slot count exceeds the 32-bit selection bitmask")
-    let partial = qwen35DraftTop32PartialKernel(
+    return qwen35DraftTop32PartialKernel(
         [row],
         grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
         outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
         outputDTypes: [.uint32, .uint32]
     )
-    return qwen35DraftTop32FinalizeKernel(
+}
+
+private func qwen35DraftTop32Finalize(_ partial: [MLXArray]) -> MLXArray {
+    qwen35DraftTop32FinalizeKernel(
         [partial[0], partial[1]],
         grid: (qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
         outputShapes: [[qwen35Top32K]],
         outputDTypes: [.uint32]
     )[0]
+}
+
+private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
+    qwen35DraftTop32Finalize(qwen35DraftTop32Partial(row))
 }
 
 /// Offline equivalence gate. Needs no checkpoint and no MTP head: it exercises
@@ -3420,15 +3732,32 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         )
         let candidateCount = Self.draftRerankCandidateCount
-        // Drift guard: the kernels bake these shapes in as constexpr.
         guard qwen35Top32RealCount == Self.compactDraftRealCount,
               qwen35Top32K == candidateCount
         else { return nil }
+        let shortlistRow = coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            .reshaped([Self.compactDraftRealCount])
+
+        if qwen35Top32Enabled {
+            let partial = qwen35DraftTop32Partial(shortlistRow)
+            return qwen35DraftTop32FusedRerankKernel(
+                [partial[0], partial[1], x.reshaped([configuration.hiddenSize]),
+                 exact.weight, exact.scales, exactBiases],
+                template: [
+                    ("PREFIX_COUNT", Self.compactDraftPrefixCount),
+                    ("CONTROL_OFFSET",
+                     Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                ],
+                grid: (qwen35Top32TG, 1, 1),
+                threadGroup: (qwen35Top32TG, 1, 1),
+                outputShapes: [[1, 1]],
+                outputDTypes: [.int32]
+            )[0]
+        }
+
         let candidateIDs: MLXArray
         if qwen35Top32Enabled {
-            candidateIDs = qwen35DraftTop32(
-                coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
-                    .reshaped([Self.compactDraftRealCount]))
+            candidateIDs = qwen35DraftTop32(shortlistRow)
         } else {
             let kth = Self.compactDraftRealCount - candidateCount
             candidateIDs = MLX.argPartition(
@@ -3436,14 +3765,12 @@ extension Qwen35TextModel: MTPCapable {
                 kth: kth, axis: -1
             )[.ellipsis, (kth)...].reshaped([candidateCount])
         }
-
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
         let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
         let exactLogits = quantizedMM(
             x, exactWeight, scales: exactScales, biases: exactZeroPoints,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
-
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
             template: [
