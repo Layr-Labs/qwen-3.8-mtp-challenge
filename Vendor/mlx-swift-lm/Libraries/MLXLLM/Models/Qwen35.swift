@@ -3335,6 +3335,333 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
 
+// ---------------------------------------------------------------------------
+// CANDIDATE-SIDE TOP-32 + CANDIDATE-ID MAP, at the shortlist width
+//
+// The pair above answers "top 32 of a 98,330-wide bf16 row" in two dispatches
+// instead of `argPartition`'s fourteen. The IVF shortlist readout in
+// `clusterCandidateIDs` asks the SAME question of a `probes * rowsPerCluster`
+// row -- 24,584 wide on the declared head -- and still calls
+// `MLX.argPartition`, which `sort.cpp:342` ("We direct arg partition to sort
+// for now") forwards to `gpu_merge_sort`. At 24,584 that is
+// `1 + 2*ceil(log2(ceil(24584/2048))) + 1 = 10` dependent dispatches and five
+// device temporaries (~0.9 MB of vals+idxs churn per proposed token) to fully
+// argsort a row from which exactly 32 entries are ever read. Eight further
+// dispatches then turn those 32 local offsets into compact-vocabulary ids:
+//
+//     local       = argPartition(rowScore, kth)[kth...]           // 10
+//     permutedRow = take(probed.asType(.int32), local / width) * width
+//                   + remainder(local, width)                     //  6
+//     return take(perm, permutedRow).asType(.uint32)              //  2
+//
+// This factory instantiates the shipped Partial/Finalize pair at the shortlist
+// width and folds the id map into Finalize's single store, so those 18
+// dispatches become 2.
+//
+// EXACTNESS. The argument is morganmcg1's, above `qwen35Top32RealCount`, and
+// it is reused rather than re-derived: it is a statement about
+// `gpu_merge_sort`'s comparator and stability, not about a width. Their
+// conclusion -- the tail-32 of the stable ascending argsort is the unique
+// 32-element set maximal under (value asc, index asc), ties to the HIGHER
+// index, NaN above every number, `-0.0` folded onto `+0.0`, and
+// `qwen_top32_ordinal` a monotone map inducing exactly that order -- applies
+// verbatim because `local` here IS `argPartition(...)[kth...]`, only narrower.
+// Three width-specific obligations remain, and all three are discharged
+// structurally rather than by measurement:
+//
+//   (1) Template constants. At REAL_COUNT = 24,584 with TG_SIZE = 256 and
+//       Tiles = 64: STRIDE = 16,384, PER_THREAD = 2, Cands = 2,048,
+//       FinPerThread = 8, PB = 8. All three `static_assert`s hold, and the
+//       Swift guard below refuses to build a kernel for which they would not.
+//
+//   (2) No dummy slot can be emitted. `REAL_COUNT >= STRIDE` is required
+//       below, so every thread's start index is in range and slot 0 always
+//       holds a real element; `bo` is therefore >= 1 before any dummy slot is
+//       examined. Ordinal 0 is unreachable for a real value (negatives map to
+//       `~u`, and `~u == 0` needs `u == 0xFFFFFFFF`, a NaN handled earlier;
+//       non-negatives map to `u | 0x80000000`), so the `(0, 0)` dummy key
+//       never aliases index 0's real key. A simdgroup owns 32 consecutive
+//       `tid` values, hence at least 32 real elements for its 32 rounds.
+//
+//   (3) The id map. `local` indexes a length-REAL_COUNT array, so `mi` is
+//       non-negative and unsigned `/` and `%` agree with `MLX.floorDivide`
+//       and `MLX.remainder` on int32. `probed[leaf] * RPC + slot` stays
+//       inside `perm`, whose entries are already folded into `[0, realCount)`
+//       by `buildDerivedClusterIndex`, so the final `int32 -> uint32` is
+//       exact -- the same conversion `.asType(.uint32)` performs today.
+//
+// No floating-point arithmetic occurs anywhere in the replaced region: the
+// comparisons are on uint ordinals and the map is integer. No GEMM block
+// width and no `M=1 -> M>1` kernel-family boundary is crossed, so this cannot
+// reproduce the island-fuse drift, and bit-exactness keeps the proposal stream
+// -- and therefore the round schedule -- identical.
+//
+// `MLX_E88_CAND_TOP32=0` restores the argPartition path bit-for-bit. The
+// `MLX_` prefix is load-bearing: the trusted worker's environment sanitizer
+// drops `MLXFAST_*`, so an `MLXFAST_`-spelled gate would never reach the
+// process that runs the scored round.
+private let qwen35CandidateTop32Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E88_CAND_TOP32"] != "0"
+
+struct Qwen35CandidateTop32Kernels {
+    let partial: MLXFast.MLXFastKernel
+    let finalize: MLXFast.MLXFastKernel
+    let realCount: Int
+    let rowsPerCluster: Int
+    let tiles: Int
+    let tgSize: Int
+    let cands: Int
+    let topK: Int
+}
+
+func makeQwen35CandidateTop32Kernels(
+    realCount: Int, rowsPerCluster: Int
+) -> Qwen35CandidateTop32Kernels? {
+    let tgSize = qwen35Top32TG
+    let tiles = qwen35Top32Tiles
+    let topK = qwen35Top32K
+    let stride = tiles * tgSize
+    let perThread = (realCount + stride - 1) / stride
+    let cands = tiles * topK
+    let finPerThread = cands / tgSize
+    let nsimd = tgSize / 32
+    let pb = (nsimd * topK) / 32
+    // Mirrors the kernel `static_assert`s, plus the two structural conditions
+    // the exactness argument rests on: every thread's first slot is real
+    // (`realCount >= stride`) and the row divides evenly into leaves.
+    guard rowsPerCluster > 0,
+          realCount > topK,
+          realCount % rowsPerCluster == 0,
+          realCount >= stride,
+          cands % tgSize == 0,
+          tgSize % 32 == 0,
+          perThread <= 32,
+          finPerThread <= 32,
+          pb <= 32
+    else { return nil }
+
+    let partial = MLXFast.metalKernel(
+        name: "qwen_mtp_cand_top32_partial",
+        inputNames: ["logits"],
+        outputNames: ["cand_ord", "cand_idx"],
+        source: """
+            constexpr uint REAL_COUNT = \(realCount);
+            constexpr uint TG_SIZE    = \(tgSize);
+            constexpr uint STRIDE     = \(stride);
+            constexpr uint PER_THREAD = \(perThread);
+            constexpr uint TOPK       = \(topK);
+            constexpr uint SIMD_SIZE  = 32;
+            constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+            constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+            static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+            static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+            static_assert(REAL_COUNT >= STRIDE, "slot 0 must always be a real element");
+
+            uint tile = threadgroup_position_in_grid.x;
+            uint tid  = thread_position_in_threadgroup.x;
+            uint lane = thread_index_in_simdgroup;
+            uint sg   = simdgroup_index_in_threadgroup;
+
+            uint ord[PER_THREAD];
+            uint idx[PER_THREAD];
+            for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
+            uint n = 0;
+            for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
+                ord[n] = qwen_top32_ordinal(float(logits[i]));
+                idx[n] = i;
+                n++;
+            }
+
+            threadgroup uint sc_ord[NSIMD * TOPK];
+            threadgroup uint sc_idx[NSIMD * TOPK];
+
+            uint taken = 0u;
+            for (uint r = 0; r < TOPK; ++r) {
+                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                for (uint t = 0; t < PER_THREAD; ++t) {
+                    if ((taken & (1u << t)) != 0u) { continue; }
+                    if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+                        bo = ord[t]; bi = idx[t]; bs = t;
+                    }
+                }
+                uint mo = simd_max(bo);
+                uint mi = simd_max((bo == mo) ? bi : 0u);
+                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                    taken |= (1u << bs);
+                }
+                if (lane == 0) {
+                    sc_ord[sg * TOPK + r] = mo;
+                    sc_idx[sg * TOPK + r] = mi;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg == 0) {
+                uint o2[PB];
+                uint i2[PB];
+                for (uint t = 0; t < PB; ++t) {
+                    uint p = t * SIMD_SIZE + lane;
+                    o2[t] = sc_ord[p];
+                    i2[t] = sc_idx[p];
+                }
+                uint tk2 = 0u;
+                for (uint r = 0; r < TOPK; ++r) {
+                    uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                    for (uint t = 0; t < PB; ++t) {
+                        if ((tk2 & (1u << t)) != 0u) { continue; }
+                        if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+                            bo = o2[t]; bi = i2[t]; bs = t;
+                        }
+                    }
+                    uint mo = simd_max(bo);
+                    uint mi = simd_max((bo == mo) ? bi : 0u);
+                    if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                        tk2 |= (1u << bs);
+                    }
+                    if (lane == 0) {
+                        cand_ord[tile * TOPK + r] = mo;
+                        cand_idx[tile * TOPK + r] = mi;
+                    }
+                }
+            }
+            """,
+        header: qwen35Top32Header,
+        ensureRowContiguous: false
+    )
+
+    // Stage 2, plus the candidate-id map. The map lives in the single store
+    // that already existed -- `token_ids[TOPK-1-r] = mi` becomes
+    // `token_ids[TOPK-1-r] = perm[probed[mi/RPC]*RPC + mi%RPC]` -- so folding
+    // it in costs one gather-of-a-gather per emitted id and no extra pass.
+    let finalize = MLXFast.metalKernel(
+        name: "qwen_mtp_cand_top32_finalize_map",
+        inputNames: ["cand_ord", "cand_idx", "probed", "perm"],
+        outputNames: ["token_ids"],
+        source: """
+            constexpr uint TG_SIZE    = \(tgSize);
+            constexpr uint PER_THREAD = \(finPerThread);
+            constexpr uint TOPK       = \(topK);
+            constexpr uint RPC        = \(rowsPerCluster);
+            constexpr uint SIMD_SIZE  = 32;
+            constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+            constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+            static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+            static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+
+            uint tid  = thread_position_in_threadgroup.x;
+            uint lane = thread_index_in_simdgroup;
+            uint sg   = simdgroup_index_in_threadgroup;
+
+            uint ord[PER_THREAD];
+            uint idx[PER_THREAD];
+            for (uint t = 0; t < PER_THREAD; ++t) {
+                uint p = t * TG_SIZE + tid;
+                ord[t] = cand_ord[p];
+                idx[t] = cand_idx[p];
+            }
+
+            threadgroup uint sc_ord[NSIMD * TOPK];
+            threadgroup uint sc_idx[NSIMD * TOPK];
+
+            uint taken = 0u;
+            for (uint r = 0; r < TOPK; ++r) {
+                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                for (uint t = 0; t < PER_THREAD; ++t) {
+                    if ((taken & (1u << t)) != 0u) { continue; }
+                    if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+                        bo = ord[t]; bi = idx[t]; bs = t;
+                    }
+                }
+                uint mo = simd_max(bo);
+                uint mi = simd_max((bo == mo) ? bi : 0u);
+                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                    taken |= (1u << bs);
+                }
+                if (lane == 0) {
+                    sc_ord[sg * TOPK + r] = mo;
+                    sc_idx[sg * TOPK + r] = mi;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg == 0) {
+                uint o2[PB];
+                uint i2[PB];
+                for (uint t = 0; t < PB; ++t) {
+                    uint p = t * SIMD_SIZE + lane;
+                    o2[t] = sc_ord[p];
+                    i2[t] = sc_idx[p];
+                }
+                uint tk2 = 0u;
+                for (uint r = 0; r < TOPK; ++r) {
+                    uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                    for (uint t = 0; t < PB; ++t) {
+                        if ((tk2 & (1u << t)) != 0u) { continue; }
+                        if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+                            bo = o2[t]; bi = i2[t]; bs = t;
+                        }
+                    }
+                    uint mo = simd_max(bo);
+                    uint mi = simd_max((bo == mo) ? bi : 0u);
+                    if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                        tk2 |= (1u << bs);
+                    }
+                    if (lane == 0) {
+                        uint leaf = mi / RPC;
+                        uint slot = mi - leaf * RPC;
+                        token_ids[TOPK - 1u - r] =
+                            uint(perm[probed[leaf] * RPC + slot]);
+                    }
+                }
+            }
+            """,
+        header: "",
+        ensureRowContiguous: false
+    )
+
+    return Qwen35CandidateTop32Kernels(
+        partial: partial, finalize: finalize,
+        realCount: realCount, rowsPerCluster: rowsPerCluster,
+        tiles: tiles, tgSize: tgSize, cands: cands, topK: topK)
+}
+
+/// Two dispatches: exact top-32 of `rowScore` mapped straight to compact
+/// candidate ids. Element-wise identical to the argPartition + 8-op chain.
+func qwen35CandidateTop32(
+    _ k: Qwen35CandidateTop32Kernels,
+    rowScore: MLXArray, probed: MLXArray, perm: MLXArray
+) -> MLXArray {
+    let partial = k.partial(
+        [rowScore],
+        grid: (k.tiles * k.tgSize, 1, 1),
+        threadGroup: (k.tgSize, 1, 1),
+        outputShapes: [[k.cands], [k.cands]],
+        outputDTypes: [.uint32, .uint32]
+    )
+    return k.finalize(
+        [partial[0], partial[1], probed, perm],
+        grid: (k.tgSize, 1, 1),
+        threadGroup: (k.tgSize, 1, 1),
+        outputShapes: [[k.topK]],
+        outputDTypes: [.uint32]
+    )[0]
+}
+
+/// The chain this replaces, as one function, so the gate compares against the
+/// shipped expression rather than a paraphrase of it.
+func qwen35CandidateTop32Reference(
+    rowScore: MLXArray, probed: MLXArray, perm: MLXArray,
+    rowsPerCluster: Int, candidateCount: Int
+) -> MLXArray {
+    let kth = rowScore.dim(0) - candidateCount
+    let local = MLX.argPartition(rowScore, kth: kth)[.ellipsis, (kth)...]
+    let width = MLXArray(Int32(rowsPerCluster))
+    let permutedRow =
+        MLX.take(probed.asType(.int32), MLX.floorDivide(local, width), axis: 0)
+        * width + MLX.remainder(local, width)
+    return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+}
+
 // Ascending compaction of the probe list that `gatherQuantizedMM` consumes.
 //
 // `MLX.argPartition` returns its top segment in partition order, so the
@@ -3642,6 +3969,296 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
     return (trials, bad, firstBad)
 }
 
+// ---------------------------------------------------------------------------
+// Offline gates for the shortlist top-32 + id map. Same shape as
+// `qwen35VerifyDraftTop32` / `qwen35ProbeSortPositiveControl` above; never
+// called on a scored path.
+
+/// The fixed side of the shortlist selection, built the way
+/// `buildDerivedClusterIndex` builds it: `perm` is a permutation of
+/// `[0, clusters*rowsPerCluster)` with the padding rows folded back onto the
+/// real rows they duplicate, and `probed` is an ascending distinct set of
+/// `probes` leaf ids, which is exactly what `qwen_mtp_probe_sort` emits.
+public func qwen35CandidateTop32Fixtures(
+    clusters: Int, rowsPerCluster: Int, probes: Int, realHeadCount: Int
+) -> (probed: MLXArray, perm: MLXArray) {
+    let padded = clusters * rowsPerCluster
+    let order = argSort(MLXRandom.normal([padded]), axis: -1).asType(.int32)
+    let fold = MLXArray(Int32(realHeadCount))
+    let perm = which(order .>= fold, order - fold, order)
+    let picked = argSort(MLXRandom.normal([clusters]), axis: -1)[0 ..< probes]
+    let probed = MLX.sorted(picked).asType(.uint32)
+    eval(perm, probed)
+    return (probed, perm)
+}
+
+/// Adversarial bf16 shortlist rows. `variant` cycles the corners the exactness
+/// argument depends on: heavy ties, an all-equal block, mixed signed zeros,
+/// NaN payloads, and one row carrying all of them at once.
+public func qwen35CandidateTop32AdversarialRow(
+    realCount: Int, variant: Int
+) -> MLXArray {
+    let negZero = MLXArray(Float(0)) * MLXArray(Float(-1))
+    switch variant % 6 {
+    case 1:
+        // dense bf16 ties: a few dozen distinct values over 24,584 slots
+        return (MLXRandom.normal([realCount]) * 4).round().asType(.bfloat16)
+    case 2:
+        // all-equal block: the selected set is entirely a tie-rule question
+        return MLX.zeros([realCount], dtype: .bfloat16)
+    case 3:
+        // +0.0 / -0.0 pairs only: every comparison is the signed-zero fold
+        let sign = which(
+            MLXRandom.normal([realCount]) .< MLXArray(Float(0)),
+            MLXArray(Float(-1)), MLXArray(Float(1)))
+        return (MLXArray(Float(0)) * sign).asType(.bfloat16)
+    case 4:
+        // NaN payloads above every number, ~2.3 % density
+        let base = MLXRandom.normal([realCount])
+        return which(
+            MLXRandom.normal([realCount]) .< MLXArray(Float(-2)),
+            MLXArray(Float.nan), base
+        ).asType(.bfloat16)
+    case 5:
+        // all corners at once: tiny alphabet + signed zeros + NaN
+        var v = (MLXRandom.normal([realCount]) * 2).round()
+        v = which(
+            MLXRandom.normal([realCount]) .< MLXArray(Float(-1.6)), negZero, v)
+        v = which(
+            MLXRandom.normal([realCount]) .< MLXArray(Float(-2)),
+            MLXArray(Float.nan), v)
+        return v.asType(.bfloat16)
+    default:
+        return MLXRandom.normal([realCount]).asType(.bfloat16)
+    }
+}
+
+/// Element-wise equivalence gate at the live shortlist width. Compares the two
+/// kernels against the shipped `argPartition` + integer-index chain, over the
+/// adversarial row set plus any caller-supplied rows (the harness feeds
+/// real-checkpoint-derived coarse scores through `extraRows`).
+/// Returns (checked, mismatches, firstBadTrial).
+public func qwen35VerifyCandidateTop32(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    realHeadCount: Int = 98_330, candidateCount: Int = 32,
+    trials: Int = 64, seed: UInt64 = 1,
+    extraRows: [MLXArray] = []
+) -> (Int, Int, Int) {
+    MLXRandom.seed(seed)
+    let realCount = probes * rowsPerCluster
+    guard let kernels = makeQwen35CandidateTop32Kernels(
+        realCount: realCount, rowsPerCluster: rowsPerCluster)
+    else { return (0, -1, -1) }
+    var bad = 0
+    var firstBad = -1
+    var checked = 0
+    let rows = (0 ..< trials).map {
+        qwen35CandidateTop32AdversarialRow(realCount: realCount, variant: $0)
+    } + extraRows
+    for (trial, row) in rows.enumerated() {
+        guard row.dim(0) == realCount else { continue }
+        let score = row.dtype == .bfloat16 ? row : row.asType(.bfloat16)
+        let (probed, perm) = qwen35CandidateTop32Fixtures(
+            clusters: clusters, rowsPerCluster: rowsPerCluster,
+            probes: probes, realHeadCount: realHeadCount)
+        let mine = qwen35CandidateTop32(
+            kernels, rowScore: score, probed: probed, perm: perm)
+        let theirs = qwen35CandidateTop32Reference(
+            rowScore: score, probed: probed, perm: perm,
+            rowsPerCluster: rowsPerCluster, candidateCount: candidateCount)
+        // Identity fixtures make the kernel emit `local` itself, so the raw
+        // selection is compared against `argPartition` with no map in the way.
+        let idProbed = MLX.arange(probes, dtype: .uint32)
+        let idPerm = MLX.arange(clusters * rowsPerCluster, dtype: .int32)
+        let mineRaw = qwen35CandidateTop32(
+            kernels, rowScore: score, probed: idProbed, perm: idPerm)
+        let kth = realCount - candidateCount
+        let theirsRaw = MLX.argPartition(score, kth: kth)[.ellipsis, (kth)...]
+            .asType(.uint32)
+        eval(mine, theirs, mineRaw, theirsRaw)
+        let ok = MLX.all(MLX.equal(mine, theirs)).item(Bool.self)
+            && MLX.all(MLX.equal(mineRaw, theirsRaw)).item(Bool.self)
+        checked += 1
+        if !ok {
+            bad += 1
+            if firstBad < 0 { firstBad = trial }
+        }
+    }
+    return (checked, bad, firstBad)
+}
+
+/// Positive control. Swaps one selected id for one rejected id -- the smallest
+/// possible wrong answer -- and requires the comparison to report it. A gate
+/// that cannot fail is not a gate. Returns true when the mismatch is caught.
+public func qwen35CandidateTop32PositiveControl(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    realHeadCount: Int = 98_330, candidateCount: Int = 32, seed: UInt64 = 7
+) -> Bool {
+    MLXRandom.seed(seed)
+    let realCount = probes * rowsPerCluster
+    guard let kernels = makeQwen35CandidateTop32Kernels(
+        realCount: realCount, rowsPerCluster: rowsPerCluster)
+    else { return false }
+    let score = MLXRandom.normal([realCount]).asType(.bfloat16)
+    let (probed, perm) = qwen35CandidateTop32Fixtures(
+        clusters: clusters, rowsPerCluster: rowsPerCluster,
+        probes: probes, realHeadCount: realHeadCount)
+    let mine = qwen35CandidateTop32(
+        kernels, rowScore: score, probed: probed, perm: perm)
+    // The 33rd-largest row is the nearest rejected candidate; substituting it
+    // for the smallest accepted one is the minimal perturbation.
+    let kth = realCount - candidateCount
+    let full = MLX.argPartition(score, kth: kth - 1)[.ellipsis, (kth - 1)...]
+    let permutedRow = qwen35CandidateTop32Reference(
+        rowScore: score, probed: probed, perm: perm,
+        rowsPerCluster: rowsPerCluster, candidateCount: candidateCount + 1)
+    eval(mine, full, permutedRow)
+    var perturbed = mine.asArray(UInt32.self)
+    let rejected = permutedRow.asArray(UInt32.self)[0]
+    guard perturbed.first != rejected else { return false }
+    perturbed[0] = rejected
+    let caught = !MLX.all(MLX.equal(mine, MLXArray(perturbed))).item(Bool.self)
+    return caught
+}
+
+/// Non-vacuity census: how many adversarial trials actually put a tie on the
+/// selection boundary, i.e. how many of them exercise the tie rule at all.
+/// Returns (trials, trialsWithBoundaryTie, trialsWithNaNInSelection).
+public func qwen35CandidateTop32TieCensus(
+    probes: Int = 3_073, rowsPerCluster: Int = 8, candidateCount: Int = 32,
+    trials: Int = 64, seed: UInt64 = 11
+) -> (Int, Int, Int) {
+    MLXRandom.seed(seed)
+    let realCount = probes * rowsPerCluster
+    let kth = realCount - candidateCount
+    var tied = 0
+    var withNaN = 0
+    for trial in 0 ..< trials {
+        let score = qwen35CandidateTop32AdversarialRow(
+            realCount: realCount, variant: trial)
+        let order = MLX.argPartition(score, kth: kth - 1)
+        let boundary = MLX.take(score, order[(kth - 1) ..< (kth + 1)], axis: 0)
+            .asType(.float32)
+        let selected = MLX.take(score, order[(kth)...], axis: 0).asType(.float32)
+        eval(boundary, selected)
+        let b = boundary.asArray(Float.self)
+        // A boundary tie means the 32nd and 33rd largest carry the same value,
+        // so only the index rule separates them.
+        if b[0].bitPattern == b[1].bitPattern || (b[0].isNaN && b[1].isNaN) {
+            tied += 1
+        }
+        if selected.asArray(Float.self).contains(where: { $0.isNaN }) {
+            withNaN += 1
+        }
+    }
+    return (trials, tied, withNaN)
+}
+
+/// Host-side bit-pattern parity gate. Returns
+/// `(rowsChecked, maxIndexDiff, maxValueBitPatternDiff, maxMappedIdDiff)`.
+///
+/// Three separate comparisons, all pulled to the host so nothing hides behind
+/// a device reduction:
+///   * raw selection indices, using identity fixtures so the kernel emits
+///     `local` itself and is compared straight against `argPartition`;
+///   * the SELECTED VALUES by IEEE bit pattern, so `-0.0` vs `+0.0` and NaN
+///     payload differences cannot pass as equal the way `==` would let them;
+///   * the mapped candidate ids against the full shipped chain.
+/// Never called on a scored path.
+public func qwen35CandidateTop32BitParity(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    realHeadCount: Int = 98_330, candidateCount: Int = 32,
+    trials: Int = 24, seed: UInt64 = 21, extraRows: [MLXArray] = []
+) -> (Int, UInt32, UInt32, UInt32) {
+    MLXRandom.seed(seed)
+    let realCount = probes * rowsPerCluster
+    guard let kernels = makeQwen35CandidateTop32Kernels(
+        realCount: realCount, rowsPerCluster: rowsPerCluster)
+    else { return (0, .max, .max, .max) }
+    let rows = (0 ..< trials).map {
+        qwen35CandidateTop32AdversarialRow(realCount: realCount, variant: $0)
+    } + extraRows
+    var maxIdx: UInt32 = 0, maxVal: UInt32 = 0, maxMapped: UInt32 = 0
+    var checked = 0
+    let kth = realCount - candidateCount
+    let idProbed = MLX.arange(probes, dtype: .uint32)
+    let idPerm = MLX.arange(clusters * rowsPerCluster, dtype: .int32)
+    for row in rows {
+        guard row.dim(0) == realCount else { continue }
+        let score = row.dtype == .bfloat16 ? row : row.asType(.bfloat16)
+        let (probed, perm) = qwen35CandidateTop32Fixtures(
+            clusters: clusters, rowsPerCluster: rowsPerCluster,
+            probes: probes, realHeadCount: realHeadCount)
+        let mineRaw = qwen35CandidateTop32(
+            kernels, rowScore: score, probed: idProbed, perm: idPerm)
+        let theirsRaw = MLX.argPartition(score, kth: kth)[.ellipsis, (kth)...]
+            .asType(.uint32)
+        let mineMapped = qwen35CandidateTop32(
+            kernels, rowScore: score, probed: probed, perm: perm)
+        let theirsMapped = qwen35CandidateTop32Reference(
+            rowScore: score, probed: probed, perm: perm,
+            rowsPerCluster: rowsPerCluster, candidateCount: candidateCount)
+        let wide = score.asType(.float32)
+        eval(mineRaw, theirsRaw, mineMapped, theirsMapped, wide)
+        let a = mineRaw.asArray(UInt32.self)
+        let b = theirsRaw.asArray(UInt32.self)
+        let m = mineMapped.asArray(UInt32.self)
+        let n = theirsMapped.asArray(UInt32.self)
+        let values = wide.asArray(Float.self)
+        guard a.count == candidateCount, b.count == candidateCount,
+              m.count == candidateCount, n.count == candidateCount
+        else { return (checked, .max, .max, .max) }
+        for i in 0 ..< candidateCount {
+            maxIdx = max(maxIdx, a[i] > b[i] ? a[i] - b[i] : b[i] - a[i])
+            let va = values[Int(a[i])].bitPattern
+            let vb = values[Int(b[i])].bitPattern
+            maxVal = max(maxVal, va > vb ? va - vb : vb - va)
+            maxMapped = max(maxMapped, m[i] > n[i] ? m[i] - n[i] : n[i] - m[i])
+        }
+        checked += 1
+    }
+    return (checked, maxIdx, maxVal, maxMapped)
+}
+
+/// Isolated micro-benchmark of the shortlist selection, both arms including
+/// the id map. Returns (argPartitionChainUs, kernelPairUs). Never scored.
+public func qwen35BenchCandidateTop32(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    realHeadCount: Int = 98_330, candidateCount: Int = 32, iters: Int = 200
+) -> (Double, Double) {
+    MLXRandom.seed(5)
+    let realCount = probes * rowsPerCluster
+    guard let kernels = makeQwen35CandidateTop32Kernels(
+        realCount: realCount, rowsPerCluster: rowsPerCluster)
+    else { return (0, 0) }
+    let score = MLXRandom.normal([realCount]).asType(.bfloat16)
+    let (probed, perm) = qwen35CandidateTop32Fixtures(
+        clusters: clusters, rowsPerCluster: rowsPerCluster,
+        probes: probes, realHeadCount: realHeadCount)
+    eval(score)
+    for _ in 0 ..< 10 {
+        eval(qwen35CandidateTop32(
+            kernels, rowScore: score, probed: probed, perm: perm))
+        eval(qwen35CandidateTop32Reference(
+            rowScore: score, probed: probed, perm: perm,
+            rowsPerCluster: rowsPerCluster, candidateCount: candidateCount))
+    }
+    var t0 = Date()
+    for _ in 0 ..< iters {
+        eval(qwen35CandidateTop32Reference(
+            rowScore: score, probed: probed, perm: perm,
+            rowsPerCluster: rowsPerCluster, candidateCount: candidateCount))
+    }
+    let baseUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    t0 = Date()
+    for _ in 0 ..< iters {
+        eval(qwen35CandidateTop32(
+            kernels, rowScore: score, probed: probed, perm: perm))
+    }
+    let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    return (baseUs, mineUs)
+}
+
 /// Offline equivalence gate for the probe compaction kernel. Checks it against
 /// `MLX.sorted(MLX.argPartition(...))` at the live width, including rows
 /// quantised hard enough to force heavy ties and one all-equal row where the
@@ -3778,6 +4395,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftClusterShape: [Int]?
     private var _draftClusterLHS: MLXArray?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
+    private var _draftCandTop32: Qwen35CandidateTop32Kernels?
+    private var _draftCandTop32Attempted = false
     // One attempt only: a head that cannot support a derived index must keep
     // the dense readout instead of re-deriving on every draft step.
     private var _derivedClusterAttempted = false
@@ -4382,6 +5001,33 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine,
             sortedIndices: true
         ).reshaped([probes * rowsPerCluster])
+
+        // Two dispatches for what `argPartition` + the integer index chain
+        // spent eighteen on. Bit-exact (see the factory's exactness note), so
+        // the proposal stream and the round schedule are unchanged. The dtype
+        // guards are load-bearing: the kernel signature is generated from the
+        // actual input dtypes, and the ordinal map is defined on the bf16 the
+        // shortlist matmul produces.
+        if qwen35CandidateTop32Enabled,
+           rowScore.dtype == .bfloat16,
+           probed.dtype == .uint32,
+           perm.dtype == .int32
+        {
+            if !_draftCandTop32Attempted {
+                _draftCandTop32Attempted = true
+                _draftCandTop32 = makeQwen35CandidateTop32Kernels(
+                    realCount: probes * rowsPerCluster,
+                    rowsPerCluster: rowsPerCluster)
+            }
+            if let kernels = _draftCandTop32,
+               kernels.realCount == probes * rowsPerCluster,
+               kernels.rowsPerCluster == rowsPerCluster,
+               kernels.topK == candidateCount
+            {
+                return qwen35CandidateTop32(
+                    kernels, rowScore: rowScore, probed: probed, perm: perm)
+            }
+        }
 
         let kth = probes * rowsPerCluster - candidateCount
         let local = MLX.argPartition(rowScore, kth: kth)[.ellipsis, (kth)...]
