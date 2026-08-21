@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:morgan/qwen38-27b-mtp-r20k-lr3-q4-g64-q2-rerank@fd4a99c590dd6e468c0e2a28168c235e32151a4b",
+  "sha256": "2f6805e1c8b7ea5e5c6cf19acc968426c5b1c3fb2e5442eb1000df96550bf174",
+  "bytes": 427742680,
   "max_bytes": 2147483648,
-  "note": "The promoted affine-4/group-64 proposal head and affine-2 compact readout remain tensor-for-tensor pinned. The live PR #958 two-level cluster index and exact one-dispatch qwen_mtp_probe_sort compaction are unchanged and still form the same 32 compact row ids at probe fraction 0.25. A new proposal-only Metal tail evaluates those selected ids directly from the full affine-4/group-64 compact matrix, preserves qmv_fast BF16 rounding and the incumbent value/id total order, and maps the winning compact id in the same dispatch. This removes the prior gather_qmm plus separate reducer without changing the target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, or trusted serial replay. The artifact remains immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "Proposal-only head swap on the live #968 selected-affine-4 runtime. The runner still fetches exactly model.safetensors, digest-verifies the single-file tree, and keeps E87 probe sort, E85 fused embed concat, the #968 qwen_mtp_draft_selected_affine4_rerank_g64_v1 tail, Amal q2 shortlist tensors (byte-copied into this artifact), island index arrays (byte-copied), cap 7, h=0.18, and qL {1,5,4}. What changes is the trained MTP core: eight affine-4/group-64 matrices plus seven BF16 norms from morgan LR3 (K=4, accept-loss beta 0.6, 20k-row train, selected step 2469), with Q/K/V island rows gathered from that core under the preserved Amal indices. Same 40-tensor ABI as the live Amal q2/q4 pin (draft_lm_head 98336 x 320 U32 + scales/biases, compact 98336-row affine-4 exact matrix, precision_islands.{q,k,v}, one decoder layer). Immutable revision fd4a99c590dd6e468c0e2a28168c235e32151a4b. Raw LFS SHA-256 5aa88cfc87a5a14cc29bf098a4d049ff537756618af86f38f0364d5c87d07d3d. Tree digest is SHA-256 of that hex, two spaces, 'model.safetensors', newline. No remote code. Target verify/accept/ledger/serial replay unchanged."
 }
