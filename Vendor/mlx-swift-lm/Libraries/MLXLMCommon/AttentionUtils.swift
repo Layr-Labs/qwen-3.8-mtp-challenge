@@ -131,6 +131,13 @@ public func attentionWithCacheUpdate(
                 scale: scale,
                 mask: .causal
             )
+            // Host/GPU overlap: chunk A does not depend on chunk B. The
+            // layer-boundary asyncEval ladder (Qwen35 rungs 0,1,9,...) only
+            // fires after the whole layer, so both SDPAs otherwise stay in
+            // one unevaluated graph until concat+rest-of-layer. Enqueue A
+            // now so the GPU can run the 5-row pass while the host builds B.
+            // Values unchanged; split=5 and k-windows unchanged.
+            asyncEval(outA)
             let outB = MLXFast.scaledDotProductAttention(
                 queries: queries[0..., 0..., split..., 0...],
                 keys: cachedKeys,
