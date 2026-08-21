@@ -375,13 +375,21 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
+            // Scored rounds dispatch callWithHiddenAndNormed and then slice
+            // the published post-norm block (hiddenRow(verifyHidden,
+            // verifyNormed, i)). Warming callWithHidden only compiles the
+            // logits+pre-norm pair; the extra published output is a different
+            // graph edge. Eval the normed block so that slice is not a
+            // first-touch inside the timed window.
+            let (verifyLogits, _, verifyNormed) = model.callWithHiddenAndNormed(
                 input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
                 cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
-            // Compile the two top-2 reduction kernels outside the scored window
-            // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
+            if let verifyNormed {
+                warmBundle.append(verifyNormed)
+            }
+            eval(warmBundle)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -515,6 +523,15 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
+        // Isolated qL={1..5} full-kL warms do not compile the live exactness
+        // chunk: width 6..9 splits a causal FA decode into qL=5 over
+        // keys[..<kL-(qL-5)] plus qL=(qL-5) over the full keys, then
+        // concatenates the two outputs on axis 2. That sliced-K family and
+        // the bf16 attn-out concat are what the 16 FA layers dispatch every
+        // deep round. Token-neutral; throwaway K/V only.
+        Self.warmExactnessChunkSDPA(
+            keys: extK, values: extV,
+            qHeads: qHeads, headDim: headDim, scale: scale)
         // Scored decode walks N past 1024 (512 seed + 512 decode).
         // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
         // The kL=1024 warm above compiles the 64-block family. Compile the
@@ -541,6 +558,46 @@ public final class Qwen36MTPBlockSession {
                 )
             }
             eval(outs1025)
+            Self.warmExactnessChunkSDPA(
+                keys: k1025, values: v1025,
+                qHeads: qHeads, headDim: headDim, scale: scale)
+        }
+    }
+
+    /// Untimed. Throwaway FA K/V only. Compiles the live exactness-chunk
+    /// graph from `attentionWithCacheUpdate` for qL in 6...9: sliced query
+    /// halves, sliced-K chunk A, full-K chunk B, concat on axis 2. Isolated
+    /// full-kL qL={1..5} SDPA evals never name this expression.
+    private static func warmExactnessChunkSDPA(
+        keys: MLXArray, values: MLXArray,
+        qHeads: Int, headDim: Int, scale: Float
+    ) {
+        var chunkOuts: [MLXArray] = []
+        for qL in 6 ... 9 {
+            let split = 5
+            let kL = keys.dim(2)
+            guard kL >= qL else { continue }
+            let kSplit = kL - (qL - split)
+            let q = MLXArray.zeros(
+                [keys.dim(0), qHeads, qL, headDim], dtype: keys.dtype)
+            let outA = MLXFast.scaledDotProductAttention(
+                queries: q[0..., 0..., 0 ..< split, 0...],
+                keys: keys[0..., 0..., 0 ..< kSplit, 0...],
+                values: values[0..., 0..., 0 ..< kSplit, 0...],
+                scale: scale,
+                mask: .causal
+            )
+            let outB = MLXFast.scaledDotProductAttention(
+                queries: q[0..., 0..., split..., 0...],
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: .causal
+            )
+            chunkOuts.append(concatenated([outA, outB], axis: 2))
+        }
+        if !chunkOuts.isEmpty {
+            eval(chunkOuts)
         }
     }
 
