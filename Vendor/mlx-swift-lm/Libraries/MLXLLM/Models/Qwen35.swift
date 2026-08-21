@@ -1852,6 +1852,240 @@ func qwen35DualRMSNormConcat(
 
 // MARK: - Attention
 
+/// Reconstruct the original 12,288-row Q+gate projection from two bit-exact
+/// sources: affine-4 rows for the non-island outputs and BF16 matmul rows for
+/// the precision islands.  `sourceMap[q] >= 0` indexes the compact affine-4
+/// result; a negative entry encodes exact row `-entry - 1`.
+private let qwen35ReconstructExactQKernel = MLXFast.metalKernel(
+    name: "qwen35_reconstruct_exact_q_bf16_v1",
+    inputNames: ["compact_q", "exact_q", "source_map"],
+    outputNames: ["full_q"],
+    source: """
+        constexpr uint Q_OUT = 12288;
+        constexpr uint EXACT_Q = 1024;
+        constexpr uint EXACT_QKV = 3072;
+        constexpr uint COMPACT_Q = Q_OUT - EXACT_Q;
+
+        uint index = thread_position_in_grid.x;
+        uint row = index / Q_OUT;
+        uint q = index - row * Q_OUT;
+        int source = source_map[q];
+        full_q[index] = source >= 0
+            ? compact_q[row * COMPACT_Q + uint(source)]
+            : exact_q[row * EXACT_QKV + uint(-source - 1)];
+    """,
+    ensureRowContiguous: true
+)
+
+private func qwen35ReconstructExactQ(
+    compact: MLXArray,
+    exact: MLXArray,
+    sourceMap: MLXArray
+) -> MLXArray {
+    var outputShape = compact.shape
+    outputShape[outputShape.count - 1] = 12_288
+    let elementCount = outputShape.reduce(1, *)
+    return qwen35ReconstructExactQKernel(
+        [compact, exact, sourceMap],
+        grid: (elementCount, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+/// Prepare Q/K for attention directly from the compact affine-4 Q rows and
+/// exact precision-island rows.  Query and gate rows share the original
+/// interleaved 512-row-per-head projection layout; the signed source map
+/// identifies which backing tensor owns each original row.  K/V are complete
+/// exact islands, so K is normalized/rotated here and V remains a direct view.
+private let qwen35CompressedAttentionQKGateKernel = MLXFast.metalKernel(
+    name: "qwen35_compressed_attention_qk_gate_bf16_v1",
+    inputNames: [
+        "compact_q", "exact_qkv", "source_map",
+        "q_weight", "k_weight", "eps", "offset", "log2_base",
+    ],
+    outputNames: ["q_out", "k_out", "gate_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint query_heads = 24;
+        constexpr uint key_heads = 4;
+        constexpr uint axis_size = 256;
+        constexpr uint q_head_stride = 512;
+        constexpr uint exact_q_rows = 1024;
+        constexpr uint rotary_dimensions = 64;
+        constexpr uint rotary_pairs = rotary_dimensions / 2;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint batch_size = uint(compact_q_shape[0]);
+        uint sequence_length = uint(compact_q_shape[1]);
+        uint query_rows = batch_size * query_heads * sequence_length;
+        bool is_query = row < query_rows;
+        uint local_row = is_query ? row : row - query_rows;
+        uint head_count = is_query ? query_heads : key_heads;
+        uint batch = local_row / (head_count * sequence_length);
+        uint head_sequence = local_row % (head_count * sequence_length);
+        uint head = head_sequence / sequence_length;
+        uint sequence = head_sequence % sequence_length;
+
+        ulong compact_base = ulong(batch) * ulong(compact_q_strides[0])
+            + ulong(sequence) * ulong(compact_q_strides[1]);
+        ulong exact_base = ulong(batch) * ulong(exact_qkv_strides[0])
+            + ulong(sequence) * ulong(exact_qkv_strides[1]);
+        ulong qk_output_base = ulong(local_row) * ulong(axis_size);
+        ulong weight_stride = is_query
+            ? ulong(q_weight_strides[0])
+            : ulong(k_weight_strides[0]);
+        ulong gate_output_base =
+            (ulong(batch) * ulong(sequence_length) + ulong(sequence))
+                * ulong(query_heads * axis_size)
+            + ulong(head * axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+        threadgroup bfloat raw[axis_size];
+        threadgroup bfloat normalized[axis_size];
+
+        float acc = 0.0f;
+        uint first = thread_id * n_reads;
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            bfloat input_value;
+            if (is_query) {
+                uint q_row = head * q_head_stride + element;
+                int q_source = source_map[q_row];
+                if (q_source >= 0) {
+                    input_value = compact_q[compact_base
+                        + ulong(q_source) * ulong(compact_q_strides[2])];
+                } else {
+                    input_value = exact_qkv[exact_base
+                        + ulong(-q_source - 1) * ulong(exact_qkv_strides[2])];
+                }
+
+                uint gate_row = q_row + axis_size;
+                int gate_source = source_map[gate_row];
+                if (gate_source >= 0) {
+                    gate_out[gate_output_base + ulong(element)] =
+                        compact_q[compact_base
+                            + ulong(gate_source) * ulong(compact_q_strides[2])];
+                } else {
+                    gate_out[gate_output_base + ulong(element)] =
+                        exact_qkv[exact_base
+                            + ulong(-gate_source - 1)
+                                * ulong(exact_qkv_strides[2])];
+                }
+            } else {
+                uint k_row = exact_q_rows + head * axis_size + element;
+                input_value = exact_qkv[exact_base
+                    + ulong(k_row) * ulong(exact_qkv_strides[2])];
+            }
+            raw[element] = input_value;
+            float value = float(input_value);
+            acc += value * value;
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            bfloat input_value = raw[element];
+            bfloat rms_value = bfloat(float(input_value) * inv_mean);
+            bfloat weight = is_query
+                ? q_weight[ulong(element) * weight_stride]
+                : k_weight[ulong(element) * weight_stride];
+            normalized[element] = weight * rms_value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element >= rotary_dimensions) {
+                if (is_query) {
+                    q_out[qk_output_base + ulong(element)] = normalized[element];
+                } else {
+                    k_out[qk_output_base + ulong(element)] = normalized[element];
+                }
+            }
+        }
+
+        if (thread_id < rotary_pairs / n_reads) {
+            for (uint i = 0; i < n_reads; ++i) {
+                uint pair = first + i;
+                float d = float(pair) / float(rotary_pairs);
+                float inv_freq = metal::exp2(-d * float(log2_base));
+                float position = float(int(sequence) + int(offset));
+                float theta = position * inv_freq;
+                float costheta = metal::fast::cos(theta);
+                float sintheta = metal::fast::sin(theta);
+                float x1 = float(normalized[pair]);
+                float x2 = float(normalized[pair + rotary_pairs]);
+                bfloat rx1 = bfloat(x1 * costheta - x2 * sintheta);
+                bfloat rx2 = bfloat(x1 * sintheta + x2 * costheta);
+                if (is_query) {
+                    q_out[qk_output_base + ulong(pair)] = rx1;
+                    q_out[qk_output_base + ulong(pair + rotary_pairs)] = rx2;
+                } else {
+                    k_out[qk_output_base + ulong(pair)] = rx1;
+                    k_out[qk_output_base + ulong(pair + rotary_pairs)] = rx2;
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+private func qwen35CompressedAttentionQKGate(
+    compactQ: MLXArray,
+    exactQKV: MLXArray,
+    sourceMap: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    offset: Int,
+    log2Base: Float
+) -> (queries: MLXArray, keys: MLXArray, gate: MLXArray) {
+    let B = compactQ.dim(0)
+    let L = compactQ.dim(1)
+    let totalRows = B * L * (24 + 4)
+    let outputs = qwen35CompressedAttentionQKGateKernel(
+        [compactQ, exactQKV, sourceMap, qWeight, kWeight,
+         eps, offset, log2Base],
+        grid: (totalRows * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [
+            [B, 24, L, 256],
+            [B, 4, L, 256],
+            [B, L, 24, 256],
+        ],
+        outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
@@ -1906,6 +2140,10 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    private var _exactKRowCount = 0
+    private var _exactKVFull = false
+    private var _qNonExactIndices: MLXArray?
+    private var _qReconstructMap: MLXArray?
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1959,21 +2197,46 @@ final class Qwen35Attention: Module {
     /// One affine-4 GEMM for Q+gate, K, and V. Rows are independent, so
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
-    private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    private func qkv(_ x: MLXArray) -> (
+        q: MLXArray?, keys: MLXArray, values: MLXArray,
+        compactQ: MLXArray?, exactQKV: MLXArray?
+    ) {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
-            var y = quantizedMM(
+            let y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
-            y = replaceExactRows(y, input: x, kvOnly: false)
+            if _exactKVFull,
+               let exactWeight = _exactQKVWeight
+            {
+                let exact = matmul(x, exactWeight.transposed(1, 0))
+                let kv = exact[.ellipsis, _exactQRowCount...]
+                return (
+                    nil,
+                    kv[.ellipsis, ..<_exactKRowCount],
+                    kv[.ellipsis, _exactKRowCount...],
+                    y,
+                    exact)
+            }
+            let corrected = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
-            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+            return (
+                corrected[.ellipsis, ..<qEnd],
+                corrected[.ellipsis, qEnd ..< kEnd],
+                corrected[.ellipsis, kEnd...],
+                nil,
+                nil)
         }
         if let w = _qkvDenseW {
             let y = matmul(x, w.transposed(1, 0))
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
-            return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+            return (
+                y[.ellipsis, ..<qEnd],
+                y[.ellipsis, qEnd ..< kEnd],
+                y[.ellipsis, kEnd...],
+                nil,
+                nil)
         }
         if let q = qProj as? QuantizedLinear,
            let k = kProj as? QuantizedLinear,
@@ -1983,9 +2246,15 @@ final class Qwen35Attention: Module {
            q.mode == k.mode, q.mode == .affine,
            let qz = q.biases, let kz = k.biases, let vz = v.biases
         {
-            _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
-            _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
-            _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            if _exactKVFull, let qNonExactIndices = _qNonExactIndices {
+                _qkvW = q.weight.take(qNonExactIndices, axis: 0).contiguous()
+                _qkvS = q.scales.take(qNonExactIndices, axis: 0).contiguous()
+                _qkvZ = qz.take(qNonExactIndices, axis: 0).contiguous()
+            } else {
+                _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
+                _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
+                _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            }
             _qkvGS = q.groupSize
             _qkvBits = q.bits
             _qkvMode = q.mode
@@ -2004,12 +2273,19 @@ final class Qwen35Attention: Module {
             _kOut = kProj.weight.dim(0)
             return qkv(x)
         }
-        return (qProj(x), kProj(x), vProj(x))
+        return (qProj(x), kProj(x), vProj(x), nil, nil)
     }
 
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if _exactKVFull, let exactWeight = _exactQKVWeight {
+            let y = matmul(
+                x, exactWeight[_exactQRowCount...].transposed(1, 0))
+            return (
+                y[.ellipsis, ..<_exactKRowCount],
+                y[.ellipsis, _exactKRowCount...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2072,20 +2348,100 @@ final class Qwen35Attention: Module {
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
-        vWeight: MLXArray, vIndices: MLXArray
+        vWeight: MLXArray, vIndices: MLXArray, vOutputCount: Int
     ) {
         precondition(
             qWeight.dim(0) == qIndices.dim(0)
                 && kWeight.dim(0) == kIndices.dim(0)
                 && vWeight.dim(0) == vIndices.dim(0),
             "Qwen MTP precision-island weights and indices must have equal row counts")
-        let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
+        let qHost = qIndices.asType(.int32).asArray(Int32.self).map(Int.init)
+        let kHost = kIndices.asType(.int32).asArray(Int32.self).map(Int.init)
+        let vHost = vIndices.asType(.int32).asArray(Int32.self).map(Int.init)
+        let qUnique = Set(qHost)
+        let kUnique = Set(kHost)
+        let vUnique = Set(vHost)
+        let exactKVFull =
+            kHost.count == kOutputCount && kUnique == Set(0 ..< kOutputCount)
+            && vHost.count == vOutputCount && vUnique == Set(0 ..< vOutputCount)
+        let qCompressible =
+            qHost.count == 1_024 && qUnique.count == qHost.count
+            && qHost.allSatisfy { $0 >= 0 && $0 < qOutputCount }
+        let quantizedProjectionCompatible: Bool
+        if let q = qProj as? QuantizedLinear,
+           let k = kProj as? QuantizedLinear,
+           let v = vProj as? QuantizedLinear
+        {
+            quantizedProjectionCompatible =
+                q.groupSize == 64 && k.groupSize == 64 && v.groupSize == 64
+                && q.bits == 4 && k.bits == 4 && v.bits == 4
+                && q.mode == .affine && k.mode == .affine && v.mode == .affine
+                && q.shape.0 == qOutputCount
+                && k.shape.0 == kOutputCount
+                && v.shape.0 == vOutputCount
+        } else {
+            quantizedProjectionCompatible = false
+        }
+
+        let useCompressedExactPath =
+            quantizedProjectionCompatible && exactKVFull && qCompressible
+            && qOutputCount == 12_288
+            && kOutputCount == 1_024 && vOutputCount == 1_024
+            && qWeight.dtype == .bfloat16
+            && kWeight.dtype == .bfloat16
+            && vWeight.dtype == .bfloat16
+        guard useCompressedExactPath else {
+            // Preserve the incumbent attachment and putAlong ordering exactly
+            // for every artifact outside the complete specialization contract.
+            let weight = concatenated(
+                [qWeight, kWeight, vWeight], axis: 0
+            ).contiguous()
+            let qkvIndices = concatenated(
+                [qIndices, kIndices + qOutputCount,
+                 vIndices + qOutputCount + kOutputCount], axis: 0)
+                .asType(.int32).contiguous()
+            let kvIndices = concatenated(
+                [kIndices, vIndices + kOutputCount], axis: 0)
+                .asType(.int32).contiguous()
+            eval(weight, qkvIndices, kvIndices)
+
+            _exactQKVWeight = weight
+            _exactQKVIndices = qkvIndices
+            _exactKVIndices = kvIndices
+            _exactQRowCount = qWeight.dim(0)
+            _exactKRowCount = kWeight.dim(0)
+            _exactKVFull = false
+            _qNonExactIndices = nil
+            _qReconstructMap = nil
+            return
+        }
+
+        let qOrder = qHost.indices.sorted { qHost[$0] < qHost[$1] }
+        let kOrder = kHost.indices.sorted { kHost[$0] < kHost[$1] }
+        let vOrder = vHost.indices.sorted { vHost[$0] < vHost[$1] }
+        let orderedQWeight = qWeight.take(
+            MLXArray(qOrder.map(Int32.init)), axis: 0)
+        let orderedKWeight = kWeight.take(
+            MLXArray(kOrder.map(Int32.init)), axis: 0)
+        let orderedVWeight = vWeight.take(
+            MLXArray(vOrder.map(Int32.init)), axis: 0)
+        let orderedQHost = qOrder.map { qHost[$0] }
+        let orderedKHost = kOrder.map { kHost[$0] }
+        let orderedVHost = vOrder.map { vHost[$0] }
+
+        let weight = concatenated(
+            [orderedQWeight, orderedKWeight, orderedVWeight], axis: 0
+        ).contiguous()
         let qkvIndices = concatenated(
-            [qIndices, kIndices + qOutputCount,
-             vIndices + qOutputCount + kOutputCount], axis: 0)
+            [MLXArray(orderedQHost.map(Int32.init)),
+             MLXArray(orderedKHost.map { Int32($0 + qOutputCount) }),
+             MLXArray(orderedVHost.map {
+                 Int32($0 + qOutputCount + kOutputCount)
+             })], axis: 0)
             .asType(.int32).contiguous()
         let kvIndices = concatenated(
-            [kIndices, vIndices + kOutputCount], axis: 0)
+            [MLXArray(orderedKHost.map(Int32.init)),
+             MLXArray(orderedVHost.map { Int32($0 + kOutputCount) })], axis: 0)
             .asType(.int32).contiguous()
         eval(weight, qkvIndices, kvIndices)
 
@@ -2093,6 +2449,38 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+        _exactKRowCount = kWeight.dim(0)
+        _exactKVFull = true
+
+        let nonExact = (0 ..< qOutputCount).filter { !qUnique.contains($0) }
+        var compactPosition = 0
+        var exactPosition = 0
+        var sourceMap = [Int32]()
+        sourceMap.reserveCapacity(qOutputCount)
+        for q in 0 ..< qOutputCount {
+            if exactPosition < orderedQHost.count,
+               orderedQHost[exactPosition] == q
+            {
+                sourceMap.append(Int32(-exactPosition - 1))
+                exactPosition += 1
+            } else {
+                sourceMap.append(Int32(compactPosition))
+                compactPosition += 1
+            }
+        }
+        precondition(nonExact.count == 11_264 && compactPosition == nonExact.count)
+        _qNonExactIndices = MLXArray(nonExact.map(Int32.init)).contiguous()
+        _qReconstructMap = MLXArray(sourceMap).contiguous()
+        eval(_qNonExactIndices!, _qReconstructMap!)
+
+        // Force lazy packs to rebuild without rows already supplied by the
+        // exact precision islands.
+        _qkvW = nil
+        _qkvS = nil
+        _qkvZ = nil
+        _kvW = nil
+        _kvS = nil
+        _kvZ = nil
     }
 
     /// Append rows to an attention cache without producing query outputs.
@@ -2115,53 +2503,108 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let (qProjOutput, keysIn, valuesIn) = qkv(x)
-        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
-        var queries = qSplit[0]
-        // Keep the gate 4-D: flattening here merged a head axis across the
-        // packed q/gate interleave, which is a REAL Copy kernel per call. The
-        // compiled elementwise below takes strided inputs without copies; the
-        // element pairing (h, d) <-> flat h*D+d is identical either way.
-        let gate = qSplit[1]
-
-        var keys = keysIn
-        var values = valuesIn
-
-        keys = keys.reshaped(B, L, kvHeads, -1)
-        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-
+        let projection = qkv(x)
+        let values = projection.values
+            .reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
         let hasArrayOffset = cache is CompilableRotatingKVCache
             || cache is CompilableKVCache
             || cache is BatchPositionedKVCache
-        if usesFusedQKPreparation,
+        let queries: MLXArray
+        let keys: MLXArray
+        let gate: MLXArray
+
+        if _exactKVFull,
+           let compactQ = projection.compactQ,
+           let exactQKV = projection.exactQKV,
+           let sourceMap = _qReconstructMap,
+           usesFusedQKPreparation,
            L <= 32,
            !hasArrayOffset,
-           queries.dtype == .bfloat16,
-           keys.dtype == .bfloat16,
+           _exactQRowCount == 1_024,
+           _exactKRowCount == 1_024,
+           compactQ.dtype == .bfloat16,
+           exactQKV.dtype == .bfloat16,
+           sourceMap.dtype == .int32,
            qNorm.weight.dtype == .bfloat16,
            kNorm.weight.dtype == .bfloat16,
-           queries.shape == [B, L, attentionHeads, headDim],
-           keys.shape == [B, L, kvHeads, headDim],
+           compactQ.shape == [B, L, 11_264],
+           exactQKV.shape == [B, L, 3_072],
+           sourceMap.shape == [12_288],
            qNorm.weight.shape == [headDim],
            kNorm.weight.shape == [headDim],
            qNorm.eps == kNorm.eps
         {
-            let prepared = qwen35AttentionQKRMSRoPE(
-                queries: queries,
-                keys: keys,
+            let prepared = qwen35CompressedAttentionQKGate(
+                compactQ: compactQ,
+                exactQKV: exactQKV,
+                sourceMap: sourceMap,
                 qWeight: qNorm.weight,
                 kWeight: kNorm.weight,
                 eps: qNorm.eps,
                 offset: cache?.offset ?? 0,
-                log2Base: ropeLog2Base
-            )
+                log2Base: ropeLog2Base)
             queries = prepared.queries
             keys = prepared.keys
+            gate = prepared.gate
         } else {
-            queries = qNorm(queries).transposed(0, 2, 1, 3)
-            keys = kNorm(keys).transposed(0, 2, 1, 3)
-            queries = applyRotaryPosition(rope, to: queries, cache: cache)
-            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+            let qProjOutput: MLXArray
+            if let fullQ = projection.q {
+                qProjOutput = fullQ
+            } else if let compactQ = projection.compactQ,
+                      let exactQKV = projection.exactQKV,
+                      let sourceMap = _qReconstructMap
+            {
+                qProjOutput = qwen35ReconstructExactQ(
+                    compact: compactQ,
+                    exact: exactQKV,
+                    sourceMap: sourceMap)
+            } else {
+                preconditionFailure("compressed Q projection is incomplete")
+            }
+
+            let qSplit = qProjOutput
+                .reshaped(B, L, attentionHeads, -1)
+                .split(parts: 2, axis: -1)
+            var legacyQueries = qSplit[0]
+            // Keep the gate 4-D: flattening here merged a head axis across the
+            // packed q/gate interleave, which is a REAL Copy per call.
+            gate = qSplit[1]
+            var legacyKeys = projection.keys.reshaped(B, L, kvHeads, -1)
+
+            if usesFusedQKPreparation,
+               L <= 32,
+               !hasArrayOffset,
+               legacyQueries.dtype == .bfloat16,
+               legacyKeys.dtype == .bfloat16,
+               qNorm.weight.dtype == .bfloat16,
+               kNorm.weight.dtype == .bfloat16,
+               legacyQueries.shape == [B, L, attentionHeads, headDim],
+               legacyKeys.shape == [B, L, kvHeads, headDim],
+               qNorm.weight.shape == [headDim],
+               kNorm.weight.shape == [headDim],
+               qNorm.eps == kNorm.eps
+            {
+                let prepared = qwen35AttentionQKRMSRoPE(
+                    queries: legacyQueries,
+                    keys: legacyKeys,
+                    qWeight: qNorm.weight,
+                    kWeight: kNorm.weight,
+                    eps: qNorm.eps,
+                    offset: cache?.offset ?? 0,
+                    log2Base: ropeLog2Base
+                )
+                legacyQueries = prepared.queries
+                legacyKeys = prepared.keys
+            } else {
+                legacyQueries = qNorm(legacyQueries).transposed(0, 2, 1, 3)
+                legacyKeys = kNorm(legacyKeys).transposed(0, 2, 1, 3)
+                legacyQueries = applyRotaryPosition(
+                    rope, to: legacyQueries, cache: cache)
+                legacyKeys = applyRotaryPosition(
+                    rope, to: legacyKeys, cache: cache)
+            }
+            queries = legacyQueries
+            keys = legacyKeys
         }
 
         // Transpose is a view; the old post-transpose flatten was the second
@@ -3125,7 +3568,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 layer.selfAttn.installExactQKVRows(
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
                     kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
-                    vWeight: vWeight, vIndices: vIndices)
+                    vWeight: vWeight, vIndices: vIndices, vOutputCount: 1_024)
             }
         }
 
