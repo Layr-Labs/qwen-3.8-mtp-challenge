@@ -1906,6 +1906,12 @@ final class Qwen35Attention: Module {
     private var _exactQKVIndices: MLXArray?
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
+    // True only after K and V island indices are a complete permutation of
+    // every projection output row. Then quantized K/V GEMM is dead work:
+    // replaceExactRows already overwrites those rows. Q stays a 1024-row
+    // subset of 12288 and still uses the quantized pack + scatter.
+    private var _exactKVFull = false
+    private var _vOut = 0
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -1964,6 +1970,15 @@ final class Qwen35Attention: Module {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+            if _exactKVFull {
+                // Pack is Q-only. Materialize K/V solely via replaceExactRows
+                // onto a dummy last-axis of zeros. Proven complete permutation
+                // => every K and V row is overwritten; dummy values never leak.
+                var kvShape = y.shape
+                kvShape[kvShape.count - 1] = _kOut + _vOut
+                y = concatenated(
+                    [y, MLXArray.zeros(kvShape, dtype: y.dtype)], axis: -1)
+            }
             y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
@@ -1983,14 +1998,22 @@ final class Qwen35Attention: Module {
            q.mode == k.mode, q.mode == .affine,
            let qz = q.biases, let kz = k.biases, let vz = v.biases
         {
-            _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
-            _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
-            _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            if _exactKVFull {
+                // K/V quantized rows would be 100% overwritten. Pack Q only.
+                _qkvW = q.weight.contiguous()
+                _qkvS = q.scales.contiguous()
+                _qkvZ = qz.contiguous()
+            } else {
+                _qkvW = concatenated([q.weight, k.weight, v.weight], axis: 0).contiguous()
+                _qkvS = concatenated([q.scales, k.scales, v.scales], axis: 0).contiguous()
+                _qkvZ = concatenated([qz, kz, vz], axis: 0).contiguous()
+            }
             _qkvGS = q.groupSize
             _qkvBits = q.bits
             _qkvMode = q.mode
             _qOut = q.shape.0
             _kOut = k.shape.0
+            _vOut = v.shape.0
             return qkv(x)
         }
         if !(qProj is QuantizedLinear), !(kProj is QuantizedLinear),
@@ -2010,6 +2033,29 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if _exactKVFull {
+            // History-flush path: no query. Skip the quantized K+V pack
+            // entirely. replaceExactRows is the only K/V materialization.
+            if _kvOut == 0 {
+                if let k = kProj as? QuantizedLinear {
+                    _kvOut = k.shape.0
+                } else {
+                    _kvOut = kProj.weight.dim(0)
+                }
+            }
+            if _vOut == 0 {
+                if let v = vProj as? QuantizedLinear {
+                    _vOut = v.shape.0
+                } else {
+                    _vOut = vProj.weight.dim(0)
+                }
+            }
+            var shape = x.shape
+            shape[shape.count - 1] = _kvOut + _vOut
+            var y = MLXArray.zeros(shape, dtype: x.dtype)
+            y = replaceExactRows(y, input: x, kvOnly: true)
+            return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2093,6 +2139,41 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+
+        let vOutputCount = kvHeads * headDim
+        _exactKVFull =
+            kOutputCount == vOutputCount
+            && isCompletePermutation(kIndices, count: kOutputCount)
+            && isCompletePermutation(vIndices, count: vOutputCount)
+        if _exactKVFull {
+            _kvOut = kOutputCount
+            _vOut = vOutputCount
+            // Force lazy packs to rebuild: Q-only QKV pack, no KV pack.
+            _qkvW = nil
+            _qkvS = nil
+            _qkvZ = nil
+            _kvW = nil
+            _kvS = nil
+            _kvZ = nil
+        }
+    }
+
+    /// Host-side algebraic check: indices are a complete permutation of
+    /// `0 ..< count`. Used only on the load path. A partial island must
+    /// never flip `_exactKVFull` — that would skip rows replaceExactRows
+    /// does not overwrite.
+    private func isCompletePermutation(_ indices: MLXArray, count: Int) -> Bool {
+        guard indices.dim(0) == count, count > 0 else { return false }
+        eval(indices)
+        let vals = indices.asType(.int32).asArray(Int32.self)
+        guard vals.count == count else { return false }
+        var seen = [Bool](repeating: false, count: count)
+        for raw in vals {
+            let i = Int(raw)
+            if i < 0 || i >= count || seen[i] { return false }
+            seen[i] = true
+        }
+        return true
     }
 
     /// Append rows to an attention cache without producing query outputs.
