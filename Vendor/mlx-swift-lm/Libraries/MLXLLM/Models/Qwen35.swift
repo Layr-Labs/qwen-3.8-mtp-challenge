@@ -1850,6 +1850,122 @@ func qwen35DualRMSNormConcat(
     return outputs[0]
 }
 
+
+/// Backbone quantized-embedding gather + first-layer RMSNorm. Candidate
+/// verify widths S=2...9 only: serial S=1 stays on `embedTokens` so the
+/// relative score sees the launch removal on the speculative leg.
+/// Affine-4/group-64 dequant matches MLX `affine_dequantize` (8 nibbles per
+/// uint32, low nibble first, `bfloat(q)*scale+bias`). Residual base is the
+/// dequantized row; attn input is the RMSNormed row — one launch instead of
+/// gather + dequant + RMSNorm.
+private let qwen35QuantizedEmbeddingRMSNormKernel = MLXFast.metalKernel(
+    name: "qwen35_q4_embedding_rms_norm_bf16_v1",
+    inputNames: [
+        "token_ids", "embedding_weight", "embedding_scales",
+        "embedding_biases", "norm_weight", "eps",
+    ],
+    outputNames: ["raw_out", "norm_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(norm_weight_shape[0]);
+        long token = long(token_ids[row]);
+        ulong packed_off = ulong(token) * ulong(embedding_weight_shape[1]);
+        ulong scale_off = ulong(token) * ulong(embedding_scales_shape[1]);
+        ulong out_off = ulong(row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint index = elem + i;
+                if (index < axis_size) {
+                    uint packed = embedding_weight[
+                        packed_off + ulong(index / 8)];
+                    uint q = (packed >> (4 * (index & 7))) & 0x0f;
+                    bfloat dequantized = bfloat(q)
+                        * embedding_scales[scale_off + ulong(index / 64)]
+                        + embedding_biases[scale_off + ulong(index / 64)];
+                    float xi = float(dequantized);
+                    acc += xi * xi;
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            for (uint i = 0; i < n_reads; ++i) {
+                uint index = elem + i;
+                if (index < axis_size) {
+                    uint packed = embedding_weight[
+                        packed_off + ulong(index / 8)];
+                    uint q = (packed >> (4 * (index & 7))) & 0x0f;
+                    bfloat dequantized = bfloat(q)
+                        * embedding_scales[scale_off + ulong(index / 64)]
+                        + embedding_biases[scale_off + ulong(index / 64)];
+                    float xi = float(dequantized);
+                    raw_out[out_off + ulong(index)] = dequantized;
+                    norm_out[out_off + ulong(index)] =
+                        norm_weight[index] * bfloat(xi * inv_mean);
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35QuantizedEmbeddingRMSNorm(
+    tokenIds: MLXArray,
+    embeddingWeight: MLXArray,
+    embeddingScales: MLXArray,
+    embeddingBiases: MLXArray,
+    normWeight: MLXArray,
+    eps: Float,
+    outShape: [Int]
+) -> (MLXArray, MLXArray) {
+    let nRows = tokenIds.size
+    let outputs = qwen35QuantizedEmbeddingRMSNormKernel(
+        [
+            tokenIds, embeddingWeight, embeddingScales, embeddingBiases,
+            normWeight, MLXArray(eps),
+        ],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape, outShape],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -2583,7 +2699,8 @@ final class Qwen35DecoderLayer: Module {
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        preNormed: MLXArray? = nil
     ) -> (base: MLXArray, delta: MLXArray) {
         let hIn: MLXArray
         let normedIn: MLXArray
@@ -2592,6 +2709,9 @@ final class Qwen35DecoderLayer: Module {
                 x: base, r: delta,
                 weight: inputLayerNorm.weight,
                 eps: inputLayerNorm.eps)
+        } else if let preNormed {
+            hIn = base
+            normedIn = preNormed
         } else {
             hIn = base
             normedIn = inputLayerNorm(base)
@@ -2657,7 +2777,37 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+        var firstLayerPreNormed: MLXArray? = nil
+        var hiddenStates: MLXArray
+        let seqLen = inputs.dim(1)
+        if seqLen >= 2, seqLen <= 9, inputs.ndim == 2,
+           (inputs.dtype == .int32 || inputs.dtype == .int64),
+           let quantized = embedTokens as? QuantizedEmbedding,
+           quantized.groupSize == 64, quantized.bits == 4,
+           quantized.mode == .affine,
+           let embeddingBiases = quantized.biases,
+           quantized.shape.1 == 5120,
+           quantized.weight.dtype == .uint32,
+           quantized.weight.shape == [quantized.shape.0, 5120 / 8],
+           quantized.scales.dtype == .bfloat16,
+           embeddingBiases.dtype == .bfloat16,
+           quantized.scales.shape == [quantized.shape.0, 5120 / 64],
+           embeddingBiases.shape == quantized.scales.shape,
+           layers[0].inputLayerNorm.weight.dtype == .bfloat16
+        {
+            let fused = qwen35QuantizedEmbeddingRMSNorm(
+                tokenIds: inputs,
+                embeddingWeight: quantized.weight,
+                embeddingScales: quantized.scales,
+                embeddingBiases: embeddingBiases,
+                normWeight: layers[0].inputLayerNorm.weight,
+                eps: layers[0].inputLayerNorm.eps,
+                outShape: [inputs.dim(0), seqLen, 5120])
+            hiddenStates = fused.0
+            firstLayerPreNormed = fused.1
+        } else {
+            hiddenStates = embedTokens(inputs)
+        }
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -2694,7 +2844,8 @@ public class Qwen35TextModelInner: Module {
                 let out = layer.boundaryFused(
                     base: base, delta: delta,
                     attentionMask: attnMask, ssmMask: mask,
-                    cache: cacheArray?[i], nConfirmed: nConfirmed)
+                    cache: cacheArray?[i], nConfirmed: nConfirmed,
+                    preNormed: i == 0 ? firstLayerPreNormed : nil)
                 base = out.base
                 delta = out.delta
                 if ladderActive {
