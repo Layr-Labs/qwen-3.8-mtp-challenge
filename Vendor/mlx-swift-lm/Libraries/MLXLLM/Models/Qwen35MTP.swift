@@ -137,6 +137,101 @@ final class Qwen35MTPModule: Module {
             [preFcNormEmbedding(embeds), preFcNormHidden(hidden)], axis: -1)
     }
 
+    /// Read selected affine-4 embedding rows inside the dual-RMSNorm-concat
+    /// kernel so the proposal path never materializes the BF16 embedding.
+    private func preFcConcat(
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        hidden: MLXArray
+    ) -> MLXArray {
+        let integerIds = nextTokenIds.dtype == .int32 || nextTokenIds.dtype == .int64
+        if integerIds,
+           let quantized = embedTokens as? QuantizedEmbedding,
+           quantized.groupSize == 64, quantized.bits == 4,
+           quantized.mode == .affine,
+           let embeddingBiases = quantized.biases,
+           hidden.dtype == .bfloat16, hidden.ndim == 3,
+           hidden.dim(-1) == 5120,
+           nextTokenIds.size == hidden.size / hidden.dim(-1),
+           quantized.shape.1 == hidden.dim(-1),
+           quantized.weight.dtype == .uint32,
+           quantized.weight.shape == [quantized.shape.0, hidden.dim(-1) / 8],
+           quantized.scales.dtype == .bfloat16,
+           embeddingBiases.dtype == .bfloat16,
+           quantized.scales.shape == [quantized.shape.0, hidden.dim(-1) / 64],
+           embeddingBiases.shape == quantized.scales.shape,
+           preFcNormEmbedding.weight.dtype == .bfloat16,
+           preFcNormHidden.weight.dtype == .bfloat16,
+           preFcNormEmbedding.eps == preFcNormHidden.eps
+        {
+            return qwen35QuantizedEmbeddingDualRMSNormConcat(
+                tokenIds: nextTokenIds,
+                embeddingWeight: quantized.weight,
+                embeddingScales: quantized.scales,
+                embeddingBiases: embeddingBiases,
+                hidden: hidden,
+                embeddingNormWeight: preFcNormEmbedding.weight,
+                hiddenNormWeight: preFcNormHidden.weight,
+                eps: preFcNormEmbedding.eps)
+        }
+        let embeds = embedTokens(nextTokenIds)
+        return preFcConcat(embeds: embeds, hidden: hidden)
+    }
+
+    /// One dispatch for the single-row `fc(preFcConcat(...))` boundary on
+    /// the quantized head: in-kernel embed dequant, dual-RMS carrier built
+    /// bit-identically to the concat kernel's output, and the affine-4/g64
+    /// fc QMV — no carrier round-trip, no separate QMV launch. Single
+    /// proposal rows only; every other shape keeps the concat + fc pair.
+    private func fusedOneDispatchPreFcRow(
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        hidden: MLXArray
+    ) -> MLXArray? {
+        let integerIds = nextTokenIds.dtype == .int32 || nextTokenIds.dtype == .int64
+        guard integerIds,
+              let quantized = embedTokens as? QuantizedEmbedding,
+              quantized.groupSize == 64, quantized.bits == 4,
+              quantized.mode == .affine,
+              let embeddingBiases = quantized.biases,
+              hidden.dtype == .bfloat16, hidden.ndim == 3,
+              hidden.dim(1) == 1, hidden.dim(-1) == 5120,
+              nextTokenIds.size == 1,
+              quantized.shape.1 == hidden.dim(-1),
+              quantized.weight.dtype == .uint32,
+              quantized.weight.shape == [quantized.shape.0, hidden.dim(-1) / 8],
+              quantized.scales.dtype == .bfloat16,
+              embeddingBiases.dtype == .bfloat16,
+              quantized.scales.shape == [quantized.shape.0, hidden.dim(-1) / 64],
+              embeddingBiases.shape == quantized.scales.shape,
+              preFcNormEmbedding.weight.dtype == .bfloat16,
+              preFcNormHidden.weight.dtype == .bfloat16,
+              preFcNormEmbedding.eps == preFcNormHidden.eps,
+              let qfc = fc as? QuantizedLinear,
+              qfc.groupSize == 64, qfc.bits == 4, qfc.mode == .affine,
+              let fcBiases = qfc.biases,
+              qfc.bias == nil,
+              qfc.weight.dtype == .uint32,
+              qfc.weight.shape == [5120, 10240 / 8],
+              qfc.scales.dtype == .bfloat16,
+              fcBiases.dtype == .bfloat16,
+              qfc.scales.shape == [5120, 10240 / 64],
+              fcBiases.shape == qfc.scales.shape
+        else { return nil }
+        return qwen35FusedQuantEmbedDualRMSNormQMVFc(
+            tokenIds: nextTokenIds,
+            embeddingWeight: quantized.weight,
+            embeddingScales: quantized.scales,
+            embeddingBiases: embeddingBiases,
+            hidden: hidden,
+            embeddingNormWeight: preFcNormEmbedding.weight,
+            hiddenNormWeight: preFcNormHidden.weight,
+            fcWeight: qfc.weight,
+            fcScales: qfc.scales,
+            fcBiases: fcBiases,
+            eps: preFcNormEmbedding.eps)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -145,8 +240,12 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        var fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        var fused = fusedOneDispatchPreFcRow(
+                nextTokenIds: nextTokenIds, embedTokens: embedTokens,
+                hidden: hidden)
+            ?? fc(preFcConcat(
+                nextTokenIds: nextTokenIds, embedTokens: embedTokens,
+                hidden: hidden))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -177,8 +276,8 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        let fused = fc(preFcConcat(
+            nextTokenIds: nextTokenIds, embedTokens: embedTokens, hidden: hidden))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
