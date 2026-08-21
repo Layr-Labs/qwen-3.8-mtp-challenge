@@ -1731,10 +1731,13 @@ func qwen35DualRMSNorm(
 }
 
 /// Dual RMSNorm that writes the concatenated `[e | h]` layout the MTP
-/// `fc` already consumes. Same per-row arithmetic as `qwen35DualRMSNorm`;
-/// the concat copy after that launch is dead.
+/// `fc` already consumes. Same per-row arithmetic as `qwen35DualRMSNorm`.
+/// #866 deleted the concat copy but kept a 2*nRows TG grid (one half-row
+/// per TG). After the two halves share one output row those TGs no longer
+/// write independent buffers: one TG owns the full `[e|h]` row and runs
+/// the two independent rsqrt trees sequentially (disjoint writes).
 private let qwen35DualRMSNormConcatKernel = MLXFast.metalKernel(
-    name: "qwen35_dual_rms_norm_concat_bf16_v1",
+    name: "qwen35_dual_rms_norm_concat_bf16_v2",
     inputNames: ["a", "b", "a_weight", "b_weight", "eps"],
     outputNames: ["concat_out"],
     source: """
@@ -1742,89 +1745,90 @@ private let qwen35DualRMSNormConcatKernel = MLXFast.metalKernel(
         constexpr uint simd_size = 32;
         constexpr uint lsize = 1024;
 
-        uint row = threadgroup_position_in_grid.x;
+        uint local_row = threadgroup_position_in_grid.x;
         uint thread_id = thread_position_in_threadgroup.x;
         uint simd_thread = thread_index_in_simdgroup;
         uint simd_group = simdgroup_index_in_threadgroup;
 
         uint axis_size = uint(a_shape[a_ndim - 1]);
-        uint a_rows = 1;
-        for (uint i = 0; i + 1 < a_ndim; ++i) {
-            a_rows *= uint(a_shape[i]);
-        }
-        bool is_a = row < a_rows;
-        uint local_row = is_a ? row : row - a_rows;
         ulong in_off = ulong(local_row) * ulong(axis_size);
-        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
-            + (is_a ? 0 : ulong(axis_size));
 
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[simd_size];
 
-        float acc = 0.0f;
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[in_off + elem + i])
-                        : float(b[in_off + elem + i]);
-                    acc += xi * xi;
-                }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
+        // Sequential a-then-b: same two independent RMS trees as the
+        // 2*nRows launch, one TG writes both concat halves.
+        for (uint half = 0; half < 2; ++half) {
+            bool is_a = (half == 0);
+            ulong out_off = ulong(local_row) * ulong(axis_size * 2)
+                + (is_a ? 0 : ulong(axis_size));
+
+            float acc = 0.0f;
+            for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+                uint elem = r_start + thread_id * n_reads;
+                if (elem + n_reads <= axis_size) {
+                    for (uint i = 0; i < n_reads; ++i) {
                         float xi = is_a
                             ? float(a[in_off + elem + i])
                             : float(b[in_off + elem + i]);
                         acc += xi * xi;
                     }
+                } else {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        if (elem + i < axis_size) {
+                            float xi = is_a
+                                ? float(a[in_off + elem + i])
+                                : float(b[in_off + elem + i]);
+                            acc += xi * xi;
+                        }
+                    }
                 }
             }
-        }
 
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(acc);
+            if (simd_group == 0) {
+                local_sums[simd_thread] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (simd_thread == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_thread]);
             if (simd_thread == 0) {
-                local_inv_mean[0] = metal::precise::rsqrt(
-                    acc / float(axis_size) + eps);
+                local_sums[simd_group] = acc;
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float inv_mean = local_inv_mean[0];
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            if (elem + n_reads <= axis_size) {
-                for (uint i = 0; i < n_reads; ++i) {
-                    float xi = is_a
-                        ? float(a[in_off + elem + i])
-                        : float(b[in_off + elem + i]);
-                    bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
-                    concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
+            if (simd_group == 0) {
+                acc = simd_sum(local_sums[simd_thread]);
+                if (simd_thread == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(
+                        acc / float(axis_size) + eps);
                 }
-            } else {
-                for (uint i = 0; i < n_reads; ++i) {
-                    if (elem + i < axis_size) {
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float inv_mean = local_inv_mean[0];
+            for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+                uint elem = r_start + thread_id * n_reads;
+                if (elem + n_reads <= axis_size) {
+                    for (uint i = 0; i < n_reads; ++i) {
                         float xi = is_a
                             ? float(a[in_off + elem + i])
                             : float(b[in_off + elem + i]);
                         bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
                         concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
                     }
+                } else {
+                    for (uint i = 0; i < n_reads; ++i) {
+                        if (elem + i < axis_size) {
+                            float xi = is_a
+                                ? float(a[in_off + elem + i])
+                                : float(b[in_off + elem + i]);
+                            bfloat wi = is_a ? a_weight[elem + i] : b_weight[elem + i];
+                            concat_out[out_off + elem + i] = wi * bfloat(xi * inv_mean);
+                        }
+                    }
                 }
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     """,
     ensureRowContiguous: false
@@ -1842,7 +1846,7 @@ func qwen35DualRMSNormConcat(
     outShape[outShape.count - 1] = a.dim(-1) + b.dim(-1)
     let outputs = qwen35DualRMSNormConcatKernel(
         [a, b, aWeight, bWeight, MLXArray(eps)],
-        grid: (2 * nRows * 1024, 1, 1),
+        grid: (nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [outShape],
         outputDTypes: [.bfloat16]
