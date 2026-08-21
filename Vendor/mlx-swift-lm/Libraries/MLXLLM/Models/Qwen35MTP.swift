@@ -65,23 +65,30 @@ final class Qwen35MTPDecoderLayer: Module {
         cache: (any KVCache)?
     ) -> MLXArray {
         // omlx: MTPDecoderLayer.__call__
-        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        // The backbone's decoder layer has fused this residual+norm boundary
-        // since `qwen35FusedResidualRMSNorm` landed; the head layer was left on
-        // the eager pair. Same kernel, same bf16/5120 guard, same
-        // bf16-round-before-square argument, so the values are bit-identical to
-        // `h = x + r; postAttentionLayerNorm(h)` — one launch and one host graph
-        // node instead of two, paid once per PROPOSED token (draftCount times a
-        // round) rather than once per layer.
-        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
-            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
-                x: x, r: r,
-                weight: postAttentionLayerNorm.weight,
-                eps: postAttentionLayerNorm.eps)
-            return h + (mlp as! UnaryLayer)(postAttnNorm)
+        if let pair = unmergedResidualMLP(x, mask: mask, cache: cache) {
+            return pair.h + pair.mlpOut
         }
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+
+    /// Split the last residual add off the eager `h + mlp(norm(h))` so the
+    /// MTP module can fold that add into `mtp.norm` with the same fused
+    /// residual+RMSNorm kernel the backbone already uses. Nil when the
+    /// bf16/5120 contract does not hold; the caller keeps `callAsFunction`.
+    func unmergedResidualMLP(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (any KVCache)?
+    ) -> (h: MLXArray, mlpOut: MLXArray)? {
+        guard x.dtype == .bfloat16, x.dim(-1) == 5120 else { return nil }
+        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+            x: x, r: r,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+        return (h, (mlp as! UnaryLayer)(postAttnNorm))
     }
 
     /// Populate this layer's K/V history without computing a dead layer
@@ -201,9 +208,20 @@ final class Qwen35MTPModule: Module {
         let firstCache: (any KVCache)? = cache.first
         let mask = createAttentionMask(h: fused, cache: firstCache)
 
-        // 3. Run each MTPDecoderLayer.
+        // 3. Run each MTPDecoderLayer. The last layer leaves its MLP
+        // residual unmerged so step 4 can fold that add into `mtp.norm`.
         for (i, layer) in layers.enumerated() {
             let c: (any KVCache)? = i < cache.count ? cache[i] : nil
+            if i + 1 == layers.count,
+               let pair = layer.unmergedResidualMLP(fused, mask: mask, cache: c),
+               pair.h.dtype == .bfloat16, pair.mlpOut.dtype == .bfloat16,
+               pair.h.dim(-1) == 5120
+            {
+                return qwen35FusedResidualRMSNorm(
+                    x: pair.h, r: pair.mlpOut,
+                    weight: norm.weight, eps: norm.eps
+                ).normed
+            }
             fused = layer(fused, mask: mask, cache: c)
         }
 
@@ -237,6 +255,16 @@ final class Qwen35MTPModule: Module {
 
         let current = fused[0..., historyCount..., 0...]
         let mask = createAttentionMask(h: current, cache: cache[0])
+        if let pair = layers[0].unmergedResidualMLP(
+            current, mask: mask, cache: cache[0]
+        ), pair.h.dtype == .bfloat16, pair.mlpOut.dtype == .bfloat16,
+           pair.h.dim(-1) == 5120
+        {
+            return qwen35FusedResidualRMSNorm(
+                x: pair.h, r: pair.mlpOut,
+                weight: norm.weight, eps: norm.eps
+            ).normed
+        }
         return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
 
