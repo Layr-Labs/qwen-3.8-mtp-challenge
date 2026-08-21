@@ -495,7 +495,13 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // qL={2,3} added to the crown's {1,4,5}: the exactness chunk splits a
+        // width-7/8/9 verify into a qL=5 chunk A plus a qL={2,3,4} chunk B, so
+        // deep rounds dispatch the qL=2 and qL=3 pipeline states too. Leaving
+        // them out first-touches those PSOs inside the scored window. Ranked
+        // receipts for exactly this extension on the pre-jump frontier:
+        // qL{1,4,5} 3.2355 -> qL{1..5} 3.2414, best draw 3.2452.
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -512,7 +518,7 @@ public final class Qwen36MTPBlockSession {
         // Scored decode walks N past 1024 (512 seed + 512 decode).
         // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
         // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
+        // 128-block family at kL=1025 for the same qL={1,2,3,4,5} set.
         if extK.dim(2) == 1024 {
             let kPad1 = MLXArray.zeros(
                 [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
@@ -521,7 +527,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
+            for qL in [1, 2, 3, 4, 5] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -759,7 +765,19 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    ///
+    /// 8 (was 7): cap 7 truncates one seventh of the parent's uniform 2..8
+    /// depth offers. Every width-9 machine path already exists and is
+    /// warmed: the sdpa exactness chunk serves qL<=9 (chunk A qL=5 + chunk
+    /// B qL=4), the GDN replay tape covers S=9, and warmAllDepthShapes
+    /// compiles widths 1...maxDepth+1 = 1...9 with nConfirmed:1. The prior
+    /// #851 cap=8 loss (3.212) was measured BEFORE the qL={2,3} warm fix:
+    /// its width-7/8/9 rounds first-touch compiled pipeline states inside
+    /// the scored window — exactly the mechanism the qL={1..5} warm
+    /// restored by this same diff (kL=1024 and kL=1025 families) removes.
+    /// Depth-rewarding evidence (fc62d1aa: shortening drafts lost -3% with
+    /// the baseline leg flat): the marginal draft beats its verify row.
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
