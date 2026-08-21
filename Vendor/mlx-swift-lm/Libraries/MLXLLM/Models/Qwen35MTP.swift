@@ -36,10 +36,13 @@ final class Qwen35MTPDecoderLayer: Module {
         } else {
             // Same fused gate/up MLP as the backbone layers; here the linears
             // stay bf16 and the fuse takes the plain-weight path. Head side —
-            // proposal-only, no exactness constraint.
+            // proposal-only, no exactness constraint. `proposalOnly` admits
+            // the single-row SwiGLU-into-down dispatch fusion; the backbone
+            // instances never set it, so the scored forward is untouched.
             _mlp.wrappedValue = Qwen35FusedMLP(
                 dimensions: args.hiddenSize,
-                hiddenDimensions: args.intermediateSize
+                hiddenDimensions: args.intermediateSize,
+                proposalOnly: true
             )
         }
         _inputLayerNorm.wrappedValue = RMSNorm(
@@ -137,6 +140,42 @@ final class Qwen35MTPModule: Module {
             [preFcNormEmbedding(embeds), preFcNormHidden(hidden)], axis: -1)
     }
 
+    /// `preFcConcat` with the embedding side's producer folded into the same
+    /// launch: the `QuantizedEmbedding` gather-dequant (packed-row, scales and
+    /// biases gathers plus `affine_dequantize`) becomes in-kernel reads, so a
+    /// head step's `[e | h]` input costs ONE dispatch instead of four. The
+    /// bf16 decode mirrors `affine_dequantize` exactly, so the embeds are
+    /// bit-identical to the materialized path. Proposal-only; any shape the
+    /// guards reject keeps the previous two-launch path byte-for-byte.
+    private func preFcConcatFromTokens(
+        nextTokenIds: MLXArray, hidden: MLXArray, embedTokens: Embedding
+    ) -> MLXArray {
+        if hidden.dtype == .bfloat16, hidden.dim(-1) == 5120,
+           nextTokenIds.dtype == .int32,
+           nextTokenIds.size == hidden.size / 5120,
+           preFcNormEmbedding.eps == preFcNormHidden.eps,
+           let quantized = embedTokens as? QuantizedEmbedding,
+           quantized.mode == .affine, quantized.groupSize == 64,
+           quantized.bits == 4,
+           quantized.weight.dtype == .uint32, quantized.weight.ndim == 2,
+           quantized.weight.dim(1) == 5120 * 4 / 32,
+           let qb = quantized.biases,
+           quantized.scales.dtype == .bfloat16, qb.dtype == .bfloat16,
+           quantized.scales.ndim == 2, quantized.scales.dim(1) == 5120 / 64,
+           quantized.scales.shape == qb.shape
+        {
+            return qwen35DualRMSNormEmbedConcat(
+                tokenIds: nextTokenIds, b: hidden,
+                aWeight: preFcNormEmbedding.weight,
+                bWeight: preFcNormHidden.weight,
+                eps: preFcNormEmbedding.eps,
+                embedWeight: quantized.weight,
+                embedScales: quantized.scales,
+                embedBiases: qb)
+        }
+        return preFcConcat(embeds: embedTokens(nextTokenIds), hidden: hidden)
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -145,8 +184,9 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        var fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        var fused = fc(preFcConcatFromTokens(
+            nextTokenIds: nextTokenIds, hidden: hidden,
+            embedTokens: embedTokens))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -177,8 +217,9 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        let fused = fc(preFcConcatFromTokens(
+            nextTokenIds: nextTokenIds, hidden: hidden,
+            embedTokens: embedTokens))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
