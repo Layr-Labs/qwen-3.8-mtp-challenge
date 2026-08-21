@@ -1198,6 +1198,151 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+
+// Width-5 single-pass extension: one weight stream shared across 5
+// activation rows. The vec<float, NA> crossrow form above caps NA at 4
+// (Metal vec width), so an M == 5 verify runs two row groups — two full
+// passes over the quantized weight matrix. This scalar-array form lifts the
+// cap so M == 5 reads the weights once. Per activation row m the load
+// order, the qdot expression tree, the fp32 accumulation order over
+// k-blocks, and the final simd_sum are IDENTICAL to the NA <= 4 kernel —
+// lane m of each vec op there is scalar index m here — so every output row
+// is bit-exact with the incumbent kernel and with the serial trajectory.
+// Measured on M4 Max (applegpu_g16s): +3.5% at forced depth 4; NA >= 6
+// register-spills there and is deliberately NOT instantiated.
+template <typename T, int NA, bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide8(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    int first_m,
+    int out_row,
+    uint simd_lid) {
+  static_assert(NA >= 2 && NA <= 5, "wide8 multi-row QMV supports NA in [2, 5]");
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float acc[rows_per_simd][NA];
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < NA; m++) {
+      acc[r][m] = 0.0f;
+    }
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    float sums[NA];
+    for (int m = 0; m < NA; m++) {
+      sums[m] = 0.0f;
+    }
+    float partial[rows_per_simd][NA];
+    for (int r = 0; r < rows_per_simd; r++) {
+      for (int m = 0; m < NA; m++) {
+        partial[r][m] = 0.0f;
+      }
+    }
+    for (int i = 0; i < 4; i++) {
+      float a0[NA], a1[NA], a2[NA], a3[NA];
+      for (int m = 0; m < NA; m++) {
+        const device T* xm = x + (first_m + m) * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        thread float xc[4];
+        if (DIRECT_NIBBLES) {
+          xc[0] = static_cast<float>(xm[0]);
+          xc[1] = static_cast<float>(xm[1]);
+          xc[2] = static_cast<float>(xm[2]);
+          xc[3] = static_cast<float>(xm[3]);
+          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+        } else {
+          sums[m] += load_vector<T, float, 4, 4>(xm, xc);
+        }
+        a0[m] = xc[0];
+        a1[m] = xc[1];
+        a2[m] = xc[2];
+        a3[m] = xc[3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        for (int m = 0; m < NA; m++) {
+          if (DIRECT_NIBBLES) {
+            partial[r][m] += (a0[m] * (packed[r][i] & 0x000f) +
+                              a1[m] * ((packed[r][i] >> 4) & 0x000f) +
+                              a2[m] * ((packed[r][i] >> 8) & 0x000f) +
+                              a3[m] * ((packed[r][i] >> 12) & 0x000f));
+          } else {
+            partial[r][m] += (a0[m] * (packed[r][i] & 0x000f) +
+                              a1[m] * (packed[r][i] & 0x00f0) +
+                              a2[m] * (packed[r][i] & 0x0f00) +
+                              a3[m] * (packed[r][i] & 0xf000));
+          }
+        }
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      for (int m = 0; m < NA; m++) {
+        acc[r][m] += scale_local[r] * partial[r][m] + sums[m] * bias_local[r];
+      }
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < NA; m++) {
+      const float reduced = simd_sum(acc[r][m]);
+      if (simd_lid == 0) {
+        y[(first_m + m) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
+// Single-group dispatch for the width-5 single pass (grid.x = M threadgroups;
+// tid.x > 0 exits at the first_m bound exactly like the _m wrapper's surplus
+// groups).
+template <typename T, int M, bool DIRECT_NIBBLES = false>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_m5s(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(M == 5, "single-group wide8 dispatch is instantiated at M == 5");
+  if (int(tid.x) != 0) {
+    return;
+  }
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+  qmv_fast_crossrow_affine4_g64_wide8<T, M, DIRECT_NIBBLES>(
+      w, scales, biases, x, y, in_vec_size, out_vec_size,
+      0, out_row, simd_lid);
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1949,7 +2094,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+          qmv_fast_crossrow_affine4_g64_m5s<T, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
