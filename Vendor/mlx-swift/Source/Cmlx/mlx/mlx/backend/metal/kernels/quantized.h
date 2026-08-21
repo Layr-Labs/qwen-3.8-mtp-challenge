@@ -1961,10 +1961,7 @@ template <typename T, int group_size, int bits, bool batched>
           // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
           // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
           // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;

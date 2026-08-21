@@ -1964,10 +1964,15 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
+          // 3+3+2, not 4+4. The even 4+4 split needs two simultaneous
+          // vec<float,4> accumulators in every active worker (register
+          // cliff: the public cross-row study measured 319 / 437 / 216 us
+          // for M = 7 / 8 / 9); the odd split mirrors M=9's cheaper
+          // three-stream structure. Lanes carry INDEPENDENT input rows and
+          // are never reduced across (simd_sum reduces along K WITHIN a
+          // row), so no row's scalar chain reorders. M % IPG = 2 (no
+          // one-row tail), IPG 3 inside the wide helper's [2,4].
+          qmv_fast_crossrow_affine4_g64_m<T, 8, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
