@@ -426,33 +426,8 @@ public final class Qwen36MTPBlockSession {
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
             eval(verifyLogits, warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
-            if width >= 3 {
-                // Warm arbitrary-prefix replay T=2...8. Restore all but the
-                // final verify row and trim that same row from attention so the
-                // throwaway cache remains aligned for the next width.
-                precondition(model.replayRecurrentPrefix(
-                    cache: warmCache, committedRows: width - 1))
-                for entry in warmCache where !(entry is ArraysCache) {
-                    if entry.isTrimmable { _ = entry.trim(1) }
-                }
-                eval(warmCache.flatMap { $0.state })
-            } else {
-                Self.clearRecurrentRollback(warmCache)
-            }
+            Self.clearRecurrentRollback(warmCache)
         }
-
-        // A K>=2 round can reject its very first draft, which replays T=1.
-        // Width 2 stays on the validated eager K1 path, so compile this last
-        // missing replay shape with one extra throwaway width-3 verify.
-        let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
-            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-            cache: oneRowReplayCache, nConfirmed: 1)
-        eval(oneRowReplayLogits)
-        eval(oneRowReplayCache.flatMap { $0.state })
-        precondition(model.replayRecurrentPrefix(
-            cache: oneRowReplayCache, committedRows: 1))
-        eval(oneRowReplayCache.flatMap { $0.state })
 
         // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
         // warm so the promoted allocator/pipeline end state is preserved.
