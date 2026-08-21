@@ -999,12 +999,21 @@ public final class Qwen36MTPBlockSession {
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
     private static let sdpaWidthWallDepthCap = 5
 
-    /// Depth cap for streak-qualified deep rounds. 8 is the trusted
+    /// FLAT depth ceiling of the promoted no-gate schedule. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
-    /// Gated on a full-accept streak so the deep rounds only fire where the
-    /// head has been perfect, mirroring the streak ladder that qualified
-    /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    /// Raised 7 -> 8 in isolation: the ceiling has never been its own arm.
+    /// The cap's history is a bundle — streak-gated 8 with floor 4 (b6ce964),
+    /// then flat 7 with the floor removed (96f20f8, official 3.30955573) —
+    /// and both receipts blamed the FLOOR ("the floor, not the ceiling, is
+    /// what was truncating 00142a44"). Width 9 is structurally served on this
+    /// stack: warmAllDepthShapes compiles verify widths 1...(maxDepth+1) = 9
+    /// plus concat extras 0...8, the GDN packed-prework mixer gates S <= 9,
+    /// the sdpa exactness chunk splits qL 6..9 at row 5 with byte-identical
+    /// windows, and M=9 rides the per-row-exact QMV dispatch below its batch
+    /// limit. The greedy rule still prices the step into width 9 with the
+    /// same h = 0.18 marginal as every other rung and demands reach_7 above
+    /// its threshold, so only stretches the head is already proving extend.
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
@@ -1036,12 +1045,12 @@ public final class Qwen36MTPBlockSession {
 
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
-        // The width wall binds the SINGLE-CALL verify; a qualifying
-        // full-accept streak opens the segmented cap (the round then feeds
-        // the target <= 5-row segments, never a wider launch). Any reject
-        // resets the streak, so a cold or struggling prompt never sees a
-        // deep round.
-        // FLAT CAP 7, NO GATE. Two ranked receipts of the organizer frontier,
+        // The width wall binds the SINGLE-CALL verify; the exactness chunk
+        // inside `attentionWithCacheUpdate` is what lets a deep round feed
+        // the target <= 5-row segments inside ONE ordinary model call, so no
+        // gate or floor is needed: a cold or struggling prompt never sees a
+        // deep round because `reach` collapses on it by itself.
+        // FLAT CAP, NO GATE. Two ranked receipts of the organizer frontier,
         // each isolating one half of this: capping at 7 gave `919318e1` (always
         // the x4 slot) 0.011967 s/tok at draft length 4.32 — still the fastest
         // reading for that prompt from any tree on this board — while removing
@@ -1051,13 +1060,15 @@ public final class Qwen36MTPBlockSession {
         // The floor, not the ceiling, is what was truncating `00142a44`: it
         // drops the cap to `sdpaWidthWallDepthCap` on every round after a
         // reject, cutting rounds the marginal rule would have taken deeper. So
-        // the ceiling stays at 7 and the floor goes, which is both receipts in
-        // one schedule.
+        // the floor goes, which is both receipts in one schedule.
         //
-        // Safety does not depend on the gate: `reach` is a product of the
-        // per-position acceptance EMAs and collapses on a cold stretch by
-        // itself. Widths 6..8 are bit-exact per position against the serial
-        // trajectory through the sdpa exactness chunk, so 7 is policy.
+        // CEILING 8 (this delta): with the floor gone the ceiling is the only
+        // remaining truncation, and it was never its own arm — 96f20f8 changed
+        // floor and ceiling together. The rule prices the step into width 9
+        // with the same h = 0.18 marginal as every other rung, and this pool
+        // rewards depth by direct measurement (h = 0.32 shortened every draft
+        // and cost -3% with the serial leg flat). Cold stretches never reach
+        // the deep rungs: `reach` collapses on them regardless of the cap.
         //
         // A floor of 6 under the ceiling of 7 was tried and REVERTED. The
         // argument for it read the x4 slot's 4.38 / 0.012191 s/tok off
