@@ -17,6 +17,16 @@ import MLXNN
 /// patches/mlx_lm_mtp/__init__.py.
 public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
+/// E85 arm gate. `MLX_E85_FUSED_EMBED=0` restores the eager
+/// `embedTokens(ids)` before the dual-norm concat.
+///
+/// The `MLX_` prefix is load-bearing: the trusted worker's environment
+/// sanitizer drops `MLXFAST_*`, so an `MLXFAST_`-spelled gate would never
+/// reach the process that runs the scored round, and both arms of an A/B
+/// would silently measure the same code.
+let qwen35FusedEmbedConcatEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E85_FUSED_EMBED"] != "0"
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -121,7 +131,44 @@ final class Qwen35MTPModule: Module {
     /// Dual RMSNorm written straight into the `[e | h]` layout `fc` consumes.
     /// Same arithmetic as `qwen35DualRMSNorm` + `concatenated([e, h], -1)`;
     /// the extra concat launch is gone. Proposal-only.
-    private func preFcConcat(embeds: MLXArray, hidden: MLXArray) -> MLXArray {
+    ///
+    /// The embedding table is affine 4-bit group-64, so `embedTokens(ids)` is
+    /// three gathers plus a dequantize. Those four intermediates exist only to
+    /// carry one row into a kernel that reads it twice, so the fused variant
+    /// reads the packed row in place and the eager embed never runs.
+    private func preFcConcat(
+        nextTokenIds: MLXArray, embedTokens: Embedding, hidden: MLXArray
+    ) -> MLXArray {
+        if qwen35FusedEmbedConcatEnabled,
+           let quantized = embedTokens as? QuantizedEmbedding,
+           quantized.mode == .affine, quantized.bits == 4,
+           quantized.groupSize == 64,
+           let zeroPoints = quantized.biases,
+           hidden.dtype == .bfloat16, hidden.dim(-1) == 5120,
+           quantized.weight.dtype == .uint32,
+           quantized.weight.dim(1) * 8 == hidden.dim(-1),
+           quantized.scales.dtype == .bfloat16,
+           quantized.scales.dim(1) * 64 == hidden.dim(-1),
+           zeroPoints.dtype == .bfloat16,
+           zeroPoints.shape == quantized.scales.shape,
+           nextTokenIds.dtype == .int32,
+           nextTokenIds.ndim == 2, nextTokenIds.dim(0) == 1,
+           nextTokenIds.strides.last == 1,
+           nextTokenIds.dim(1) * hidden.dim(-1) == hidden.size,
+           preFcNormEmbedding.eps == preFcNormHidden.eps
+        {
+            return qwen35EmbedDualRMSNormConcat(
+                ids: nextTokenIds,
+                embedWeight: quantized.weight,
+                embedScales: quantized.scales,
+                embedBiases: zeroPoints,
+                b: hidden,
+                aWeight: preFcNormEmbedding.weight,
+                bWeight: preFcNormHidden.weight,
+                eps: preFcNormEmbedding.eps)
+        }
+
+        let embeds = embedTokens(nextTokenIds)
         if embeds.dtype == .bfloat16, hidden.dtype == .bfloat16,
            embeds.dim(-1) == 5120, hidden.dim(-1) == 5120,
            embeds.shape == hidden.shape,
@@ -145,8 +192,10 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        let embeds = embedTokens(nextTokenIds)
-        var fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        var fused = fc(
+            preFcConcat(
+                nextTokenIds: nextTokenIds, embedTokens: embedTokens,
+                hidden: hidden))
 
         // 2. Compute attention mask from the first cache entry (or nil if empty).
         let firstCache: (any KVCache)? = cache.first
@@ -177,8 +226,10 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let embeds = embedTokens(nextTokenIds)
-        let fused = fc(preFcConcat(embeds: embeds, hidden: hidden))
+        let fused = fc(
+            preFcConcat(
+                nextTokenIds: nextTokenIds, embedTokens: embedTokens,
+                hidden: hidden))
         let historyCount = fused.dim(1) - 1
 
         layers[0].appendHistoryKV(
