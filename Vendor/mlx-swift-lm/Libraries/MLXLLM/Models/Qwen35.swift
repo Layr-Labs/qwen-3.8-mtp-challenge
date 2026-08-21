@@ -1850,140 +1850,6 @@ func qwen35DualRMSNormConcat(
     return outputs[0]
 }
 
-/// Quantized-embedding twin of the fused MTP pre-FC input kernel. It
-/// reproduces affine-4/group-64 dequantization at BF16 before the unchanged
-/// RMSNorm reduction, removing gather + dequantized embedding materialization.
-private let qwen35QuantizedEmbeddingDualRMSNormConcatKernel = MLXFast.metalKernel(
-    name: "qwen35_q4_embedding_dual_rms_norm_concat_bf16_v1",
-    inputNames: [
-        "token_ids", "embedding_weight", "embedding_scales",
-        "embedding_biases", "hidden", "embedding_norm_weight",
-        "hidden_norm_weight", "eps",
-    ],
-    outputNames: ["concat_out"],
-    source: """
-        constexpr uint n_reads = 4;
-        constexpr uint simd_size = 32;
-        constexpr uint lsize = 1024;
-
-        uint row = threadgroup_position_in_grid.x;
-        uint thread_id = thread_position_in_threadgroup.x;
-        uint simd_thread = thread_index_in_simdgroup;
-        uint simd_group = simdgroup_index_in_threadgroup;
-
-        uint axis_size = uint(hidden_shape[hidden_ndim - 1]);
-        uint hidden_rows = 1;
-        for (uint i = 0; i + 1 < hidden_ndim; ++i) {
-            hidden_rows *= uint(hidden_shape[i]);
-        }
-        bool is_embedding = row < hidden_rows;
-        uint local_row = is_embedding ? row : row - hidden_rows;
-        long token = is_embedding ? long(token_ids[local_row]) : 0;
-        ulong hidden_off = ulong(local_row) * ulong(axis_size);
-        ulong packed_off = ulong(token) * ulong(embedding_weight_shape[1]);
-        ulong scale_off = ulong(token) * ulong(embedding_scales_shape[1]);
-        ulong out_off = ulong(local_row) * ulong(axis_size * 2)
-            + (is_embedding ? 0 : ulong(axis_size));
-
-        threadgroup float local_inv_mean[1];
-        threadgroup float local_sums[simd_size];
-
-        float acc = 0.0f;
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            for (uint i = 0; i < n_reads; ++i) {
-                uint index = elem + i;
-                if (index < axis_size) {
-                    float xi;
-                    if (is_embedding) {
-                        uint packed = embedding_weight[
-                            packed_off + ulong(index / 8)];
-                        uint q = (packed >> (4 * (index & 7))) & 0x0f;
-                        bfloat dequantized = bfloat(q)
-                            * embedding_scales[scale_off + ulong(index / 64)]
-                            + embedding_biases[scale_off + ulong(index / 64)];
-                        xi = float(dequantized);
-                    } else {
-                        xi = float(hidden[hidden_off + ulong(index)]);
-                    }
-                    acc += xi * xi;
-                }
-            }
-        }
-
-        acc = simd_sum(acc);
-        if (simd_group == 0) {
-            local_sums[simd_thread] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_thread == 0) {
-            local_sums[simd_group] = acc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_group == 0) {
-            acc = simd_sum(local_sums[simd_thread]);
-            if (simd_thread == 0) {
-                local_inv_mean[0] = metal::precise::rsqrt(
-                    acc / float(axis_size) + eps);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_mean = local_inv_mean[0];
-        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
-            uint elem = r_start + thread_id * n_reads;
-            for (uint i = 0; i < n_reads; ++i) {
-                uint index = elem + i;
-                if (index < axis_size) {
-                    float xi;
-                    if (is_embedding) {
-                        uint packed = embedding_weight[
-                            packed_off + ulong(index / 8)];
-                        uint q = (packed >> (4 * (index & 7))) & 0x0f;
-                        bfloat dequantized = bfloat(q)
-                            * embedding_scales[scale_off + ulong(index / 64)]
-                            + embedding_biases[scale_off + ulong(index / 64)];
-                        xi = float(dequantized);
-                    } else {
-                        xi = float(hidden[hidden_off + ulong(index)]);
-                    }
-                    bfloat wi = is_embedding
-                        ? embedding_norm_weight[index]
-                        : hidden_norm_weight[index];
-                    concat_out[out_off + ulong(index)] =
-                        wi * bfloat(xi * inv_mean);
-                }
-            }
-        }
-    """,
-    ensureRowContiguous: false
-)
-
-func qwen35QuantizedEmbeddingDualRMSNormConcat(
-    tokenIds: MLXArray,
-    embeddingWeight: MLXArray,
-    embeddingScales: MLXArray,
-    embeddingBiases: MLXArray,
-    hidden: MLXArray,
-    embeddingNormWeight: MLXArray,
-    hiddenNormWeight: MLXArray,
-    eps: Float
-) -> MLXArray {
-    let nRows = hidden.size / hidden.dim(-1)
-    var outShape = hidden.shape
-    outShape[outShape.count - 1] = 2 * hidden.dim(-1)
-    return qwen35QuantizedEmbeddingDualRMSNormConcatKernel(
-        [
-            tokenIds, embeddingWeight, embeddingScales, embeddingBiases,
-            hidden, embeddingNormWeight, hiddenNormWeight, MLXArray(eps),
-        ],
-        grid: (2 * nRows * 1024, 1, 1),
-        threadGroup: (1024, 1, 1),
-        outputShapes: [outShape],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
@@ -2041,6 +1907,26 @@ final class Qwen35Attention: Module {
     private var _exactKVIndices: MLXArray?
     private var _exactQRowCount = 0
 
+    // Island fast-path state. The gates are set only when the installed
+    // island indices are complete permutations of their output columns —
+    // the artifact property that makes the quantized base under putAlong
+    // dead work. Any other artifact (partial islands, unexpected geometry,
+    // a non-fusable head) keeps the legacy quantized+putAlong assembly
+    // bit-for-bit; the fast branches below clear the gate permanently on
+    // the first mismatch.
+    private var _kvIslandsComplete = false
+    private var _qkvIslandsComplete = false
+    // Live Q rows (the Q output width minus the Q island rows) as a
+    // shrunken quantized pack, built lazily on the first draft-step call.
+    private var _qkvLiveW: MLXArray?
+    private var _qkvLiveS: MLXArray?
+    private var _qkvLiveZ: MLXArray?
+    private var _qkvLiveRowIdx: MLXArray?
+    // Pure-data column orders: output column -> source column of the exact
+    // island GEMM (kv) / of the `[liveQ | islandQKV]` concat (qkv).
+    private var _qkvTakeOrder: MLXArray?
+    private var _kvTakeOrder: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -2094,6 +1980,41 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        // Island fast path (draft step): with complete-permutation islands
+        // the island columns of the fused quantized base are always
+        // overwritten by the exact GEMM, so the pack shrinks to the live Q
+        // rows and the output is reassembled by one pure-data take. Gated
+        // on exactly the fusable conditions under which the packed branch
+        // below applies islands at all, so every other artifact takes the
+        // legacy code unchanged.
+        if _qkvIslandsComplete {
+            if let q = qProj as? QuantizedLinear,
+               let k = kProj as? QuantizedLinear,
+               let v = vProj as? QuantizedLinear,
+               q.groupSize == k.groupSize, k.groupSize == v.groupSize,
+               q.bits == k.bits, k.bits == v.bits,
+               q.mode == k.mode, q.mode == .affine,
+               q.biases != nil, k.biases != nil, v.biases != nil,
+               q.shape.0 == _qOut, k.shape.0 == _kOut, v.shape.0 == _kOut
+            {
+                if _qkvLiveW == nil {
+                    _ = buildIslandLivePack(q: q)
+                }
+                if let w = _qkvLiveW, let s = _qkvLiveS, let z = _qkvLiveZ,
+                   let exactWeight = _exactQKVWeight, let order = _qkvTakeOrder
+                {
+                    return Self.islandQKVForward(
+                        x: x, liveW: w, liveScales: s, liveBiases: z,
+                        groupSize: q.groupSize, bits: q.bits,
+                        islandWeight: exactWeight, takeOrder: order,
+                        qEnd: _qOut, kEnd: _qOut + _kOut)
+                }
+            }
+            // Not the fusable complete-island artifact the fast path
+            // serves (or the live pack could not be built): permanently
+            // revert to the legacy assembly.
+            _qkvIslandsComplete = false
+        }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2144,6 +2065,27 @@ final class Qwen35Attention: Module {
     /// One projection for K and V when no query output is observable. The
     /// pack is model-general and is built lazily from the attached linears.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        // Island fast path (history flush): with a complete-permutation
+        // K/V island every column of the quantized K/V base is overwritten
+        // by the exact GEMM, so the base is dead work — skip it entirely
+        // and take the exact rows straight into K/V column order. Same
+        // gating rule as the qkv fast path above.
+        if _kvIslandsComplete {
+            if let k = kProj as? QuantizedLinear,
+               let v = vProj as? QuantizedLinear,
+               k.groupSize == v.groupSize, k.bits == v.bits,
+               k.mode == v.mode, k.mode == .affine,
+               k.biases != nil, v.biases != nil,
+               k.shape.0 == _kvOut, v.shape.0 == _kvOut,
+               let exactWeight = _exactQKVWeight, let order = _kvTakeOrder
+            {
+                return Self.islandKVForward(
+                    x: x,
+                    islandKVWeight: exactWeight[_exactQRowCount...],
+                    takeOrder: order, kvOut: _kvOut)
+            }
+            _kvIslandsComplete = false
+        }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
             var y = quantizedMM(
                 x, w, scales: s, biases: z, transpose: true,
@@ -2203,6 +2145,152 @@ final class Qwen35Attention: Module {
             base, indices.reshaped(indexShape), values: exact, axis: -1)
     }
 
+    /// Island fast path for the history flush: the exact island GEMM alone,
+    /// taken straight into K/V column order. The legacy quantized K/V base
+    /// is not computed at all — with a complete-permutation island every
+    /// one of its columns was overwritten by these exact rows. Internal so
+    /// the synthetic-parity unit tests can drive it without weights.
+    static func islandKVForward(
+        x: MLXArray, islandKVWeight: MLXArray, takeOrder: MLXArray, kvOut: Int
+    ) -> (MLXArray, MLXArray) {
+        let y = MLX.take(
+            matmul(x, islandKVWeight.transposed(1, 0)), takeOrder, axis: -1)
+        return (y[.ellipsis, ..<kvOut], y[.ellipsis, kvOut...])
+    }
+
+    /// Island fast path for the draft step: one quantized GEMM over the
+    /// live Q rows plus one exact GEMM over the island rows, reassembled
+    /// into the original `[Q | K | V]` column order by one pure-data take.
+    /// Rows are independent, so per-row results are bit-identical with the
+    /// legacy fused-pack+putAlong assembly.
+    static func islandQKVForward(
+        x: MLXArray, liveW: MLXArray, liveScales: MLXArray, liveBiases: MLXArray,
+        groupSize: Int, bits: Int, islandWeight: MLXArray, takeOrder: MLXArray,
+        qEnd: Int, kEnd: Int
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let qLive = quantizedMM(
+            x, liveW, scales: liveScales, biases: liveBiases, transpose: true,
+            groupSize: groupSize, bits: bits, mode: .affine)
+        let exact = matmul(x, islandWeight.transposed(1, 0))
+        let y = MLX.take(
+            concatenated([qLive, exact], axis: -1), takeOrder, axis: -1)
+        return (y[.ellipsis, ..<qEnd], y[.ellipsis, qEnd ..< kEnd], y[.ellipsis, kEnd...])
+    }
+
+    /// Row-gather the live (non-island) Q rows out of the checkpoint's
+    /// quantized Q projection into the shrunken draft-step pack.
+    private func buildIslandLivePack(q: QuantizedLinear) -> MLXArray? {
+        guard let liveIdx = _qkvLiveRowIdx, let z = q.biases else { return nil }
+        let w = MLX.take(q.weight, liveIdx, axis: 0).contiguous()
+        let s = MLX.take(q.scales, liveIdx, axis: 0).contiguous()
+        let zb = MLX.take(z, liveIdx, axis: 0).contiguous()
+        eval(w, s, zb)
+        _qkvLiveW = w
+        _qkvLiveS = s
+        _qkvLiveZ = zb
+        return w
+    }
+
+    /// Install-time plan for the island fast paths. `kvComplete` gates the
+    /// flush path: the K/V island indices are a permutation of the whole
+    /// K/V output range, so the quantized K/V base is dead work.
+    /// `qkvComplete` additionally requires the Q islands distinct, in
+    /// range, and not covering every Q row, so the fused pack can shrink to
+    /// the live Q rows. The take orders map output column -> source column
+    /// of the exact island GEMM (kv) / of `[liveQ | islandQKV]` (qkv).
+    struct IslandFastPathPlan {
+        var kvComplete = false
+        var qkvComplete = false
+        var kvTakeOrder: [Int32] = []
+        var qkvTakeOrder: [Int32] = []
+        var qkvLiveRows: [Int32] = []
+    }
+
+    static func isPermutationOfRange(_ values: [Int32], _ upper: Int) -> Bool {
+        guard values.count == upper else { return false }
+        var seen = [Bool](repeating: false, count: upper)
+        for raw in values {
+            let p = Int(raw)
+            if p < 0 || p >= upper || seen[p] { return false }
+            seen[p] = true
+        }
+        return true
+    }
+
+    static func islandFastPathPlan(
+        qIslandCount: Int, qOutputCount: Int, kOutputCount: Int,
+        kvIndices: [Int32], qkvIndices: [Int32]
+    ) -> IslandFastPathPlan {
+        var plan = IslandFastPathPlan()
+        let kvTotal = 2 * kOutputCount
+        guard kvTotal > 0,
+              kvIndices.count == kvTotal,
+              isPermutationOfRange(kvIndices, kvTotal)
+        else { return plan }
+        plan.kvComplete = true
+        var kvOrder = [Int32](repeating: -1, count: kvTotal)
+        for (j, raw) in kvIndices.enumerated() { kvOrder[Int(raw)] = Int32(j) }
+        plan.kvTakeOrder = kvOrder
+
+        // The draft path additionally needs the Q islands distinct and in
+        // range; the K/V halves of qkvIndices are permutations of their
+        // ranges by the kv gate above.
+        guard qkvIndices.count == qIslandCount + kvTotal,
+              qIslandCount < qOutputCount
+        else { return plan }
+        var qSeen = [Bool](repeating: false, count: qOutputCount)
+        for raw in qkvIndices[0..<qIslandCount] {
+            let p = Int(raw)
+            if p < 0 || p >= qOutputCount || qSeen[p] { return plan }
+            qSeen[p] = true
+        }
+
+        let liveCount = qOutputCount - qIslandCount
+        var qkvOrder = [Int32](repeating: -1, count: qOutputCount + kvTotal)
+        var qIslandRow = [Int: Int32](minimumCapacity: qIslandCount)
+        for (j, raw) in qkvIndices[0..<qIslandCount].enumerated() {
+            qIslandRow[Int(raw)] = Int32(j)
+        }
+        var liveRows = [Int32]()
+        liveRows.reserveCapacity(liveCount)
+        var rank: Int32 = 0
+        for p in 0..<qOutputCount {
+            if let j = qIslandRow[p] {
+                qkvOrder[p] = Int32(liveCount) + j
+            } else {
+                qkvOrder[p] = rank
+                rank += 1
+                liveRows.append(Int32(p))
+            }
+        }
+        // The K/V halves of qkvIndices arrive ALREADY OFFSET into the fused
+        // output space (installExactQKVRows concatenates
+        // `[qIndices, kIndices + qOutputCount, vIndices + qOutputCount +
+        // kOutputCount]`), so they index qkvOrder directly; the explicit
+        // bounds checks keep a malformed artifact on the legacy path
+        // instead of trapping.
+        for (j, raw) in qkvIndices[qIslandCount ..< (qIslandCount + kOutputCount)]
+            .enumerated()
+        {
+            let p = Int(raw)
+            guard p >= qOutputCount, p < qOutputCount + kOutputCount else {
+                return plan
+            }
+            qkvOrder[p] = Int32(liveCount + qIslandCount + j)
+        }
+        for (j, raw) in qkvIndices[(qIslandCount + kOutputCount)...].enumerated() {
+            let p = Int(raw)
+            guard p >= qOutputCount + kOutputCount,
+                  p < qOutputCount + 2 * kOutputCount
+            else { return plan }
+            qkvOrder[p] = Int32(liveCount + qIslandCount + kOutputCount + j)
+        }
+        plan.qkvComplete = true
+        plan.qkvTakeOrder = qkvOrder
+        plan.qkvLiveRows = liveRows
+        return plan
+    }
+
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
@@ -2227,6 +2315,36 @@ final class Qwen35Attention: Module {
         _exactQKVIndices = qkvIndices
         _exactKVIndices = kvIndices
         _exactQRowCount = qWeight.dim(0)
+
+        // Fast-path planning. The V output width equals the K width by
+        // construction (both projections are `kvHeads * headDim` wide);
+        // the fast branches re-verify the loaded checkpoint geometry on
+        // every call before they run and clear the gate permanently on any
+        // mismatch, so a declared count that disagrees with the loaded
+        // weights can only ever fall back to the legacy assembly.
+        let plan = Self.islandFastPathPlan(
+            qIslandCount: qWeight.dim(0),
+            qOutputCount: qOutputCount,
+            kOutputCount: kOutputCount,
+            kvIndices: kvIndices.asArray(Int32.self),
+            qkvIndices: qkvIndices.asArray(Int32.self))
+        _qOut = qOutputCount
+        _kOut = kOutputCount
+        _kvOut = kOutputCount
+        if plan.kvComplete {
+            let order = MLXArray(plan.kvTakeOrder, [plan.kvTakeOrder.count])
+            eval(order)
+            _kvIslandsComplete = true
+            _kvTakeOrder = order
+        }
+        if plan.qkvComplete {
+            let order = MLXArray(plan.qkvTakeOrder, [plan.qkvTakeOrder.count])
+            let liveRows = MLXArray(plan.qkvLiveRows, [plan.qkvLiveRows.count])
+            eval(order, liveRows)
+            _qkvIslandsComplete = true
+            _qkvTakeOrder = order
+            _qkvLiveRowIdx = liveRows
+        }
     }
 
     /// Append rows to an attention cache without producing query outputs.
@@ -3036,209 +3154,29 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
-// Ranked receipt 1a4218f: this executed tree made candidate MTP s/token
-// lower on all 8 prompts (mean -0.136%); resample #1 changes this comment only.
-// Finalize the 2,048 coarse candidates, evaluate the selected affine-4 rows
-// in place, and reduce their exact BF16 scores without materializing the
-// 32-id shortlist or any gathered weight/scales/bias tensors.
-private let qwen35DraftTop32FusedRerankKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_fused_rerank_affine4_g64_v1",
-    inputNames: ["cand_ord", "cand_idx", "x", "weight", "scales", "biases"],
-    outputNames: ["token_id"],
-    source: """
-        constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
-        constexpr uint TOPK       = \(qwen35Top32K);
-        constexpr uint SIMD_SIZE  = 32;
-        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
-        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-        constexpr uint K          = 5120;
-        constexpr uint K_WORDS    = 640;
-        constexpr uint K_GROUPS   = 80;
-        constexpr uint VALUES_PER_LANE = 16;
-        constexpr uint BLOCK      = 512;
-        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds selection mask");
-        static_assert(PB <= 32, "PB exceeds selection mask");
-        static_assert(NSIMD * 4 == TOPK, "one four-row dot tile per SIMDgroup");
-
-        uint tid  = thread_position_in_threadgroup.x;
-        uint lane = thread_index_in_simdgroup;
-        uint sg   = simdgroup_index_in_threadgroup;
-
-        uint ord[PER_THREAD];
-        uint idx[PER_THREAD];
-        for (uint t = 0; t < PER_THREAD; ++t) {
-            uint p = t * TG_SIZE + tid;
-            ord[t] = cand_ord[p];
-            idx[t] = cand_idx[p];
-        }
-
-        threadgroup uint sc_ord[NSIMD * TOPK];
-        threadgroup uint sc_idx[NSIMD * TOPK];
-        uint taken = 0u;
-        for (uint r = 0; r < TOPK; ++r) {
-            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-            for (uint t = 0; t < PER_THREAD; ++t) {
-                if ((taken & (1u << t)) != 0u) { continue; }
-                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
-                    bo = ord[t]; bi = idx[t]; bs = t;
-                }
-            }
-            uint mo = simd_max(bo);
-            uint mi = simd_max((bo == mo) ? bi : 0u);
-            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                taken |= (1u << bs);
-            }
-            if (lane == 0) {
-                sc_ord[sg * TOPK + r] = mo;
-                sc_idx[sg * TOPK + r] = mi;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        threadgroup uint final_ids[TOPK];
-        if (sg == 0) {
-            uint o2[PB];
-            uint i2[PB];
-            for (uint t = 0; t < PB; ++t) {
-                uint p = t * SIMD_SIZE + lane;
-                o2[t] = sc_ord[p];
-                i2[t] = sc_idx[p];
-            }
-            uint tk2 = 0u;
-            for (uint r = 0; r < TOPK; ++r) {
-                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
-                for (uint t = 0; t < PB; ++t) {
-                    if ((tk2 & (1u << t)) != 0u) { continue; }
-                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
-                        bo = o2[t]; bi = i2[t]; bs = t;
-                    }
-                }
-                uint mo = simd_max(bo);
-                uint mi = simd_max((bo == mo) ? bi : 0u);
-                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
-                    tk2 |= (1u << bs);
-                }
-                if (lane == 0) { final_ids[TOPK - 1u - r] = mi; }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint candidate_base = sg * 4;
-        float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (uint k = 0; k < K; k += BLOCK) {
-            float xv[VALUES_PER_LANE];
-            uint x_base = k + lane * VALUES_PER_LANE;
-            float sum = 0.0f;
-            for (uint i = 0; i < VALUES_PER_LANE; i += 4) {
-                sum += x[x_base + i] + x[x_base + i + 1]
-                    + x[x_base + i + 2] + x[x_base + i + 3];
-                xv[i] = x[x_base + i];
-                xv[i + 1] = x[x_base + i + 1] / 16.0f;
-                xv[i + 2] = x[x_base + i + 2] / 256.0f;
-                xv[i + 3] = x[x_base + i + 3] / 4096.0f;
-            }
-            for (uint r = 0; r < 4; ++r) {
-                uint row = final_ids[candidate_base + r];
-                uint word_base = row * K_WORDS + k / 8 + lane * 2;
-                uint p0 = weight[word_base];
-                uint p1 = weight[word_base + 1];
-                ushort packed[4] = {
-                    ushort(p0 & 0xffffu), ushort(p0 >> 16),
-                    ushort(p1 & 0xffffu), ushort(p1 >> 16)
-                };
-                uint group_index = row * K_GROUPS + k / 64 + lane / 4;
-                float scale = scales[group_index];
-                float bias = biases[group_index];
-                float accum = 0.0f;
-                for (uint i = 0; i < 4; ++i) {
-                    accum +=
-                        xv[4 * i] * (packed[i] & 0x000f) +
-                        xv[4 * i + 1] * (packed[i] & 0x00f0) +
-                        xv[4 * i + 2] * (packed[i] & 0x0f00) +
-                        xv[4 * i + 3] * (packed[i] & 0xf000);
-                }
-                result[r] += scale * accum + sum * bias;
-            }
-        }
-
-        threadgroup float exact_scores[TOPK];
-        for (uint r = 0; r < 4; ++r) {
-            float reduced = simd_sum(result[r]);
-            if (lane == 0) {
-                exact_scores[candidate_base + r] = float(InT(reduced));
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sg == 0) {
-            float best_value = exact_scores[lane];
-            uint best_id = final_ids[lane];
-            for (uint offset = 16; offset > 0; offset >>= 1) {
-                float other_value = simd_shuffle_down(best_value, offset);
-                uint other_id = simd_shuffle_down(best_id, offset);
-                if (lane < offset && qwen_draft_top32_fused_better(
-                        other_value, other_id, best_value, best_id)) {
-                    best_value = other_value;
-                    best_id = other_id;
-                }
-            }
-            if (lane == 0) {
-                token_id[0] = int(
-                    best_id < PREFIX_COUNT
-                        ? best_id
-                        : best_id + CONTROL_OFFSET);
-            }
-        }
-    """,
-    header: """
-        typedef bfloat16_t InT;
-        inline bool qwen_draft_top32_fused_better(
-            float candidate_value,
-            uint candidate_id,
-            float current_value,
-            uint current_id
-        ) {
-            bool candidate_nan = isnan(candidate_value);
-            bool current_nan = isnan(current_value);
-            if (candidate_nan != current_nan) { return !candidate_nan; }
-            if (candidate_value > current_value) { return true; }
-            if (candidate_value < current_value) { return false; }
-            return candidate_id < current_id;
-        }
-    """,
-    ensureRowContiguous: false
-)
-
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
 
 /// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
-private func qwen35DraftTop32Partial(_ row: MLXArray) -> [MLXArray] {
+private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
+    // Mirrors the kernel static_asserts; see the bitmask note there.
     precondition(qwen35Top32PerThread <= 32 && qwen35Top32FinPerThread <= 32,
                  "top-32 slot count exceeds the 32-bit selection bitmask")
-    return qwen35DraftTop32PartialKernel(
+    let partial = qwen35DraftTop32PartialKernel(
         [row],
         grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
         outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
         outputDTypes: [.uint32, .uint32]
     )
-}
-
-private func qwen35DraftTop32Finalize(_ partial: [MLXArray]) -> MLXArray {
-    qwen35DraftTop32FinalizeKernel(
+    return qwen35DraftTop32FinalizeKernel(
         [partial[0], partial[1]],
         grid: (qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
         outputShapes: [[qwen35Top32K]],
         outputDTypes: [.uint32]
     )[0]
-}
-
-private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
-    qwen35DraftTop32Finalize(qwen35DraftTop32Partial(row))
 }
 
 /// Offline equivalence gate. Needs no checkpoint and no MTP head: it exercises
@@ -3734,32 +3672,15 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         )
         let candidateCount = Self.draftRerankCandidateCount
+        // Drift guard: the kernels bake these shapes in as constexpr.
         guard qwen35Top32RealCount == Self.compactDraftRealCount,
               qwen35Top32K == candidateCount
         else { return nil }
-        let shortlistRow = coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
-            .reshaped([Self.compactDraftRealCount])
-
-        if qwen35Top32Enabled {
-            let partial = qwen35DraftTop32Partial(shortlistRow)
-            return qwen35DraftTop32FusedRerankKernel(
-                [partial[0], partial[1], x.reshaped([configuration.hiddenSize]),
-                 exact.weight, exact.scales, exactBiases],
-                template: [
-                    ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                    ("CONTROL_OFFSET",
-                     Self.compactDraftControlStart - Self.compactDraftPrefixCount),
-                ],
-                grid: (qwen35Top32TG, 1, 1),
-                threadGroup: (qwen35Top32TG, 1, 1),
-                outputShapes: [[1, 1]],
-                outputDTypes: [.int32]
-            )[0]
-        }
-
         let candidateIDs: MLXArray
         if qwen35Top32Enabled {
-            candidateIDs = qwen35DraftTop32(shortlistRow)
+            candidateIDs = qwen35DraftTop32(
+                coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
+                    .reshaped([Self.compactDraftRealCount]))
         } else {
             let kth = Self.compactDraftRealCount - candidateCount
             candidateIDs = MLX.argPartition(
@@ -3767,12 +3688,14 @@ extension Qwen35TextModel: MTPCapable {
                 kth: kth, axis: -1
             )[.ellipsis, (kth)...].reshaped([candidateCount])
         }
+
         let exactWeight = MLX.take(exact.weight, candidateIDs, axis: 0)
         let exactScales = MLX.take(exact.scales, candidateIDs, axis: 0)
         let exactZeroPoints = MLX.take(exactBiases, candidateIDs, axis: 0)
         let exactLogits = quantizedMM(
             x, exactWeight, scales: exactScales, biases: exactZeroPoints,
             transpose: true, groupSize: 64, bits: 4, mode: .affine)
+
         return qwen35DraftRerankKernel(
             [exactLogits.reshaped([candidateCount]), candidateIDs],
             template: [
@@ -3835,6 +3758,18 @@ extension Qwen35TextModel: MTPCapable {
         return Linear(
             weight: compactRows(full.weight),
             bias: full.bias.map(compactRows))
+    }
+
+    /// Local-instrument access (Tests/ consumers only; no production caller):
+    /// materializes and returns the compact affine-4 draft rerank scorer
+    /// exactly as `draftTokenIDWithDeclaredRerank` builds it, so the local
+    /// shortlist-width study reads the same packed rows the production rerank
+    /// scores. Proposal-side only; the target path never consults this.
+    var draftRerankScorerForInstrument: QuantizedLinear? {
+        if _compactDraftHead == nil {
+            _compactDraftHead = makeCompactDraftHead()
+        }
+        return _compactDraftHead as? QuantizedLinear
     }
 
 
