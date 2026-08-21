@@ -359,6 +359,21 @@ public final class Qwen36MTPBlockSession {
         let primedDraftID = model.draftTokenID(
             primed[0..., (primed.dim(1) - 1) ..< primed.dim(1), 0...])
         eval(primedDraftID)
+        // VERIFY-CONCAT JIT WARM. Scored rounds assemble verifyTokens as
+        // concatenated([host primary] + device draftIds) over int32 [1, 1]
+        // arrays. The width loop below feeds callWithHidden a single host
+        // [1, width] tensor, so it never compiles that multi-input concat.
+        // Values are zeros / already-eval'd draft IDs; result discarded.
+        // Warm extra=0...maxDepth. Provenance: promoted 1cb1f43 (#597,
+        // +0.028% vs its base) then REPLACE-dropped. Warm-path only.
+        // Isolated from the embed-concat leftover (#879 3.308 miss).
+        for extra in 0 ... maxDepth {
+            var parts = [MLXArray([Int32(0)]).reshaped([1, 1])]
+            for _ in 0 ..< extra {
+                parts.append(primedDraftID)
+            }
+            eval(concatenated(parts, axis: 1))
+        }
         let foldHidden = MLXArray.zeros([1, 2, hDim], dtype: row.dtype)
         let foldTokens = MLXArray([Int32(0), Int32(0)]).reshaped([1, 2])
         let folded = model.mtpHeadLastHiddenWithKVOnlyHistory(
