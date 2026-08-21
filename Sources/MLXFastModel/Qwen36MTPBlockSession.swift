@@ -509,33 +509,18 @@ public final class Qwen36MTPBlockSession {
             )
         }
         eval(outs)
-        // Scored decode walks N past 1024 (512 seed + 512 decode).
-        // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
-        // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,5,4} only.
-        if extK.dim(2) == 1024 {
-            let kPad1 = MLXArray.zeros(
-                [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
-            let vPad1 = MLXArray.zeros(
-                [extV.dim(0), extV.dim(1), 1, extV.dim(3)], dtype: extV.dtype)
-            let k1025 = concatenated([extK, kPad1], axis: 2)
-            let v1025 = concatenated([extV, vPad1], axis: 2)
-            var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
-                let q = MLXArray.zeros(
-                    [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
-                outs1025.append(
-                    MLXFast.scaledDotProductAttention(
-                        queries: q,
-                        keys: k1025,
-                        values: v1025,
-                        scale: scale,
-                        mask: .causal
-                    )
-                )
-            }
-            eval(outs1025)
-        }
+        // GPU REMOVE leftover after `#939` depth-1 temper miss 3.28396:
+        // do NOT compile the kL=1025 / 128-block `sdpa_vector_2pass` family.
+        // The kL=1024 qL={1,5,4} warm above still covers serial, exactness
+        // chunk-A (qL=5) and chunk-B (qL=4) on the 64-block vector path.
+        // Extra warmup graphs on this crown have been pollution (`#926`
+        // qL-2/3, `#909` JIT concat, `#920` extra exactness-chunk). The
+        // 1025 pad is a third compile family the 512+512 window only
+        // touches on the last row if N walks past 1024; compiling it
+        // untimed occupies pipeline cache that the scored 64-block family
+        // wants. First-touch of 128-block, if it happens, is one late-window
+        // shape — cheaper than three extra compiles crowding the hot set.
+        // Live `begin()` caches still untouched. qL stays {1,5,4}.
     }
 
     // MARK: - begin
