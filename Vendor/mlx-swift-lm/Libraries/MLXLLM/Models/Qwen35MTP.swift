@@ -139,32 +139,35 @@ final class Qwen35MTPModule: Module {
     private func preFcConcat(
         nextTokenIds: MLXArray, embedTokens: Embedding, hidden: MLXArray
     ) -> MLXArray {
+        let integerIds = nextTokenIds.dtype == .int32 || nextTokenIds.dtype == .int64
         if qwen35FusedEmbedConcatEnabled,
+           integerIds,
            let quantized = embedTokens as? QuantizedEmbedding,
-           quantized.mode == .affine, quantized.bits == 4,
-           quantized.groupSize == 64,
-           let zeroPoints = quantized.biases,
-           hidden.dtype == .bfloat16, hidden.dim(-1) == 5120,
+           quantized.groupSize == 64, quantized.bits == 4,
+           quantized.mode == .affine,
+           let embeddingBiases = quantized.biases,
+           hidden.dtype == .bfloat16, hidden.ndim == 3,
+           hidden.dim(-1) == 5120,
+           nextTokenIds.size == hidden.size / hidden.dim(-1),
+           quantized.shape.1 == hidden.dim(-1),
            quantized.weight.dtype == .uint32,
-           quantized.weight.dim(1) * 8 == hidden.dim(-1),
+           quantized.weight.shape == [quantized.shape.0, hidden.dim(-1) / 8],
            quantized.scales.dtype == .bfloat16,
-           quantized.scales.dim(1) * 64 == hidden.dim(-1),
-           zeroPoints.dtype == .bfloat16,
-           zeroPoints.shape == quantized.scales.shape,
-           nextTokenIds.dtype == .int32,
-           nextTokenIds.ndim == 2, nextTokenIds.dim(0) == 1,
-           nextTokenIds.strides.last == 1,
-           nextTokenIds.dim(1) * hidden.dim(-1) == hidden.size,
+           embeddingBiases.dtype == .bfloat16,
+           quantized.scales.shape == [quantized.shape.0, hidden.dim(-1) / 64],
+           embeddingBiases.shape == quantized.scales.shape,
+           preFcNormEmbedding.weight.dtype == .bfloat16,
+           preFcNormHidden.weight.dtype == .bfloat16,
            preFcNormEmbedding.eps == preFcNormHidden.eps
         {
-            return qwen35EmbedDualRMSNormConcat(
-                ids: nextTokenIds,
-                embedWeight: quantized.weight,
-                embedScales: quantized.scales,
-                embedBiases: zeroPoints,
-                b: hidden,
-                aWeight: preFcNormEmbedding.weight,
-                bWeight: preFcNormHidden.weight,
+            return qwen35QuantizedEmbeddingDualRMSNormConcat(
+                tokenIds: nextTokenIds,
+                embeddingWeight: quantized.weight,
+                embeddingScales: quantized.scales,
+                embeddingBiases: embeddingBiases,
+                hidden: hidden,
+                embeddingNormWeight: preFcNormEmbedding.weight,
+                hiddenNormWeight: preFcNormHidden.weight,
                 eps: preFcNormEmbedding.eps)
         }
 
