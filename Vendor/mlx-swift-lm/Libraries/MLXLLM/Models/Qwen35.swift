@@ -1236,6 +1236,12 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
 
+    /// True only for the MTP head layer's MLP: permits the single-row
+    /// SwiGLU-into-down fusion (proposal side only — the backbone/target
+    /// instances never set it, so the scored forward's arithmetic is
+    /// untouched by construction).
+    private let proposalOnly: Bool
+
     private var _fqW: MLXArray?
     private var _fqS: MLXArray?
     private var _fqZ: MLXArray?
@@ -1245,7 +1251,10 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fbfW: MLXArray?
     private var _gateOut = 0
 
-    init(dimensions: Int, hiddenDimensions: Int) {
+    init(
+        dimensions: Int, hiddenDimensions: Int, proposalOnly: Bool = false
+    ) {
+        self.proposalOnly = proposalOnly
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1290,9 +1299,41 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+            // PROPOSAL HEAD ONLY (never the backbone/target MLP): single-row
+            // steps can fold the SwiGLU activation into the down projection's
+            // weight-stream kernel, one dispatch instead of two. The kernel
+            // reproduces the stock M=1 `qmv_fast` dot structure and the
+            // `silu(g) * u` bf16 rounding chain element-for-element, so the
+            // head's proposals are unchanged; any guard miss keeps the
+            // two-launch path byte-for-byte.
+            if proposalOnly, x.dim(-2) == 1, y.dtype == .bfloat16,
+               let fused = fusedSwiGLUDown(y)
+            {
+                return fused
+            }
             return downProj(qwen35CompiledFusedSwiGLU(y))
         }
         return downProj(silu(gateProj(x)) * upProj(x))
+    }
+
+    /// One-launch SwiGLU + down projection for single-row PROPOSAL steps:
+    /// reads the fused gate_up output directly and computes the activation
+    /// inline at the weight-stream's x-load positions. Nil on any guard miss
+    /// (non-quantized down, wrong bits/group/mode, unexpected shapes).
+    private func fusedSwiGLUDown(_ y: MLXArray) -> MLXArray? {
+        guard let down = downProj as? QuantizedLinear,
+              down.mode == .affine, down.groupSize == 64, down.bits == 4,
+              down.weight.dtype == .uint32, down.weight.ndim == 2,
+              down.weight.dim(0) == 5120, down.weight.dim(1) == 2176,
+              let db = down.biases,
+              down.scales.dtype == .bfloat16, db.dtype == .bfloat16,
+              down.scales.ndim == 2, down.scales.dim(0) == 5120,
+              down.scales.dim(1) == 272,
+              down.scales.shape == db.shape,
+              y.dim(-1) == 2 * 17408
+        else { return nil }
+        return qwen35FusedSwiGLUDownQMV(
+            y: y, w: down.weight, scales: down.scales, biases: db)
     }
 
 }
@@ -1844,6 +1885,269 @@ func qwen35DualRMSNormConcat(
         [a, b, aWeight, bWeight, MLXArray(eps)],
         grid: (2 * nRows * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
+/// `qwen35DualRMSNormConcat` with the embedding side's WHOLE producer folded
+/// in: the token-id gather, the packed affine-4/g64 row, and the dequant that
+/// `QuantizedEmbedding.callAsFunction` performs as three gather launches plus
+/// `affine_dequantize` all become in-kernel reads. One launch replaces four,
+/// per head step and per flush row. Proposal-only (the head side proposes;
+/// the target decides every emitted token), and the decode mirrors
+/// `affine_dequantize`'s bits=4 expression (`scale * d + bias` in bf16
+/// arithmetic, `d = (word >> 4*(i%8)) & 0xf`) so the embeds are bit-identical
+/// to the materialized path and head behaviour is unchanged.
+private let qwen35DualRMSNormEmbedConcatKernel = MLXFast.metalKernel(
+    name: "qwen35_dual_rms_norm_embed_concat_bf16_v1",
+    inputNames: [
+        "token_ids", "b", "embed_w", "embed_scales", "embed_biases",
+        "a_weight", "b_weight", "eps",
+    ],
+    outputNames: ["concat_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+        constexpr uint hidden_size = 5120;
+        constexpr uint words_per_row = hidden_size / 8;
+        constexpr uint groups_per_row = hidden_size / 64;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint total_rows = 1;
+        for (uint i = 0; i + 1 < b_ndim; ++i) {
+            total_rows *= uint(b_shape[i]);
+        }
+        bool is_a = row < total_rows;
+        uint local_row = is_a ? row : row - total_rows;
+
+        uint tok = uint(token_ids[local_row]);
+        const device uint32_t* wrow =
+            embed_w + ulong(tok) * ulong(words_per_row);
+        const device bfloat* srow =
+            embed_scales + ulong(tok) * ulong(groups_per_row);
+        const device bfloat* zrow =
+            embed_biases + ulong(tok) * ulong(groups_per_row);
+        ulong b_off = ulong(local_row) * ulong(hidden_size);
+        ulong out_off = ulong(local_row) * ulong(hidden_size * 2)
+            + (is_a ? 0 : ulong(hidden_size));
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < hidden_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= hidden_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    float xi = is_a
+                        ? float(bfloat(float(srow[e >> 6])
+                              * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                              + float(zrow[e >> 6])))
+                        : float(b[b_off + e]);
+                    acc += xi * xi;
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    if (e < hidden_size) {
+                        float xi = is_a
+                            ? float(bfloat(float(srow[e >> 6])
+                                  * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                                  + float(zrow[e >> 6])))
+                            : float(b[b_off + e]);
+                        acc += xi * xi;
+                    }
+                }
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(hidden_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint r_start = 0; r_start < hidden_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= hidden_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    float xi = is_a
+                        ? float(bfloat(float(srow[e >> 6])
+                              * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                              + float(zrow[e >> 6])))
+                        : float(b[b_off + e]);
+                    bfloat wi = is_a ? a_weight[e] : b_weight[e];
+                    concat_out[out_off + e] = wi * bfloat(xi * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    uint e = elem + i;
+                    if (e < hidden_size) {
+                        float xi = is_a
+                            ? float(bfloat(float(srow[e >> 6])
+                                  * float((wrow[e >> 3] >> (4 * (e & 7))) & 0x0fu)
+                                  + float(zrow[e >> 6])))
+                            : float(b[b_off + e]);
+                        bfloat wi = is_a ? a_weight[e] : b_weight[e];
+                        concat_out[out_off + e] = wi * bfloat(xi * inv_mean);
+                    }
+                }
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35DualRMSNormEmbedConcat(
+    tokenIds: MLXArray,
+    b: MLXArray,
+    aWeight: MLXArray,
+    bWeight: MLXArray,
+    eps: Float,
+    embedWeight: MLXArray,
+    embedScales: MLXArray,
+    embedBiases: MLXArray
+) -> MLXArray {
+    let axis = b.dim(-1)
+    let nRows = b.size / axis
+    var outShape = b.shape
+    outShape[outShape.count - 1] = axis * 2
+    let outputs = qwen35DualRMSNormEmbedConcatKernel(
+        [
+            tokenIds, b, embedWeight, embedScales, embedBiases,
+            aWeight, bWeight, MLXArray(eps),
+        ],
+        grid: (2 * nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [outShape],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
+/// Single-row SwiGLU + affine-4/g64 down projection in ONE dispatch, for the
+/// proposal head's per-step MLP. Reads the fused gate_up output `y` directly
+/// (gate half then up half) and computes the activation inline at exactly the
+/// positions the stock M=1 `qmv_fast` kernel would load its x from. The dot
+/// structure (power-of-two x scaling, masked-nibble products, k-block order,
+/// per-row scales/biases, `simd_sum`) replicates `qmv_fast_impl<T, 64, 4>` at
+/// M=1 verbatim, and the activation reproduces the materialized chain's
+/// rounding (`bf16(silu_f32(g))`, then `bf16(silu * u)` with silu =
+/// `x * (1 / (1 + exp(-x)))` in fp32) — so the values are bit-identical to
+/// `downProj(qwen35CompiledFusedSwiGLU(y))` while the activation launch and
+/// its intermediate buffer disappear. Proposal side only; the caller gates.
+private let qwen35FusedSwiGLUDownQMVKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_swiglu_down_qmv_bf16_v1",
+    inputNames: ["y", "w", "scales", "biases"],
+    outputNames: ["out"],
+    source: """
+        constexpr int values_per_thread = 16;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int in_vec_size = 17408;
+        constexpr int in_vec_size_w = in_vec_size / 2;
+        constexpr int in_vec_size_g = in_vec_size / 64;
+
+        uint gy = threadgroup_position_in_grid.x;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint simd_lid = thread_index_in_simdgroup;
+
+        const int out_row = int(gy) * 8 + int(simd_gid) * 4;
+
+        const device uint8_t* ws =
+            reinterpret_cast<const device uint8_t*>(w)
+            + ulong(out_row) * ulong(in_vec_size_w) + simd_lid * 8;
+        const device bfloat* sl =
+            scales + ulong(out_row) * ulong(in_vec_size_g) + simd_lid / 4;
+        const device bfloat* bl =
+            biases + ulong(out_row) * ulong(in_vec_size_g) + simd_lid / 4;
+
+        float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int k = 0; k < in_vec_size; k += block_size) {
+            float x_thread[values_per_thread];
+            float sum = 0.0f;
+            // Inline SwiGLU at the x-load: x[e] = bf16(bf16(silu32(g)) * u).
+            const int base = k + int(simd_lid) * values_per_thread;
+            for (int j = 0; j < values_per_thread; j += 4) {
+                float xv[4];
+                for (int q = 0; q < 4; ++q) {
+                    const int e = base + j + q;
+                    float g = float(y[e]);
+                    float u = float(y[in_vec_size + e]);
+                    float sil = g * (1.0f / (1.0f + exp(-g)));
+                    xv[q] = float(bfloat(float(bfloat(sil)) * u));
+                }
+                sum += xv[0] + xv[1] + xv[2] + xv[3];
+                x_thread[j] = xv[0];
+                x_thread[j + 1] = xv[1] / 16.0f;
+                x_thread[j + 2] = xv[2] / 256.0f;
+                x_thread[j + 3] = xv[3] / 4096.0f;
+            }
+
+            for (int row = 0; row < 4; ++row) {
+                auto wl = reinterpret_cast<const device uint16_t*>(
+                    ws + row * in_vec_size_w);
+                float s = sl[row * in_vec_size_g];
+                float b = bl[row * in_vec_size_g];
+                float accum = 0.0f;
+                for (int i = 0; i < (values_per_thread / 4); ++i) {
+                    accum +=
+                        (x_thread[4 * i] * (wl[i] & 0x000f) +
+                         x_thread[4 * i + 1] * (wl[i] & 0x00f0) +
+                         x_thread[4 * i + 2] * (wl[i] & 0x0f00) +
+                         x_thread[4 * i + 3] * (wl[i] & 0xf000));
+                }
+                result[row] += s * accum + sum * b;
+            }
+
+            ws += block_size / 2;
+            sl += block_size / 64;
+            bl += block_size / 64;
+        }
+
+        for (int row = 0; row < 4; ++row) {
+            float reduced = simd_sum(result[row]);
+            if (simd_lid == 0) {
+                out[ulong(out_row) + ulong(row)] = bfloat(reduced);
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+func qwen35FusedSwiGLUDownQMV(
+    y: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray
+) -> MLXArray {
+    var outShape = y.shape
+    outShape[outShape.count - 1] = 5120
+    let outputs = qwen35FusedSwiGLUDownQMVKernel(
+        [y, w, scales, biases],
+        grid: (640 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
         outputShapes: [outShape],
         outputDTypes: [.bfloat16]
     )
