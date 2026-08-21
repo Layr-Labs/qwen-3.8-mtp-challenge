@@ -945,6 +945,30 @@ public final class Qwen36MTPBlockSession {
         case ship, pb5, pb7, pbfit
     }
 
+    /// Rig-calibrated depth price. The default price is fitted to LOCAL machine
+    /// economics (head-step / verify-forward ~= 0.25). On the ranked M5 the
+    /// marginal verify cost is far flatter (round ~= base + ~2.45*width, so the
+    /// head/verify ratio ~= 0.045), so the greedy marginal rule accepts a lower
+    /// `reach` threshold at every depth and commits more tokens per round. Only
+    /// the per-round DRAFT DEPTH changes; the target forward, the verify block,
+    /// the accept walk, the row ledger and rollback are all unchanged.
+    internal static let rigDepthPriceH = 0.045
+
+    /// Uniform-shape price built at `rigDepthPriceH`; same closed form as
+    /// `makeUniformDepthPrice`.
+    internal static func makeRigCalibratedDepthPrice() -> DepthPrice {
+        DepthPrice(
+            marginal: [Double](repeating: rigDepthPriceH,
+                               count: Qwen36MTPLimits.maxDepth),
+            cumulative: (0 ... Qwen36MTPLimits.maxDepth).map {
+                1.0 + Double($0) * rigDepthPriceH
+            })
+    }
+
+    /// Built once, mirroring `depthPrice`.
+    internal static let rigCalibratedDepthPrice: DepthPrice =
+        makeRigCalibratedDepthPrice()
+
     /// THE ONE LINE AN ARM SESSION PATCHES. `QwenMTPDepthPriceTests` pins the
     /// shipped value so a leg session cannot leave another arm behind.
     ///
@@ -1080,7 +1104,7 @@ public final class Qwen36MTPBlockSession {
         // there would describe the next round's inputs, not this one's.
         if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
         guard cap > 0 else { return 0 }
-        let price = Self.depthPrice
+        let price = Self.rigCalibratedDepthPrice
         var reach = 1.0
         var expected = 0.0
         var depth = 0
