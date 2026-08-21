@@ -1435,6 +1435,22 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 
+    /// `residual + downProj(x)` in one AddMM dispatch for the proposal head
+    /// layer. Nil when shapes/dtypes miss or the rollback flag is set; the
+    /// caller owns the fallback. The C-add folds into the GEMM epilogue, so
+    /// this replaces one matmul + one elementwise add with a single node on
+    /// the draft step.
+    func downProjResidualAdd(_ x: MLXArray, residual: MLXArray) -> MLXArray? {
+        guard lagunaQwenMLPResidualAddMMEnabled,
+            downProj.bias == nil,
+            downProj.weight.dtype == .bfloat16,
+            x.dtype == .bfloat16, residual.dtype == .bfloat16,
+            x.dim(-1) == downProj.weight.dim(0),
+            residual.dim(-1) == downProj.weight.dim(1)
+        else { return nil }
+        return addMM(residual, x, downProj.weight.T, alpha: 1.0, beta: 1.0)
+    }
+
 }
 
 // MARK: - Full-attention Q/K preparation
@@ -3503,6 +3519,12 @@ private let qwen35ProbeSortEnabled: Bool =
 /// expects under one changed proposal. 0.25 is the low-variance choice and it
 /// is the byte point the r1 arm-C and r2 balanced sessions both measured.
 private let qwen35DerivedClusterProbeFraction: Double = 0.25
+
+/// Rollback switch for the proposal-head MLP residual AddMM fold
+/// (`Qwen35FusedMLP.downProjResidualAdd`). Set "0" to restore the eager
+/// `h + downProj(...)` pair.
+let lagunaQwenMLPResidualAddMMEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MLP_RESIDUAL_ADDMM"] != "0"
 
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
