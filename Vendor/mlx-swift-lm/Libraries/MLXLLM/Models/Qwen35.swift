@@ -1295,6 +1295,22 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 
+    /// `residual + downProj(x)` in one AddMM dispatch for the proposal head
+    /// layer. Nil when shapes/dtypes miss or the rollback flag is set; the
+    /// caller owns the fallback. The C-add folds into the GEMM epilogue, so
+    /// this replaces one matmul + one elementwise add with a single node on
+    /// the host-build-bound draft step.
+    func downProjResidualAdd(_ x: MLXArray, residual: MLXArray) -> MLXArray? {
+        guard lagunaQwenMLPResidualAddMMEnabled,
+            downProj.bias == nil,
+            downProj.weight.dtype == .bfloat16,
+            x.dtype == .bfloat16, residual.dtype == .bfloat16,
+            x.dim(-1) == downProj.weight.dim(0),
+            residual.dim(-1) == downProj.weight.dim(1)
+        else { return nil }
+        return addMM(residual, x, downProj.weight.T, alpha: 1.0, beta: 1.0)
+    }
+
 }
 
 // MARK: - Full-attention Q/K preparation
@@ -3158,6 +3174,26 @@ private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
 
+/// Rollback switch for the proposal-head MLP residual AddMM fold
+/// (`Qwen35FusedMLP.downProjResidualAdd`). Set "0" to restore the eager
+/// `h + downProj(...)` pair.
+let lagunaQwenMLPResidualAddMMEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MLP_RESIDUAL_ADDMM"] != "0"
+
+/// Rollback switch for the two-stage coarse draft readout
+/// (`draftTokenIDWithDeclaredRerank`). Set "0" to restore the single full-plane
+/// coarse GEMV.
+let qwenTwoStageCoarseEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_TWO_STAGE_COARSE"] != "0"
+
+/// Stage-1 survivor count for the two-stage coarse readout. Coverage on real
+/// head hidden states: 64/64 in top-256 of quarter-dimension partial scores.
+let qwenTwoStageSurvivors = 256
+
+/// Fraction (in 64-dim groups) of the packed coarse plane used for stage-1
+/// partial scores. 20 of 80 groups = dims 0..1279, a contiguous packed slice.
+let qwenTwoStageStage1Groups = 20
+
 /// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
 private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
     // Mirrors the kernel static_asserts; see the bitmask note there.
@@ -3246,6 +3282,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftHeadW: MLXArray?
     private var _draftHeadS: MLXArray?
     private var _draftHeadZ: MLXArray?
+
+    // Two-stage coarse readout: compact contiguous stage-1 plane (the first
+    // `qwenTwoStageStage1Groups` groups of the declared coarse plane), derived
+    // once at first use from input-independent weight state.
+    private var _stage1W: MLXArray?
+    private var _stage1S: MLXArray?
+    private var _stage1Z: MLXArray?
 
     // Input-independent compact copy of the loaded exact lm_head, used only
     // for draft proposals when no declared draft_lm_head is present. It is not
@@ -3644,6 +3687,65 @@ extension Qwen35TextModel: MTPCapable {
         return outputs[0]
     }
 
+    /// Two-stage coarse candidate selection. Stage 1 scores every vocabulary
+    /// row against only the leading slice of the packed coarse plane (a quarter
+    /// of the bytes); stage 2 re-scores the survivors with the FULL coarse row
+    /// so the final shortlist uses exactly the same arithmetic as the single
+    ///-stage path whenever the true coarse winner survives stage 1. Measured
+    /// survivor coverage on real head hidden states: 64/64 in the top-256 of
+    /// quarter-dimension partial scores (Gaussian inputs are far harsher and
+    /// were never the operating regime). Proposal-only path: a rare miss costs
+    /// one weaker proposal, never an emitted token.
+    private func qwen35TwoStageCoarseCandidateIDs(
+        x: MLXArray,
+        coarseWeight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        candidateCount: Int
+    ) -> MLXArray? {
+        let groups = qwenTwoStageStage1Groups
+        let packedPerGroup = 64 / 32 * 2  // 2-bit values: 16 u32 per 64-dim group
+        let stage1Packed = groups * packedPerGroup
+        guard coarseWeight.dim(1) == 320,
+            scales.dim(1) == 80, biases.dim(1) == 80,
+            stage1Packed < coarseWeight.dim(1)
+        else { return nil }
+        if _stage1W == nil {
+            _stage1W = coarseWeight[0..., 0..<stage1Packed].contiguous()
+            _stage1S = scales[0..., 0..<groups].contiguous()
+            _stage1Z = biases[0..., 0..<groups].contiguous()
+        }
+        guard let w1 = _stage1W, let s1 = _stage1S, let z1 = _stage1Z else {
+            return nil
+        }
+        // Stage 1: partial affine-2 scores over all rows, using only the
+        // leading hidden dimensions covered by the stage-1 plane slice.
+        let stage1Dims = groups * 64
+        let partial = quantizedMM(
+            x[0..., 0..., 0..<stage1Dims], w1, scales: s1, biases: z1,
+            transpose: true, groupSize: 64, bits: 2, mode: .affine)
+        let partialReal = partial[0..., 0..., 0 ..< Self.compactDraftRealCount]
+            .reshaped([Self.compactDraftRealCount])
+        // Survivors.
+        let survivors = qwenTwoStageSurvivors
+        let kth1 = Self.compactDraftRealCount - survivors
+        let survivorIDs = MLX.argPartition(partialReal, kth: kth1, axis: -1)[(kth1)...]
+        // Stage 2: exact coarse rescore of the survivors with full rows.
+        let wg = MLX.take(coarseWeight, survivorIDs, axis: 0)
+        let sg = MLX.take(scales, survivorIDs, axis: 0)
+        let zg = MLX.take(biases, survivorIDs, axis: 0)
+        let refined = quantizedMM(
+            x, wg, scales: sg, biases: zg,
+            transpose: true, groupSize: 64, bits: 2, mode: .affine)
+            .reshaped([survivors])
+        let kth2 = survivors - candidateCount
+        let localTop = MLX.argPartition(refined, kth: kth2, axis: -1)[(kth2)...]
+            .reshaped([candidateCount])
+        // Map survivor-relative picks back to vocabulary row indices; the
+        // caller gathers exact-rerank rows and maps IDs by vocab position.
+        return MLX.take(survivorIDs, localTop, axis: 0).reshaped([candidateCount])
+    }
+
     private func draftTokenIDWithDeclaredRerank(_ x: MLXArray) -> MLXArray? {
         guard let coarseWeight = _draftHeadW,
               let coarseScales = _draftHeadS,
@@ -3667,21 +3769,30 @@ extension Qwen35TextModel: MTPCapable {
               exactBiases.shape == [Self.compactDraftPaddedCount, 80]
         else { return nil }
 
-        let coarse = quantizedMM(
-            x, coarseWeight, scales: coarseScales, biases: coarseBiases,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine
-        )
         let candidateCount = Self.draftRerankCandidateCount
         // Drift guard: the kernels bake these shapes in as constexpr.
         guard qwen35Top32RealCount == Self.compactDraftRealCount,
               qwen35Top32K == candidateCount
         else { return nil }
         let candidateIDs: MLXArray
-        if qwen35Top32Enabled {
+        if qwenTwoStageCoarseEnabled,
+            let staged = qwen35TwoStageCoarseCandidateIDs(
+                x: x, coarseWeight: coarseWeight,
+                scales: coarseScales, biases: coarseBiases,
+                candidateCount: candidateCount)
+        {
+            candidateIDs = staged
+        } else if qwen35Top32Enabled {
+            let coarse = quantizedMM(
+                x, coarseWeight, scales: coarseScales, biases: coarseBiases,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine)
             candidateIDs = qwen35DraftTop32(
                 coarse[0..., 0..., 0 ..< Self.compactDraftRealCount]
                     .reshaped([Self.compactDraftRealCount]))
         } else {
+            let coarse = quantizedMM(
+                x, coarseWeight, scales: coarseScales, biases: coarseBiases,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine)
             let kth = Self.compactDraftRealCount - candidateCount
             candidateIDs = MLX.argPartition(
                 coarse[0..., 0..., 0 ..< Self.compactDraftRealCount],
