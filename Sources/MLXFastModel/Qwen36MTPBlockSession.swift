@@ -495,13 +495,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        // qL={2,3} added to the crown's {1,4,5}: the exactness chunk splits a
-        // width-7/8/9 verify into a qL=5 chunk A plus a qL={2,3,4} chunk B, so
-        // deep rounds dispatch the qL=2 and qL=3 pipeline states too. Leaving
-        // them out first-touches those PSOs inside the scored window. Ranked
-        // receipts for exactly this extension on the pre-jump frontier:
-        // qL{1,4,5} 3.2355 -> qL{1..5} 3.2414, best draw 3.2452.
-        for qL in [1, 2, 3, 4, 5] {
+        for qL in [1, 5, 4] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -518,7 +512,7 @@ public final class Qwen36MTPBlockSession {
         // Scored decode walks N past 1024 (512 seed + 512 decode).
         // `sdpa_vector_2pass` on this arch bumps blocks 64→128 when N>1024.
         // The kL=1024 warm above compiles the 64-block family. Compile the
-        // 128-block family at kL=1025 for the same qL={1,2,3,4,5} set.
+        // 128-block family at kL=1025 for the same qL={1,5,4} only.
         if extK.dim(2) == 1024 {
             let kPad1 = MLXArray.zeros(
                 [extK.dim(0), extK.dim(1), 1, extK.dim(3)], dtype: extK.dtype)
@@ -527,7 +521,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 2, 3, 4, 5] {
+            for qL in [1, 5, 4] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -758,7 +752,7 @@ public final class Qwen36MTPBlockSession {
     /// serial trajectory. Segmenting the whole FORWARD instead (two model
     /// calls, 5+k) was measured bit-exact too but pays a second full weight
     /// pass (~25 ms) and loses on net; the chunk lives at the sdpa only.
-    private static let sdpaWidthWallDepthCap = 5
+    private static let sdpaWidthWallDepthCap = 6
 
     /// Depth cap for streak-qualified deep rounds. 8 is the trusted
     /// per-round maximum; rows_per_round = depth + 1 stays ledger-legal.
@@ -795,6 +789,78 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+    // MARK: - _benchCOSTGATE: cumulative-acceptance marginal-cost gate
+    //
+    // OFF by default -> byte-identical to the shipped cost-model schedule.
+    // When enabled, the per-position continue-drafting test in
+    // `costModelDepth` is replaced by the literature marginal-cost rule
+    // (round12/F2-dynamic-depth.md): draft position k iff the cumulative
+    // acceptance probability -- the product of the per-position EMAs, the SAME
+    // estimate the shipped rule chains -- is at least the relative drafting
+    // cost `costGateRatio` (default 0.25 = ~12 ms marginal / ~48 ms base). The
+    // widthCap / streak-gate ceilings still bound the result. SCHEDULE-ONLY:
+    // emitted tokens stay exact via verification; only drafts / D change.
+    //
+    // ENV NAMES. The task specified `MLXFAST_COST_RATIO` /
+    // `MLXFAST_COSTGATE_TRACE`, but `sanitizedRuntimeWorkerEnvironment` strips
+    // every `MLXFAST_*` name before the sandboxed worker starts, so those never
+    // reach this hot path. The worker-reachable `MLX_` prefix is the primary
+    // name (matching `MLX_QWEN_MTP_TRACE`); the literal `MLXFAST_*` name is kept
+    // as a fallback for non-sandboxed local invocation.
+    private static func costGateEnv(_ mlxName: String, _ mlxfastName: String)
+        -> String?
+    {
+        let env = ProcessInfo.processInfo.environment
+        return env[mlxName] ?? env[mlxfastName]
+    }
+    private static let costGateEnabled =
+        costGateEnv("MLX_QWEN_MTP_COSTGATE", "MLXFAST_COSTGATE") != "0"
+    private static let costGateRatio =
+        costGateEnv("MLX_QWEN_MTP_COST_RATIO", "MLXFAST_COST_RATIO")
+            .flatMap(Double.init) ?? 0.10
+    private static let costGateTrace =
+        costGateEnv("MLX_QWEN_MTP_COSTGATE_TRACE", "MLXFAST_COSTGATE_TRACE")
+            == "1"
+
+    /// Per-prompt (per-session) tallies of how the gate's depth compares to the
+    /// legacy marginal rule. Makes an enabled run fire-proof: a phantom toggle
+    /// that never actually executed the changed path prints nothing.
+    private var costGateExtended = 0
+    private var costGateTruncated = 0
+    private var costGateUnchanged = 0
+    private var costGateAnnounced = false
+
+    /// P(draft i accepted | drafts 0..<i accepted) -- the estimate BOTH the
+    /// shipped rule and the cost gate chain. Extracted verbatim from
+    /// `costModelDepth`'s loop so the two schedules read one estimator.
+    private func positionAcceptEstimate(_ depth: Int) -> Double {
+        var p = positionAcceptEMA[depth]
+        if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
+            let margin = tail.1[0] - tail.1[1]
+            let conf = 1.0 / (1.0 + exp(-margin / 2.0))
+            p = Swift.min(p, conf)
+        } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
+            let margin = tail.1[0] - tail.1[1]
+            let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
+            p = Swift.min(p, conf2)
+        }
+        return p
+    }
+
+    /// The cumulative-acceptance gate. `cap` already carries the widthCap /
+    /// streak-gate ceiling. Draft position k while Π_{i<=k} p_i >= ratio.
+    private func costGateDepth(cap: Int) -> Int {
+        let ratio = Self.costGateRatio
+        var reach = 1.0
+        var depth = 0
+        while depth < cap {
+            reach *= positionAcceptEstimate(depth)
+            guard reach >= ratio else { break }
+            depth += 1
+        }
+        return depth
+    }
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -823,7 +889,28 @@ public final class Qwen36MTPBlockSession {
         // per-position acceptance EMAs and collapses on a cold stretch by
         // itself. Widths 6..8 are bit-exact per position against the serial
         // trajectory through the sdpa exactness chunk, so 7 is policy.
-        let widthCap = Self.segmentedVerifyDepthCap
+        // A floor of 6 under the promoted ceiling of 7. Taking the streak gate
+        // away is what won this tree the frontier, but the per-prompt receipt
+        // shows it overshot on ONE slot: `919318e1` — always the x4 slot —
+        // came back at draft length 4.38 / 0.012191 s/tok, against its own
+        // board minimum 0.011967 at 4.32 on the cap-7 tree that still HAD a
+        // floor, and against a 4.25 optimum. Removing a floor can only deepen
+        // a round, and x4 wants to be shallow: that is a -1.1% we handed back.
+        //
+        // The gain came from the other slot: `00142a44` reached 0.010975 at
+        // draft length 5.26, a new board minimum, because the old floor of 5
+        // truncated rounds its `reach` had earned (trunk held it at 4.77
+        // against a 5.75 optimum).
+        //
+        // So the floor is not damage, it was too BLUNT — one reject dropped the
+        // cap the whole way from 7 to 5. At 6 a rejecting round is restrained
+        // by one rung instead of two: x4 gets the restraint that keeps it near
+        // 4.3, while the high-acceptance prompts keep the depth they earned.
+        // Widths 6..8 are bit-exact per position through the sdpa exactness
+        // chunk, so both constants are policy, not correctness.
+        let widthCap = fullAcceptStreak >= Self.segmentedStreakGate
+            ? Self.segmentedVerifyDepthCap
+            : Self.sdpaWidthWallDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
@@ -833,23 +920,41 @@ public final class Qwen36MTPBlockSession {
         var expected = 0.0
         var depth = 0
         while depth < cap {
-            var p = positionAcceptEMA[depth]
-            if depth == 0, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf = 1.0 / (1.0 + exp(-margin / 2.0))
-                p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
-            }
+            let p = positionAcceptEstimate(depth)
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
             expected += reach
             depth += 1
         }
-        return depth
+        // _benchCOSTGATE: OFF -> return the shipped depth unchanged
+        // (byte-identical). ON -> resolve the cumulative-acceptance gate under
+        // the SAME cap, tally the comparison vs the legacy rule, and return the
+        // gate's depth. The first execution always emits one stderr line (even
+        // with trace off) so an enabled run cannot be a phantom; with trace on,
+        // every round prints and the last line of a prompt carries its totals.
+        guard Self.costGateEnabled else { return depth }
+        let gateDepth = costGateDepth(cap: cap)
+        if gateDepth > depth {
+            costGateExtended += 1
+        } else if gateDepth < depth {
+            costGateTruncated += 1
+        } else {
+            costGateUnchanged += 1
+        }
+        if Self.costGateTrace || !costGateAnnounced {
+            costGateAnnounced = true
+            let decision = gateDepth > depth
+                ? "extended"
+                : (gateDepth < depth ? "truncated" : "unchanged")
+            Self.traceWrite(
+                "costgate: round=\(roundCount) ratio=\(Self.costGateRatio) "
+                + "legacy=\(depth) gate=\(gateDepth) cap=\(cap) "
+                + "decision=\(decision) totals(ext/trunc/unch)="
+                + "\(costGateExtended)/\(costGateTruncated)/"
+                + "\(costGateUnchanged)\n")
+        }
+        return gateDepth
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
