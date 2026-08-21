@@ -1034,6 +1034,80 @@ public final class Qwen36MTPBlockSession {
     /// measured dead (2.833, -7.1%); gate 0 only tied (2.9200).
     private static let segmentedStreakGate = 2
 
+    /// E99 rung 5: the conditional one-bit `G` clamp, off unless the arm is
+    /// selected by the environment.
+    ///
+    /// `G = ceil(M / IPG)` counts how many times a round streams the whole
+    /// weight set. The E96 census measured 2.005x the organizer's
+    /// 14,412,349,440 transformed bytes moved at `M = 5`, 88.6 % of the round
+    /// spent streaming at 249.55 GB/s, so a `G = 2` round is literally two
+    /// complete passes over the model and the `G` boundary is the largest
+    /// single step on the cost curve.
+    ///
+    /// E99 rungs 2 to 4 replayed the recorded rounds on the ranked M5 curve.
+    /// The whole allocation prize is 3.04 % to 7.40 % of us/token by offered
+    /// cap; the single binary choice "stay inside the `G = 1` band or keep the
+    /// shipped depth" carries 0.57 to 0.78 of it; and the pre-round top-2
+    /// margin separates the two cases better than any other legal pre-round
+    /// scalar (r = -0.480 with "this round accepts fewer than three", against
+    /// -0.292 for the previous round's acceptance and -0.241 for the depth the
+    /// walk would pick). Held out by leaving one whole leg out of the fit, a
+    /// single threshold on that margin earns +1.02 % to +3.04 %.
+    ///
+    /// The walk already reads the same margin as `sigmoid(margin / 2)`, which
+    /// returns 0.991 at margin 9.4. That transform is saturated across exactly
+    /// the band that separates a shallow round from a deep one, so the signal
+    /// reaches the schedule and is then thrown away.
+    internal enum MarginGateArm: String {
+        case off, g1
+    }
+
+    /// `g1` is the shipped default. The ranked worker exports no campaign
+    /// environment, so an arm that needs a variable to switch on submits a
+    /// bit-identical no-op. The variable stays as a research override only.
+    ///
+    /// A malformed value fails the run instead of falling back, which is what
+    /// keeps an arm session from silently timing the wrong path.
+    internal static let marginGateArm: MarginGateArm = {
+        guard let raw = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_MARGIN_GATE"], !raw.isEmpty
+        else { return .g1 }
+        guard let arm = MarginGateArm(rawValue: raw) else {
+            preconditionFailure(
+                "MLX_QWEN_MTP_MARGIN_GATE=\(raw) is not a margin gate arm")
+        }
+        return arm
+    }()
+
+    /// The median of the four leg-out fits, which chose 8.25, 9.1875, 9.4375
+    /// and 10.4375 on caps 4, 5, 6 and 7.
+    internal static let marginGateDefaultThreshold = 9.4375
+
+    internal static let marginGateThreshold: Double = {
+        guard let raw = ProcessInfo.processInfo
+            .environment["MLX_QWEN_MTP_MARGIN_GATE_T"], !raw.isEmpty
+        else { return marginGateDefaultThreshold }
+        guard let value = Double(raw), value.isFinite else {
+            preconditionFailure(
+                "MLX_QWEN_MTP_MARGIN_GATE_T=\(raw) is not a finite number")
+        }
+        return value
+    }()
+
+    /// The widest draft that still streams the weights once: `M = d + 1 = 4`
+    /// gives `IPG = 4` and `G = 1`.
+    internal static let marginGateDepth = 3
+
+    /// The pending primary's target top-2 margin, or NaN before the first
+    /// commit of a request. Every NaN comparison is false, so a round without
+    /// the signal keeps the shipped cap.
+    private func pendingTop2Margin() -> Double {
+        guard let tail = pendingTop2, tail.1.count >= 2 else {
+            return Double.nan
+        }
+        return tail.1[0] - tail.1[1]
+    }
+
     /// The greedy marginal-depth rule described at the policy's assignment.
     private func costModelDepth(offeredDepth: Int) -> Int {
         // The width wall binds the SINGLE-CALL verify; a qualifying
@@ -1071,14 +1145,21 @@ public final class Qwen36MTPBlockSession {
         // Imported from promoted submission c6af1e24 (organizer 88578f92,
         // official 3.30955573); it supersedes ead84bba (official 3.30221310).
         let widthCap = Self.segmentedVerifyDepthCap
-        let cap = Swift.min(
+        var cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
+        let margin = pendingTop2Margin()
+        let gateFired = Self.marginGateArm == .g1
+            && margin <= Self.marginGateThreshold
+        if gateFired { cap = Swift.min(cap, Self.marginGateDepth) }
         // Snapshot BEFORE the walk and before any drafting: by the time the
         // round's trace line is emitted, the EMAs, the streak and `pendingTop2`
         // have all been advanced by this round's own outcome, so reading them
         // there would describe the next round's inputs, not this one's.
-        if Self.traceRounds { snapshotScheduleSignal(widthCap: widthCap) }
+        if Self.traceRounds {
+            snapshotScheduleSignal(widthCap: widthCap, margin: margin,
+                                   gateFired: gateFired)
+        }
         guard cap > 0 else { return 0 }
         let price = Self.depthPrice
         var reach = 1.0
@@ -1119,18 +1200,16 @@ public final class Qwen36MTPBlockSession {
     /// full-accept streak and the width cap in force. Recorded so an offline
     /// fit can ask which of these separates a round that accepts its whole
     /// chain from one that accepts nothing, without spending a second run.
-    private func snapshotScheduleSignal(widthCap: Int) {
-        let margin: Double
-        if let tail = pendingTop2, tail.1.count >= 2 {
-            margin = tail.1[0] - tail.1[1]
-        } else {
-            margin = Double.nan
-        }
+    private func snapshotScheduleSignal(widthCap: Int, margin: Double,
+                                        gateFired: Bool) {
         let emas = positionAcceptEMA
             .map { String(format: "%.6f", $0) }.joined(separator: ",")
-        scheduleTrace = "arm=" + Self.depthPriceArm.rawValue + " " + String(
-            format: "m=%.6f streak=%d cap=%d ema=",
-            margin, fullAcceptStreak, widthCap) + emas + " sched="
+        scheduleTrace = "arm=" + Self.depthPriceArm.rawValue
+            + " gate=" + Self.marginGateArm.rawValue + String(
+                format: " gt=%.6f fire=%d ", Self.marginGateThreshold,
+                gateFired ? 1 : 0) + String(
+                format: "m=%.6f streak=%d cap=%d ema=",
+                margin, fullAcceptStreak, widthCap) + emas + " sched="
     }
 
     /// Fold one round's acceptance outcome into the per-position EMAs.
