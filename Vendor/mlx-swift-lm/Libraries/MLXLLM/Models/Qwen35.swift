@@ -3487,6 +3487,114 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
         ensureRowContiguous: false
     )
 }
+/// E88: the post-gather candidate pick in one dispatch.
+///
+/// The cluster path's exact stage used to close with NINE launches over tiny
+/// intermediates:
+///
+///     argPartition(rowScore, kth)[(kth)...]        // top-32 flat indices
+///     floorDivide(local, width)                    // leaf per selected row
+///     remainder(local, width)                      // row inside the leaf
+///     take(probed, leaf)                           // leaf -> probed leaf id
+///     mul / add                                    // probed*W + off
+///     take(perm, permutedRow)                      // compact source row
+///     asType(.uint32)
+///
+/// Every tensor there is at most [24,584] elements, so each launch costs more
+/// in submission latency than in arithmetic, and the chain runs once per
+/// PROPOSED token. This kernel streams `rowScore` once per selection round,
+/// keeps the running best in registers plus one threadgroup reduction, and
+/// performs the identical leaf/perm mapping before writing the winner.
+///
+/// Selection semantics versus `argPartition`: both select the same SET except
+/// when an exact tie straddles the cut boundary. argPartition's order among
+/// equal values is unspecified; this kernel breaks ties toward the LOWER flat
+/// index, which is the same preference the downstream rerank's strict
+/// (value, id) total order applies. The shortlist feeds a proposal head whose
+/// every proposal is verified against the target before it can be emitted, so
+/// a boundary tie resolved differently can move acceptance by at most one
+/// draft and can never move an emitted token.
+private func makeQwen35RowPickKernel(
+    rows: Int, rowsPerLeaf: Int, cands: Int
+) -> MLXFast.MLXFastKernel {
+    let tg = qwen35ProbeSortTG
+    return MLXFast.metalKernel(
+        name: "qwen_mtp_row_pick_v1",
+        inputNames: ["scores", "probed", "perm"],
+        outputNames: ["candidate_ids"],
+        source: """
+            constexpr uint ROWS        = \(rows);
+            constexpr uint CANDS       = \(cands);
+            constexpr uint LEAF_WIDTH  = \(rowsPerLeaf);
+            constexpr uint USED_WORDS  = (ROWS + 31u) / 32u;
+            constexpr uint TG_SIZE     = \(tg);
+
+            uint tid = thread_position_in_threadgroup.x;
+
+            threadgroup atomic_uint used[USED_WORDS];
+            threadgroup float best_value[TG_SIZE];
+            threadgroup uint  best_index[TG_SIZE];
+
+            for (uint w = tid; w < USED_WORDS; w += TG_SIZE) {
+                atomic_store_explicit(&used[w], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint c = 0u; c < CANDS; ++c) {
+                float mine_value = NAN;
+                uint  mine_index = 0u;
+                bool  have = false;
+                for (uint i = tid; i < ROWS; i += TG_SIZE) {
+                    uint word = i >> 5u;
+                    uint bit = 1u << (i & 31u);
+                    if ((atomic_load_explicit(
+                            &used[word], memory_order_relaxed) & bit) != 0u) {
+                        continue;
+                    }
+                    float v = scores[i];
+                    if (isnan(v)) { continue; }
+                    if (!have || v > mine_value) {
+                        mine_value = v;
+                        mine_index = i;
+                        have = true;
+                    }
+                }
+                best_value[tid] = have ? mine_value : NAN;
+                best_index[tid] = mine_index;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid == 0u) {
+                    float value = best_value[0];
+                    uint index = best_index[0];
+                    for (uint t = 1u; t < TG_SIZE; ++t) {
+                        float other = best_value[t];
+                        if (isnan(other)) { continue; }
+                        if (isnan(value) || other > value
+                                || (other == value && best_index[t] < index)) {
+                            value = other;
+                            index = best_index[t];
+                        }
+                    }
+                    uint leaf = index / LEAF_WIDTH;
+                    uint offset = index - leaf * LEAF_WIDTH;
+                    uint src = probed[leaf] * LEAF_WIDTH + offset;
+                    candidate_ids[c] = uint(perm[src]);
+                    atomic_fetch_or_explicit(
+                        &used[index >> 5u], 1u << (index & 31u),
+                        memory_order_relaxed);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """,
+        header: "",
+        ensureRowContiguous: true
+    )
+}
+
+/// `MLX_E88_ROW_PICK=0` restores the eager nine-launch chain bit-for-bit.
+/// The `MLX_` prefix is load-bearing: the worker sanitizer drops `MLXFAST_*`.
+private let qwen35RowPickEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E88_ROW_PICK"] != "0"
 
 /// `MLX_E87_PROBE_SORT=0` restores the `MLX.sorted` path bit-for-bit. The
 /// `MLX_` prefix is load-bearing: the worker sanitizer drops `MLXFAST_*`.
@@ -3828,6 +3936,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftCentroidS: MLXArray?
     private var _draftCentroidZ: MLXArray?
     private var _draftClusterPerm: MLXArray?
+    private var _draftRowPick: MLXFast.MLXFastKernel?
     private var _draftClusterShape: [Int]?
     private var _draftClusterLHS: MLXArray?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
@@ -4418,6 +4527,29 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine,
             sortedIndices: true
         ).reshaped([probes * rowsPerCluster])
+
+        // E88 fast path: one dispatch replaces the nine-launch chain below.
+        // The eager chain stays as the guarded fallback and the A/B arm.
+        if qwen35RowPickEnabled,
+           rowScore.dtype == .float32,
+           probed.dtype == .uint32,
+           let pick = _draftRowPick ?? {
+               let kernel = makeQwen35RowPickKernel(
+                   rows: probes * rowsPerCluster,
+                   rowsPerLeaf: rowsPerCluster,
+                   cands: candidateCount)
+               _draftRowPick = kernel
+               return kernel
+           }()
+        {
+            return pick(
+                [rowScore, probed, perm],
+                grid: (qwen35ProbeSortTG, 1, 1),
+                threadGroup: (qwen35ProbeSortTG, 1, 1),
+                outputShapes: [[candidateCount]],
+                outputDTypes: [.uint32]
+            )[0]
+        }
 
         let kth = probes * rowsPerCluster - candidateCount
         let local = MLX.argPartition(rowScore, kth: kth)[.ellipsis, (kth)...]
