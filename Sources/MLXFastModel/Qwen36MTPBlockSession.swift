@@ -800,8 +800,15 @@ public final class Qwen36MTPBlockSession {
     /// truth within ~10 rounds regardless; what protects the hard prompts
     /// is the 0.95 optimism CAP below (the p5 over-draft bug was the
     /// uncapped transfer, not the prior).
+    /// Warm-start LEVEL: 0.92 at position 0 (bounded by the 0.95 optimism cap
+    /// this file treats as the ceiling for an inferred, not-yet-observed
+    /// acceptance estimate), gently decaying by 0.99 — only the level moves,
+    /// not the shape, so the greedy marginal rule in `costModelDepth` clears
+    /// its per-position threshold at greater depth before the real EMA warms.
+    /// The estimate the price rule reads changes; the accept walk and verify
+    /// do not, so which tokens the target commits cannot change.
     private var positionAcceptEMA: [Double] = (0 ..< Qwen36MTPLimits.maxDepth)
-        .map { 0.85 * pow(0.98, Double($0)) }
+        .map { 0.92 * pow(0.99, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
     /// h = (one head draft step) / (one batched verify forward), the only
