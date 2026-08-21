@@ -411,20 +411,16 @@ public final class Qwen36MTPBlockSession {
             cache: oneRowReplayCache, committedRows: 1))
         eval(oneRowReplayCache.flatMap { $0.state })
 
-        // SEED-PREFILL SHAPE WARM (M=512 backbone). Keep this as the final
-        // warm so the promoted allocator/pipeline end state is preserved.
-        // The phase trace measured
-        // `begin` at ~0.9 s of eval wall for a 512-token seed — mostly
-        // first-touch pipeline compilation and allocator growth for the
-        // M=512 shapes, charged inside the timed window because this warm
-        // path previously exercised only M=8 and the decode widths. One
-        // input-independent 512-zero forward on a throwaway cache moves that
-        // first-touch out here, into the untimed warm, replaying `begin`'s
-        // exact op sequence: full-seed forward whose full logits are a dead
-        // lazy graph (never evaluated, exactly as `begin` leaves them), the
-        // final-norm over the priming rows, and the single-row lm_head
-        // readout. Zero tokens in, nothing read out — pure shape warm, the
-        // same contract as every warm above.
+        // SEED-PREFILL SHAPE WARM (M=512 backbone). The 512-row throwaway
+        // forward still materialises FA caches at kL=512 so later-window
+        // SDPA can HOST-extend them. GPU REMOVE leftover after `#942`
+        // (kL=1025 128-block warm delete, 3.30593 miss): do NOT also
+        // compile `applyFinalNorm` over 511 priming rows plus last-row
+        // lm_head top-2. `begin()` never evals a 511-row final-norm —
+        // seed logits stay a dead lazy graph and only the last hidden row
+        // is projected. Those extra graphs occupied pipeline cache the
+        // scored 64-block decode family wants. Keep kL=1024 and kL=1025
+        // qL={1,5,4} SDPA warms. Live `begin()` caches untouched.
         let seedWarmCache = model.newCache(parameters: nil)
         let seedWarmTokens = Array(repeating: 0, count: 512)
         let (seedWarmLogits, seedWarmHidden) = model.callWithHidden(
@@ -432,13 +428,8 @@ public final class Qwen36MTPBlockSession {
                 tokens: MLXArray(seedWarmTokens).reshaped([1, 512])),
             cache: seedWarmCache, nConfirmed: 0)
         _ = seedWarmLogits
-        let seedWarmRow = hiddenRow(seedWarmHidden, seedWarmHidden.dim(1) - 1)
-        let seedWarmNorm = model.applyFinalNorm(
-            seedWarmHidden[0..., 0 ..< 511, 0...])
-        let (seedWarmIDs, seedWarmValues) =
-            Self.linearTopTwoRows(model.applyLMHead(seedWarmRow))
-        eval(seedWarmCache.flatMap { $0.state }
-            + [seedWarmIDs, seedWarmValues, seedWarmNorm])
+        _ = seedWarmHidden
+        eval(seedWarmCache.flatMap { $0.state })
 
         // TARGET-SIDE later-window SDPA compile. Distinct from the rejected
         // #674 proposal-head HOST KV walk (3.23670). After the 512-row seed
