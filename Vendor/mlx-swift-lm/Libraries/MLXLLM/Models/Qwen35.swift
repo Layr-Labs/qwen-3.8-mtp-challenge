@@ -3493,6 +3493,211 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
+// MARK: - E88b cluster row top-32 (proposal-side only)
+//
+// E88 (`#987`) replaced both per-draft `argPartition`s and scored a fair
+// 3.34596 (−0.43%). The unproven half was the K=3,073 centroid radix-select.
+// This leftover keeps the live E87 centroid path (`argPartition` + probe
+// sort) and only replaces the 24,584-row `argPartition` plus the
+// floor-divide / remainder / take map with the already-promoted dense
+// top-32 clone at REAL_COUNT=24584. Probe SET identity is the promoted
+// E87 SET. No seqLen gate. 2-bit QMV and `#968` affine-4 rerank stay.
+private let qwen35ClusterSelectN = 12_292
+private let qwen35ClusterSelectProbes = 3_073
+private let qwen35ClusterSelectRowsPer = 8
+private let qwen35ClusterSelectTopK = 32
+private let qwen35ClusterSelectTG = 256
+private let qwen35ClusterRowN =
+    qwen35ClusterSelectProbes * qwen35ClusterSelectRowsPer
+private let qwen35ClusterRowTop32Tiles = 64
+private let qwen35ClusterRowTop32Stride =
+    qwen35ClusterRowTop32Tiles * qwen35ClusterSelectTG
+private let qwen35ClusterRowTop32PerThread =
+    (qwen35ClusterRowN + qwen35ClusterRowTop32Stride - 1)
+    / qwen35ClusterRowTop32Stride
+private let qwen35ClusterRowTop32Cands =
+    qwen35ClusterRowTop32Tiles * qwen35ClusterSelectTopK
+private let qwen35ClusterRowTop32FinPerThread =
+    qwen35ClusterRowTop32Cands / qwen35ClusterSelectTG
+
+private let qwen35ClusterSelectEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E88_CLUSTER_SELECT"] != "0"
+
+private let qwen35ClusterRowTop32PartialKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_row_top32_partial_v1",
+    inputNames: ["logits"],
+    outputNames: ["cand_ord", "cand_idx"],
+    source: """
+        constexpr uint REAL_COUNT = \(qwen35ClusterRowN);
+        constexpr uint TG_SIZE    = \(qwen35ClusterSelectTG);
+        constexpr uint STRIDE     = \(qwen35ClusterRowTop32Stride);
+        constexpr uint PER_THREAD = \(qwen35ClusterRowTop32PerThread);
+        constexpr uint TOPK       = \(qwen35ClusterSelectTopK);
+        constexpr uint SIMD_SIZE  = 32;
+        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+
+        uint tile = threadgroup_position_in_grid.x;
+        uint tid  = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg   = simdgroup_index_in_threadgroup;
+
+        uint ord[PER_THREAD];
+        uint idx[PER_THREAD];
+        for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
+        uint n = 0;
+        for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
+            ord[n] = qwen_top32_ordinal(float(logits[i]));
+            idx[n] = i;
+            n++;
+        }
+
+        threadgroup uint sc_ord[NSIMD * TOPK];
+        threadgroup uint sc_idx[NSIMD * TOPK];
+
+        uint taken = 0u;
+        for (uint r = 0; r < TOPK; ++r) {
+            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+            for (uint t = 0; t < PER_THREAD; ++t) {
+                if ((taken & (1u << t)) != 0u) { continue; }
+                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+                    bo = ord[t]; bi = idx[t]; bs = t;
+                }
+            }
+            uint mo = simd_max(bo);
+            uint mi = simd_max((bo == mo) ? bi : 0u);
+            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                taken |= (1u << bs);
+            }
+            if (lane == 0) {
+                sc_ord[sg * TOPK + r] = mo;
+                sc_idx[sg * TOPK + r] = mi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            uint o2[PB];
+            uint i2[PB];
+            for (uint t = 0; t < PB; ++t) {
+                uint p = t * SIMD_SIZE + lane;
+                o2[t] = sc_ord[p];
+                i2[t] = sc_idx[p];
+            }
+            uint tk2 = 0u;
+            for (uint r = 0; r < TOPK; ++r) {
+                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                for (uint t = 0; t < PB; ++t) {
+                    if ((tk2 & (1u << t)) != 0u) { continue; }
+                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+                        bo = o2[t]; bi = i2[t]; bs = t;
+                    }
+                }
+                uint mo = simd_max(bo);
+                uint mi = simd_max((bo == mo) ? bi : 0u);
+                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                    tk2 |= (1u << bs);
+                }
+                if (lane == 0) {
+                    cand_ord[tile * TOPK + r] = mo;
+                    cand_idx[tile * TOPK + r] = mi;
+                }
+            }
+        }
+    """,
+    header: qwen35Top32Header,
+    ensureRowContiguous: false
+)
+
+private let qwen35ClusterRowTop32FinalizeKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_row_top32_finalize_v1",
+    inputNames: ["cand_ord", "cand_idx", "probed", "perm"],
+    outputNames: ["token_ids"],
+    source: """
+        constexpr uint TG_SIZE    = \(qwen35ClusterSelectTG);
+        constexpr uint PER_THREAD = \(qwen35ClusterRowTop32FinPerThread);
+        constexpr uint TOPK       = \(qwen35ClusterSelectTopK);
+        constexpr uint ROWS_PER   = \(qwen35ClusterSelectRowsPer);
+        constexpr uint SIMD_SIZE  = 32;
+        constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+        constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+        static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+        static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+
+        uint tid  = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg   = simdgroup_index_in_threadgroup;
+
+        uint ord[PER_THREAD];
+        uint idx[PER_THREAD];
+        for (uint t = 0; t < PER_THREAD; ++t) {
+            uint p = t * TG_SIZE + tid;
+            ord[t] = cand_ord[p];
+            idx[t] = cand_idx[p];
+        }
+
+        threadgroup uint sc_ord[NSIMD * TOPK];
+        threadgroup uint sc_idx[NSIMD * TOPK];
+
+        uint taken = 0u;
+        for (uint r = 0; r < TOPK; ++r) {
+            uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+            for (uint t = 0; t < PER_THREAD; ++t) {
+                if ((taken & (1u << t)) != 0u) { continue; }
+                if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+                    bo = ord[t]; bi = idx[t]; bs = t;
+                }
+            }
+            uint mo = simd_max(bo);
+            uint mi = simd_max((bo == mo) ? bi : 0u);
+            if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                taken |= (1u << bs);
+            }
+            if (lane == 0) {
+                sc_ord[sg * TOPK + r] = mo;
+                sc_idx[sg * TOPK + r] = mi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 0) {
+            uint o2[PB];
+            uint i2[PB];
+            for (uint t = 0; t < PB; ++t) {
+                uint p = t * SIMD_SIZE + lane;
+                o2[t] = sc_ord[p];
+                i2[t] = sc_idx[p];
+            }
+            uint tk2 = 0u;
+            for (uint r = 0; r < TOPK; ++r) {
+                uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+                for (uint t = 0; t < PB; ++t) {
+                    if ((tk2 & (1u << t)) != 0u) { continue; }
+                    if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+                        bo = o2[t]; bi = i2[t]; bs = t;
+                    }
+                }
+                uint mo = simd_max(bo);
+                uint mi = simd_max((bo == mo) ? bi : 0u);
+                if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+                    tk2 |= (1u << bs);
+                }
+                if (lane == 0) {
+                    uint local = mi;
+                    uint cluster = local / ROWS_PER;
+                    uint row = local - cluster * ROWS_PER;
+                    uint compact = uint(probed[cluster]) * ROWS_PER + row;
+                    token_ids[TOPK - 1u - r] = uint(perm[compact]);
+                }
+            }
+        }
+    """,
+    header: "",
+    ensureRowContiguous: false
+)
+
 /// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
 /// declared head's per-draft bytes at a worst-domain argmax miss rate of
 /// 2.3e-4, 13x inside the accepted gate.
@@ -4418,6 +4623,29 @@ extension Qwen35TextModel: MTPCapable {
             transpose: true, groupSize: 64, bits: 2, mode: .affine,
             sortedIndices: true
         ).reshaped([probes * rowsPerCluster])
+
+        if qwen35ClusterSelectEnabled,
+           clusters == qwen35ClusterSelectN,
+           probes == qwen35ClusterSelectProbes,
+           rowsPerCluster == qwen35ClusterSelectRowsPer,
+           candidateCount == qwen35ClusterSelectTopK
+        {
+            let partial = qwen35ClusterRowTop32PartialKernel(
+                [rowScore],
+                grid: (qwen35ClusterRowTop32Tiles * qwen35ClusterSelectTG, 1, 1),
+                threadGroup: (qwen35ClusterSelectTG, 1, 1),
+                outputShapes: [[qwen35ClusterRowTop32Cands],
+                               [qwen35ClusterRowTop32Cands]],
+                outputDTypes: [.uint32, .uint32]
+            )
+            return qwen35ClusterRowTop32FinalizeKernel(
+                [partial[0], partial[1], probed, perm],
+                grid: (qwen35ClusterSelectTG, 1, 1),
+                threadGroup: (qwen35ClusterSelectTG, 1, 1),
+                outputShapes: [[candidateCount]],
+                outputDTypes: [.uint32]
+            )[0]
+        }
 
         let kth = probes * rowsPerCluster - candidateCount
         let local = MLX.argPartition(rowScore, kth: kth)[.ellipsis, (kth)...]
