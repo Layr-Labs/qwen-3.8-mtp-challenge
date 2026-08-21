@@ -3432,13 +3432,22 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
-/// E85 arm gate. `MLX_E85_GATHER_QMM=0` restores the three-`take` rerank path.
-/// The `MLX_` prefix is load-bearing: the trusted worker's environment
-/// sanitizer drops `MLXFAST_*`, so an `MLXFAST_`-spelled gate would never
-/// reach the process that runs the scored round, and both arms of an A/B would
-/// silently measure the same code.
+/// E85 exact-tail geometry.
+///
+/// Crown #958 (`23ef755`) defaulted this ON: `gatherQuantizedMM` over 32
+/// independent `N=1` affine-4 rows. That launch selects MLX's general
+/// `qmv_impl` (32 threadgroups, 8 values/lane, 256-wide K tile). The
+/// pre-#958 exact tail — three `MLX.take` gathers of the selected 32 rows
+/// plus one `quantizedMM(N=32)` — rides `qmv_fast_impl` (16 values/lane,
+/// 512-wide K tiles) for the same 32 dots.
+///
+/// This cycle restores that N=32 grain as the default. Cluster index,
+/// probe-sort, candidate IDs, and `qwen_mtp_draft_rerank` stay on the
+/// crown. `MLX_E85_GATHER_QMM=1` is the kill switch back to #958 gather.
+/// The `MLX_` prefix is load-bearing: the trusted worker sanitizer drops
+/// `MLXFAST_*`.
 private let qwen35GatherQMMRerankEnabled: Bool =
-    ProcessInfo.processInfo.environment["MLX_E85_GATHER_QMM"] != "0"
+    ProcessInfo.processInfo.environment["MLX_E85_GATHER_QMM"] == "1"
 
 /// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
 /// declared head's per-draft bytes at a worst-domain argmax miss rate of
