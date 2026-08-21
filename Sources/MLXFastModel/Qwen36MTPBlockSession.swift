@@ -832,11 +832,12 @@ public final class Qwen36MTPBlockSession {
                 let margin = tail.1[0] - tail.1[1]
                 let conf = 1.0 / (1.0 + exp(-margin / 2.0))
                 p = Swift.min(p, conf)
-            } else if depth == 1, let tail = pendingTop2, tail.1.count >= 2 {
-                let margin = tail.1[0] - tail.1[1]
-                let conf2 = 1.0 / (1.0 + exp(-margin / 3.0))
-                p = Swift.min(p, conf2)
             }
+            // Depth-1 logistic tempering removed. Depth-0 still caps the
+            // first-token reach. The extra min() at depth 1 was shortening
+            // rounds the marginal rule had already paid for; this pool
+            // rewards depth (h=0.32 scored 2.845). Distinct from 0.95-EMA
+            // seeding (`#917`/`#915`/`#923` dead) and from cap-8 (`#851`).
             reach *= p
             let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
             guard reach > threshold else { break }
