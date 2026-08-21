@@ -533,7 +533,7 @@ public final class Qwen36MTPBlockSession {
         else { return }
         eval(extended)
         // 4 KV heads × 6 GQA = 24 Q heads; head_dim from the live FA tensor
-        // (config pins 256). Scale matches Qwen35Attention.
+        // (config pins 256). Scale exactly matches Qwen35Attention.
         let qHeads = extK.dim(1) * 6
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
