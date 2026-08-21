@@ -89,6 +89,30 @@ final class Qwen35MTPDecoderLayer: Module {
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
         selfAttn.appendHistoryKV(inputLayerNorm(x), cache: cache)
     }
+
+    /// Consume `[committed history..., current]` in one normalized block:
+    /// one inputLayerNorm and one shared K/V projection serve the whole
+    /// block, and only the final row produces attention residual and MLP
+    /// outputs. The residual+norm tail replicates `callAsFunction`'s fused
+    /// boundary bit-for-bit on the current-row slice. A nil result is
+    /// guaranteed not to have mutated the cache.
+    func lastOutputWithKVOnlyHistory(
+        _ x: MLXArray, cache: any KVCache
+    ) -> MLXArray? {
+        let current = x[0..., (x.dim(1) - 1)..., 0...]
+        guard let r = selfAttn.lastOutputWithKVOnlyHistory(
+            inputLayerNorm(x), cache: cache)
+        else { return nil }
+        if x.dtype == .bfloat16, r.dtype == .bfloat16, x.dim(-1) == 5120 {
+            let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+                x: current, r: r,
+                weight: postAttentionLayerNorm.weight,
+                eps: postAttentionLayerNorm.eps)
+            return h + (mlp as! UnaryLayer)(postAttnNorm)
+        }
+        let h = current + r
+        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
 }
 
 // MARK: - MTPModule

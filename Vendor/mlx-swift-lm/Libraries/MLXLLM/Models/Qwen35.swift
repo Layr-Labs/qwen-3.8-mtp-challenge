@@ -2225,6 +2225,21 @@ final class Qwen35Attention: Module {
     private var _qOnlyW: MLXArray?
     private var _qOnlyS: MLXArray?
     private var _qOnlyZ: MLXArray?
+    // Narrowed draft-step island state (complete-permutation artifacts only,
+    // planned at install time): the fused `[liveQ-rows | exact islands+KV]`
+    // BF16 weight with its K/V rows permuted into output-column order, the
+    // pure-data Q-half column order, and the live (non-island) row indices
+    // into the checkpoint's quantized Q projection. With these, the draft
+    // step streams 11,264 instead of 12,288 quantized Q rows (the 1,024
+    // island rows were overwritten before any consumer saw them) and one
+    // 3,072-row BF16 GEMM replaces the separate 1,024- and 2,048-row GEMMs.
+    private var _narrowLiveW: MLXArray?
+    private var _narrowLiveS: MLXArray?
+    private var _narrowLiveZ: MLXArray?
+    private var _narrowFoldedW: MLXArray?
+    private var _narrowQOrder: MLXArray?
+    private var _narrowLiveRowIdx: MLXArray?
+    private var _narrowReady = false
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -2279,6 +2294,50 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        // Narrowed complete-island draft step: one quantized GEMM over the
+        // LIVE Q rows only (the 1,024 island rows of the full pack were
+        // overwritten by exact rows before any consumer saw them), one BF16
+        // GEMM over `[Q islands | K | V]` with its K/V rows already in
+        // output-column order, and a pure-data take restoring the packed
+        // `[Q | K | V]` column order for the Q half. Rows are independent,
+        // so per-row results are bit-identical with both older assemblies.
+        if let foldedW = _narrowFoldedW,
+           let qOrder = _narrowQOrder,
+           let liveIdx = _narrowLiveRowIdx,
+           _narrowReady,
+           islandFastPathReady(),
+           let q = qProj as? QuantizedLinear,
+           let k = kProj as? QuantizedLinear,
+           let v = vProj as? QuantizedLinear,
+           q.groupSize == k.groupSize, k.groupSize == v.groupSize,
+           q.bits == k.bits, k.bits == v.bits,
+           q.mode == k.mode, q.mode == .affine,
+           q.biases != nil, k.biases != nil, v.biases != nil,
+           q.shape.0 == _qOut, k.shape.0 == _kOut
+        {
+            if _narrowLiveW == nil {
+                let w = MLX.take(q.weight, liveIdx, axis: 0).contiguous()
+                let sC = MLX.take(q.scales, liveIdx, axis: 0).contiguous()
+                let zC = MLX.take(q.biases!, liveIdx, axis: 0).contiguous()
+                eval(w, sC, zC)
+                _narrowLiveW = w
+                _narrowLiveS = sC
+                _narrowLiveZ = zC
+            }
+            if let w = _narrowLiveW, let sC = _narrowLiveS, let zC = _narrowLiveZ {
+                let qLive = quantizedMM(
+                    x, w, scales: sC, biases: zC, transpose: true,
+                    groupSize: q.groupSize, bits: q.bits, mode: .affine)
+                let exact = matmul(x, foldedW.transposed(1, 0))
+                let qAssembled = MLX.take(
+                    concatenated([qLive, exact[.ellipsis, ..<_exactQRowCount]], axis: -1),
+                    qOrder, axis: -1)
+                let kvWidth = _kOut
+                let kOut = exact[.ellipsis, _exactQRowCount ..< (_exactQRowCount + kvWidth)]
+                let vOut = exact[.ellipsis, (_exactQRowCount + kvWidth)...]
+                return (qAssembled, kOut, vOut)
+            }
+        }
         // Complete K/V island coverage: narrow the affine-4 pack to the q+gate
         // rows and read K and V straight out of the BF16 island rows. Every
         // quantized K/V value the old form produced was overwritten before any
@@ -2486,10 +2545,57 @@ final class Qwen35Attention: Module {
 
             _exactKVDenseW = kvNatural
             _exactKVDenseKOut = kOutputCount
+            _qOut = qOutputCount
+            _kOut = kOutputCount
             _exactQKVWeight = qOnlyWeight
             _exactQKVIndices = qOnlyIndices
             _exactKVIndices = nil
             _exactQRowCount = qWeight.dim(0)
+
+            // Narrowed draft-step plan. The Q islands are a scattered subset
+            // (distinct, in range, not covering every row); everything else
+            // about the artifact is already verified above. The folded weight
+            // is `[qIsland rows | K natural | V natural]` — the same bytes as
+            // `qOnlyWeight` and `kvNatural`, concatenated — so one BF16 GEMM
+            // serves the exact half of both the draft step and the flush.
+            let qIdxHost = qOnlyIndices.asArray(Int32.self)
+            var distinct = true
+            var seen = [Bool](repeating: false, count: qOutputCount)
+            for raw in qIdxHost {
+                let row = Int(raw)
+                guard row >= 0, row < qOutputCount, !seen[row] else {
+                    distinct = false
+                    break
+                }
+                seen[row] = true
+            }
+            if distinct {
+                let liveCount = qOutputCount - qIdxHost.count
+                var islandRowOf = [Int: Int32](minimumCapacity: qIdxHost.count)
+                for (j, raw) in qIdxHost.enumerated() { islandRowOf[Int(raw)] = Int32(j) }
+                var qOrder = [Int32](repeating: -1, count: qOutputCount)
+                var liveRows = [Int32]()
+                liveRows.reserveCapacity(liveCount)
+                var rank: Int32 = 0
+                for p in 0..<qOutputCount {
+                    if let j = islandRowOf[p] {
+                        qOrder[p] = Int32(liveCount) + j
+                    } else {
+                        qOrder[p] = rank
+                        rank += 1
+                        liveRows.append(Int32(p))
+                    }
+                }
+                let foldedWeight = concatenated(
+                    [qOnlyWeight, kvNatural], axis: 0).contiguous()
+                let qOrderArr = MLXArray(qOrder, [qOutputCount])
+                let liveIdx = MLXArray(liveRows, [liveRows.count])
+                eval(foldedWeight, qOrderArr, liveIdx)
+                _narrowFoldedW = foldedWeight
+                _narrowQOrder = qOrderArr
+                _narrowLiveRowIdx = liveIdx
+                _narrowReady = true
+            }
             return
         }
         let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
@@ -2511,24 +2617,110 @@ final class Qwen35Attention: Module {
     /// Append rows to an attention cache without producing query outputs.
     /// The target model never uses this proposal-head maintenance primitive.
     func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
-        let B = x.dim(0)
-        let L = x.dim(1)
-        var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
+        let (keys, values) = kv(x)
+        appendProjectedKV(keys: keys, values: values, cache: cache)
+    }
+
+    /// Norm, rotate, and commit already-projected K/V rows. Shared by the
+    /// history flush paths so the fused flush commits the same bytes in the
+    /// same order as the two-phase path it replaces.
+    private func appendProjectedKV(
+        keys keysIn: MLXArray, values valuesIn: MLXArray, cache: any KVCache
+    ) {
+        let B = keysIn.dim(0)
+        let L = keysIn.dim(1)
+        var keys = kNorm(keysIn.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, kvHeads, -1)
+        let values = valuesIn.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
     }
 
+    /// Project only the Q+gate columns of one row whose K/V were already
+    /// produced by the shared flush projection (`kv`). Mirrors the draft-step
+    /// island branch exactly — same `_qOnlyW` quantized pack at M=1, same
+    /// `replaceExactRows` exact-row overwrite — so per-row values are
+    /// bit-identical with the established current-row path. Nil means this
+    /// head does not carry the fast-path preconditions; no device state is
+    /// mutated on that path.
+    private func projectQOnly(_ x: MLXArray) -> MLXArray? {
+        guard let foldedW = _narrowFoldedW,
+              let qOrder = _narrowQOrder,
+              _narrowReady,
+              islandFastPathReady()
+        else { return nil }
+        if _narrowLiveW == nil, let q = qProj as? QuantizedLinear,
+           let liveIdx = _narrowLiveRowIdx, let qz = q.biases
+        {
+            let w = MLX.take(q.weight, liveIdx, axis: 0).contiguous()
+            let sC = MLX.take(q.scales, liveIdx, axis: 0).contiguous()
+            let zC = MLX.take(qz, liveIdx, axis: 0).contiguous()
+            eval(w, sC, zC)
+            _narrowLiveW = w
+            _narrowLiveS = sC
+            _narrowLiveZ = zC
+            _qkvGS = q.groupSize
+            _qkvBits = q.bits
+            _qkvMode = q.mode
+            _qOut = q.shape.0
+        }
+        guard let w = _narrowLiveW, let sC = _narrowLiveS, let zC = _narrowLiveZ
+        else { return nil }
+        let qLive = quantizedMM(
+            x, w, scales: sC, biases: zC, transpose: true,
+            groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+        let exactQ = matmul(x, foldedW[..<(_exactQRowCount)].transposed(1, 0))
+        return MLX.take(
+            concatenated([qLive, exactQ], axis: -1), qOrder, axis: -1)
+    }
+
+    /// Proposal-head flush for `[committed history..., current]`: one K/V
+    /// projection serves the whole block, the history rows are committed
+    /// first, and the current row reuses its slice of that shared projection
+    /// while computing only Q+gate at the established M=1 geometry. This
+    /// merges the two inputLayerNorm launches and the two separate K/V GEMMs
+    /// of the two-phase flush into one normalized block and one GEMM; the
+    /// only arithmetic whose context changes is the current row's K/V slice
+    /// (one M=L exact GEMM instead of an M=1 recompute). Returning nil is
+    /// mutation-free and lets the caller keep the established two-phase
+    /// flush.
+    func lastOutputWithKVOnlyHistory(
+        _ x: MLXArray, cache: any KVCache
+    ) -> MLXArray? {
+        guard x.ndim == 3, x.dim(1) > 1 else { return nil }
+        let historyCount = x.dim(1) - 1
+        let current = x[0..., historyCount..., 0...]
+        guard let qCurrent = projectQOnly(current) else { return nil }
+        let (allKeys, allValues) = kv(x)
+        appendProjectedKV(
+            keys: allKeys[0..., 0 ..< historyCount, 0...],
+            values: allValues[0..., 0 ..< historyCount, 0...],
+            cache: cache)
+        let mask = createAttentionMask(h: current, cache: cache)
+        return attendProjected(
+            qProjOutput: qCurrent,
+            keys: allKeys[0..., historyCount..., 0...],
+            values: allValues[0..., historyCount..., 0...],
+            mask: mask, cache: cache)
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let B = x.dim(0)
-        let L = x.dim(1)
+        let (qProjOutput, keys, values) = qkv(x)
+        return attendProjected(
+            qProjOutput: qProjOutput, keys: keys, values: values,
+            mask: mask, cache: cache)
+    }
 
-        let (qProjOutput, keysIn, valuesIn) = qkv(x)
+    private func attendProjected(
+        qProjOutput: MLXArray, keys keysIn: MLXArray, values valuesIn: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let B = qProjOutput.dim(0)
+        let L = qProjOutput.dim(1)
+
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         // Keep the gate 4-D: flattening here merged a head axis across the
