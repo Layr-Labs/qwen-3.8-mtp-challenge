@@ -1984,6 +1984,143 @@ func qwen35QuantizedEmbeddingDualRMSNormConcat(
     )[0]
 }
 
+// MARK: - Fused quant-embed dual RMSNorm + fc GEMV (single proposal row)
+
+/// One dispatch for the whole single-row `fc(preFcConcat(...))` boundary:
+/// the affine-4/group-64 embedding row is dequantized in-kernel with the
+/// same arithmetic as the quantized-embedding concat kernel above, both
+/// RMS rsqrt scalars are computed cooperatively over the staged raw rows,
+/// and each simdgroup then owns one `fc` output row's dot product over a
+/// folded weight (`W'[j,i] = fc.weight[j,i] * [e_norm.weight |
+/// h_norm.weight][i]`, built offline). Deletes the concat kernel dispatch
+/// and the 10240-element `[e | h]` carrier from every single-row head-chain
+/// step. Proposal-only; the target never dispatches this. Not bit-identical
+/// to the concat + Linear pair (the norm weight is pre-rounded into `W'`
+/// and rsqrt is applied after the fp32 dot) — legal on the head side, where
+/// the whole weight set is participant-declarable.
+///
+/// Geometry is fixed by the gate that selects it: axis 5120 (H4 = 1280
+/// bfloat4 per half), 5120 output rows, one row per simdgroup, 32
+/// simdgroups per 1024-thread group, 160 threadgroups.
+private let qwen35FusedQuantEmbedDualRMSNormFcKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_q4embed_dual_rms_fc_gemv_v2",
+    inputNames: [
+        "token_ids", "embedding_weight", "embedding_scales",
+        "embedding_biases", "hidden", "w", "eps",
+    ],
+    outputNames: ["out"],
+    source: """
+        using bfloat4 = vec<bfloat, 4>;
+        constexpr uint lsize = 1024;
+        constexpr uint simd_size = 32;
+        constexpr uint H4 = 1280;
+
+        uint tg = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint lane = thread_index_in_simdgroup;
+        uint sg = simdgroup_index_in_threadgroup;
+
+        threadgroup bfloat sh[8 * H4];
+        threadgroup float scal[2];
+        threadgroup float sums_e[simd_size];
+        threadgroup float sums_h[simd_size];
+
+        long token = long(token_ids[0]);
+        ulong packed_off = ulong(token) * ulong(embedding_weight_shape[1]);
+        ulong scale_off = ulong(token) * ulong(embedding_scales_shape[1]);
+
+        float acc_e = 0.0f;
+        float acc_h = 0.0f;
+        for (uint i = thread_id; i < 4 * H4; i += lsize) {
+            uint packed = embedding_weight[packed_off + ulong(i / 8)];
+            uint q = (packed >> (4 * (i & 7))) & 0x0f;
+            bfloat ev = bfloat(q)
+                * embedding_scales[scale_off + ulong(i / 64)]
+                + embedding_biases[scale_off + ulong(i / 64)];
+            bfloat hv = hidden[i];
+            sh[i] = ev;
+            sh[4 * H4 + i] = hv;
+            acc_e += float(ev) * float(ev);
+            acc_h += float(hv) * float(hv);
+        }
+        acc_e = simd_sum(acc_e);
+        acc_h = simd_sum(acc_h);
+        if (sg == 0) { sums_e[lane] = 0.0f; sums_h[lane] = 0.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) { sums_e[sg] = acc_e; sums_h[sg] = acc_h; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            float se = simd_sum(sums_e[lane]);
+            float sh2 = simd_sum(sums_h[lane]);
+            if (lane == 0) {
+                scal[0] = metal::precise::rsqrt(se / float(4 * H4) + eps);
+                scal[1] = metal::precise::rsqrt(sh2 / float(4 * H4) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float rs_e = scal[0];
+        float rs_h = scal[1];
+
+        threadgroup const bfloat4 *sh4 = (threadgroup const bfloat4 *)sh;
+        uint row = tg * (lsize / simd_size) + sg;
+        if (row < 5120) {
+            device const bfloat4 *wrow =
+                (device const bfloat4 *)(w + ulong(row) * ulong(8 * H4));
+            float de = 0.0f;
+            float dh = 0.0f;
+            for (uint kk = lane; kk < H4; kk += simd_size) {
+                bfloat4 wv = wrow[kk];
+                bfloat4 xv = sh4[kk];
+                de += float(wv.x) * float(xv.x) + float(wv.y) * float(xv.y)
+                    + float(wv.z) * float(xv.z) + float(wv.w) * float(xv.w);
+            }
+            for (uint kk = lane; kk < H4; kk += simd_size) {
+                bfloat4 wv = wrow[H4 + kk];
+                bfloat4 xv = sh4[H4 + kk];
+                dh += float(wv.x) * float(xv.x) + float(wv.y) * float(xv.y)
+                    + float(wv.z) * float(xv.z) + float(wv.w) * float(xv.w);
+            }
+            de = simd_sum(de);
+            dh = simd_sum(dh);
+            if (lane == 0) {
+                out[row] = bfloat(rs_e * de + rs_h * dh);
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Wraps the fused quant-embed pre-fc kernel. `tokenIds` is a single id,
+/// `hidden` a `[1, 1, 5120]` BF16 row; the embedding arrays are the
+/// affine-4/group-64 triplet the quantized concat kernel above reads;
+/// `foldedWeight` is `fc.weight * [e_norm.weight | h_norm.weight]`,
+/// `[5120, 10240]` BF16 row-contiguous. Returns the fc output row
+/// `[1, 1, 5120]`.
+func qwen35FusedQuantEmbedDualRMSNormFc(
+    tokenIds: MLXArray,
+    embeddingWeight: MLXArray,
+    embeddingScales: MLXArray,
+    embeddingBiases: MLXArray,
+    hidden: MLXArray,
+    foldedWeight: MLXArray,
+    eps: Float
+) -> MLXArray {
+    let outDim = foldedWeight.dim(0)
+    let simdgroupsPerGroup = 1024 / 32
+    let nGroups = (outDim + simdgroupsPerGroup - 1) / simdgroupsPerGroup
+    let outputs = qwen35FusedQuantEmbedDualRMSNormFcKernel(
+        [
+            tokenIds, embeddingWeight, embeddingScales, embeddingBiases,
+            hidden, foldedWeight, MLXArray(eps),
+        ],
+        grid: (nGroups * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[hidden.dim(0), 1, outDim]],
+        outputDTypes: [.bfloat16]
+    )
+    return outputs[0]
+}
+
 // MARK: - Attention
 
 final class Qwen35Attention: Module {
