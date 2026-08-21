@@ -765,7 +765,19 @@ public final class Qwen36MTPBlockSession {
     /// Gated on a full-accept streak so the deep rounds only fire where the
     /// head has been perfect, mirroring the streak ladder that qualified
     /// cap 4; any reject resets the streak.
-    private static let segmentedVerifyDepthCap = 7
+    ///
+    /// 8 (was 7): cap 7 truncates one seventh of the parent's uniform 2..8
+    /// depth offers. Every width-9 machine path already exists and is
+    /// warmed: the sdpa exactness chunk serves qL<=9 (chunk A qL=5 + chunk
+    /// B qL=4), the GDN replay tape covers S=9, and warmAllDepthShapes
+    /// compiles widths 1...maxDepth+1 = 1...9 with nConfirmed:1. The prior
+    /// #851 cap=8 loss (3.212) was measured BEFORE the qL={2,3} warm fix:
+    /// its width-7/8/9 rounds first-touch compiled pipeline states inside
+    /// the scored window, which is exactly the mechanism the jonathan308
+    /// qL={1..5} warm overlay (this base) removes. The depth-rewarding
+    /// evidence (fc62d1aa: shortening drafts lost -3% with the baseline leg
+    /// flat) says the marginal draft is worth more than its verify row.
+    private static let segmentedVerifyDepthCap = 8
     /// 2, not 3 — the FOURTH restore of this literal, and it has still never
     /// lost on its merits.
     ///
