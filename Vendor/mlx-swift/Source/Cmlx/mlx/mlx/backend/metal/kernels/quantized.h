@@ -2201,6 +2201,43 @@ template <typename T, const int group_size, const int bits, int split_k = 32>
       simd_lid);
 }
 
+
+// Threadgroup launch-order swizzle for the tiled quantized GEMMs (qmm_t).
+//
+// The host dispatches the grid as (N / BN, M / BM, B) and Metal launches
+// threadgroups x-fastest, so the M / BM threadgroups that share one packed W
+// block (same tid.x) are N / BN launches apart: every W tile is streamed from
+// far memory once per M block (8x at the 512-row prefill with BM = 64). This
+// remaps the launch index so that up to SWIZZLE_M consecutive threadgroups
+// share the same W block (walk M first inside bands of SWIZZLE_M row blocks,
+// then N), so the repeat reads hit in cache while the first one is still
+// resident. It is a pure permutation of (x, y) over the grid -- every tile is
+// still computed exactly once, by the identical per-tile arithmetic and
+// accumulation order, only by a different threadgroup -- so the output is
+// bit-identical to the unswizzled launch. Grids with a single M block (the
+// decode / verify rows) are returned unchanged.
+template <int SWIZZLE_M>
+METAL_FUNC uint3 qmm_swizzle_tid(uint3 tid, uint3 grid) {
+  if (SWIZZLE_M <= 1 || grid.y <= 1) {
+    return tid;
+  }
+  const uint gx = grid.x;
+  const uint gy = grid.y;
+  const uint linear = tid.y * gx + tid.x;
+  const uint band_tiles = uint(SWIZZLE_M) * gx;
+  const uint full_bands = gy / uint(SWIZZLE_M);
+  uint band = linear / band_tiles;
+  uint rows = uint(SWIZZLE_M);
+  uint local = linear - band * band_tiles;
+  if (band >= full_bands) {
+    // Ragged last band: fewer than SWIZZLE_M M blocks remain.
+    band = full_bands;
+    local = linear - full_bands * band_tiles;
+    rows = gy - full_bands * uint(SWIZZLE_M);
+  }
+  return uint3(local / rows, band * uint(SWIZZLE_M) + local % rows, tid.z);
+}
+
 template <
     typename T,
     const int group_size,
@@ -2227,7 +2264,8 @@ template <
     const constant int64_t* w_strides [[buffer(13)]],
     const constant int64_t* s_strides [[buffer(14)]],
     const constant int64_t* b_strides [[buffer(15)]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_in [[threadgroup_position_in_grid]],
+    uint3 tgp_grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -2237,6 +2275,10 @@ template <
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
+
+  // Prefill-shaped grids (M / BM > 1) walk the M blocks of one W tile
+  // back to back; see qmm_swizzle_tid.
+  const uint3 tid = qmm_swizzle_tid<8>(tid_in, tgp_grid);
 
   if (batched) {
     adjust_matrix_offsets<T>(

@@ -318,13 +318,27 @@ public final class Qwen36MTPBlockSession {
         eval(row)
 
         let headCache = model.makeMTPCache()
-        for _ in 0 ..< maxDepth {
+        // The scored chain builds steps 2..d LAZILY (one asyncEval after the
+        // loop), so step k's attention still references the head K/V buffers
+        // when step k+1 slice-updates them: MLX cannot donate and materialises
+        // a copy-on-write of the whole cache buffer (a contiguous bf16 copy,
+        // `vn_copy`, >= 64K elements). Evaluating every warm step eagerly never
+        // builds that copy, so its pipeline state was first created inside
+        // scored round 1 (measured 4.4 ms, MLX_JIT_LOG). Keep every second
+        // step lazy so the warm dispatches the same copy kernel untimed.
+        var pendingWarm: [MLXArray] = []
+        for step in 0 ..< maxDepth {
             let (draftLogits, draftHidden) = model.mtpForwardWithHidden(
                 hidden: row,
                 nextTokenIds: MLXArray([0]).reshaped([1, 1]),
                 cache: headCache)
             row = draftHidden[0..., (draftHidden.dim(1) - 1) ..< draftHidden.dim(1), 0...]
-            eval(draftLogits, row)
+            pendingWarm.append(draftLogits)
+            if step % 2 == 1 || step == maxDepth - 1 {
+                pendingWarm.append(row)
+                eval(pendingWarm)
+                pendingWarm.removeAll()
+            }
         }
 
         // Committed-history head shapes: compile both the K/V-only leading-row
@@ -412,6 +426,31 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        eval(historyWarmCache.flatMap { $0.state })
+        // Every scored round after the first flushes the previous round's
+        // accepted rows (1...maxDepth) plus the current row through the same
+        // K/V-only history path, i.e. 2...maxDepth+1 rows against a ~512-row
+        // head cache. The fold above covers 2; the prime covers 512. Nothing
+        // covered the widths between, and the head's dense precision-island
+        // projections pick their GEMM kernel by row count: on an M4 Pro the
+        // 4-row flush of scored round 2 JIT-compiled a split-K kernel pair
+        // inside the timed window (117 ms, MLX_JIT_LOG receipt). Dispatch
+        // rules differ per GPU generation, so warm every width rather than
+        // the one this machine happens to need. Throwaway cache, zero rows,
+        // token-neutral, untimed.
+        for rows in stride(from: 3, through: maxDepth + 1, by: 1) {
+            let widthHidden = MLXArray.zeros([1, rows, hDim], dtype: row.dtype)
+            let widthTokens = MLXArray(
+                Array(repeating: Int32(0), count: rows)).reshaped([1, rows])
+            let widthOut = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                hidden: widthHidden, nextTokenIds: widthTokens,
+                cache: historyWarmCache)
+                ?? model.mtpHeadHiddenForward(
+                    hidden: widthHidden, nextTokenIds: widthTokens,
+                    cache: historyWarmCache)
+            eval(model.draftTokenID(
+                widthOut[0..., (widthOut.dim(1) - 1) ..< widthOut.dim(1), 0...]))
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
