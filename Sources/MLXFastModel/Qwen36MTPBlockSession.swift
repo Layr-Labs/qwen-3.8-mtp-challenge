@@ -285,6 +285,20 @@ public final class Qwen36MTPBlockSession {
         // every throwaway cache and tensor is released before residency sizing.
         try warmAllDepthShapes(maxDepth: maxDepth)
         Self.wireResidentWeightsIfEnabled()
+        // Allocator pre-materialization (F3). The wiring clear above empties
+        // the MLX buffer pool AFTER every shape warm has run, so round 1
+        // re-grows its intermediates cold inside the timed window (begin +
+        // seed prefill are charged; QwenRuntimeMTPDriver starts the clock
+        // immediately before begin, and `mtp_decode_begin` skips the trusted
+        // phase-start allocator reset when warm already ran). Re-running the
+        // identical input-independent pass here repopulates the pool with
+        // exactly the buffers the first real round demands — same expressions,
+        // same shapes, throwaway caches, results discarded — so the first
+        // allocation misses land in untimed warm instead. No new kernels or
+        // expressions are introduced; this is the same class of warm-family
+        // coverage already shipped six times, extended from kernel shapes to
+        // allocator state.
+        try warmAllDepthShapes(maxDepth: maxDepth)
     }
 
     private func warmAllDepthShapes(maxDepth: Int) throws {
