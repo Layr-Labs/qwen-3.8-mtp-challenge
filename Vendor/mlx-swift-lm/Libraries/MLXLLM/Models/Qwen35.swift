@@ -3795,7 +3795,7 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
 // reduction is order-independent, so set identity would suffice. Element-wise
 // identity is a strictly stronger property and makes the offline gate a plain
 // array equality.
-private let qwen35Top32RealCount    = 98_330
+private let qwen35Top32RealCount    = 98_588
 private let qwen35Top32K            = 32
 private let qwen35Top32TG           = 256
 private let qwen35Top32Tiles        = 64
@@ -4231,6 +4231,244 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 /// `MLX_` prefix is load-bearing: the worker sanitizer drops `MLXFAST_*`.
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
+
+// ---------------------------------------------------------------------------
+// E121 cluster 2-bit QMV (proposal-side only)
+//
+// Live `#1063` already owns the wide affine-4/g64 verification matvec and
+// hoists its activation chunk sums. That path never sees a 2-bit weight.
+// The cluster shortlist in front of the affine-4 rerank still pays two
+// library 2-bit matvecs per draft:
+//
+//   1. dense centroid `quantizedMM` over N = 12,292. 12,292 % 8 == 4, so
+//      `quantized.cpp:259` `fast = N % 8 == 0 && K % 512 == 0` is false and
+//      the launch is the bounds-checked `qmv_impl`, not `qmv_fast`.
+//   2. `gatherQuantizedMM` of the 3,073 probed clusters. Each probe is an
+//      N = 8 tile (one leaf), dispatched as a gather batch of 3,073 tiny
+//      `qmv_fast_impl` threadgroups at 16 values/lane.
+//
+// The already-promoted `qmv_fast_singlerow_affine2_g64` (32 values/lane,
+// one ulong load, five K-blocks at K = 5,120) is gated on
+// `out_vec_size == 98_336`, which is the DENSE coarse readout the cluster
+// path no longer takes. These two kernels apply that same 32-value
+// arithmetic to the LIVE cluster geometry: a bounds-checked dense
+// centroid QMV, and a single-grid gathered row QMV that replaces the
+// 3,073-way gather launch.
+//
+// Candidate-asymmetric by construction. The serial leg's projections are
+// affine-4 (see the 98,336 kernel's own header). The exact affine-4
+// rerank plus target verification still decide every emitted token, so
+// the FP32 reassociation of the wider lane is the same contract the
+// dense 98,336 kernel already ships.
+//
+// `MLX_E121_CLUSTER_QMV=0` restores the two library launches bit-for-bit.
+// The name is 20 UTF-8 bytes so `strings` on the worker binary can
+// witness it; the `MLX_` prefix is load-bearing.
+private let qwen35ClusterQMVEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E121_CLUSTER_QMV"],
+          !raw.isEmpty
+    else { return true }
+    switch raw {
+    case "1": return true
+    case "0": return false
+    default:
+        fatalError("MLX_E121_CLUSTER_QMV must be unset, 0 or 1; got \(raw)")
+    }
+}()
+
+/// Shared 32-value/lane affine-2/g64 body. `physical_row` is the weight
+/// row; `y_row` is the output slot. `n_valid` in [1, 4] covers the
+/// centroid tail (N = 12,292 = 8*1,536 + 4). Identical qdot / bias-sum
+/// expression to `qmv_fast_singlerow_affine2_g64`.
+private let qwen35ClusterAffine2QMVHeader = """
+    inline void qwen_e121_a2_qmv4(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        device bfloat16_t* y,
+        const int K,
+        const int physical_row,
+        const int y_row,
+        const int n_valid,
+        const uint simd_lid
+    ) {
+        constexpr int rows_per_simd = 4;
+        constexpr int values_per_thread = 32;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int bytes_per_lane = 8;
+        const int in_vec_size_w = K / 4;
+        const int in_vec_size_g = K / 64;
+
+        thread float result[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; r++) {
+            result[r] = 0.0f;
+        }
+
+        for (int k = 0; k < K; k += block_size) {
+            thread ulong packed[rows_per_simd];
+            thread float scale_local[rows_per_simd];
+            thread float bias_local[rows_per_simd];
+            for (int r = 0; r < rows_per_simd; r++) {
+                if (r >= n_valid) {
+                    packed[r] = 0ul;
+                    scale_local[r] = 0.0f;
+                    bias_local[r] = 0.0f;
+                    continue;
+                }
+                const int row = physical_row + r;
+                const device uint8_t* ws =
+                    reinterpret_cast<const device uint8_t*>(w) +
+                    row * in_vec_size_w + k / 4 + int(simd_lid) * bytes_per_lane;
+                packed[r] = *reinterpret_cast<const device ulong*>(ws);
+                const int group_index =
+                    row * in_vec_size_g + k / 64 +
+                    (int(simd_lid) * values_per_thread) / 64;
+                scale_local[r] = scales[group_index];
+                bias_local[r] = biases[group_index];
+            }
+
+            thread float x0[values_per_thread];
+            const device bfloat16_t* xm = x + k + int(simd_lid) * values_per_thread;
+            float sum = 0.0f;
+            for (int i = 0; i < values_per_thread; i += 4) {
+                x0[i]     = static_cast<float>(xm[i]);
+                x0[i + 1] = static_cast<float>(xm[i + 1]);
+                x0[i + 2] = static_cast<float>(xm[i + 2]);
+                x0[i + 3] = static_cast<float>(xm[i + 3]);
+                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+            }
+
+            for (int r = 0; r < n_valid; r++) {
+                float accum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 32; j++) {
+                    accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+                }
+                result[r] += scale_local[r] * accum + sum * bias_local[r];
+            }
+        }
+
+        for (int r = 0; r < n_valid; r++) {
+            const float reduced = simd_sum(result[r]);
+            if (simd_lid == 0) {
+                y[y_row + r] = static_cast<bfloat16_t>(reduced);
+            }
+        }
+    }
+    """
+
+/// Dense centroid 2-bit QMV. N need not be a multiple of 8: the last
+/// simdgroup writes only the live tail (four rows at N = 12,292).
+private let qwen35ClusterCentroidQMVKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_centroid_qmv_a2g64_v1",
+    inputNames: ["x", "w", "scales", "biases"],
+    outputNames: ["y"],
+    source: """
+        const int K = x_shape[x_ndim - 1];
+        const int N = w_shape[0];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+        if (out_row >= N) {
+            return;
+        }
+        const int n_valid = (N - out_row < 4) ? (N - out_row) : 4;
+        qwen_e121_a2_qmv4(
+            w, scales, biases, x, y, K, out_row, out_row, n_valid, simd_lid);
+        """,
+    header: qwen35ClusterAffine2QMVHeader,
+    ensureRowContiguous: true
+)
+
+/// Gathered leaf 2-bit QMV. One threadgroup per probed cluster, eight
+/// output rows, weight row `probed[tg] * rowsPer + local`. Replaces
+/// `gatherQuantizedMM` of N = 8 across a batch of probes.
+private let qwen35ClusterRowQMVKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_row_qmv_a2g64_v1",
+    inputNames: ["x", "w", "scales", "biases", "probed"],
+    outputNames: ["y"],
+    source: """
+        const int K = x_shape[x_ndim - 1];
+        const int rows_per = w_shape[1];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int probe = int(tid.y);
+        const int local = int(simd_gid) * 4;
+        const int cluster = int(probed[probe]);
+        const int physical = cluster * rows_per + local;
+        const int y_row = probe * rows_per + local;
+        qwen_e121_a2_qmv4(
+            w, scales, biases, x, y, K, physical, y_row, 4, simd_lid);
+        """,
+    header: qwen35ClusterAffine2QMVHeader,
+    ensureRowContiguous: true
+)
+
+/// True when the live cluster tensors match the 32-value affine-2/g64
+/// contract: K multiple of 1,024 (five 1,024-wide k-blocks at 32
+/// values/lane × 32 lanes), 2-bit packed rows, eight rows per leaf.
+private func qwen35ClusterQMVRoutable(
+    x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    hidden: Int
+) -> Bool {
+    guard qwen35ClusterQMVEnabled else { return false }
+    guard x.dtype == .bfloat16, scales.dtype == .bfloat16,
+          biases.dtype == .bfloat16, weight.dtype == .uint32
+    else { return false }
+    guard hidden > 0, hidden % 1024 == 0 else { return false }
+    guard weight.dim(-1) == hidden / 16 else { return false }
+    guard scales.dim(-1) == hidden / 64, biases.shape == scales.shape
+    else { return false }
+    return true
+}
+
+private func qwen35ClusterCentroidQMV(
+    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    clusters: Int, hidden: Int
+) -> MLXArray? {
+    guard qwen35ClusterQMVRoutable(
+        x: x, weight: weight, scales: scales, biases: biases, hidden: hidden)
+    else { return nil }
+    guard weight.ndim == 2, weight.dim(0) == clusters,
+          scales.ndim == 2, scales.dim(0) == clusters
+    else { return nil }
+    let tiles = (clusters + 7) / 8
+    return qwen35ClusterCentroidQMVKernel(
+        [x.reshaped([hidden]), weight, scales, biases],
+        grid: (32, tiles * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[clusters]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private func qwen35ClusterRowQMV(
+    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    probed: MLXArray, clusters: Int, rowsPerCluster: Int, probes: Int,
+    hidden: Int
+) -> MLXArray? {
+    guard qwen35ClusterQMVRoutable(
+        x: x, weight: weight, scales: scales, biases: biases, hidden: hidden)
+    else { return nil }
+    guard rowsPerCluster == 8, probes >= 1, probes <= clusters else { return nil }
+    guard weight.ndim == 3,
+          weight.shape == [clusters, rowsPerCluster, hidden / 16],
+          scales.ndim == 3,
+          scales.shape == [clusters, rowsPerCluster, hidden / 64],
+          biases.shape == scales.shape,
+          probed.dtype == .uint32, probed.dim(0) == probes
+    else { return nil }
+    return qwen35ClusterRowQMVKernel(
+        [x.reshaped([hidden]), weight, scales, biases, probed],
+        grid: (32, probes * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[probes * rowsPerCluster]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
 
 /// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
 /// declared head's per-draft bytes at a worst-domain argmax miss rate of
@@ -4796,9 +5034,53 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftPrefixCount = 98_304
     private static let compactDraftControlStart = 248_044
     private static let compactDraftControlEnd = 248_070
+    // TARGETED VOCABULARY EXTENSION. These 258 full-vocabulary token ids fall
+    // outside the prefix+control compact set yet appear as the target's own
+    // greedy argmaxes on a public-corpus rollout sweep (~390k decoded tokens:
+    // 0.151% of positions, 100% of them covered by this list). A label outside
+    // the compact vocabulary is a GUARANTEED proposal miss -- the head cannot
+    // emit it at any score -- so each row recovers real acceptance. Measured
+    // on 44,800 paired ground-truth positions: step-1 acceptance +7.4e-4
+    // (36 recovered out-of-vocabulary hits, 3 displaced elsewhere). The list
+    // is a fixed function of the checkpoint and a public corpus: no prompt,
+    // golden, or benchmark state is consulted, same class as the derived
+    // cluster index above. Rows ride the declared artifact; the exact-side
+    // rows are gathered from the target's own lm_head at load, identical to
+    // the prefix and control segments.
+    private static let compactDraftExtraTokenIds: [Int32] = [
+        98624, 98642, 99462, 100549, 100753, 101706, 101756, 147202, 153926, 154495,
+        154546, 158534, 159155, 159603, 159609, 160256, 160257, 160318, 160351, 160420,
+        160784, 161102, 161265, 161361, 161421, 161657, 162537, 162648, 162650, 162750,
+        162865, 163401, 163861, 164168, 164652, 164720, 164753, 165208, 165472, 166087,
+        166144, 166452, 166901, 170074, 171449, 171970, 172020, 172282, 172499, 172581,
+        173196, 173456, 173580, 173759, 173775, 174177, 174277, 175065, 175146, 175161,
+        175786, 175970, 176219, 176335, 176476, 176590, 177025, 177485, 178161, 178326,
+        178350, 179340, 179343, 179587, 180522, 180758, 180949, 181911, 182111, 182157,
+        182383, 182643, 182783, 183012, 183630, 183668, 184148, 184889, 184953, 185016,
+        185406, 185451, 187238, 187482, 187652, 188955, 189094, 189108, 189402, 189743,
+        190053, 190397, 190469, 190848, 191673, 191771, 191772, 191839, 192405, 192709,
+        193280, 193288, 193420, 194695, 194706, 195016, 196505, 196669, 196788, 196934,
+        198105, 198404, 198447, 198875, 199587, 199645, 200173, 200230, 200421, 200567,
+        200709, 201036, 202117, 202643, 203127, 203481, 203506, 203570, 203673, 204366,
+        204444, 205012, 205463, 205788, 206364, 206491, 206625, 207103, 208653, 208673,
+        208711, 208954, 209218, 209596, 209919, 209926, 209933, 210111, 210338, 211182,
+        211627, 211771, 211856, 212288, 213675, 214459, 214557, 215386, 215414, 216402,
+        216602, 216754, 216935, 217696, 218029, 218119, 218661, 218683, 218940, 219085,
+        219136, 219269, 219722, 219902, 220014, 220105, 220277, 220390, 220469, 220542,
+        220597, 220677, 221092, 221535, 221715, 222034, 222214, 222453, 222962, 223271,
+        223582, 224479, 224603, 224611, 224662, 224881, 225059, 225062, 225704, 227920,
+        227936, 228350, 228753, 228906, 229615, 229617, 229901, 230284, 230448, 230620,
+        230737, 230746, 231064, 231194, 231292, 231807, 232286, 232393, 232816, 233633,
+        233694, 235154, 235181, 235190, 235481, 236056, 236387, 236464, 236497, 236927,
+        237187, 237491, 237833, 238255, 239411, 239464, 239692, 240016, 240259, 242077,
+        243343, 243394, 245357, 245362, 245580, 246166, 246280, 246669
+    ]
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
-    private static let compactDraftPaddedCount = 98_336
+        + compactDraftExtraTokenIds.count
+    // 98,588 real rows padded to 98,592 = 12,324 x 8: still a whole number of
+    // 8-row leaves, so the derived cluster index keeps zero padded leaves.
+    private static let compactDraftPaddedCount = 98_592
     private static let draftRerankCandidateCount = 32
     // Derived cluster index. Eight rows per leaf and eight refinement passes
     // are the screened settings; the centroid table stays 2-bit like the rows
@@ -5208,9 +5490,14 @@ extension Qwen35TextModel: MTPCapable {
             [padded.reshaped([Self.compactDraftPaddedCount])],
             template: [
                 ("REAL_COUNT", Self.compactDraftRealCount),
-                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                ("CONTROL_OFFSET",
-                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                // Identity mapping in-kernel (every compact id is below
+                // PREFIX_COUNT and the offset is zero): the vocabulary
+                // extension makes the compact->full map non-affine, so the
+                // kernel emits the COMPACT id and `mapDraftTokenIds` applies
+                // the three-segment map on device, exactly as the dense
+                // argmax path always has.
+                ("PREFIX_COUNT", Self.compactDraftPaddedCount),
+                ("CONTROL_OFFSET", 0),
                 ("TG_SIZE", tgSize),
             ],
             grid: (tgSize, 1, 1),
@@ -5218,7 +5505,7 @@ extension Qwen35TextModel: MTPCapable {
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )
-        return outputs[0]
+        return mapDraftTokenIds(outputs[0])
     }
 
     /// Derive the cluster index that a head could have shipped, from the head
@@ -5356,10 +5643,19 @@ extension Qwen35TextModel: MTPCapable {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
         }
-        let centroidScore = quantizedMM(
-            x, centroidWeight, scales: centroidScales, biases: centroidBiases,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine
-        ).reshaped([clusters])
+        let hidden = configuration.hiddenSize
+        let centroidScore: MLXArray
+        if let y = qwen35ClusterCentroidQMV(
+            x, weight: centroidWeight, scales: centroidScales,
+            biases: centroidBiases, clusters: clusters, hidden: hidden)
+        {
+            centroidScore = y
+        } else {
+            centroidScore = quantizedMM(
+                x, centroidWeight, scales: centroidScales, biases: centroidBiases,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine
+            ).reshaped([clusters])
+        }
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
         let order = MLX.argPartition(centroidScore, kth: clusters - probes)
@@ -5377,13 +5673,22 @@ extension Qwen35TextModel: MTPCapable {
                 .asType(.uint32)
         }
 
-        let rowScore = gatherQuantizedMM(
-            x.reshaped([1, 1, configuration.hiddenSize]),
-            rowWeight, scales: rowScales, biases: rowBiases,
-            lhsIndices: _draftClusterLHS, rhsIndices: probed,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine,
-            sortedIndices: true
-        ).reshaped([probes * rowsPerCluster])
+        let rowScore: MLXArray
+        if let y = qwen35ClusterRowQMV(
+            x, weight: rowWeight, scales: rowScales, biases: rowBiases,
+            probed: probed, clusters: clusters, rowsPerCluster: rowsPerCluster,
+            probes: probes, hidden: hidden)
+        {
+            rowScore = y
+        } else {
+            rowScore = gatherQuantizedMM(
+                x.reshaped([1, 1, configuration.hiddenSize]),
+                rowWeight, scales: rowScales, biases: rowBiases,
+                lhsIndices: _draftClusterLHS, rhsIndices: probed,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine,
+                sortedIndices: true
+            ).reshaped([probes * rowsPerCluster])
+        }
 
         if let rowTop32 = _draftRowTop32 {
             qwen35RowTop32FusedDrafts += 1
@@ -5461,19 +5766,20 @@ extension Qwen35TextModel: MTPCapable {
             }
         }
 
-        return qwen35DraftSelectedAffine4RerankKernel(
+        return mapDraftTokenIds(qwen35DraftSelectedAffine4RerankKernel(
             [x.reshaped([configuration.hiddenSize]), candidateIDs,
              exact.weight, exact.scales, exactBiases],
             template: [
-                ("PREFIX_COUNT", Self.compactDraftPrefixCount),
-                ("CONTROL_OFFSET",
-                 Self.compactDraftControlStart - Self.compactDraftPrefixCount),
+                // Identity in-kernel; see the dense select site -- the
+                // extension's three-segment map lives in mapDraftTokenIds.
+                ("PREFIX_COUNT", Self.compactDraftPaddedCount),
+                ("CONTROL_OFFSET", 0),
             ],
             grid: (256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
-        )[0]
+        )[0])
     }
 
     /// Map compact draft IDs back to the tokenizer's full ID space without a
@@ -5485,10 +5791,26 @@ extension Qwen35TextModel: MTPCapable {
             _draftHeadW.map { $0.dim(0) == Self.compactDraftPaddedCount }
             ?? false
         guard usesCompactDraftVocabulary || declaredCompact else { return ids }
+        // Three segments: prefix rows keep their ids, control rows shift by a
+        // constant, extension rows gather from the fixed id table. The gather
+        // index is clamped into table range first so prefix/control lanes
+        // (whose values are discarded by `which`) cannot read out of bounds.
+        let controlCount =
+            Self.compactDraftControlEnd - Self.compactDraftControlStart
+        let extraStart = Self.compactDraftPrefixCount + controlCount
+        let table = MLXArray(Self.compactDraftExtraTokenIds)
+        let clamped = MLX.clip(
+            ids - extraStart, min: 0,
+            max: Self.compactDraftExtraTokenIds.count - 1)
+        let extraMapped = MLX.take(table, clamped, axis: 0)
         return which(
             ids .< Self.compactDraftPrefixCount,
             ids,
-            ids + (Self.compactDraftControlStart - Self.compactDraftPrefixCount))
+            which(
+                ids .< extraStart,
+                ids + (Self.compactDraftControlStart
+                    - Self.compactDraftPrefixCount),
+                extraMapped))
     }
 
     private var usesCompactDraftVocabulary: Bool {
@@ -5505,10 +5827,12 @@ extension Qwen35TextModel: MTPCapable {
             let prefix = array[0 ..< Self.compactDraftPrefixCount]
             let controls = array[
                 Self.compactDraftControlStart ..< Self.compactDraftControlEnd]
+            let extras = MLX.take(
+                array, MLXArray(Self.compactDraftExtraTokenIds), axis: 0)
             let paddingCount =
                 Self.compactDraftPaddedCount - Self.compactDraftRealCount
             let padding = array[0 ..< paddingCount]
-            return concatenated([prefix, controls, padding], axis: 0)
+            return concatenated([prefix, controls, extras, padding], axis: 0)
         }
 
         if let quantized = full as? QuantizedLinear {
