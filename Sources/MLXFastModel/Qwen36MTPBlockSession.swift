@@ -412,6 +412,34 @@ public final class Qwen36MTPBlockSession {
                 cache: historyWarmCache)
         eval(model.draftTokenID(
             folded[0..., (folded.dim(1) - 1) ..< folded.dim(1), 0...]))
+        // Flush-fold widths 3...maxDepth+1. A live round's FIRST head step
+        // folds acceptedCount+1 rows through this exact expression
+        // (`draftInputHidden = concatenated(flushHidden, axis: 1)`), so every
+        // width beyond 2 otherwise JIT-compiles its appendHistoryKV /
+        // folded-rows attention / M-row head projections inside a scored
+        // round the first time a streak reaches it (Floofy6 isolate-B
+        // receipt; sibling qL{2,3} SDPA warm restore ranked +0.18%).
+        // Values are zeros on the same throwaway cache; only shape+dtype
+        // select kernels. The cache grows by <= maxDepth rows past the
+        // folded state, staying in the same long-context dispatch family as
+        // decode (~512+ committed rows), matching how the live history
+        // length also drifts upward across the window.
+        if maxDepth >= 2 {
+            for foldWidth in 3 ... (maxDepth + 1) {
+                let flushHidden = MLXArray.zeros(
+                    [1, foldWidth, hDim], dtype: row.dtype)
+                let flushTokens = MLXArray(
+                    Array(repeating: Int32(0), count: foldWidth)).reshaped([1, foldWidth])
+                let flushFolded = model.mtpHeadLastHiddenWithKVOnlyHistory(
+                    hidden: flushHidden, nextTokenIds: flushTokens,
+                    cache: historyWarmCache)
+                    ?? model.mtpHeadHiddenForward(
+                        hidden: flushHidden, nextTokenIds: flushTokens,
+                        cache: historyWarmCache)
+                eval(model.draftTokenID(
+                    flushFolded[0..., (flushFolded.dim(1) - 1) ..< flushFolded.dim(1), 0...]))
+            }
+        }
         eval(historyWarmCache.flatMap { $0.state })
         for width in 1 ... (maxDepth + 1) {
             let block = Array(repeating: 0, count: width)
@@ -1492,11 +1520,17 @@ public final class Qwen36MTPBlockSession {
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
         var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        // One concatenated draft-id readout rides the round's single batched
+        // eval, so the accept walk copies ONE materialised buffer instead of
+        // paying d separate `.item()` readbacks (Carme99 rider 99e46f4).
+        // Same integers, same order; `verifyTokens` still chains the raw
+        // per-step arrays.
+        let draftsReadout = concatenated(draftIdArrays, axis: 0)
+        bundle.append(draftsReadout)
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = draftsReadout.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
