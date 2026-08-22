@@ -1104,7 +1104,14 @@ public final class Qwen36MTPBlockSession {
         //
         // Imported from promoted submission c6af1e24 (organizer 88578f92,
         // official 3.30955573); it supersedes ead84bba (official 3.30221310).
-        let widthCap = Self.segmentedVerifyDepthCap
+        // The current crown already promotes the flat cap-7 policy. On a
+        // fully accepted round the next round's observed conditional reach is
+        // exactly 1.0, so this one-round extension only removes the EMA ramp
+        // on rounds that have just proven depth is safe; any rejection resets
+        // `fullAcceptStreak` and restores the crown policy.
+        let widthCap = fullAcceptStreak >= 1
+            ? Qwen36MTPLimits.maxDepth
+            : Self.segmentedVerifyDepthCap
         let cap = Swift.min(
             Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
             widthCap)
