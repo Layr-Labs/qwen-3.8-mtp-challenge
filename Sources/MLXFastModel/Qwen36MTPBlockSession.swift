@@ -563,10 +563,6 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        // Restores 0dd455f0's validated qL{1..5} SDPA warm extension (receipt
-        // 3.2355→3.2414 in its note), removed by b40c28e's stale-base overlay.
-        // qL∈{2,3} are dispatched as chunk-B of width-7/8 verifies (see
-        // AttentionUtils exactness chunk).
         for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
@@ -593,10 +589,6 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            // Same provenance: restores 0dd455f0's validated qL{1..5} warm
-            // extension (receipt 3.2355→3.2414), removed by b40c28e's
-            // stale-base overlay. qL∈{2,3} hit as chunk-B of width-7/8
-            // verifies (AttentionUtils exactness chunk).
             for qL in [1, 2, 3, 4, 5] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
@@ -1823,6 +1815,9 @@ public final class Qwen36MTPBlockSession {
             // round's draft chain does not stall on their first use.
             // Re-validated 2026-08-21: ranked pair a5cd3ef vs ccc5184
             // moved +0.033%, reproducing the promoted receipt within noise.
+            // Ledger: 447689cd (E123+restack) FAILED on the runner
+            // 8/22 11:22 AM (no score; the full package builds clean
+            // locally with -c release) — resubmitted unchanged.
             let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
                 guard let arrays = entry as? ArraysCache else { return nil }
                 return arrays[1]
