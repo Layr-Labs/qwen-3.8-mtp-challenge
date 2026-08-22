@@ -1646,6 +1646,9 @@ public final class Qwen36MTPBlockSession {
                 + "sel_env=\(qwen35RowTop32GateSource) "
                 + "sel_fused=\(qwen35RowTop32FusedDrafts) "
                 + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
+                + "sel_probe_env=\(qwen35ProbeSelectGateSource) "
+                + "sel_probe_fused=\(qwen35ProbeSelectFusedDrafts) "
+                + "sel_probe_legacy=\(qwen35ProbeSelectLegacyDrafts) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
