@@ -881,7 +881,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(M >= 2 && M <= 9, "multi-row QMV supports M in [2, 9]");
+  static_assert(M >= 1 && M <= 9, "multi-row QMV supports M in [1, 9]");
   constexpr int inputs_per_group = 2;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -1981,6 +1981,22 @@ template <typename T, int group_size, int bits, bool batched>
       }
     } else {
       switch (ntg.x) {
+        case 1:
+          // M == 1 below 4096 outputs: the MTP head's per-position narrow
+          // matmuls (head qkv 3*1024 = 3072, the per-committed-token K/V
+          // pack at 2048) previously fell through to qmv_fast_impl. The
+          // serial leg is 512 plain forwards whose quantized matmuls are
+          // ALL >= 4096 outputs (fused qkv 8192, o_proj 5120, mlp
+          // 17408/20480, lm_head 248_320), so this branch is MTP-only by
+          // construction and cannot touch the serial numerator or the
+          // 5% denominator band. With M == 1 the kernel's has_pair guard
+          // idles the second-lane load; the single lane is the same
+          // qdot_affine4_loaded expression tree as the promoted narrow
+          // rows, so no arithmetic drift vs the fallback.
+          qmv_fast_crossrow_affine4_g64<T, 1>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
@@ -2204,6 +2220,43 @@ template <typename T, const int group_size, const int bits, int split_k = 32>
       simd_lid);
 }
 
+
+// Threadgroup launch-order swizzle for the tiled quantized GEMMs (qmm_t).
+//
+// The host dispatches the grid as (N / BN, M / BM, B) and Metal launches
+// threadgroups x-fastest, so the M / BM threadgroups that share one packed W
+// block (same tid.x) are N / BN launches apart: every W tile is streamed from
+// far memory once per M block (8x at the 512-row prefill with BM = 64). This
+// remaps the launch index so that up to SWIZZLE_M consecutive threadgroups
+// share the same W block (walk M first inside bands of SWIZZLE_M row blocks,
+// then N), so the repeat reads hit in cache while the first one is still
+// resident. It is a pure permutation of (x, y) over the grid -- every tile is
+// still computed exactly once, by the identical per-tile arithmetic and
+// accumulation order, only by a different threadgroup -- so the output is
+// bit-identical to the unswizzled launch. Grids with a single M block (the
+// decode / verify rows) are returned unchanged.
+template <int SWIZZLE_M>
+METAL_FUNC uint3 qmm_swizzle_tid(uint3 tid, uint3 grid) {
+  if (SWIZZLE_M <= 1 || grid.y <= 1) {
+    return tid;
+  }
+  const uint gx = grid.x;
+  const uint gy = grid.y;
+  const uint linear = tid.y * gx + tid.x;
+  const uint band_tiles = uint(SWIZZLE_M) * gx;
+  const uint full_bands = gy / uint(SWIZZLE_M);
+  uint band = linear / band_tiles;
+  uint rows = uint(SWIZZLE_M);
+  uint local = linear - band * band_tiles;
+  if (band >= full_bands) {
+    // Ragged last band: fewer than SWIZZLE_M M blocks remain.
+    band = full_bands;
+    local = linear - full_bands * band_tiles;
+    rows = gy - full_bands * uint(SWIZZLE_M);
+  }
+  return uint3(local / rows, band * uint(SWIZZLE_M) + local % rows, tid.z);
+}
+
 template <
     typename T,
     const int group_size,
@@ -2230,7 +2283,8 @@ template <
     const constant int64_t* w_strides [[buffer(13)]],
     const constant int64_t* s_strides [[buffer(14)]],
     const constant int64_t* b_strides [[buffer(15)]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_in [[threadgroup_position_in_grid]],
+    uint3 tgp_grid [[threadgroups_per_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -2240,6 +2294,10 @@ template <
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
+
+  // Prefill-shaped grids (M / BM > 1) walk the M blocks of one W tile
+  // back to back; see qmm_swizzle_tid.
+  const uint3 tid = qmm_swizzle_tid<8>(tid_in, tgp_grid);
 
   if (batched) {
     adjust_matrix_offsets<T>(
