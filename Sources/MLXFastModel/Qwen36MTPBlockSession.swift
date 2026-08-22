@@ -538,11 +538,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        // Restores 0dd455f0's validated qL{1..5} SDPA warm extension (receipt
-        // 3.2355→3.2414 in its note), removed by b40c28e's stale-base overlay.
-        // qL∈{2,3} are dispatched as chunk-B of width-7/8 verifies (see
-        // AttentionUtils exactness chunk).
-        for qL in [1, 2, 3, 4, 5] {
+        for qL in [1, 5, 4] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -568,11 +564,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            // Same provenance: restores 0dd455f0's validated qL{1..5} warm
-            // extension (receipt 3.2355→3.2414), removed by b40c28e's
-            // stale-base overlay. qL∈{2,3} hit as chunk-B of width-7/8
-            // verifies (AttentionUtils exactness chunk).
-            for qL in [1, 2, 3, 4, 5] {
+            for qL in [1, 5, 4] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(

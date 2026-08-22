@@ -4232,6 +4232,244 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
+// ---------------------------------------------------------------------------
+// E121 cluster 2-bit QMV (proposal-side only)
+//
+// Live `#1063` already owns the wide affine-4/g64 verification matvec and
+// hoists its activation chunk sums. That path never sees a 2-bit weight.
+// The cluster shortlist in front of the affine-4 rerank still pays two
+// library 2-bit matvecs per draft:
+//
+//   1. dense centroid `quantizedMM` over N = 12,292. 12,292 % 8 == 4, so
+//      `quantized.cpp:259` `fast = N % 8 == 0 && K % 512 == 0` is false and
+//      the launch is the bounds-checked `qmv_impl`, not `qmv_fast`.
+//   2. `gatherQuantizedMM` of the 3,073 probed clusters. Each probe is an
+//      N = 8 tile (one leaf), dispatched as a gather batch of 3,073 tiny
+//      `qmv_fast_impl` threadgroups at 16 values/lane.
+//
+// The already-promoted `qmv_fast_singlerow_affine2_g64` (32 values/lane,
+// one ulong load, five K-blocks at K = 5,120) is gated on
+// `out_vec_size == 98_336`, which is the DENSE coarse readout the cluster
+// path no longer takes. These two kernels apply that same 32-value
+// arithmetic to the LIVE cluster geometry: a bounds-checked dense
+// centroid QMV, and a single-grid gathered row QMV that replaces the
+// 3,073-way gather launch.
+//
+// Candidate-asymmetric by construction. The serial leg's projections are
+// affine-4 (see the 98,336 kernel's own header). The exact affine-4
+// rerank plus target verification still decide every emitted token, so
+// the FP32 reassociation of the wider lane is the same contract the
+// dense 98,336 kernel already ships.
+//
+// `MLX_E121_CLUSTER_QMV=0` restores the two library launches bit-for-bit.
+// The name is 20 UTF-8 bytes so `strings` on the worker binary can
+// witness it; the `MLX_` prefix is load-bearing.
+private let qwen35ClusterQMVEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E121_CLUSTER_QMV"],
+          !raw.isEmpty
+    else { return true }
+    switch raw {
+    case "1": return true
+    case "0": return false
+    default:
+        fatalError("MLX_E121_CLUSTER_QMV must be unset, 0 or 1; got \(raw)")
+    }
+}()
+
+/// Shared 32-value/lane affine-2/g64 body. `physical_row` is the weight
+/// row; `y_row` is the output slot. `n_valid` in [1, 4] covers the
+/// centroid tail (N = 12,292 = 8*1,536 + 4). Identical qdot / bias-sum
+/// expression to `qmv_fast_singlerow_affine2_g64`.
+private let qwen35ClusterAffine2QMVHeader = """
+    inline void qwen_e121_a2_qmv4(
+        const device uint32_t* w,
+        const device bfloat16_t* scales,
+        const device bfloat16_t* biases,
+        const device bfloat16_t* x,
+        device bfloat16_t* y,
+        const int K,
+        const int physical_row,
+        const int y_row,
+        const int n_valid,
+        const uint simd_lid
+    ) {
+        constexpr int rows_per_simd = 4;
+        constexpr int values_per_thread = 32;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int bytes_per_lane = 8;
+        const int in_vec_size_w = K / 4;
+        const int in_vec_size_g = K / 64;
+
+        thread float result[rows_per_simd];
+        for (int r = 0; r < rows_per_simd; r++) {
+            result[r] = 0.0f;
+        }
+
+        for (int k = 0; k < K; k += block_size) {
+            thread ulong packed[rows_per_simd];
+            thread float scale_local[rows_per_simd];
+            thread float bias_local[rows_per_simd];
+            for (int r = 0; r < rows_per_simd; r++) {
+                if (r >= n_valid) {
+                    packed[r] = 0ul;
+                    scale_local[r] = 0.0f;
+                    bias_local[r] = 0.0f;
+                    continue;
+                }
+                const int row = physical_row + r;
+                const device uint8_t* ws =
+                    reinterpret_cast<const device uint8_t*>(w) +
+                    row * in_vec_size_w + k / 4 + int(simd_lid) * bytes_per_lane;
+                packed[r] = *reinterpret_cast<const device ulong*>(ws);
+                const int group_index =
+                    row * in_vec_size_g + k / 64 +
+                    (int(simd_lid) * values_per_thread) / 64;
+                scale_local[r] = scales[group_index];
+                bias_local[r] = biases[group_index];
+            }
+
+            thread float x0[values_per_thread];
+            const device bfloat16_t* xm = x + k + int(simd_lid) * values_per_thread;
+            float sum = 0.0f;
+            for (int i = 0; i < values_per_thread; i += 4) {
+                x0[i]     = static_cast<float>(xm[i]);
+                x0[i + 1] = static_cast<float>(xm[i + 1]);
+                x0[i + 2] = static_cast<float>(xm[i + 2]);
+                x0[i + 3] = static_cast<float>(xm[i + 3]);
+                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+            }
+
+            for (int r = 0; r < n_valid; r++) {
+                float accum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 32; j++) {
+                    accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
+                }
+                result[r] += scale_local[r] * accum + sum * bias_local[r];
+            }
+        }
+
+        for (int r = 0; r < n_valid; r++) {
+            const float reduced = simd_sum(result[r]);
+            if (simd_lid == 0) {
+                y[y_row + r] = static_cast<bfloat16_t>(reduced);
+            }
+        }
+    }
+    """
+
+/// Dense centroid 2-bit QMV. N need not be a multiple of 8: the last
+/// simdgroup writes only the live tail (four rows at N = 12,292).
+private let qwen35ClusterCentroidQMVKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_centroid_qmv_a2g64_v1",
+    inputNames: ["x", "w", "scales", "biases"],
+    outputNames: ["y"],
+    source: """
+        const int K = x_shape[x_ndim - 1];
+        const int N = w_shape[0];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+        if (out_row >= N) {
+            return;
+        }
+        const int n_valid = (N - out_row < 4) ? (N - out_row) : 4;
+        qwen_e121_a2_qmv4(
+            w, scales, biases, x, y, K, out_row, out_row, n_valid, simd_lid);
+        """,
+    header: qwen35ClusterAffine2QMVHeader,
+    ensureRowContiguous: true
+)
+
+/// Gathered leaf 2-bit QMV. One threadgroup per probed cluster, eight
+/// output rows, weight row `probed[tg] * rowsPer + local`. Replaces
+/// `gatherQuantizedMM` of N = 8 across a batch of probes.
+private let qwen35ClusterRowQMVKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_cluster_row_qmv_a2g64_v1",
+    inputNames: ["x", "w", "scales", "biases", "probed"],
+    outputNames: ["y"],
+    source: """
+        const int K = x_shape[x_ndim - 1];
+        const int rows_per = w_shape[1];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const int probe = int(tid.y);
+        const int local = int(simd_gid) * 4;
+        const int cluster = int(probed[probe]);
+        const int physical = cluster * rows_per + local;
+        const int y_row = probe * rows_per + local;
+        qwen_e121_a2_qmv4(
+            w, scales, biases, x, y, K, physical, y_row, 4, simd_lid);
+        """,
+    header: qwen35ClusterAffine2QMVHeader,
+    ensureRowContiguous: true
+)
+
+/// True when the live cluster tensors match the 32-value affine-2/g64
+/// contract: K multiple of 1,024 (five 1,024-wide k-blocks at 32
+/// values/lane × 32 lanes), 2-bit packed rows, eight rows per leaf.
+private func qwen35ClusterQMVRoutable(
+    x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    hidden: Int
+) -> Bool {
+    guard qwen35ClusterQMVEnabled else { return false }
+    guard x.dtype == .bfloat16, scales.dtype == .bfloat16,
+          biases.dtype == .bfloat16, weight.dtype == .uint32
+    else { return false }
+    guard hidden > 0, hidden % 1024 == 0 else { return false }
+    guard weight.dim(-1) == hidden / 16 else { return false }
+    guard scales.dim(-1) == hidden / 64, biases.shape == scales.shape
+    else { return false }
+    return true
+}
+
+private func qwen35ClusterCentroidQMV(
+    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    clusters: Int, hidden: Int
+) -> MLXArray? {
+    guard qwen35ClusterQMVRoutable(
+        x: x, weight: weight, scales: scales, biases: biases, hidden: hidden)
+    else { return nil }
+    guard weight.ndim == 2, weight.dim(0) == clusters,
+          scales.ndim == 2, scales.dim(0) == clusters
+    else { return nil }
+    let tiles = (clusters + 7) / 8
+    return qwen35ClusterCentroidQMVKernel(
+        [x.reshaped([hidden]), weight, scales, biases],
+        grid: (32, tiles * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[clusters]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
+private func qwen35ClusterRowQMV(
+    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    probed: MLXArray, clusters: Int, rowsPerCluster: Int, probes: Int,
+    hidden: Int
+) -> MLXArray? {
+    guard qwen35ClusterQMVRoutable(
+        x: x, weight: weight, scales: scales, biases: biases, hidden: hidden)
+    else { return nil }
+    guard rowsPerCluster == 8, probes >= 1, probes <= clusters else { return nil }
+    guard weight.ndim == 3,
+          weight.shape == [clusters, rowsPerCluster, hidden / 16],
+          scales.ndim == 3,
+          scales.shape == [clusters, rowsPerCluster, hidden / 64],
+          biases.shape == scales.shape,
+          probed.dtype == .uint32, probed.dim(0) == probes
+    else { return nil }
+    return qwen35ClusterRowQMVKernel(
+        [x.reshaped([hidden]), weight, scales, biases, probed],
+        grid: (32, probes * 2, 1),
+        threadGroup: (32, 2, 1),
+        outputShapes: [[probes * rowsPerCluster]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 /// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
 /// declared head's per-draft bytes at a worst-domain argmax miss rate of
 /// 2.3e-4, 13x inside the accepted gate.
@@ -5356,10 +5594,19 @@ extension Qwen35TextModel: MTPCapable {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
         }
-        let centroidScore = quantizedMM(
-            x, centroidWeight, scales: centroidScales, biases: centroidBiases,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine
-        ).reshaped([clusters])
+        let hidden = configuration.hiddenSize
+        let centroidScore: MLXArray
+        if let y = qwen35ClusterCentroidQMV(
+            x, weight: centroidWeight, scales: centroidScales,
+            biases: centroidBiases, clusters: clusters, hidden: hidden)
+        {
+            centroidScore = y
+        } else {
+            centroidScore = quantizedMM(
+                x, centroidWeight, scales: centroidScales, biases: centroidBiases,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine
+            ).reshaped([clusters])
+        }
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
         let order = MLX.argPartition(centroidScore, kth: clusters - probes)
@@ -5377,13 +5624,22 @@ extension Qwen35TextModel: MTPCapable {
                 .asType(.uint32)
         }
 
-        let rowScore = gatherQuantizedMM(
-            x.reshaped([1, 1, configuration.hiddenSize]),
-            rowWeight, scales: rowScales, biases: rowBiases,
-            lhsIndices: _draftClusterLHS, rhsIndices: probed,
-            transpose: true, groupSize: 64, bits: 2, mode: .affine,
-            sortedIndices: true
-        ).reshaped([probes * rowsPerCluster])
+        let rowScore: MLXArray
+        if let y = qwen35ClusterRowQMV(
+            x, weight: rowWeight, scales: rowScales, biases: rowBiases,
+            probed: probed, clusters: clusters, rowsPerCluster: rowsPerCluster,
+            probes: probes, hidden: hidden)
+        {
+            rowScore = y
+        } else {
+            rowScore = gatherQuantizedMM(
+                x.reshaped([1, 1, configuration.hiddenSize]),
+                rowWeight, scales: rowScales, biases: rowBiases,
+                lhsIndices: _draftClusterLHS, rhsIndices: probed,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine,
+                sortedIndices: true
+            ).reshaped([probes * rowsPerCluster])
+        }
 
         if let rowTop32 = _draftRowTop32 {
             qwen35RowTop32FusedDrafts += 1
