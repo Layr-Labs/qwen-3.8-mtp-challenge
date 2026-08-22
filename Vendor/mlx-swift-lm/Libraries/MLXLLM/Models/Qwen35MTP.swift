@@ -115,6 +115,11 @@ final class Qwen35MTPModule: Module {
     let layers: [Qwen35MTPDecoderLayer]
     let norm: RMSNorm
 
+    /// Split `fc.weight` [5120, 10240] into the two K=5120 halves the tower
+    /// GEMMs already use. Underscore so they are not Module parameters.
+    private var _fcEmbedHalf: MLXArray?
+    private var _fcHiddenHalf: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         _preFcNormHidden.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
@@ -184,6 +189,33 @@ final class Qwen35MTPModule: Module {
             [preFcNormEmbedding(embeds), preFcNormHidden(hidden)], axis: -1)
     }
 
+    /// Apply `fc` to a dual-RMS `[e | h]` concat. One-row draft steps keep
+    /// the stock Linear. Multi-row history flushes (seed prime, backlog)
+    /// split the 10240-wide GEMM into two K=5120 GEMMs — the same N/K the
+    /// tower already streams — then add. Arithmetic: `concat @ W.T` with
+    /// `W = [We | Wh]`. Proposal-only; serial never enters this module.
+    private func applyFc(_ concat: MLXArray) -> MLXArray {
+        let d = concat.dim(-1) / 2
+        guard concat.dim(-1) == 2 * d, concat.dim(-2) >= 2,
+              d == 5120, fc.bias == nil, !(fc is QuantizedLinear)
+        else { return fc(concat) }
+
+        let we: MLXArray
+        let wh: MLXArray
+        if let cachedE = _fcEmbedHalf, let cachedH = _fcHiddenHalf {
+            we = cachedE
+            wh = cachedH
+        } else {
+            we = fc.weight[0..., 0..<d].contiguous()
+            wh = fc.weight[0..., d...].contiguous()
+            _fcEmbedHalf = we
+            _fcHiddenHalf = wh
+        }
+        let e = concat[.ellipsis, 0..<d]
+        let h = concat[.ellipsis, d...]
+        return matmul(e, we.transposed(1, 0)) + matmul(h, wh.transposed(1, 0))
+    }
+
     func callAsFunction(
         hidden: MLXArray,
         nextTokenIds: MLXArray,
@@ -192,7 +224,7 @@ final class Qwen35MTPModule: Module {
     ) -> MLXArray {
         // omlx: MTPModule.__call__
         // 1. Embed next-token ids and fuse with normed hidden state.
-        var fused = fc(
+        var fused = applyFc(
             preFcConcat(
                 nextTokenIds: nextTokenIds, embedTokens: embedTokens,
                 hidden: hidden))
@@ -226,7 +258,7 @@ final class Qwen35MTPModule: Module {
               nextTokenIds.dim(1) == hidden.dim(1)
         else { return nil }
 
-        let fused = fc(
+        let fused = applyFc(
             preFcConcat(
                 nextTokenIds: nextTokenIds, embedTokens: embedTokens,
                 hidden: hidden))
