@@ -1151,6 +1151,122 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
   }
 }
 
+
+// Single-stream five-input affine4/g64 QMV for the M = 5 verify width (the
+// d = 4 drafting round). The frozen host launches five x-groups per 8-output
+// tile; group 0 claims ALL five input rows and the other four return without
+// reading weights, so each weight tile is streamed ONCE instead of twice
+// (the shipped 3+2 split). Lanes are SCALAR floats rather than vec<float,N>:
+// five scalar lanes fit under the register cliff that every float4-padded
+// NA > 4 form falls off (measured: NA = 5 scalar -9 % on every K = 5120
+// verify projection at M = 5, bit-identical; NA >= 6 in any form slower).
+// Narrow outputs keep the shipped split: with N = 5120 one stream leaves too
+// few threadgroups to hide latency, so the gate below is on out_vec_size.
+//
+// EXACTNESS: per (input row, output row) the scalar chain is the wide
+// kernel's -- x loaded per 4-k chunk and widened bf16 -> f32, `sums` carried
+// in the incumbent bf16 expression tree, `partial` as the same 16 products
+// in the same i / nibble order, `acc += scale * partial + sums * bias` once
+// per k-block, and `simd_sum` at the end. Lanes are never reduced across,
+// so the lane layout cannot reorder any element's arithmetic. Gate
+// receipt: 4 shapes x M = 5, output bits equal to the shipped dispatch.
+template <typename T>
+METAL_FUNC void qmv_fast_crossrow_affine4_g64_scalar5(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int NA = 5;
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+  if (tid.x != 0) {
+    return;
+  }
+  const int first_m = 0;
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  float acc[rows_per_simd][NA];
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < NA; m++) {
+      acc[r][m] = 0.0f;
+    }
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+          reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
+          k / 2 + simd_lid * bytes_per_lane);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    float sums[NA];
+    float partial[rows_per_simd][NA];
+    for (int m = 0; m < NA; m++) {
+      sums[m] = 0.0f;
+      for (int r = 0; r < rows_per_simd; r++) {
+        partial[r][m] = 0.0f;
+      }
+    }
+    for (int i = 0; i < 4; i++) {
+      float a0[NA], a1[NA], a2[NA], a3[NA];
+      for (int m = 0; m < NA; m++) {
+        const device T* xm = x + (first_m + m) * in_vec_size + k +
+            simd_lid * values_per_thread + 4 * i;
+        a0[m] = static_cast<float>(xm[0]);
+        a1[m] = static_cast<float>(xm[1]);
+        a2[m] = static_cast<float>(xm[2]);
+        a3[m] = static_cast<float>(xm[3]);
+        // Preserve the incumbent BF16 expression tree used for the affine
+        // bias correction (same statement as the DIRECT_NIBBLES wide path).
+        sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+      }
+      for (int r = 0; r < rows_per_simd; r++) {
+        const float n0 = float(packed[r][i] & 0x000f);
+        const float n1 = float((packed[r][i] >> 4) & 0x000f);
+        const float n2 = float((packed[r][i] >> 8) & 0x000f);
+        const float n3 = float((packed[r][i] >> 12) & 0x000f);
+        for (int m = 0; m < NA; m++) {
+          partial[r][m] += (a0[m] * n0 + a1[m] * n1 + a2[m] * n2 + a3[m] * n3);
+        }
+      }
+    }
+    for (int r = 0; r < rows_per_simd; r++) {
+      for (int m = 0; m < NA; m++) {
+        acc[r][m] += scale_local[r] * partial[r][m] + sums[m] * bias_local[r];
+      }
+    }
+  }
+
+  for (int r = 0; r < rows_per_simd; r++) {
+    for (int m = 0; m < NA; m++) {
+      const float reduced = simd_sum(acc[r][m]);
+      if (simd_lid == 0) {
+        y[(first_m + m) * out_vec_size + out_row + r] = static_cast<T>(reduced);
+      }
+    }
+  }
+}
+
 // IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
 // with the remainder spread evenly so no group runs a one-row tail.
 template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
@@ -1936,6 +2052,14 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
+          // One weight stream for the d = 4 verify width on wide outputs;
+          // the 3+2 split stays for N < 8192 (too few tiles for one stream).
+          if (out_vec_size >= 8192) {
+            qmv_fast_crossrow_affine4_g64_scalar5<T>(
+                w, scales, biases, x, y, in_vec_size, out_vec_size,
+                tid, simd_gid, simd_lid);
+            return;
+          }
           qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
