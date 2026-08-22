@@ -4436,16 +4436,13 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
-/// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
-/// declared head's per-draft bytes at a worst-domain argmax miss rate of
-/// 2.3e-4, 13x inside the accepted gate.
-///
-/// 0.15 screens better under the fitted acceptance penalty (+2.02 % against
-/// +1.83 %), but the whole difference lives inside that fitted coefficient,
-/// and no local leg can resolve it: at these miss rates a 512-token leg
-/// expects under one changed proposal. 0.25 is the low-variance choice and it
-/// is the byte point the r1 arm-C and r2 balanced sessions both measured.
-private let qwen35DerivedClusterProbeFraction: Double = 0.25
+/// Fraction of leaves probed per draft step. 0.15 probes 1,844 of the 12,292
+/// leaves and scores 14,752 coarse rows instead of 24,584, a 40 % cut while
+/// the exact affine-4 rerank and 32-row shortlist stay unchanged. The isolated
+/// ranked receipt `02742bf0` promoted this cut on the same cluster/index
+/// lineage; the later wide-QMV launch overlay removed the literal but does not
+/// overlap the proposal-side retrieval path restored here.
+private let qwen35DerivedClusterProbeFraction: Double = 0.15
 
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
