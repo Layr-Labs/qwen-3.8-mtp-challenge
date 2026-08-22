@@ -417,14 +417,36 @@ public final class Qwen36MTPBlockSession {
             let block = Array(repeating: 0, count: width)
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
-            // tape. Warm the same shapes the scored rounds dispatch.
-            let (verifyLogits, _) = model.callWithHidden(
-                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
-                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
+            // tape. Warm the SAME expression scored rounds dispatch:
+            // `callWithHiddenAndNormed` (E). Warming only `callWithHidden`
+            // leaves the published post-norm output to cold-JIT inside
+            // the first timed verify — the 7b33621 failure mode. (Promoted
+            // at 1d7876fd/be3361b, then deleted by a later whole-file
+            // overlay whose author branched from a pre-be3361b base;
+            // restored byte-for-byte with this provenance note.)
+            let verifyLogits: MLXArray
+            let verifyNormed: MLXArray?
+            if width >= 2 {
+                let triple = model.callWithHiddenAndNormed(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 1)
+                verifyLogits = triple.0
+                verifyNormed = triple.2
+            } else {
+                let pair = model.callWithHidden(
+                    input: LMInput.Text(
+                        tokens: MLXArray(block).reshaped([1, width])),
+                    cache: warmCache, nConfirmed: 0)
+                verifyLogits = pair.0
+                verifyNormed = nil
+            }
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            eval(verifyLogits, warmTop2IDs, warmTop2Values)
+            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
+            if let verifyNormed { warmBundle.append(verifyNormed) }
+            eval(warmBundle)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -445,10 +467,13 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _) = model.callWithHidden(
-            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-            cache: oneRowReplayCache, nConfirmed: 1)
-        eval(oneRowReplayLogits)
+        let (oneRowReplayLogits, _, oneRowReplayNormed) =
+            model.callWithHiddenAndNormed(
+                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+                cache: oneRowReplayCache, nConfirmed: 1)
+        var oneRowBundle = [oneRowReplayLogits]
+        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
+        eval(oneRowBundle)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -538,7 +563,12 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // qL={2,3} added to {1,4,5}: the exactness chunk splits width-7/8/9
+        // verifies into a qL=5 chunk A plus a qL={2,3,4} chunk B, so deep
+        // rounds dispatch the qL=2 and qL=3 pipeline states too. Ranked
+        // receipts for exactly this extension on the pre-jump frontier:
+        // qL{1,4,5} 3.2355 -> qL{1..5} 3.2414, best draw 3.2452.
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -564,7 +594,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
+            for qL in [1, 2, 3, 4, 5] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -709,7 +739,6 @@ public final class Qwen36MTPBlockSession {
     /// `MLXFAST_OFFICIAL_BENCHMARK_RUN=1`, so this stays local-only.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
-
     /// Attribution probe only. `verify_build_us` measures the window in which
     /// the host builds the verify graph WHILE the asynchronously submitted head
     /// chain runs on the GPU, so a head-chain stall is indistinguishable from
@@ -1638,14 +1667,6 @@ public final class Qwen36MTPBlockSession {
                 // the same host work at a lower clock. E89 measures the same
                 // field on a second host under the same name and units.
                 + "host_thread_cpu_ns=\(Self.threadCPUNanoseconds() &- cpuRound0) "
-                // Which row-selection path the drafts of this run actually
-                // took, and the text that resolved the gate. A leg that
-                // exports nothing must read sel_env=unset with sel_argpart=0,
-                // which is the bare-leg proof that the fused kernels are the
-                // compiled default rather than an opt-in.
-                + "sel_env=\(qwen35RowTop32GateSource) "
-                + "sel_fused=\(qwen35RowTop32FusedDrafts) "
-                + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
@@ -1783,6 +1804,19 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
+            // E020 replay-prefetch (promoted +0.039%, then deleted by a
+            // whole-file overlay in 6209702 whose author never opened this
+            // file — see Amal-David's crown-tree audit note 062ba58): submit
+            // the restored GDN boundary states asynchronously so the next
+            // round's draft chain does not stall on their first use.
+            // Re-validated 2026-08-21: the one ranked pair differing by
+            // exactly this block (a5cd3ef vs ccc5184) moved +0.033%,
+            // reproducing the promoted receipt within noise.
+            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
+                guard let arrays = entry as? ArraysCache else { return nil }
+                return arrays[1]
+            }
+            asyncEval(replayedRecurrentStates)
             return true
         }
 
