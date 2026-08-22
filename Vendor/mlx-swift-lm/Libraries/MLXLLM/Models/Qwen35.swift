@@ -1564,7 +1564,7 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1696,9 +1696,12 @@ public enum Qwen35CustomQMV {
         return Arm(rawValue: raw) ?? .sumTable
     }()
 
-    /// Widths whose incumbent route is `qmv_fast_crossrow_affine4_g64_m`. M=1
-    /// and M=2 reach different kernels and are left to MLX.
-    static let widths = 3 ... 9
+    /// Widths the candidate-owned dispatch may take. M=1 stays on MLX
+    /// (serial and the candidate share it, so speeding it does not move the
+    /// ratio). M=2 is the pair kernel the library still launches as two
+    /// X-groups, one of which returns before any read. Routing it here
+    /// applies the same active-group launch the M=3..9 path already uses.
+    static let widths = 2 ... 9
 
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
@@ -1712,6 +1715,7 @@ public enum Qwen35CustomQMV {
     static func activeInputGroups(_ m: Int) -> Int {
         let inputsPerGroup: Int
         switch m {
+        case 2: inputsPerGroup = 2
         case 3: inputsPerGroup = 3
         case 4: inputsPerGroup = 4
         case 5: inputsPerGroup = 5
