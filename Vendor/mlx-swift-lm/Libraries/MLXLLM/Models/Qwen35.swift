@@ -697,6 +697,12 @@ final class Qwen35GatedDeltaNet: Module {
     private var _inW: MLXArray?
     private var _inS: MLXArray?
     private var _inZ: MLXArray?
+
+    // E122 hand-off: chunk-sum table produced by the decoder layer's fused
+    // entry norm for its own output. Set immediately before this module is
+    // invoked; consumed by the first routed in-projection cell on that
+    // activation and cleared. Nil keeps the standalone fill.
+    var pendingInProjXSums: MLXArray?
     private var _inGS = 64
     private var _inBits = 4
     private var _inMode = QuantizationMode.affine
@@ -805,10 +811,13 @@ final class Qwen35GatedDeltaNet: Module {
     private func fusedInProjections(
         _ x: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        let e122 = pendingInProjXSums
+        pendingInProjXSums = nil
         if let w = _inW, let s = _inS, let zp = _inZ {
             let y = qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: zp,
-                groupSize: _inGS, bits: _inBits, mode: _inMode)
+                groupSize: _inGS, bits: _inBits, mode: _inMode,
+                precomputedXSums: e122)
             let qkvEnd = keyDim * 2 + valueDim
             let zEnd = qkvEnd + valueDim
             let bEnd = zEnd + numVHeads
@@ -1819,7 +1828,8 @@ public enum Qwen35CustomQMV {
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        arm: Arm = Qwen35CustomQMV.arm
+        arm: Arm = Qwen35CustomQMV.arm,
+        precomputedXSums: MLXArray? = nil
     ) -> MLXArray? {
         guard arm != .off else { return nil }
         guard
@@ -1829,8 +1839,15 @@ public enum Qwen35CustomQMV {
         else { return nil }
 
         if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
+            // A producer-fused table (E122) is trusted only when it has
+            // exactly the shape this activation's fill would have produced;
+            // anything else falls back to the standalone dispatch.
+            let expected = (cell.k / 512) * 32 * sumsStride(cell.m)
+            let table =
+                (precomputedXSums?.size == expected)
+                ? precomputedXSums! : xsumsTable(x)
             return matmulWithTable(
-                x, w, scales: scales, biases: biases, xsums: xsumsTable(x),
+                x, w, scales: scales, biases: biases, xsums: table,
                 groupSize: groupSize, bits: bits, mode: mode,
                 consume: arm == .sumTable)
         }
@@ -1858,11 +1875,13 @@ func qwen35RoutedQuantizedMM(
     biases: MLXArray,
     groupSize: Int,
     bits: Int,
-    mode: QuantizationMode
+    mode: QuantizationMode,
+    precomputedXSums: MLXArray? = nil
 ) -> MLXArray {
     if let y = Qwen35CustomQMV.matmul(
         x, w, scales: scales, biases: biases,
-        groupSize: groupSize, bits: bits, mode: mode)
+        groupSize: groupSize, bits: bits, mode: mode,
+        precomputedXSums: precomputedXSums)
     {
         return y
     }
@@ -1896,17 +1915,26 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
     private var _fbfW: MLXArray?
     private var _gateOut = 0
 
+    // E122 hand-off: the chunk-sum table the decoder layer's fused
+    // post-attention norm produced for its own output. Set immediately before
+    // this module is invoked; consumed by the first routed gate_up cell on
+    // that same activation and cleared. Nil keeps the standalone fill.
+    var pendingGateUpXSums: MLXArray?
+
     init(dimensions: Int, hiddenDimensions: Int) {
         _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
-    private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
+    private func fusedGateUp(_ x: MLXArray, precomputedXSums: MLXArray? = nil)
+        -> MLXArray?
+    {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
             return qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: z,
-                groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
+                groupSize: _fqGS, bits: _fqBits, mode: _fqMode,
+                precomputedXSums: precomputedXSums)
         }
         if let w = _fbfW {
             return matmul(x, w.T)
@@ -1940,7 +1968,11 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // equal halves (`_gateOut * 2 == N`); a mismatched pair falls back
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
-        if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
+        let e122 = pendingGateUpXSums
+        pendingGateUpXSums = nil
+        if x.dim(-2) <= 16, let y = fusedGateUp(x, precomputedXSums: e122),
+            _gateOut * 2 == y.dim(-1)
+        {
             return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
         }
         return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
@@ -2246,6 +2278,200 @@ func qwen35FusedResidualRMSNorm(
         outputDTypes: [.bfloat16, .bfloat16]
     )
     return (outputs[0], outputs[1])
+}
+
+// MARK: - E122: producer-fused chunk-sum table (norm writes the xsums)
+
+/// E122 kill switch. `MLX_E122_NORM_XSUMS=0` restores the incumbent stream
+/// bit for bit: the fused norm launches without the table output and every
+/// routed cell fills its own table with `qwen35CustomAffine4XSumsKernel`.
+public let qwen35NormXSumsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E122_NORM_XSUMS"],
+        !raw.isEmpty
+    else { return true }
+    switch raw {
+    case "1": return true
+    case "0": return false
+    default:
+        fatalError("MLX_E122_NORM_XSUMS must be unset, 0 or 1; got \(raw)")
+    }
+}()
+
+/// The fused residual+RMSNorm kernel plus an E120 chunk-sum epilogue over its
+/// own stored `normed` values. The epilogue reproduces
+/// `qwen35CustomAffine4XSumsKernel` bit for bit from registers instead of a
+/// re-read:
+///
+/// * Fill lane `l` owns the 16 stored-BF16 values `[kb*512 + l*16, +16)` and
+///   accumulates them as four sequential float adds over quads, where each
+///   quad is three native BF16 adds (`xv[0]+xv[1]+xv[2]+xv[3]`, rounded per
+///   add) converted to float.
+/// * This kernel's threads own exactly one quad each (`n_reads = 4`), so the
+///   per-thread partial IS one fill quad, computed on the same register bits
+///   that are stored to `normed`. Threads `4l..4l+3` of one r_start block map
+///   to fill lane `(t % 128) / 4` of chunk block `(r_start + t*4) / 512`; all
+///   four live in one SIMD group, so three `simd_shuffle_down`s bring the
+///   partner quads home and lane 0 adds them as sequential float adds — same
+///   operands, same order, same rounding as the fill.
+/// * `routable()` requires `k % 512 == 0`, so every lane span is fully
+///   in-bounds; hidden 5120 decomposes into one full 4096 block plus a 1024
+///   tail whose 64 lanes complete exactly.
+private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm_xsums",
+    inputNames: ["x", "r", "weight", "eps", "sums_stride"],
+    outputNames: ["h", "normed", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        uint sums_stride_u = uint(sums_stride);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write h and normed, and accumulate the chunk-sum table --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            bool full = elem + n_reads <= axis_size;
+            bfloat quad[4];
+            bool quad_full[4];
+            for (uint i = 0; i < n_reads; ++i) {
+                bool inb = full || (elem + i < axis_size);
+                quad_full[i] = inb;
+                if (inb) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    bfloat yo = wi * bfloat(float(hi) * inv_mean);
+                    normed[offset + elem + i] = yo;
+                    quad[i] = yo;
+                }
+            }
+
+            // One fill quad per thread: three native BF16 adds, then float.
+            float q = 0.0f;
+            if (quad_full[0]) {
+                bfloat t01 = quad[0] + quad[1];
+                bfloat t012 = quad_full[2] ? (t01 + quad[2]) : t01;
+                bfloat t0123 =
+                    quad_full[3] ? (t012 + quad[3]) : t012;
+                q = float(t0123);
+            }
+
+            // Combine quads {4l..4l+3} of this r_start block in fill order.
+            // Lane base b = thread_id & ~3 never crosses a SIMD boundary
+            // (b % 32 <= 28), so the shuffles read valid lanes whenever the
+            // result is used.
+            float p1 = simd_shuffle_down(q, 1);
+            float p2 = simd_shuffle_down(q, 2);
+            float p3 = simd_shuffle_down(q, 3);
+            uint lane_base = thread_id & ~3u;
+            uint lane_elem = r_start + lane_base * n_reads;
+            bool lane_complete =
+                quad_full[0] && (lane_elem + 16 <= axis_size);
+            if ((thread_id & 3u) == 0 && lane_complete) {
+                float total = ((q + p1) + p2) + p3;
+                uint kb = lane_elem >> 9;
+                uint lane = (thread_id % 128u) >> 2;
+                xsums[(kb * 32u + lane) * sums_stride_u + row] = total;
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Wraps the fused residual+RMSNorm kernel with the E122 chunk-sum epilogue.
+/// Returns `(residual, normed, xsums)` where `xsums` is non-nil only when the
+/// activation geometry matches a routed wide-QMV cell that would otherwise pay
+/// its own fill dispatch: hidden 5120, BF16, and `tablePays(m:)` true. Every
+/// other shape takes the plain two-output launch unchanged.
+func qwen35FusedResidualRMSNormWithXSums(
+    x: MLXArray,
+    r: MLXArray,
+    weight: MLXArray,
+    eps: Float
+) -> (residual: MLXArray, normed: MLXArray, xsums: MLXArray?) {
+    let axisSize = x.dim(-1)
+    let m = x.size / axisSize
+    guard qwen35NormXSumsEnabled,
+        x.dtype == .bfloat16, r.dtype == .bfloat16,
+        axisSize == 5120, axisSize % 512 == 0,
+        Qwen35CustomQMV.tablePays(m: m), (3...9).contains(m)
+    else {
+        let pair = qwen35FusedResidualRMSNorm(x: x, r: r, weight: weight, eps: eps)
+        return (pair.residual, pair.normed, nil)
+    }
+    let kBlocks = axisSize / 512
+    let stride = Qwen35CustomQMV.sumsStride(m)
+    let nRows = m
+    let shape = x.shape
+    let outputs = qwen35FusedResidualRMSNormXSumsKernel(
+        [x, r, weight, MLXArray(eps), stride],
+        grid: (nRows * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [shape, shape, [kBlocks * 32 * stride]],
+        outputDTypes: [.bfloat16, .bfloat16, .float32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 // MARK: - Dual independent RMSNorm (proposal-side pre-fc)
@@ -2807,6 +3033,12 @@ final class Qwen35Attention: Module {
     private var _qOnlyS: MLXArray?
     private var _qOnlyZ: MLXArray?
 
+    // E122 hand-off: chunk-sum table produced by the decoder layer's fused
+    // entry norm for its own output. Set immediately before this module is
+    // invoked; consumed by the first routed cell on that activation (the
+    // q-only or full Q/K/V pack) and cleared. Nil keeps the standalone fill.
+    var pendingEntryXSums: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.attentionHeads = args.attentionHeads
@@ -2860,6 +3092,8 @@ final class Qwen35Attention: Module {
     /// concatenating already-packed weights on N is bit-exact with three
     /// separate qmv_fast launches. Unquantized (MTP bf16) falls back.
     private func qkv(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        let e122 = pendingEntryXSums
+        pendingEntryXSums = nil
         // Complete K/V island coverage: narrow the affine-4 pack to the q+gate
         // rows and read K and V straight out of the BF16 island rows. Every
         // quantized K/V value the old form produced was overwritten before any
@@ -2869,7 +3103,8 @@ final class Qwen35Attention: Module {
             if let w = _qOnlyW, let s = _qOnlyS, let z = _qOnlyZ {
                 var q = qwen35RoutedQuantizedMM(
                     x, w, scales: s, biases: z,
-                    groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+                    groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode,
+                    precomputedXSums: e122)
                 q = replaceExactRows(q, input: x, kvOnly: false)
                 let kvRows = matmul(x, kvExact.transposed(1, 0))
                 let kEnd = _exactKVDenseKOut
@@ -2889,7 +3124,8 @@ final class Qwen35Attention: Module {
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
             var y = qwen35RoutedQuantizedMM(
                 x, w, scales: s, biases: z,
-                groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
+                groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode,
+                precomputedXSums: e122)
             y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
             let kEnd = _qOut + _kOut
@@ -3313,14 +3549,19 @@ final class Qwen35DecoderLayer: Module {
         // h = x + r; postAttentionLayerNorm(h) sequence.
         let h: MLXArray
         let postAttnNorm: MLXArray
+        var postSums: MLXArray?
         if x.dtype == .bfloat16 && r.dtype == .bfloat16 && x.dim(-1) == 5120 {
-            (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+            (h, postAttnNorm, postSums) = qwen35FusedResidualRMSNormWithXSums(
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
         } else {
             h = x + r
             postAttnNorm = postAttentionLayerNorm(h)
+            postSums = nil
+        }
+        if let mlpFused = mlp as? Qwen35FusedMLP {
+            mlpFused.pendingGateUpXSums = postSums
         }
         return h + (mlp as! UnaryLayer)(postAttnNorm)
     }
@@ -3344,14 +3585,21 @@ final class Qwen35DecoderLayer: Module {
     ) -> (base: MLXArray, delta: MLXArray) {
         let hIn: MLXArray
         let normedIn: MLXArray
+        var entrySums: MLXArray?
         if let delta {
-            (hIn, normedIn) = qwen35FusedResidualRMSNorm(
+            (hIn, normedIn, entrySums) = qwen35FusedResidualRMSNormWithXSums(
                 x: base, r: delta,
                 weight: inputLayerNorm.weight,
                 eps: inputLayerNorm.eps)
         } else {
             hIn = base
             normedIn = inputLayerNorm(base)
+            entrySums = nil
+        }
+        if isLinear {
+            linearAttn?.pendingInProjXSums = entrySums
+        } else {
+            selfAttn?.pendingEntryXSums = entrySums
         }
         let r: MLXArray
         if isLinear {
@@ -3361,10 +3609,13 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(normedIn, mask: attentionMask, cache: cache)
         }
-        let (h, postAttnNorm) = qwen35FusedResidualRMSNorm(
+        let (h, postAttnNorm, postSums) = qwen35FusedResidualRMSNormWithXSums(
             x: hIn, r: r,
             weight: postAttentionLayerNorm.weight,
             eps: postAttentionLayerNorm.eps)
+        if let mlpFused = mlp as? Qwen35FusedMLP {
+            mlpFused.pendingGateUpXSums = postSums
+        }
         return (h, (mlp as! UnaryLayer)(postAttnNorm))
     }
 }
