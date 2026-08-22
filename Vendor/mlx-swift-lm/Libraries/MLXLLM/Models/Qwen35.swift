@@ -806,8 +806,8 @@ final class Qwen35GatedDeltaNet: Module {
         _ x: MLXArray
     ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
         if let w = _inW, let s = _inS, let zp = _inZ {
-            let y = qwen35RoutedQuantizedMM(
-                x, w, scales: s, biases: zp,
+            let y = quantizedMM(
+                x, w, scales: s, biases: zp, transpose: true,
                 groupSize: _inGS, bits: _inBits, mode: _inMode)
             let qkvEnd = keyDim * 2 + valueDim
             let zEnd = qkvEnd + valueDim
@@ -1319,7 +1319,7 @@ final class Qwen35GatedDeltaNet: Module {
         } else {
             normedOut = norm(out, gate: z)
         }
-        return qwen35RoutedLinear(outProj, normedOut.reshaped(B, S, -1))
+        return outProj(normedOut.reshaped(B, S, -1))
     }
 }
 
@@ -1371,915 +1371,6 @@ private let qwen35CompiledFusedSwiGLU:
     return body
 }()
 
-// MARK: - Candidate-owned affine-4/group-64 QMV dispatch
-//
-// MLX's `quantized.cpp` host launcher is outside the editable surface, so the
-// shipped wide cross-row QMV can never receive a buffer the launcher does not
-// already bind, and can never be launched on a grid the launcher does not
-// already choose. This section owns the dispatch instead of trying to pass an
-// argument through it: the same arithmetic, the same group indexing and the
-// same `simd_sum` reduction, launched from Swift through the custom-kernel
-// API, which binds exactly the buffers named here and dispatches exactly the
-// grid named here.
-//
-// The replica exists to answer one question before anything is built on it:
-// can a Swift-dispatched custom kernel match MLX's own launcher on identical
-// arithmetic and identical geometry? Everything downstream -- a precomputed
-// activation chunk-sum table, a launched grid volume that matches the working
-// group count -- depends on that answer and on nothing else.
-//
-// Geometry. `quantized.cpp:253-254` launches `grid_dims(M, (N+7)/8, B)`
-// threadgroups of `(32, 2, 1)` threads. `custom_kernel.cpp:113-117` calls
-// `dispatch_threads`, which counts the grid in THREADS, so the identical
-// geometry is `grid: (M*32, (N/8)*2, 1)` with `threadGroup: (32, 2, 1)`.
-// `threadgroup_position_in_grid` and `simdgroup_index_in_threadgroup` then
-// carry the same values the incumbent reads.
-//
-// M is read from `x_shape` rather than from `threadgroups_per_grid.x`, because
-// the launched x-extent stops being M as soon as the dispatch is ours to
-// choose.
-
-/// The wide cross-row affine-4/group-64 QMV, replicated exactly from
-/// `quantized.h:969-1065` at `DIRECT_NIBBLES = true`, plus the `IPG` group
-/// partition from `quantized.h:1156-1187` and the width switch from
-/// `quantized.h:1922-1979`.
-///
-/// Every floating-point operation, its order, and its type are the incumbent's:
-/// the four activations per lane are read as one `vec<T,4>`, the chunk sum is
-/// three BF16 adds accumulated into a float lane, the nibble products are
-/// summed into a `vec<float,NA>` per output row, and the K reduction closes
-/// with `simd_sum`. `K` and `N` stay runtime values, read from `x_shape` and
-/// `w_shape`; making them template arguments unrolls the K loop and the
-/// compiler then produces a wrong answer at NA = 5 with K = 5120 (E120 rung 1,
-/// 174,072 of 174,080 outputs differ, `max_abs_diff` 4501.3125), so one
-/// pipeline serves every shape and every width.
-///
-/// `USE_TABLE` selects where the per-k-block chunk sums come from. False
-/// recomputes them in the loop, which is the incumbent. True reads them from a
-/// table produced once per activation tensor by
-/// `qwen35CustomAffine4XSumsKernel`. The table entry is the same float
-/// accumulation of the same BF16 expression tree, in the same `i` order, so the
-/// two paths agree bit for bit.
-///
-/// The `scales`/`biases` reads and the `xsums` table read sit as late as their
-/// first use allows (askeladd's E132 `late_meta` + `sink_sums`). That is pure
-/// code motion: no floating-point operation, operand or order changes, and the
-/// same `group_index` is read for the same `r`. It only shortens the live range
-/// of `2 * RPS` metadata values and of `NA` table values across the product
-/// loop, which is what keeps `IPG = 7` inside the g17s register frame.
-private let qwen35E120QMVHeader = """
-    template <int NA, int RPS, bool USE_TABLE>
-    inline void qwen_e120_qmv_wide(
-        const device uint32_t* w,
-        const device bfloat16_t* scales,
-        const device bfloat16_t* biases,
-        const device bfloat16_t* x,
-        const device float* xsums,
-        device bfloat16_t* y,
-        const int in_vec_size,
-        const int out_vec_size,
-        const int sums_stride,
-        int first_m,
-        int out_row,
-        uint simd_lid
-    ) {
-        typedef vec<float, NA> VF;
-        constexpr int rows_per_simd = RPS;
-        constexpr int values_per_thread = 16;
-        constexpr int block_size = values_per_thread * 32;
-        constexpr int bytes_per_lane = 8;
-        const int in_vec_size_w = in_vec_size / 2;
-        const int in_vec_size_g = in_vec_size / 64;
-
-        VF acc[rows_per_simd];
-        for (int r = 0; r < rows_per_simd; r++) {
-            acc[r] = VF(0.0f);
-        }
-
-        for (int k = 0; k < in_vec_size; k += block_size) {
-            thread uint16_t packed[rows_per_simd][4];
-            for (int r = 0; r < rows_per_simd; r++) {
-                const int row = out_row + r;
-                const device uint16_t* ws =
-                    reinterpret_cast<const device uint16_t*>(
-                        reinterpret_cast<const device uint8_t*>(w) +
-                        row * in_vec_size_w + k / 2 +
-                        simd_lid * bytes_per_lane);
-                for (int i = 0; i < 4; i++) {
-                    packed[r][i] = ws[i];
-                }
-            }
-
-            VF sums = VF(0.0f);
-            VF partial[rows_per_simd];
-            for (int r = 0; r < rows_per_simd; r++) {
-                partial[r] = VF(0.0f);
-            }
-            for (int i = 0; i < 4; i++) {
-                VF a0, a1, a2, a3;
-                for (int m = 0; m < NA; m++) {
-                    const device bfloat16_t* xm =
-                        x + (first_m + m) * in_vec_size + k +
-                        simd_lid * values_per_thread + 4 * i;
-                    const vec<bfloat16_t, 4> xv =
-                        *reinterpret_cast<const device vec<bfloat16_t, 4>*>(
-                            xm);
-                    a0[m] = static_cast<float>(xv[0]);
-                    a1[m] = static_cast<float>(xv[1]);
-                    a2[m] = static_cast<float>(xv[2]);
-                    a3[m] = static_cast<float>(xv[3]);
-                    if (!USE_TABLE) {
-                        sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
-                    }
-                }
-                for (int r = 0; r < rows_per_simd; r++) {
-                    partial[r] += (a0 * (packed[r][i] & 0x000f) +
-                                   a1 * ((packed[r][i] >> 4) & 0x000f) +
-                                   a2 * ((packed[r][i] >> 8) & 0x000f) +
-                                   a3 * ((packed[r][i] >> 12) & 0x000f));
-                }
-            }
-            if (USE_TABLE) {
-                const device float* st =
-                    xsums + ((k / block_size) * 32 + int(simd_lid)) *
-                    sums_stride + first_m;
-                for (int m = 0; m < NA; m++) {
-                    sums[m] = st[m];
-                }
-            }
-            for (int r = 0; r < rows_per_simd; r++) {
-                const int group_index =
-                    (out_row + r) * in_vec_size_g + k / 64 + int(simd_lid) / 4;
-                const float scale_local_r = scales[group_index];
-                const float bias_local_r = biases[group_index];
-                acc[r] += scale_local_r * partial[r] + sums * bias_local_r;
-            }
-        }
-
-        for (int r = 0; r < rows_per_simd; r++) {
-            for (int m = 0; m < NA; m++) {
-                const float reduced = simd_sum(acc[r][m]);
-                if (simd_lid == 0) {
-                    y[(first_m + m) * out_vec_size + out_row + r] =
-                        static_cast<bfloat16_t>(reduced);
-                }
-            }
-        }
-    }
-
-    template <int M, int IPG, int RPS, bool USE_TABLE>
-    inline void qwen_e120_qmv_m(
-        const device uint32_t* w,
-        const device bfloat16_t* scales,
-        const device bfloat16_t* biases,
-        const device bfloat16_t* x,
-        const device float* xsums,
-        device bfloat16_t* y,
-        const int in_vec_size,
-        const int out_vec_size,
-        const int sums_stride,
-        int group_x,
-        int out_row,
-        uint simd_lid
-    ) {
-        static_assert(M % IPG != 1, "a one-input tail group is not built");
-        constexpr int TAIL = M % IPG;
-        const int first_m = group_x * IPG;
-        if (first_m >= M) {
-            return;
-        }
-        if (TAIL == 0 || M - first_m >= IPG) {
-            qwen_e120_qmv_wide<IPG, RPS, USE_TABLE>(
-                w, scales, biases, x, xsums, y, in_vec_size, out_vec_size,
-                sums_stride, first_m, out_row, simd_lid);
-        } else {
-            qwen_e120_qmv_wide<(TAIL >= 2 ? TAIL : 2), RPS, USE_TABLE>(
-                w, scales, biases, x, xsums, y, in_vec_size, out_vec_size,
-                sums_stride, first_m, out_row, simd_lid);
-        }
-    }
-    """
-
-/// Geometry and width switch shared by both QMV pipelines. `table` decides
-/// whether the chunk-sum table is a bound buffer at all: the four-input
-/// pipeline has no such buffer and passes a null pointer that `USE_TABLE =
-/// false` never reads.
-///
-/// `tier` selects the widths this entry point carries. `nil` emits all seven,
-/// which is the shared switch. A value emits only the widths whose `ipg`
-/// equals it, so the compiler allocates that entry point for its own widest
-/// body instead of for the union of all of them.
-private func qwen35E120QMVSource(table: Bool, tier: Int?) -> String {
-    let sums = table ? "xsums" : "qmv_null_sums"
-    let flag = table ? "USE_TABLE" : "false"
-    let cases = Qwen35CustomQMV.widthPlan
-        .filter { tier == nil || $0.ipg == tier }
-        .map { plan in
-            """
-                    case \(plan.m):
-                        qwen_e120_qmv_m<\(plan.m), \(plan.ipg), \(plan.rps), \(flag)>(
-                            w, scales, biases, x, \(sums), y,
-                            qmv_k, qmv_n, qmv_stride,
-                            qmv_gx,
-                            int(qmv_tid.y) * \(2 * plan.rps) + int(qmv_sgid) * \(plan.rps),
-                            qmv_lid);
-                        break;
-            """
-        }
-        .joined(separator: "\n")
-    let nullDecl = table ? "" : "\n        const device float* qmv_null_sums = nullptr;"
-    return """
-            // \(Qwen35CustomQMV.planWitness)
-            const int qmv_m = x_shape[x_ndim - 2];
-            const int qmv_k = x_shape[x_ndim - 1];
-            const int qmv_n = w_shape[0];
-            const int qmv_stride = qmv_m <= 8 ? 8 : 16;
-            const uint3 qmv_tid = threadgroup_position_in_grid;
-            const uint qmv_lid = thread_index_in_simdgroup;
-            const uint qmv_sgid = simdgroup_index_in_threadgroup;
-            const int qmv_gx = int(qmv_tid.x);\(nullDecl)
-            switch (qmv_m) {
-        \(cases)
-                default:
-                    break;
-            }
-        """
-}
-
-/// Every pipeline name as a whole literal.
-///
-/// `senpai/rebuild-and-assert-worker.sh` witnesses kernel content through the
-/// worker's string table, and a name assembled by `+` or interpolation never
-/// reaches it. Building these by concatenation left the shipped pipeline set
-/// unwitnessable, so the pre-submit chain could neither require a name that is
-/// present nor forbid one that is absent.
-///
-/// `MLX` also keys its library cache by this name and rebuilds the library
-/// whenever one name is seen with two different sources, so a collision here
-/// would put a full JIT compile in the decode loop. A total `switch` makes both
-/// properties checkable by reading one list.
-private func qwen35E120QMVName(table: Bool, tier: Int?) -> String {
-    switch (table, tier) {
-    case (false, nil): return "qwen35_custom_affine4_g64_qmv_wide_v2"
-    case (true, nil): return "qwen35_custom_affine4_g64_qmv_wide_sums_v2"
-    case (false, 3): return "qwen35_custom_affine4_g64_qmv_wide_na3_v2"
-    case (false, 4): return "qwen35_custom_affine4_g64_qmv_wide_na4_v2"
-    case (false, 5): return "qwen35_custom_affine4_g64_qmv_wide_na5_v2"
-    case (false, 6): return "qwen35_custom_affine4_g64_qmv_wide_na6_v2"
-    case (false, 7): return "qwen35_custom_affine4_g64_qmv_wide_na7_v2"
-    case (false, 8): return "qwen35_custom_affine4_g64_qmv_wide_na8_v2"
-    case (true, 3): return "qwen35_custom_affine4_g64_qmv_wide_sums_na3_v2"
-    case (true, 4): return "qwen35_custom_affine4_g64_qmv_wide_sums_na4_v2"
-    case (true, 5): return "qwen35_custom_affine4_g64_qmv_wide_sums_na5_v2"
-    case (true, 6): return "qwen35_custom_affine4_g64_qmv_wide_sums_na6_v2"
-    case (true, 7): return "qwen35_custom_affine4_g64_qmv_wide_sums_na7_v2"
-    case (true, 8): return "qwen35_custom_affine4_g64_qmv_wide_sums_na8_v2"
-    default: preconditionFailure("no pipeline name for tier \(tier as Any)")
-    }
-}
-
-private func qwen35E120QMVKernel(table: Bool, tier: Int?) -> MLXFast.MLXFastKernel {
-    MLXFast.metalKernel(
-        name: qwen35E120QMVName(table: table, tier: tier),
-        inputNames: table
-            ? ["w", "scales", "biases", "x", "xsums"] : ["w", "scales", "biases", "x"],
-        outputNames: ["y"],
-        source: qwen35E120QMVSource(table: table, tier: tier),
-        header: qwen35E120QMVHeader,
-        ensureRowContiguous: true
-    )
-}
-
-/// The shared-switch pair. The `shared` arm dispatches these; they are the
-/// comparison the templated arm is measured against.
-private let qwen35CustomAffine4QMVKernel = qwen35E120QMVKernel(table: false, tier: nil)
-private let qwen35CustomAffine4QMVTableKernel = qwen35E120QMVKernel(table: true, tier: nil)
-
-/// One entry point per distinct `ipg`. Building the descriptor is free; a
-/// pipeline is compiled only when a dispatch first reaches it, and the shipped
-/// arm reaches four of these six.
-private let qwen35CustomAffine4QMVTierKernels: [Int: MLXFast.MLXFastKernel] =
-    Dictionary(
-        uniqueKeysWithValues: Qwen35CustomQMV.tiers.map {
-            ($0, qwen35E120QMVKernel(table: false, tier: $0))
-        })
-
-private let qwen35CustomAffine4QMVTierTableKernels: [Int: MLXFast.MLXFastKernel] =
-    Dictionary(
-        uniqueKeysWithValues: Qwen35CustomQMV.tiers.map {
-            ($0, qwen35E120QMVKernel(table: true, tier: $0))
-        })
-
-/// Produces the activation chunk-sum table consumed by
-/// `qwen35CustomAffine4QMVTableKernel`.
-///
-/// One entry per `(k_block, lane, m)`. The offset never mentions the output
-/// row, `N`, or the weight matrix, so one table serves every wide QMV that
-/// consumes the same activation tensor at the same K, and it serves every width
-/// at once. Lane stride is padded to 8 floats (16 at M = 9) so a lane's entries
-/// stay in one cache line; at K = 5120 and M <= 8 the table is 10,240 bytes.
-///
-/// The value is the incumbent expression at `quantized.h:1029` and nothing
-/// else: three BF16 adds per group of four activations, accumulated into a
-/// float across the four groups a lane owns, in ascending `i`. Filling this
-/// table from host float32 would change the arithmetic and break exactness.
-private let qwen35CustomAffine4XSumsKernel = MLXFast.metalKernel(
-    name: "qwen35_custom_affine4_g64_xsums_v1",
-    inputNames: ["x"],
-    outputNames: ["xsums"],
-    source: """
-        const int xs_m = x_shape[x_ndim - 2];
-        const int xs_k = x_shape[x_ndim - 1];
-        const int xs_stride = xs_m <= 8 ? 8 : 16;
-        const uint3 xs_gid = thread_position_in_grid;
-        const int xs_lane = int(xs_gid.x);
-        const int xs_kb = int(xs_gid.y);
-        const int xs_row = int(xs_gid.z);
-        const device bfloat16_t* xm =
-            x + xs_row * xs_k + xs_kb * 512 + xs_lane * 16;
-        float s = 0.0f;
-        for (int i = 0; i < 4; i++) {
-            const vec<bfloat16_t, 4> xv =
-                *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
-            s += xv[0] + xv[1] + xv[2] + xv[3];
-        }
-        xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
-        """,
-    ensureRowContiguous: true
-)
-
-/// Candidate-owned entry point for the wide affine-4/group-64 QMV.
-///
-/// `matmul` returns `nil` for every cell the incumbent must keep, so a routed
-/// call site is a strict subset of the shipped dispatch: same kernel family,
-/// same partition, same arithmetic.
-public enum Qwen35CustomQMV {
-    public enum Arm: String, Sendable {
-        /// MLX's own launcher. The comparison arm, and the fallback whenever a
-        /// cell fails `routable`.
-        case off
-        /// Bit-exact replica of the incumbent wide kernel, our dispatch.
-        case replica
-        /// Replica plus a live chunk-sum table that the kernel does not read.
-        /// The table is still a bound input, so the fill dispatch really runs
-        /// in the stream. This arm exists to price the fill on its own.
-        case fillNoConsume = "fill_noconsume"
-        /// Replica reading the chunk sums from the table instead of
-        /// recomputing them once per output-row block.
-        case sumTable = "sumtable"
-    }
-
-    /// The shipped arm. `sumtable` routes the wide affine-4/group-64 cells the
-    /// decode round reaches and hoists the per-block activation sums out of the
-    /// output-row loop. The environment override exists so the research
-    /// instrument can time the other arms in the same build; it is read once at
-    /// process start and never varies with the request, the prompt or the
-    /// benchmark phase.
-    ///
-    /// The name must carry the `MLX_` prefix. `sanitizedRuntimeWorkerEnvironment`
-    /// is a strict allowlist and drops every `MLXFAST_*` name, so an
-    /// `MLXFAST_`-prefixed override would never reach the runtime worker and
-    /// every arm of an end-to-end A/B would silently time `sumtable`.
-    ///
-    /// It is also 16 UTF-8 bytes on purpose. Swift stores a literal of 15 bytes
-    /// or fewer inline in the `String` value, so it never reaches the binary's
-    /// string table and `senpai/rebuild-and-assert-worker.sh --require` reports
-    /// zero copies for a name that is certainly compiled in. FINDING 28 needs
-    /// the arm switch to be assertable inside the built worker, so the name is
-    /// long enough for `strings` to witness it.
-    public static let arm: Arm = {
-        let raw = ProcessInfo.processInfo.environment["MLX_E120_QMV_ARM"]
-        guard let raw, !raw.isEmpty else { return .sumTable }
-        return Arm(rawValue: raw) ?? .sumTable
-    }()
-
-    public enum Entry: String, Sendable {
-        /// One switch over all seven routed widths.
-        case shared = "shared_switch"
-        /// One entry point per distinct `ipg`.
-        case tiered = "tiered_switch"
-
-        /// The layout a run with no override selects.
-        public static let compiledDefault = Entry.tiered
-    }
-
-    /// Which entry-point layout the dispatch uses. Both layouts emit the same
-    /// case bodies from the same generator, so they execute identical code and
-    /// differ only in the register maximum the compiler allocates. Read once at
-    /// process start, exactly like `arm`, and never varies with the request,
-    /// the prompt or the benchmark phase.
-    public static let entry: Entry = {
-        let raw = ProcessInfo.processInfo.environment["MLX_E120_QMV_ENTRY"]
-        guard let raw, !raw.isEmpty else { return .compiledDefault }
-        return Entry(rawValue: raw) ?? .compiledDefault
-    }()
-
-    /// Widths whose incumbent route is `qmv_fast_crossrow_affine4_g64_m`. M=1
-    /// and M=2 reach different kernels and are left to MLX.
-    public static let widths = 3 ... 9
-
-    /// How the shared entry point is specialized for each routed width.
-    ///
-    /// `ipg` is how many input rows one threadgroup accumulates, so the kernel
-    /// makes `ceil(m / ipg)` passes over the whole weight matrix. Weight
-    /// traffic dominates every routed cell, so `ipg = m` and its single pass
-    /// is the target wherever the register ceiling allows it.
-    ///
-    /// `rps` is how many output rows one simdgroup accumulates. Every plan
-    /// here keeps the shipped `rps = 4`. Halving it does fit a wider `ipg` in
-    /// fewer registers, but per output element the m-keyed statements cost
-    /// `1 / rps`, so `rps = 2` doubles 21.9 % of measured QMV time to save
-    /// 19.2 % of 30.5 %. That trade is adverse and the plan carrying it was
-    /// deleted rather than kept behind a flag.
-    public enum Table: String, Sendable, CaseIterable {
-        /// Two verify passes at M=6, M=7 and M=8.
-        case shipped
-        /// One pass at M=6.
-        case onePass6 = "onepass6"
-        /// One pass at M=6 and M=7.
-        case onePass67 = "onepass67"
-        /// One pass at M=6, M=7 and M=8.
-        case onePass678 = "onepass678"
-
-        /// The table a run with no override selects, so the table the ranked
-        /// runner uses. `{6:6, 7:7}` sits on the mode of the width
-        /// distribution of the prompts that carry the ranked median: beagle
-        /// carries it in 97.9 % of official runs at mean width 5.38, and the
-        /// next four carry it at 5.99 to 7.15. M=8 is left on tier 4 here and
-        /// moves in its own receipt, because its ranked mass is small even
-        /// though it dominates the local fixture.
-        public static let compiledDefault = Table.onePass67
-
-        /// `(m, ipg, rps)` for every routable width.
-        ///
-        /// `ipg` is how many INPUT rows one threadgroup accumulates, so
-        /// `ceil(m / ipg)` is the number of reads of the whole weight matrix.
-        /// Per output element the row-keyed statements cost `1 / ipg`, which
-        /// is why raising it is the only lever that collapses a pass.
-        ///
-        /// M=9 stays on tier 3 in every plan. It is above the ranked verify
-        /// cap of 8, so one pass there would add a pipeline and buy nothing.
-        /// It cannot be dropped from the table either: the dispatch switch
-        /// routes `3 ... 9` with `default: break`, so a missing case is a
-        /// silent no-op round rather than a compile error.
-        public var plan: [(m: Int, ipg: Int, rps: Int)] {
-            switch self {
-            case .shipped:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 3, 4), (7, 4, 4),
-                        (8, 4, 4), (9, 3, 4)]
-            case .onePass6:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4), (7, 4, 4),
-                        (8, 4, 4), (9, 3, 4)]
-            case .onePass67:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4), (7, 7, 4),
-                        (8, 4, 4), (9, 3, 4)]
-            case .onePass678:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4), (7, 7, 4),
-                        (8, 8, 4), (9, 3, 4)]
-            }
-        }
-
-        /// The plan as one literal the worker's string table can carry.
-        ///
-        /// The dispatch table reaches the built worker only through
-        /// interpolation into the generated Metal source, so no `m:ipg:rps`
-        /// triple is a literal and `senpai/rebuild-and-assert-worker.sh`
-        /// cannot witness which tables the timed binary holds. These literals
-        /// are the witness. `qwen35E120QMVSource` emits the selected one as a
-        /// comment so the optimizer cannot strip it, and
-        /// `planWitnessMatchesWidthPlan` fails the build if any literal ever
-        /// drifts from its plan.
-        public var witness: String {
-            switch self {
-            case .shipped:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:3:4,7:4:4,8:4:4,9:3:4"
-            case .onePass6:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:6:4,7:4:4,8:4:4,9:3:4"
-            case .onePass67:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:6:4,7:7:4,8:4:4,9:3:4"
-            case .onePass678:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:6:4,7:7:4,8:8:4,9:3:4"
-            }
-        }
-    }
-
-    /// Which dispatch table the entry points are built from.
-    ///
-    /// Changing the table inside the shared switch charges every routed width
-    /// the widest inlined body's registers and spill, which is how E104 lost
-    /// 0.383 % ranked. This selector is therefore only legal together with
-    /// `Entry.tiered`, and `plans` enforces that.
-    public static let table: Table = {
-        let raw = ProcessInfo.processInfo.environment["MLX_E120_QMV_TABLE"]
-        guard let raw, !raw.isEmpty else { return .compiledDefault }
-        return Table(rawValue: raw) ?? .compiledDefault
-    }()
-
-    /// The compiled-in route, as one literal the worker's string table carries.
-    ///
-    /// The ranked runner sets no environment, so the route it takes is whatever
-    /// `entry` and `table` fall back to. Every `Table.witness` literal is
-    /// compiled in whichever table is the default, so those literals prove only
-    /// that a plan exists, never that it ships. This literal exists only for
-    /// the pair actually selected, which makes it a `strings` witness that can
-    /// fail. `defaultRouteWitnessNamesTheCompiledDefaults` pins it against the
-    /// two `compiledDefault` constants.
-    public static let defaultRouteWitness = "e120_default_route/tiered_switch/onepass67"
-
-    public static let widthPlan: [(m: Int, ipg: Int, rps: Int)] = {
-        precondition(
-            table == .shipped || entry == .tiered,
-            "a one-pass table is only legal on tiered entry points")
-        return table.plan
-    }()
-
-    public static var planWitness: String { table.witness }
-
-    /// A plan rendered in the witness form. Every `Table` case is checked
-    /// against its own literal by test, so no table can drift from its witness.
-    public static func renderPlan(_ plan: [(m: Int, ipg: Int, rps: Int)]) -> String {
-        "e120_width_plan/"
-            + plan.map { "\($0.m):\($0.ipg):\($0.rps)" }.joined(separator: ",")
-    }
-
-    /// The entry-point name a dispatch would ask for. `generatedSource` is the
-    /// matching accessor for the JIT source.
-    public static func pipelineName(useTable: Bool, tier: Int?) -> String {
-        qwen35E120QMVName(table: useTable, tier: tier)
-    }
-
-    static func plan(m: Int) -> (m: Int, ipg: Int, rps: Int) {
-        guard let entry = widthPlan.first(where: { $0.m == m }) else {
-            preconditionFailure("width \(m) is routed but has no entry-point plan")
-        }
-        return entry
-    }
-
-    /// The entry point a width is dispatched to.
-    ///
-    /// A Metal entry point is allocated the maximum register count over every
-    /// branch inlined into it, so one switch over all seven widths charges
-    /// `M = 3` for the `M = 5` body. A width's own maximum is exactly its
-    /// `ipg`: the tail group of a partial pass carries `m % ipg` rows, which is
-    /// fewer than a full group, so the full-group body always dominates.
-    /// Widths that share an `ipg` therefore share an entry point with no
-    /// register cost, and the shipped table has only three distinct values.
-    public static func tier(m: Int) -> Int { plan(m: m).ipg }
-
-    public static let tiers: [Int] = Set(widthPlan.map(\.ipg)).sorted()
-
-    /// How many threadgroups the `x` axis carries.
-    ///
-    /// `wide` launches `m` of them and `tight` launches `ceil(m / ipg)`, which
-    /// is the number that do any work: group `g` starts at `first_m = g * ipg`
-    /// and `qwen_e120_qmv_m` returns immediately once that reaches `M`. The
-    /// two settings are bit-identical by construction, because the groups
-    /// `tight` removes write nothing.
-    ///
-    /// This matters most where `rps` is small. `y` carries `n / (2 * rps)`
-    /// threadgroups, so halving `rps` doubles the launched total while the
-    /// working total stays at `ceil(m / ipg) * n / (2 * rps)`. Under `wide` the
-    /// one-pass table therefore pays twice the launch count of the shipped
-    /// table at M = 6, 7 and 8 for the same work, which prices the table
-    /// against itself. Under `tight` both tables launch the same count.
-    public enum Grid: String, Sendable {
-        case wide
-        case tight
-    }
-
-    public static let grid: Grid = {
-        let raw = ProcessInfo.processInfo.environment["MLX_E120_QMV_GRID"]
-        guard let raw, let parsed = Grid(rawValue: raw) else { return .wide }
-        return parsed
-    }()
-
-    /// Launch geometry for one routed cell.
-    static func launch(m: Int, n: Int) -> (grid: (Int, Int, Int), threadGroup: (Int, Int, Int)) {
-        let entry = plan(m: m)
-        let columns = grid == .tight ? (m + entry.ipg - 1) / entry.ipg : m
-        return ((columns * 32, n / entry.rps, 1), (32, 2, 1))
-    }
-
-    /// Rung 2b instrument. Set `MLX_E120_QMV_PIPELINE_LOG` to a writable path
-    /// and the entry point records every distinct JIT specialization it asks
-    /// for, together with the widths that reached it.
-    ///
-    /// The width switch lives inside the Metal kernel and `IPG` is chosen
-    /// there, so the host key is `(kernel, USE_TABLE)` and never mentions `M`
-    /// or `IPG`. Changing an `IPG` literal therefore cannot add a pipeline: a
-    /// leg that reaches all seven routed widths must still report the same two
-    /// QMV specializations. The name must carry the `MLX_` prefix to survive
-    /// `sanitizedRuntimeWorkerEnvironment`. It is unset in every timed run, so
-    /// the dispatch path pays one optional test.
-    static let pipelineLogPath: String? = {
-        let raw = ProcessInfo.processInfo.environment["MLX_E120_QMV_PIPELINE_LOG"]
-        guard let raw, !raw.isEmpty else { return nil }
-        atexit { Qwen35CustomQMV.flushPipelineLog() }
-        return raw
-    }()
-
-    public nonisolated(unsafe) static var pipelineKeys: [String: Int] = [:]
-    public nonisolated(unsafe) static var pipelineWidths: [Int: Int] = [:]
-    /// Dispatch ordinal at which each key and each width was first seen.
-    ///
-    /// This is the warmup gate for a multi-pipeline entry point. A pipeline
-    /// first compiled inside a timed leg reads as a large regression, so the
-    /// gate has to show that every pipeline was already resident. It does,
-    /// because `warmAllDepthShapes` runs exactly one throwaway forward at each
-    /// legal width in ascending order before any scored token: the first
-    /// dispatch index per width is then an ARITHMETIC PROGRESSION whose step
-    /// is the QMV dispatch count of one forward. Any width — and therefore any
-    /// tier pipeline — first reached inside the timed window breaks that
-    /// progression by orders of magnitude.
-    public nonisolated(unsafe) static var pipelineKeyFirstIndex: [String: Int] = [:]
-    public nonisolated(unsafe) static var pipelineWidthFirstIndex: [Int: Int] = [:]
-    public nonisolated(unsafe) static var pipelineDispatches = 0
-
-    /// `width` is nil for the chunk-sum fill, which is not a QMV dispatch.
-    static func notePipeline(_ key: String, width: Int?) {
-        guard pipelineLogPath != nil else { return }
-        var isNew = pipelineKeys[key] == nil
-        if isNew { pipelineKeyFirstIndex[key] = pipelineDispatches }
-        pipelineKeys[key, default: 0] += 1
-        if let width {
-            if pipelineWidths[width] == nil {
-                pipelineWidthFirstIndex[width] = pipelineDispatches
-                isNew = true
-            }
-            pipelineWidths[width, default: 0] += 1
-            pipelineDispatches += 1
-        }
-        if isNew { flushPipelineLog() }
-    }
-
-    static func flushPipelineLog() {
-        guard let path = pipelineLogPath else { return }
-        let keys = pipelineKeys.keys.sorted()
-            .map { "    \"\($0)\": \(pipelineKeys[$0]!)" }
-            .joined(separator: ",\n")
-        let widths = pipelineWidths.keys.sorted()
-            .map { "    \"\($0)\": \(pipelineWidths[$0]!)" }
-            .joined(separator: ",\n")
-        let total = pipelineKeys.values.reduce(0, +)
-        let keyFirst = pipelineKeyFirstIndex.keys.sorted()
-            .map { "    \"\($0)\": \(pipelineKeyFirstIndex[$0]!)" }
-            .joined(separator: ",\n")
-        let widthFirst = pipelineWidthFirstIndex.keys.sorted()
-            .map { "    \"\($0)\": \(pipelineWidthFirstIndex[$0]!)" }
-            .joined(separator: ",\n")
-        let json = """
-            {
-              "arm": "\(arm.rawValue)",
-              "entry": "\(entry.rawValue)",
-              "table": "\(table.rawValue)",
-              "grid": "\(grid.rawValue)",
-              "plan": "\(planWitness)",
-              "default_route": "\(defaultRouteWitness)",
-              "qmv_specializations": \(pipelineKeys.count),
-              "dispatches": \(total),
-              "by_key": {
-            \(keys)
-              },
-              "by_width": {
-            \(widths)
-              },
-              "first_index_by_key": {
-            \(keyFirst)
-              },
-              "first_index_by_width": {
-            \(widthFirst)
-              }
-            }
-
-            """
-        try? json.write(toFile: path, atomically: true, encoding: .utf8)
-    }
-
-    /// The exact strings the two shipped QMV pipelines are built from.
-    ///
-    /// The rung 2 probe compiles them again under a second kernel name with one
-    /// template argument textually replaced, so a single binary can time two
-    /// `IPG` choices in one counterbalanced session instead of comparing two
-    /// builds. Nothing in the scored path calls these.
-    public static func generatedSource(table: Bool, tier: Int? = nil) -> String {
-        qwen35E120QMVSource(table: table, tier: tier)
-    }
-
-    public static var generatedHeader: String { qwen35E120QMVHeader }
-
-    /// Lane stride of the chunk-sum table, in floats.
-    public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
-
-    /// The chunk-sum table costs one fill dispatch, measured at 4 to 6 us and
-    /// close to flat in the table size, and repays it with recomputation the
-    /// wide kernel no longer does. The gate is a pure function of the width: no
-    /// clock, no counter, no state that survives a request.
-    ///
-    /// E120 rung 5d measured the complete grid of the seven shapes that make up
-    /// all 257 wide QMV calls of one decode round, at every legal width.
-    /// `harness=local`, Apple M4 Pro, median of 6 ABBA blocks per cell.
-    /// Net microseconds saved per matvec:
-    ///
-    ///     shape         M=3     M=4     M=5     M=6     M=7     M=8     M=9
-    ///     mlp.gate_up  -0.55  +24.76  +35.42  +23.41  +40.74  +58.76  +34.81
-    ///     mlp.down     +0.01  +11.21  +10.47   +9.26  +18.85  +28.49  +14.57
-    ///     gdn.in_proj  -1.91   +9.69  +14.71   +9.28  +17.29  +26.59  +14.26
-    ///     gdn.out_proj +0.86   +1.62   +3.24   +0.82   +4.00   +7.49   +2.69
-    ///     fa.qkv       -1.62   +7.67  +12.56   +0.46  +13.90  +22.58  +12.16
-    ///     fa.o_proj    +0.23   +1.11   +3.05   +1.47   +4.05   +7.20   +2.31
-    ///     lm_head     +17.10 +199.03 +274.69 +189.66 +314.22 +439.75 +264.88
-    ///
-    /// Every cell at M>=4 pays, so no per-shape term can improve on the width
-    /// test there. At M=3 the sign splits and the whole question is worth at
-    /// most +62 us of a 68,410 us round (0.09%), against -90 us for taking
-    /// every M=3 cell. A per-shape M=3 table would buy that 0.09% by hard
-    /// coding one host's timings, so this declines M=3 outright instead.
-    public static let minimumTableWidth = 4
-
-    public static func tablePays(m: Int) -> Bool { m >= minimumTableWidth }
-
-    /// True when the last two dimensions are densely packed, so the kernel's
-    /// `row * rowStride + col` indexing reads the buffer as it stands.
-    public static func rowContiguous(_ a: MLXArray, rowStride: Int) -> Bool {
-        let s = a.strides
-        return s.count >= 2 && s[s.count - 1] == 1 && s[s.count - 2] == rowStride
-    }
-
-    /// Cells the replica may take from MLX. Returns `(m, k, n)` or `nil`.
-    static func routable(
-        _ x: MLXArray, _ w: MLXArray, scales: MLXArray, biases: MLXArray,
-        groupSize: Int, bits: Int, mode: QuantizationMode
-    ) -> (m: Int, k: Int, n: Int)? {
-        guard bits == 4, groupSize == 64, mode == .affine else { return nil }
-        guard x.dtype == .bfloat16, scales.dtype == .bfloat16,
-            biases.dtype == .bfloat16, w.dtype == .uint32
-        else { return nil }
-        guard w.ndim == 2, x.ndim >= 2 else { return nil }
-        let k = x.dim(-1)
-        let n = w.dim(0)
-        // `fast = N % 8 == 0 && K % 512 == 0` (quantized.cpp:260) and the wide
-        // branch needs `out_vec_size >= 4096` (quantized.h:1917).
-        guard w.dim(1) == k / 8, k % 512 == 0, n % 8 == 0, n >= 4096 else {
-            return nil
-        }
-        let m = x.size / k
-        guard Self.widths.contains(m), x.dim(-2) == m else { return nil }
-        // `ensureRowContiguous: true` would keep a strided input correct by
-        // copying it first. `quantizedMM` reads the stride directly, so hand
-        // the cell back rather than pay for a copy the incumbent avoids.
-        guard rowContiguous(x, rowStride: k), rowContiguous(w, rowStride: k / 8),
-            rowContiguous(scales, rowStride: k / groupSize),
-            rowContiguous(biases, rowStride: k / groupSize)
-        else { return nil }
-        return (m, k, n)
-    }
-
-    /// The chunk-sum table for one activation tensor. One table per distinct
-    /// `x`: handing a matvec the table of a different tensor is silently wrong.
-    public static func xsumsTable(_ x: MLXArray) -> MLXArray {
-        let k = x.dim(-1)
-        let m = x.size / k
-        let kBlocks = k / 512
-        notePipeline("xsums_v1", width: nil)
-        return qwen35CustomAffine4XSumsKernel(
-            [x],
-            grid: (32, kBlocks, m),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[kBlocks * 32 * sumsStride(m)]],
-            outputDTypes: [.float32]
-        )[0]
-    }
-
-    /// The wide QMV against a caller-supplied chunk-sum table. Exposed so the
-    /// exactness instrument can perturb one table entry and prove the load is
-    /// live.
-    public static func matmulWithTable(
-        _ x: MLXArray,
-        _ w: MLXArray,
-        scales: MLXArray,
-        biases: MLXArray,
-        xsums: MLXArray,
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode,
-        consume: Bool = true
-    ) -> MLXArray? {
-        guard
-            let cell = routable(
-                x, w, scales: scales, biases: biases,
-                groupSize: groupSize, bits: bits, mode: mode)
-        else { return nil }
-        var outShape = x.shape
-        outShape[outShape.count - 1] = cell.n
-        let kernel: MLXFast.MLXFastKernel
-        switch entry {
-        case .shared:
-            kernel = qwen35CustomAffine4QMVTableKernel
-            notePipeline("qmv_sums_v2/USE_TABLE=\(consume)", width: cell.m)
-        case .tiered:
-            let tier = Self.tier(m: cell.m)
-            guard let tiered = qwen35CustomAffine4QMVTierTableKernels[tier] else {
-                preconditionFailure("no tier-\(tier) table entry point")
-            }
-            kernel = tiered
-            notePipeline("qmv_sums_na\(tier)_v2/USE_TABLE=\(consume)", width: cell.m)
-        }
-        let launch = Self.launch(m: cell.m, n: cell.n)
-        return kernel(
-            [w, scales, biases, x, xsums],
-            template: [("USE_TABLE", consume)],
-            grid: launch.grid,
-            threadGroup: launch.threadGroup,
-            outputShapes: [outShape],
-            outputDTypes: [.bfloat16]
-        )[0]
-    }
-
-    public static func matmul(
-        _ x: MLXArray,
-        _ w: MLXArray,
-        scales: MLXArray,
-        biases: MLXArray,
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode,
-        arm: Arm = Qwen35CustomQMV.arm
-    ) -> MLXArray? {
-        guard arm != .off else { return nil }
-        guard
-            let cell = routable(
-                x, w, scales: scales, biases: biases,
-                groupSize: groupSize, bits: bits, mode: mode)
-        else { return nil }
-
-        if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
-            return matmulWithTable(
-                x, w, scales: scales, biases: biases, xsums: xsumsTable(x),
-                groupSize: groupSize, bits: bits, mode: mode,
-                consume: arm == .sumTable)
-        }
-
-        var outShape = x.shape
-        outShape[outShape.count - 1] = cell.n
-        let kernel: MLXFast.MLXFastKernel
-        switch entry {
-        case .shared:
-            kernel = qwen35CustomAffine4QMVKernel
-            notePipeline("qmv_wide_v2", width: cell.m)
-        case .tiered:
-            let tier = Self.tier(m: cell.m)
-            guard let tiered = qwen35CustomAffine4QMVTierKernels[tier] else {
-                preconditionFailure("no tier-\(tier) entry point")
-            }
-            kernel = tiered
-            notePipeline("qmv_wide_na\(tier)_v2", width: cell.m)
-        }
-        let launch = Self.launch(m: cell.m, n: cell.n)
-        return kernel(
-            [w, scales, biases, x],
-            grid: launch.grid,
-            threadGroup: launch.threadGroup,
-            outputShapes: [outShape],
-            outputDTypes: [.bfloat16]
-        )[0]
-    }
-}
-
-/// `quantizedMM` with the candidate-owned wide QMV dispatch in front of it.
-/// `Qwen35CustomQMV.matmul` returns nil for every arm, shape, width, group
-/// size, bit width and mode it does not own, so this is a drop-in replacement
-/// at any transposed affine call site.
-func qwen35RoutedQuantizedMM(
-    _ x: MLXArray,
-    _ w: MLXArray,
-    scales: MLXArray,
-    biases: MLXArray,
-    groupSize: Int,
-    bits: Int,
-    mode: QuantizationMode
-) -> MLXArray {
-    if let y = Qwen35CustomQMV.matmul(
-        x, w, scales: scales, biases: biases,
-        groupSize: groupSize, bits: bits, mode: mode)
-    {
-        return y
-    }
-    return quantizedMM(
-        x, w, scales: scales, biases: biases, transpose: true,
-        groupSize: groupSize, bits: bits, mode: mode)
-}
-
-/// A projection layer with the candidate-owned wide QMV dispatch in front of
-/// it. Only an affine `QuantizedLinear` without an additive bias reaches the
-/// replica; anything else keeps its original `Linear` call.
-func qwen35RoutedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
-    guard let q = layer as? QuantizedLinear, q.bias == nil, let z = q.biases
-    else { return layer(x) }
-    return qwen35RoutedQuantizedMM(
-        x, q.weight, scales: q.scales, biases: z,
-        groupSize: q.groupSize, bits: q.bits, mode: q.mode)
-}
-
 final class Qwen35FusedMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -2302,8 +1393,8 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
 
     private func fusedGateUp(_ x: MLXArray) -> MLXArray? {
         if let w = _fqW, let s = _fqS, let z = _fqZ {
-            return qwen35RoutedQuantizedMM(
-                x, w, scales: s, biases: z,
+            return quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
                 groupSize: _fqGS, bits: _fqBits, mode: _fqMode)
         }
         if let w = _fbfW {
@@ -2339,9 +1430,9 @@ final class Qwen35FusedMLP: Module, UnaryLayer {
         // to the exact two-projection expression, preserving the original
         // slicing semantics in every case.
         if x.dim(-2) <= 16, let y = fusedGateUp(x), _gateOut * 2 == y.dim(-1) {
-            return qwen35RoutedLinear(downProj, qwen35CompiledFusedSwiGLU(y))
+            return downProj(qwen35CompiledFusedSwiGLU(y))
         }
-        return qwen35RoutedLinear(downProj, silu(gateProj(x)) * upProj(x))
+        return downProj(silu(gateProj(x)) * upProj(x))
     }
 
 }
@@ -3062,76 +2153,6 @@ func qwen35DualRMSNormConcat(
 
 // MARK: - Attention
 
-/// Which of the proposal head's BF16 precision-island corrections to install.
-///
-/// RESEARCH-ONLY selector for E124, read once in `Qwen35TextModel.sanitize`.
-/// `all` is the default and reproduces the shipped behaviour exactly. The
-/// partial arms exist to separate the acceptance cost of the correction from
-/// the time cost of the traffic it adds: K and V together are 20.97 MB of
-/// dense BF16 per proposal step, while Q is 10.49 MB plus a `putAlong` scatter
-/// over only 1,024 of 12,288 output rows.
-enum Qwen35IslandArm: String {
-    case all
-    case none
-    case q
-    case kv
-
-    var installsQ: Bool { self == .all || self == .q }
-    var installsKV: Bool { self == .all || self == .kv }
-
-    /// `DARKBLOOM_QWEN_MTP_ISLAND_ARM` selects the arm. The older
-    /// `MLXFAST_QWEN_MTP_EXACT_QKV_ROWS=0` kill switch keeps its meaning and
-    /// wins, so no existing invocation changes behaviour.
-    ///
-    /// The `DARKBLOOM_` prefix is load-bearing, not cosmetic.
-    /// `sanitizedRuntimeWorkerEnvironment` forwards only `DARKBLOOM_`, `DYLD_`,
-    /// `LC_`, `METAL_`, `MLX_` and `MTL_` to the runtime worker, so an
-    /// `MLXFAST_`-spelled selector is dropped and every arm silently runs the
-    /// shipped default. That is why the legacy kill switch below has never had
-    /// any effect on a worker leg.
-    static func fromEnvironment(_ env: [String: String]) -> Qwen35IslandArm {
-        if env["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] == "0" { return .none }
-        guard let raw = env["DARKBLOOM_QWEN_MTP_ISLAND_ARM"], !raw.isEmpty else {
-            return .all
-        }
-        guard let arm = Qwen35IslandArm(rawValue: raw.lowercased()) else {
-            fatalError(
-                "DARKBLOOM_QWEN_MTP_ISLAND_ARM='\(raw)' is not one of "
-                    + "all, none, q, kv")
-        }
-        return arm
-    }
-
-    /// Record which arm this process selected, where a research leg can read
-    /// it afterwards.
-    ///
-    /// Not stderr. The `mtp-timed` parent drains the runtime worker's stderr
-    /// into a swallowing emitter and surfaces it only when the worker exits
-    /// badly, so a successful leg discards every worker stderr line.
-    /// `Qwen36MTPBlockSession.traceSink` documents the same behaviour and
-    /// solves it the same way: append to the configured trace file, which is
-    /// opened `O_APPEND` precisely so the reference, serial and timed workers
-    /// of one leg can all write it.
-    func writeWitness() {
-        let line = "qwen-mtp-island-arm: \(rawValue)"
-            + " installsQ=\(installsQ) installsKV=\(installsKV)\n"
-        let data = Data(line.utf8)
-        if let path = ProcessInfo.processInfo
-            .environment["MLX_QWEN_MTP_TRACE_PATH"], !path.isEmpty
-        {
-            let descriptor = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-            if descriptor >= 0 {
-                let handle = FileHandle(
-                    fileDescriptor: descriptor, closeOnDealloc: true)
-                handle.write(data)
-                try? handle.close()
-                return
-            }
-        }
-        FileHandle.standardError.write(data)
-    }
-}
-
 final class Qwen35Attention: Module {
     let attentionHeads: Int
     let kvHeads: Int
@@ -3265,8 +2286,8 @@ final class Qwen35Attention: Module {
         // permutation of the output range.
         if let kvExact = _exactKVDenseW, islandFastPathReady() {
             if let w = _qOnlyW, let s = _qOnlyS, let z = _qOnlyZ {
-                var q = qwen35RoutedQuantizedMM(
-                    x, w, scales: s, biases: z,
+                var q = quantizedMM(
+                    x, w, scales: s, biases: z, transpose: true,
                     groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
                 q = replaceExactRows(q, input: x, kvOnly: false)
                 let kvRows = matmul(x, kvExact.transposed(1, 0))
@@ -3285,8 +2306,8 @@ final class Qwen35Attention: Module {
             }
         }
         if let w = _qkvW, let s = _qkvS, let z = _qkvZ {
-            var y = qwen35RoutedQuantizedMM(
-                x, w, scales: s, biases: z,
+            var y = quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
                 groupSize: _qkvGS, bits: _qkvBits, mode: _qkvMode)
             y = replaceExactRows(y, input: x, kvOnly: false)
             let qEnd = _qOut
@@ -3342,8 +2363,8 @@ final class Qwen35Attention: Module {
             return (y[.ellipsis, ..<kEnd], y[.ellipsis, kEnd...])
         }
         if let w = _kvW, let s = _kvS, let z = _kvZ {
-            var y = qwen35RoutedQuantizedMM(
-                x, w, scales: s, biases: z,
+            var y = quantizedMM(
+                x, w, scales: s, biases: z, transpose: true,
                 groupSize: _kvGS, bits: _kvBits, mode: _kvMode)
             y = replaceExactRows(y, input: x, kvOnly: true)
             return (y[.ellipsis, ..<_kvOut], y[.ellipsis, _kvOut...])
@@ -3441,8 +2462,7 @@ final class Qwen35Attention: Module {
     func installExactQKVRows(
         qWeight: MLXArray, qIndices: MLXArray, qOutputCount: Int,
         kWeight: MLXArray, kIndices: MLXArray, kOutputCount: Int,
-        vWeight: MLXArray, vIndices: MLXArray, vOutputCount: Int,
-        arm: Qwen35IslandArm = .all
+        vWeight: MLXArray, vIndices: MLXArray, vOutputCount: Int
     ) {
         precondition(
             qWeight.dim(0) == qIndices.dim(0)
@@ -3454,37 +2474,23 @@ final class Qwen35Attention: Module {
         {
             // Put the island rows back in output order once, so K and V need no
             // scatter at all. `argSort` of a permutation is its inverse.
-            // A partial arm allocates only the tensors it installs, so an
-            // uninstalled island never occupies resident memory in its leg.
-            if arm.installsKV {
-                let kNatural = take(
-                    kWeight, argSort(kIndices.asType(.int32)), axis: 0)
-                let vNatural = take(
-                    vWeight, argSort(vIndices.asType(.int32)), axis: 0)
-                let kvNatural = concatenated([kNatural, vNatural], axis: 0)
-                    .contiguous()
-                eval(kvNatural)
-                _exactKVDenseW = kvNatural
-                _exactKVDenseKOut = kOutputCount
-            }
-            if arm.installsQ {
-                let qOnlyWeight = qWeight.contiguous()
-                let qOnlyIndices = qIndices.asType(.int32).contiguous()
-                eval(qOnlyWeight, qOnlyIndices)
-                _exactQKVWeight = qOnlyWeight
-                _exactQKVIndices = qOnlyIndices
-                _exactQRowCount = qWeight.dim(0)
-            }
+            let kNatural = take(
+                kWeight, argSort(kIndices.asType(.int32)), axis: 0)
+            let vNatural = take(
+                vWeight, argSort(vIndices.asType(.int32)), axis: 0)
+            let kvNatural = concatenated([kNatural, vNatural], axis: 0)
+                .contiguous()
+            let qOnlyWeight = qWeight.contiguous()
+            let qOnlyIndices = qIndices.asType(.int32).contiguous()
+            eval(kvNatural, qOnlyWeight, qOnlyIndices)
+
+            _exactKVDenseW = kvNatural
+            _exactKVDenseKOut = kOutputCount
+            _exactQKVWeight = qOnlyWeight
+            _exactQKVIndices = qOnlyIndices
             _exactKVIndices = nil
+            _exactQRowCount = qWeight.dim(0)
             return
-        }
-        // Every partial arm below depends on the complete-permutation branch to
-        // separate Q from K/V. The generic scatter form fuses all three into one
-        // index list, so it cannot express `q` or `kv`.
-        guard arm == .all else {
-            fatalError(
-                "Qwen MTP island arm \(arm.rawValue) requires complete K and V "
-                    + "index permutations; this head has a partial island set")
         }
         let weight = concatenated([qWeight, kWeight, vWeight], axis: 0).contiguous()
         let qkvIndices = concatenated(
@@ -3585,8 +2591,8 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
 
-        return qwen35RoutedLinear(
-            oProj, qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
+        return oProj(
+            qwen35CompiledSigmoidMultiply(output, gate).reshaped(B, L, -1))
     }
 }
 
@@ -4188,39 +3194,19 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
 // removed `[0 ..< 98_330]` pre-slice did, so the six duplicated padding rows
 // stay unreachable even on a tie.
 //
-// Downstream, `qwen35DraftSelectedAffine4RerankKernel` scores the 32
-// candidates and reduces them under a strict total order on (value, id). That
-// reduction is order-independent, so set identity would suffice. Element-wise
-// identity is a strictly stronger property and makes the offline gate a plain
-// array equality.
+// Downstream, `qwen35DraftRerankKernel` reduces the 32 candidates under a
+// strict total order on (value, id), which is order-independent -- so set
+// identity would suffice. Element-wise identity is a strictly stronger
+// property and makes the offline gate a plain array equality.
 private let qwen35Top32RealCount    = 98_330
 private let qwen35Top32K            = 32
 private let qwen35Top32TG           = 256
 private let qwen35Top32Tiles        = 64
-
-/// Shape constants of one two-dispatch top-32 selection at one key width.
-/// `tiles` is the stage-1 threadgroup count; it sets how many keys one thread
-/// scans and how many candidates stage 2 reduces.
-private struct Qwen35Top32Plan {
-    let realCount: Int
-    let tiles: Int
-    let stride: Int
-    let perThread: Int
-    let cands: Int
-    let finPerThread: Int
-
-    init(realCount: Int, tiles: Int) {
-        self.realCount = realCount
-        self.tiles = tiles
-        stride = tiles * qwen35Top32TG
-        perThread = (realCount + stride - 1) / stride
-        cands = tiles * qwen35Top32K
-        finPerThread = cands / qwen35Top32TG
-    }
-}
-
-private let qwen35Top32DensePlan =
-    Qwen35Top32Plan(realCount: qwen35Top32RealCount, tiles: qwen35Top32Tiles)
+private let qwen35Top32Stride       = qwen35Top32Tiles * qwen35Top32TG
+private let qwen35Top32PerThread    =
+    (qwen35Top32RealCount + qwen35Top32Stride - 1) / qwen35Top32Stride
+private let qwen35Top32Cands        = qwen35Top32Tiles * qwen35Top32K
+private let qwen35Top32FinPerThread = qwen35Top32Cands / qwen35Top32TG
 
 private let qwen35Top32Header = """
     inline uint qwen_top32_ordinal(float v) {
@@ -4231,14 +3217,17 @@ private let qwen35Top32Header = """
     }
     """
 
-// Stage 1: `tiles` threadgroups partition [0, REAL_COUNT); each emits its top
-// 32 as (ordinal, index) pairs, so stage 2 reduces `tiles * 32` candidates.
-private func qwen35Top32PartialSource(_ plan: Qwen35Top32Plan) -> String {
-    """
-        constexpr uint REAL_COUNT = \(plan.realCount);
+// Stage 1: 64 threadgroups partition [0, REAL_COUNT); each emits its top 32
+// as (ordinal, index) pairs. 64 * 32 = 2,048 candidates.
+private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_top32_partial",
+    inputNames: ["logits"],
+    outputNames: ["cand_ord", "cand_idx"],
+    source: """
+        constexpr uint REAL_COUNT = \(qwen35Top32RealCount);
         constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint STRIDE     = \(plan.stride);
-        constexpr uint PER_THREAD = \(plan.perThread);
+        constexpr uint STRIDE     = \(qwen35Top32Stride);
+        constexpr uint PER_THREAD = \(qwen35Top32PerThread);
         constexpr uint TOPK       = \(qwen35Top32K);
         constexpr uint SIMD_SIZE  = 32;
         constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
@@ -4315,38 +3304,21 @@ private func qwen35Top32PartialSource(_ plan: Qwen35Top32Plan) -> String {
                 }
             }
         }
-        """
-}
-
-private let qwen35DraftTop32PartialKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_partial",
-    inputNames: ["logits"],
-    outputNames: ["cand_ord", "cand_idx"],
-    source: qwen35Top32PartialSource(qwen35Top32DensePlan),
+        """,
     header: qwen35Top32Header,
     ensureRowContiguous: false
 )
 
-// Stage 2: one threadgroup reduces the `tiles * 32` candidates to the final 32,
+// Stage 2: one threadgroup reduces the 2,048 candidates to the final 32,
 // written ASCENDING so the result is element-wise identical to
 // `argPartition(...)[kth...]`.
-//
-// `rowsPerCluster` fuses the cluster-index address arithmetic into the same
-// dispatch: the winner is a row inside the probed leaves, and the caller wants
-// the compact-vocabulary id that row carries. Emitting that id here removes the
-// separate divide, remainder, multiply, add and two gathers that MLX would
-// otherwise run as five more command buffers on 32 elements.
-private func qwen35Top32FinalizeSource(
-    _ plan: Qwen35Top32Plan, rowsPerCluster: Int?
-) -> String {
-    let emit = rowsPerCluster.map { rows in
-        "uint cluster = probed[mi / \(rows)u]; "
-            + "token_ids[TOPK - 1u - r] = "
-            + "uint(perm[cluster * \(rows)u + (mi % \(rows)u)]);"
-    } ?? "token_ids[TOPK - 1u - r] = mi;"
-    return """
+private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_top32_finalize",
+    inputNames: ["cand_ord", "cand_idx"],
+    outputNames: ["token_ids"],
+    source: """
         constexpr uint TG_SIZE    = \(qwen35Top32TG);
-        constexpr uint PER_THREAD = \(plan.finPerThread);
+        constexpr uint PER_THREAD = \(qwen35Top32FinPerThread);
         constexpr uint TOPK       = \(qwen35Top32K);
         constexpr uint SIMD_SIZE  = 32;
         constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
@@ -4412,122 +3384,13 @@ private func qwen35Top32FinalizeSource(
                 if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
                     tk2 |= (1u << bs);
                 }
-                if (lane == 0) { \(emit) }
+                if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
             }
         }
-        """
-}
-
-private let qwen35DraftTop32FinalizeKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_draft_top32_finalize",
-    inputNames: ["cand_ord", "cand_idx"],
-    outputNames: ["token_ids"],
-    source: qwen35Top32FinalizeSource(qwen35Top32DensePlan, rowsPerCluster: nil),
+        """,
     header: "",
     ensureRowContiguous: false
 )
-
-// ---------------------------------------------------------------------------
-// ARM C ROW TOP-32
-//
-// Replaces `MLX.argPartition(rowScore, kth: rows - 32)[kth...]` and the index
-// arithmetic behind it. It is the same selection problem as the dense shortlist
-// at a quarter of the width: 32 winners out of `probes * rowsPerCluster` bf16
-// scores, which arm C reaches once per draft.
-//
-// EXACTNESS. The argument is the dense one, unchanged, because the input is
-// again a float row and the reference is again the tail of MLX's stable
-// ascending argsort: the tail-32 is the unique 32-element set maximal under
-// (value asc, index asc), ties break toward the HIGHER index, NaN ranks above
-// every number, and `qwen_top32_ordinal` induces exactly that order. The fused
-// address arithmetic is an injective function applied element-wise to that
-// tail, so element-wise identity of the ids follows from element-wise identity
-// of the selection.
-private let qwen35RowTop32Tiles = 32
-
-private struct Qwen35RowTop32 {
-    let plan: Qwen35Top32Plan
-    let partial: MLXFast.MLXFastKernel
-    let finalize: MLXFast.MLXFastKernel
-
-    init(rows: Int, rowsPerCluster: Int) {
-        plan = Qwen35Top32Plan(realCount: rows, tiles: qwen35RowTop32Tiles)
-        precondition(plan.perThread <= 32 && plan.finPerThread <= 32,
-                     "row top-32 slot count exceeds the 32-bit selection bitmask")
-        partial = MLXFast.metalKernel(
-            name: "qwen_mtp_row_top32_partial",
-            inputNames: ["logits"],
-            outputNames: ["cand_ord", "cand_idx"],
-            source: qwen35Top32PartialSource(plan),
-            header: qwen35Top32Header,
-            ensureRowContiguous: false
-        )
-        finalize = MLXFast.metalKernel(
-            name: "qwen_mtp_row_top32_finalize",
-            inputNames: ["cand_ord", "cand_idx", "probed", "perm"],
-            outputNames: ["token_ids"],
-            source: qwen35Top32FinalizeSource(plan, rowsPerCluster: rowsPerCluster),
-            header: "",
-            ensureRowContiguous: false
-        )
-    }
-
-    /// The 32 compact-vocabulary ids the probed rows carry, ascending under the
-    /// reference order. `rowScore` is [rows], `probed` is [probes] uint32 and
-    /// `perm` is the whole cluster permutation.
-    func callAsFunction(_ rowScore: MLXArray, _ probed: MLXArray, _ perm: MLXArray)
-        -> MLXArray
-    {
-        let candidates = partial(
-            [rowScore],
-            grid: (plan.tiles * qwen35Top32TG, 1, 1),
-            threadGroup: (qwen35Top32TG, 1, 1),
-            outputShapes: [[plan.cands], [plan.cands]],
-            outputDTypes: [.uint32, .uint32]
-        )
-        return finalize(
-            [candidates[0], candidates[1], probed, perm],
-            grid: (qwen35Top32TG, 1, 1),
-            threadGroup: (qwen35Top32TG, 1, 1),
-            outputShapes: [[qwen35Top32K]],
-            outputDTypes: [.uint32]
-        )[0]
-    }
-}
-
-/// The fused row top-32 selection is the COMPILED DEFAULT: the ranked worker
-/// exports no environment, so an unset variable must reach the shipped path.
-/// `MLX_E101_ROW_TOP32=0` restores the `argPartition` row selection and its
-/// separate index arithmetic bit-for-bit, for research arms only. Any other
-/// value fails closed rather than resolving to a path the operator did not
-/// name, so a typo can never time one arm under the other arm's tag. The
-/// `MLX_` prefix is load-bearing: the trusted worker's environment sanitizer
-/// drops `MLXFAST_*`.
-private let qwen35RowTop32Enabled: Bool = qwen35RowTop32Resolved.enabled
-
-/// The resolved gate beside the raw text that produced it, so a trace can name
-/// which of the three cases a leg actually took.
-let qwen35RowTop32Resolved: (enabled: Bool, source: String) = {
-    guard let raw = ProcessInfo.processInfo.environment["MLX_E101_ROW_TOP32"],
-          !raw.isEmpty
-    else { return (true, "unset") }
-    switch raw {
-    case "1": return (true, "1")
-    case "0": return (false, "0")
-    default:
-        fatalError(
-            "MLX_E101_ROW_TOP32 must be unset, 0 or 1; got \(raw)")
-    }
-}()
-
-/// Counts the row-selection path each draft actually took. A leg that exports
-/// nothing must show `fused` rising and `argPartition` flat at zero, which is
-/// the bare-leg proof that the compiled default reaches the fused kernels.
-public nonisolated(unsafe) var qwen35RowTop32FusedDrafts: Int = 0
-public nonisolated(unsafe) var qwen35RowTop32ArgPartitionDrafts: Int = 0
-
-/// `unset`, `0` or `1`, for the same trace line.
-public var qwen35RowTop32GateSource: String { qwen35RowTop32Resolved.source }
 
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
@@ -4625,248 +3488,382 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
     )
 }
 
+
+// MARK: - E87 single-dispatch selections (proposal side only)
+
+/// `MLX_E87_SELECT=0` restores the incumbent `argPartition` chains
+/// bit-for-bit. Proposal-side only: these kernels choose the SAME candidate
+/// sets the incumbent chooses (same tie rule), so the exact rerank that
+/// follows sees identical inputs and the emitted proposal cannot change.
+private let qwen35E87SelectEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E87_SELECT"] != "0"
+
+/// 16-bit order-preserving key of a bf16-sourced float under the merge sort's
+/// (value asc, index asc) order, i.e. `qwen_top32_ordinal >> 16`. Exact for
+/// every bf16 value: bf16 -> f32 leaves the low 16 mantissa bits zero, so the
+/// positive branch truncates nothing and the negative branch (`~u`) drops a
+/// constant 0xFFFF. NaN ranks above every number; -0 folds into +0 so the pair
+/// ties and breaks by index, exactly as the incumbent.
+private let qwen35E87KeyHeader = """
+    inline ushort qwen_e87_key16(float v) {
+        if (isnan(v))  { return 0xFFFFu; }
+        if (v == 0.0f) { return 0x8000u; }
+        uint u = as_type<uint>(v);
+        uint o = (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+        return ushort(o >> 16);
+    }
+    """
+
+private let qwen35E87SelectTG = 1024
+
+/// Replaces `MLX.sorted(MLX.argPartition(score, kth: C - P)[(C - P)...])`
+/// (one 9-dispatch merge sort plus the probe compaction) with ONE dispatch.
+///
+/// The selected set is the P elements maximal under (key asc, index asc):
+/// every key above a threshold T, plus -- among the keys equal to T -- the
+/// highest indices until P is reached (the merge sort's stable tail breaks
+/// ties toward the higher index). T is found by two 8-bit histogram passes,
+/// the index cut by a popcount walk over a bitmap of the T-keyed indices.
+/// Thread `t` owns the contiguous index range [t*PT, t*PT+PT) and the final
+/// prefix scan is exclusive over `t`, so the emitted ids ascend globally.
+private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
+    -> MLXFast.MLXFastKernel
+{
+    MLXFast.metalKernel(
+        name: "qwen_mtp_e87_probe_select",
+        inputNames: ["score"],
+        outputNames: ["probed"],
+        source: """
+            constexpr uint CLUSTERS = \(clusters);
+            constexpr uint PROBES   = \(probes);
+            constexpr uint TG       = \(qwen35E87SelectTG);
+            constexpr uint PT       = (CLUSTERS + TG - 1u) / TG;
+            constexpr uint WORDS    = (CLUSTERS + 31u) / 32u;
+            constexpr uint NSIMD    = TG / 32u;
+            static_assert(PROBES >= 1u && PROBES <= CLUSTERS, "probe count");
+            static_assert(NSIMD == 32u, "scan assumes 32 simdgroups");
+
+            const uint tid  = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg   = simdgroup_index_in_threadgroup;
+            const uint base = tid * PT;
+
+            threadgroup atomic_uint hist[256];
+            threadgroup atomic_uint bits[WORDS];
+            threadgroup uint sel[8];
+            threadgroup uint sgsum[NSIMD];
+
+            ushort key[PT];
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                key[j] = (i < CLUSTERS) ? qwen_e87_key16(float(score[i])) : ushort(0);
+            }
+
+            // Pass 1: high byte.
+            for (uint x = tid; x < 256u; x += TG) {
+                atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = 0; j < PT; ++j) {
+                if (base + j < CLUSTERS) {
+                    atomic_fetch_add_explicit(&hist[uint(key[j]) >> 8], 1u, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                uint acc = 0u, b = 0u;
+                for (int x = 255; x >= 0; --x) {
+                    const uint c = atomic_load_explicit(&hist[x], memory_order_relaxed);
+                    if (acc + c >= PROBES) { b = uint(x); break; }
+                    acc += c;
+                }
+                sel[0] = b; sel[1] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint hi = sel[0];
+            const uint k1 = PROBES - sel[1];
+
+            // Pass 2: low byte among keys whose high byte is `hi`.
+            for (uint x = tid; x < 256u; x += TG) {
+                atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = 0; j < PT; ++j) {
+                if (base + j < CLUSTERS && (uint(key[j]) >> 8) == hi) {
+                    atomic_fetch_add_explicit(&hist[uint(key[j]) & 0xFFu], 1u, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                uint acc = 0u, c = 0u;
+                for (int x = 255; x >= 0; --x) {
+                    const uint n = atomic_load_explicit(&hist[x], memory_order_relaxed);
+                    if (acc + n >= k1) { c = uint(x); break; }
+                    acc += n;
+                }
+                sel[2] = c; sel[3] = acc;
+                sel[4] = atomic_load_explicit(&hist[c], memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const ushort T  = ushort((hi << 8) | sel[2]);
+            const uint   k2 = k1 - sel[3];
+            const uint   eq = sel[4];
+
+            // Index cut among the T-keyed elements: keep the k2 highest.
+            uint idxThr = 0u;
+            if (k2 < eq) {
+                for (uint w = tid; w < WORDS; w += TG) {
+                    atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint j = 0; j < PT; ++j) {
+                    const uint i = base + j;
+                    if (i < CLUSTERS && key[j] == T) {
+                        atomic_fetch_or_explicit(&bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0) {
+                    uint need = k2, thr = 0u;
+                    for (int w = int(WORDS) - 1; w >= 0; --w) {
+                        uint v = atomic_load_explicit(&bits[w], memory_order_relaxed);
+                        const uint pc = popcount(v);
+                        if (pc >= need) {
+                            for (uint k = 0; k + 1u < need; ++k) {
+                                v &= ~(1u << (31u - clz(v)));
+                            }
+                            thr = uint(w) * 32u + (31u - clz(v));
+                            break;
+                        }
+                        need -= pc;
+                    }
+                    sel[5] = thr;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                idxThr = sel[5];
+            }
+
+            // Compaction in ascending index order.
+            uint cnt = 0u;
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) { ++cnt; }
+            }
+            const uint incl = simd_prefix_inclusive_sum(cnt);
+            if (lane == 31u) { sgsum[sg] = incl; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                const uint v = sgsum[lane];
+                sgsum[lane] = simd_prefix_exclusive_sum(v);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint out = sgsum[sg] + incl - cnt;
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) {
+                    probed[out++] = i;
+                }
+            }
+            """,
+        header: qwen35E87KeyHeader,
+        ensureRowContiguous: true
+    )
+}
+
+/// Replaces `argPartition(rowScore, kth)[kth...]` (a 7-dispatch merge sort)
+/// plus the five-op probe/permutation lookup with ONE dispatch that emits the
+/// 32 shortlist candidate ids directly.
+///
+/// Each element is packed as `(key16 << 16) | index` (N < 65,536), so one
+/// `simd_max` per round ranks (key asc, index asc) exactly as the merge sort
+/// does. 32 rounds per simdgroup, then 32 rounds over the 32 x 32 survivors
+/// in simdgroup 0. Round r is the r-th largest, written at slot 31 - r so the
+/// output ascends like `argPartition`'s tail; the lookup
+/// `perm[probed[l / RPC] * RPC + l % RPC]` is the incumbent's, element-wise.
+private func makeQwen35E87ShortlistKernel(
+    probes: Int, rowsPerCluster: Int, topK: Int
+) -> MLXFast.MLXFastKernel {
+    MLXFast.metalKernel(
+        name: "qwen_mtp_e87_shortlist",
+        inputNames: ["score", "probed", "perm"],
+        outputNames: ["candidates"],
+        source: """
+            constexpr uint RPC   = \(rowsPerCluster);
+            constexpr uint N     = \(probes) * RPC;
+            constexpr uint TOPK  = \(topK);
+            constexpr uint TG    = \(qwen35E87SelectTG);
+            constexpr uint PT    = (N + TG - 1u) / TG;
+            constexpr uint NSIMD = TG / 32u;
+            constexpr uint PB    = (NSIMD * TOPK) / 32u;
+            constexpr uint NONE  = 0xFFFFFFFFu;
+            static_assert(N < 65536u, "index must fit in 16 bits");
+            static_assert(PT <= 32u, "PT exceeds taken-bitmask width");
+            static_assert(PB <= 32u, "PB exceeds tk2-bitmask width");
+            static_assert(NSIMD * TOPK >= TOPK, "survivor pool");
+
+            const uint tid  = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg   = simdgroup_index_in_threadgroup;
+
+            threadgroup uint sc[NSIMD * TOPK];
+
+            uint comp[PT];
+            uint taken = 0u;
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = j * TG + tid;
+                if (i < N) {
+                    comp[j] = (uint(qwen_e87_key16(float(score[i]))) << 16) | i;
+                } else {
+                    comp[j] = 0u;
+                    taken |= (1u << j);
+                }
+            }
+            for (uint r = 0; r < TOPK; ++r) {
+                uint best = 0u, bs = NONE;
+                for (uint j = 0; j < PT; ++j) {
+                    if ((taken & (1u << j)) != 0u) { continue; }
+                    if (bs == NONE || comp[j] > best) { best = comp[j]; bs = j; }
+                }
+                const uint m = simd_max(best);
+                if (bs != NONE && best == m) { taken |= (1u << bs); }
+                if (lane == 0u) { sc[sg * TOPK + r] = m; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                uint o2[PB];
+                for (uint t = 0; t < PB; ++t) { o2[t] = sc[t * 32u + lane]; }
+                uint tk2 = 0u;
+                for (uint r = 0; r < TOPK; ++r) {
+                    uint best = 0u, bs = NONE;
+                    for (uint t = 0; t < PB; ++t) {
+                        if ((tk2 & (1u << t)) != 0u) { continue; }
+                        if (bs == NONE || o2[t] > best) { best = o2[t]; bs = t; }
+                    }
+                    const uint m = simd_max(best);
+                    if (bs != NONE && best == m) { tk2 |= (1u << bs); }
+                    if (lane == 0u) {
+                        const uint local = m & 0xFFFFu;
+                        const uint leaf  = uint(probed[local / RPC]);
+                        candidates[TOPK - 1u - r] =
+                            uint(perm[leaf * RPC + local % RPC]);
+                    }
+                }
+            }
+            """,
+        header: qwen35E87KeyHeader,
+        ensureRowContiguous: true
+    )
+}
+
+/// Offline equivalence gate for both E87 selection kernels against the
+/// incumbent chains on synthetic bf16 rows at the live shape, including rows
+/// quantised hard enough to force heavy ties and all-equal rows. Returns
+/// (checked, mismatches, firstBadTrial). Never called on a scored path.
+public func qwen35VerifyE87Select(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    trials: Int = 64, seed: UInt64 = 1
+) -> (Int, Int, Int) {
+    MLXRandom.seed(seed)
+    let topK = 32
+    let selectK = makeQwen35E87ProbeSelectKernel(clusters: clusters, probes: probes)
+    let shortK = makeQwen35E87ShortlistKernel(
+        probes: probes, rowsPerCluster: rowsPerCluster, topK: topK)
+    let perm = MLXRandom.permutation(clusters * rowsPerCluster).asType(.int32)
+    var bad = 0, firstBad = -1
+    for trial in 0 ..< trials {
+        func row(_ n: Int) -> MLXArray {
+            switch trial % 4 {
+            case 1: return (MLXRandom.normal([n]) * 4).round().asType(.bfloat16)
+            case 2: return MLX.zeros([n], dtype: .bfloat16)
+            case 3: return (MLXRandom.normal([n]) * 0.5).round().asType(.bfloat16)
+            default: return MLXRandom.normal([n]).asType(.bfloat16)
+            }
+        }
+        let score = row(clusters)
+        let kth = clusters - probes
+        let order = MLX.argPartition(score, kth: kth)
+        let probedRef = MLX.sorted(order[.ellipsis, (kth)...]).asType(.uint32)
+        let probedMine = selectK(
+            [score], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[probes]], outputDTypes: [.uint32])[0]
+        let rowScore = row(probes * rowsPerCluster)
+        let k2 = probes * rowsPerCluster - topK
+        let local = MLX.argPartition(rowScore, kth: k2)[.ellipsis, (k2)...]
+        let width = MLXArray(Int32(rowsPerCluster))
+        let permutedRow =
+            MLX.take(probedRef.asType(.int32), MLX.floorDivide(local, width), axis: 0)
+            * width + MLX.remainder(local, width)
+        let candRef = MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+        let candMine = shortK(
+            [rowScore, probedRef, perm], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[topK]], outputDTypes: [.uint32])[0]
+        eval(probedRef, probedMine, candRef, candMine)
+        let sameA = MLX.all(MLX.equal(probedRef, probedMine)).item(Bool.self)
+        let sameB = MLX.all(MLX.equal(candRef, candMine)).item(Bool.self)
+        if !(sameA && sameB) {
+            bad += 1
+            if firstBad < 0 { firstBad = trial }
+        }
+    }
+    return (trials, bad, firstBad)
+}
+
+/// Isolated micro-benchmark: incumbent chain vs the two kernels, per draft
+/// step, at the live shape. Returns (incumbentUs, mineUs).
+public func qwen35BenchE87Select(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    iters: Int = 200
+) -> (Double, Double) {
+    MLXRandom.seed(3)
+    let topK = 32
+    let selectK = makeQwen35E87ProbeSelectKernel(clusters: clusters, probes: probes)
+    let shortK = makeQwen35E87ShortlistKernel(
+        probes: probes, rowsPerCluster: rowsPerCluster, topK: topK)
+    let sorter = makeQwen35ProbeSortKernel(clusters: clusters, probes: probes)
+    let perm = MLXRandom.permutation(clusters * rowsPerCluster).asType(.int32)
+    let score = MLXRandom.normal([clusters]).asType(.bfloat16)
+    let rowScore = MLXRandom.normal([probes * rowsPerCluster]).asType(.bfloat16)
+    let width = MLXArray(Int32(rowsPerCluster))
+    func incumbent() -> MLXArray {
+        let kth = clusters - probes
+        let order = MLX.argPartition(score, kth: kth)
+        let probed = sorter(
+            [order], grid: (qwen35ProbeSortTG, 1, 1),
+            threadGroup: (qwen35ProbeSortTG, 1, 1),
+            outputShapes: [[probes]], outputDTypes: [.uint32])[0]
+        let k2 = probes * rowsPerCluster - topK
+        let local = MLX.argPartition(rowScore, kth: k2)[.ellipsis, (k2)...]
+        let permutedRow =
+            MLX.take(probed.asType(.int32), MLX.floorDivide(local, width), axis: 0)
+            * width + MLX.remainder(local, width)
+        return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+    }
+    func mine() -> MLXArray {
+        let probed = selectK(
+            [score], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[probes]], outputDTypes: [.uint32])[0]
+        return shortK(
+            [rowScore, probed, perm], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[topK]], outputDTypes: [.uint32])[0]
+    }
+    for _ in 0 ..< 10 { eval(incumbent()); eval(mine()) }
+    var t0 = Date()
+    for _ in 0 ..< iters { eval(incumbent()) }
+    let baseUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    t0 = Date()
+    for _ in 0 ..< iters { eval(mine()) }
+    let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    return (baseUs, mineUs)
+}
+
 /// `MLX_E87_PROBE_SORT=0` restores the `MLX.sorted` path bit-for-bit. The
 /// `MLX_` prefix is load-bearing: the worker sanitizer drops `MLXFAST_*`.
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
-
-// ---------------------------------------------------------------------------
-// E121 cluster 2-bit QMV (proposal-side only)
-//
-// Live `#1063` already owns the wide affine-4/g64 verification matvec and
-// hoists its activation chunk sums. That path never sees a 2-bit weight.
-// The cluster shortlist in front of the affine-4 rerank still pays two
-// library 2-bit matvecs per draft:
-//
-//   1. dense centroid `quantizedMM` over N = 12,292. 12,292 % 8 == 4, so
-//      `quantized.cpp:259` `fast = N % 8 == 0 && K % 512 == 0` is false and
-//      the launch is the bounds-checked `qmv_impl`, not `qmv_fast`.
-//   2. `gatherQuantizedMM` of the 3,073 probed clusters. Each probe is an
-//      N = 8 tile (one leaf), dispatched as a gather batch of 3,073 tiny
-//      `qmv_fast_impl` threadgroups at 16 values/lane.
-//
-// The already-promoted `qmv_fast_singlerow_affine2_g64` (32 values/lane,
-// one ulong load, five K-blocks at K = 5,120) is gated on
-// `out_vec_size == 98_336`, which is the DENSE coarse readout the cluster
-// path no longer takes. These two kernels apply that same 32-value
-// arithmetic to the LIVE cluster geometry: a bounds-checked dense
-// centroid QMV, and a single-grid gathered row QMV that replaces the
-// 3,073-way gather launch.
-//
-// Candidate-asymmetric by construction. The serial leg's projections are
-// affine-4 (see the 98,336 kernel's own header). The exact affine-4
-// rerank plus target verification still decide every emitted token, so
-// the FP32 reassociation of the wider lane is the same contract the
-// dense 98,336 kernel already ships.
-//
-// `MLX_E121_CLUSTER_QMV=0` restores the two library launches bit-for-bit.
-// The name is 20 UTF-8 bytes so `strings` on the worker binary can
-// witness it; the `MLX_` prefix is load-bearing.
-private let qwen35ClusterQMVEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment["MLX_E121_CLUSTER_QMV"],
-          !raw.isEmpty
-    else { return true }
-    switch raw {
-    case "1": return true
-    case "0": return false
-    default:
-        fatalError("MLX_E121_CLUSTER_QMV must be unset, 0 or 1; got \(raw)")
-    }
-}()
-
-/// Shared 32-value/lane affine-2/g64 body. `physical_row` is the weight
-/// row; `y_row` is the output slot. `n_valid` in [1, 4] covers the
-/// centroid tail (N = 12,292 = 8*1,536 + 4). Identical qdot / bias-sum
-/// expression to `qmv_fast_singlerow_affine2_g64`.
-private let qwen35ClusterAffine2QMVHeader = """
-    inline void qwen_e121_a2_qmv4(
-        const device uint32_t* w,
-        const device bfloat16_t* scales,
-        const device bfloat16_t* biases,
-        const device bfloat16_t* x,
-        device bfloat16_t* y,
-        const int K,
-        const int physical_row,
-        const int y_row,
-        const int n_valid,
-        const uint simd_lid
-    ) {
-        constexpr int rows_per_simd = 4;
-        constexpr int values_per_thread = 32;
-        constexpr int block_size = values_per_thread * 32;
-        constexpr int bytes_per_lane = 8;
-        const int in_vec_size_w = K / 4;
-        const int in_vec_size_g = K / 64;
-
-        thread float result[rows_per_simd];
-        for (int r = 0; r < rows_per_simd; r++) {
-            result[r] = 0.0f;
-        }
-
-        for (int k = 0; k < K; k += block_size) {
-            thread ulong packed[rows_per_simd];
-            thread float scale_local[rows_per_simd];
-            thread float bias_local[rows_per_simd];
-            for (int r = 0; r < rows_per_simd; r++) {
-                if (r >= n_valid) {
-                    packed[r] = 0ul;
-                    scale_local[r] = 0.0f;
-                    bias_local[r] = 0.0f;
-                    continue;
-                }
-                const int row = physical_row + r;
-                const device uint8_t* ws =
-                    reinterpret_cast<const device uint8_t*>(w) +
-                    row * in_vec_size_w + k / 4 + int(simd_lid) * bytes_per_lane;
-                packed[r] = *reinterpret_cast<const device ulong*>(ws);
-                const int group_index =
-                    row * in_vec_size_g + k / 64 +
-                    (int(simd_lid) * values_per_thread) / 64;
-                scale_local[r] = scales[group_index];
-                bias_local[r] = biases[group_index];
-            }
-
-            thread float x0[values_per_thread];
-            const device bfloat16_t* xm = x + k + int(simd_lid) * values_per_thread;
-            float sum = 0.0f;
-            for (int i = 0; i < values_per_thread; i += 4) {
-                x0[i]     = static_cast<float>(xm[i]);
-                x0[i + 1] = static_cast<float>(xm[i + 1]);
-                x0[i + 2] = static_cast<float>(xm[i + 2]);
-                x0[i + 3] = static_cast<float>(xm[i + 3]);
-                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
-            }
-
-            for (int r = 0; r < n_valid; r++) {
-                float accum = 0.0f;
-                #pragma unroll
-                for (int j = 0; j < 32; j++) {
-                    accum += x0[j] * float((packed[r] >> (2 * j)) & 0x03ul);
-                }
-                result[r] += scale_local[r] * accum + sum * bias_local[r];
-            }
-        }
-
-        for (int r = 0; r < n_valid; r++) {
-            const float reduced = simd_sum(result[r]);
-            if (simd_lid == 0) {
-                y[y_row + r] = static_cast<bfloat16_t>(reduced);
-            }
-        }
-    }
-    """
-
-/// Dense centroid 2-bit QMV. N need not be a multiple of 8: the last
-/// simdgroup writes only the live tail (four rows at N = 12,292).
-private let qwen35ClusterCentroidQMVKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_cluster_centroid_qmv_a2g64_v1",
-    inputNames: ["x", "w", "scales", "biases"],
-    outputNames: ["y"],
-    source: """
-        const int K = x_shape[x_ndim - 1];
-        const int N = w_shape[0];
-        const uint3 tid = threadgroup_position_in_grid;
-        const uint simd_gid = simdgroup_index_in_threadgroup;
-        const uint simd_lid = thread_index_in_simdgroup;
-        const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
-        if (out_row >= N) {
-            return;
-        }
-        const int n_valid = (N - out_row < 4) ? (N - out_row) : 4;
-        qwen_e121_a2_qmv4(
-            w, scales, biases, x, y, K, out_row, out_row, n_valid, simd_lid);
-        """,
-    header: qwen35ClusterAffine2QMVHeader,
-    ensureRowContiguous: true
-)
-
-/// Gathered leaf 2-bit QMV. One threadgroup per probed cluster, eight
-/// output rows, weight row `probed[tg] * rowsPer + local`. Replaces
-/// `gatherQuantizedMM` of N = 8 across a batch of probes.
-private let qwen35ClusterRowQMVKernel = MLXFast.metalKernel(
-    name: "qwen_mtp_cluster_row_qmv_a2g64_v1",
-    inputNames: ["x", "w", "scales", "biases", "probed"],
-    outputNames: ["y"],
-    source: """
-        const int K = x_shape[x_ndim - 1];
-        const int rows_per = w_shape[1];
-        const uint3 tid = threadgroup_position_in_grid;
-        const uint simd_gid = simdgroup_index_in_threadgroup;
-        const uint simd_lid = thread_index_in_simdgroup;
-        const int probe = int(tid.y);
-        const int local = int(simd_gid) * 4;
-        const int cluster = int(probed[probe]);
-        const int physical = cluster * rows_per + local;
-        const int y_row = probe * rows_per + local;
-        qwen_e121_a2_qmv4(
-            w, scales, biases, x, y, K, physical, y_row, 4, simd_lid);
-        """,
-    header: qwen35ClusterAffine2QMVHeader,
-    ensureRowContiguous: true
-)
-
-/// True when the live cluster tensors match the 32-value affine-2/g64
-/// contract: K multiple of 1,024 (five 1,024-wide k-blocks at 32
-/// values/lane × 32 lanes), 2-bit packed rows, eight rows per leaf.
-private func qwen35ClusterQMVRoutable(
-    x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
-    hidden: Int
-) -> Bool {
-    guard qwen35ClusterQMVEnabled else { return false }
-    guard x.dtype == .bfloat16, scales.dtype == .bfloat16,
-          biases.dtype == .bfloat16, weight.dtype == .uint32
-    else { return false }
-    guard hidden > 0, hidden % 1024 == 0 else { return false }
-    guard weight.dim(-1) == hidden / 16 else { return false }
-    guard scales.dim(-1) == hidden / 64, biases.shape == scales.shape
-    else { return false }
-    return true
-}
-
-private func qwen35ClusterCentroidQMV(
-    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
-    clusters: Int, hidden: Int
-) -> MLXArray? {
-    guard qwen35ClusterQMVRoutable(
-        x: x, weight: weight, scales: scales, biases: biases, hidden: hidden)
-    else { return nil }
-    guard weight.ndim == 2, weight.dim(0) == clusters,
-          scales.ndim == 2, scales.dim(0) == clusters
-    else { return nil }
-    let tiles = (clusters + 7) / 8
-    return qwen35ClusterCentroidQMVKernel(
-        [x.reshaped([hidden]), weight, scales, biases],
-        grid: (32, tiles * 2, 1),
-        threadGroup: (32, 2, 1),
-        outputShapes: [[clusters]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
-
-private func qwen35ClusterRowQMV(
-    _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
-    probed: MLXArray, clusters: Int, rowsPerCluster: Int, probes: Int,
-    hidden: Int
-) -> MLXArray? {
-    guard qwen35ClusterQMVRoutable(
-        x: x, weight: weight, scales: scales, biases: biases, hidden: hidden)
-    else { return nil }
-    guard rowsPerCluster == 8, probes >= 1, probes <= clusters else { return nil }
-    guard weight.ndim == 3,
-          weight.shape == [clusters, rowsPerCluster, hidden / 16],
-          scales.ndim == 3,
-          scales.shape == [clusters, rowsPerCluster, hidden / 64],
-          biases.shape == scales.shape,
-          probed.dtype == .uint32, probed.dim(0) == probes
-    else { return nil }
-    return qwen35ClusterRowQMVKernel(
-        [x.reshaped([hidden]), weight, scales, biases, probed],
-        grid: (32, probes * 2, 1),
-        threadGroup: (32, 2, 1),
-        outputShapes: [[probes * rowsPerCluster]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
 
 /// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
 /// declared head's per-draft bytes at a worst-domain argmax miss rate of
@@ -5004,15 +4001,13 @@ private func qwen35BisectingPartition(
 /// Exact top-32 of `row` (shape [REAL_COUNT], bf16) as ascending uint32 ids.
 private func qwen35DraftTop32(_ row: MLXArray) -> MLXArray {
     // Mirrors the kernel static_asserts; see the bitmask note there.
-    precondition(
-        qwen35Top32DensePlan.perThread <= 32
-            && qwen35Top32DensePlan.finPerThread <= 32,
-        "top-32 slot count exceeds the 32-bit selection bitmask")
+    precondition(qwen35Top32PerThread <= 32 && qwen35Top32FinPerThread <= 32,
+                 "top-32 slot count exceeds the 32-bit selection bitmask")
     let partial = qwen35DraftTop32PartialKernel(
         [row],
-        grid: (qwen35Top32DensePlan.tiles * qwen35Top32TG, 1, 1),
+        grid: (qwen35Top32Tiles * qwen35Top32TG, 1, 1),
         threadGroup: (qwen35Top32TG, 1, 1),
-        outputShapes: [[qwen35Top32DensePlan.cands], [qwen35Top32DensePlan.cands]],
+        outputShapes: [[qwen35Top32Cands], [qwen35Top32Cands]],
         outputDTypes: [.uint32, .uint32]
     )
     return qwen35DraftTop32FinalizeKernel(
@@ -5045,8 +4040,7 @@ public func qwen35BenchDraftTop32(iters: Int = 200) -> (Double, Double, Int, Int
     t0 = Date()
     for _ in 0 ..< iters { eval(qwen35DraftTop32(row)) }
     let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    return (baseUs, mineUs, qwen35Top32DensePlan.tiles,
-            qwen35Top32DensePlan.perThread)
+    return (baseUs, mineUs, qwen35Top32Tiles, qwen35Top32PerThread)
 }
 
 public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, Int, Int) {
@@ -5172,209 +4166,6 @@ public func qwen35BenchProbeSort(
     return (baseUs, Date().timeIntervalSince(t0) / Double(iters) * 1e6)
 }
 
-// ---------------------------------------------------------------------------
-// ARM C ROW TOP-32 RESEARCH ENTRY POINTS. None of these runs on a scored path.
-
-/// One synthetic arm C selection input at the live shapes: bf16 row scores, an
-/// ascending distinct probe list, and a permutation of the compact rows.
-private func qwen35RowTop32Fixture(clusters: Int, rowsPerCluster: Int, probes: Int,
-                                   trial: Int) -> (MLXArray, MLXArray, MLXArray)
-{
-    let rows = probes * rowsPerCluster
-    var rowScore = MLXRandom.normal([rows]).asType(.bfloat16)
-    switch trial % 4 {
-    // Quantise hard so many scores collide, then an all-equal row where every
-    // selected index is decided by the tie rule alone.
-    case 1: rowScore = (MLXRandom.normal([rows]) * 4).round().asType(.bfloat16)
-    case 2: rowScore = MLX.zeros([rows], dtype: .bfloat16)
-    default: break
-    }
-    let centroid = MLXRandom.normal([clusters]).asType(.bfloat16)
-    let probed = MLX.sorted(
-        MLX.argPartition(centroid, kth: clusters - probes)[(clusters - probes)...]
-    ).asType(.uint32)
-    let perm = MLX.argSort(MLXRandom.normal([clusters * rowsPerCluster])).asType(.int32)
-    eval(rowScore, probed, perm)
-    return (rowScore, probed, perm)
-}
-
-/// The exact expression the fused kernel replaces.
-private func qwen35RowTop32Reference(
-    _ rowScore: MLXArray, _ probed: MLXArray, _ perm: MLXArray,
-    rowsPerCluster: Int, candidateCount: Int
-) -> MLXArray {
-    let kth = rowScore.dim(0) - candidateCount
-    let local = MLX.argPartition(rowScore, kth: kth)[(kth)...]
-    let width = MLXArray(Int32(rowsPerCluster))
-    let permutedRow =
-        MLX.take(probed.asType(.int32), MLX.floorDivide(local, width), axis: 0)
-        * width + MLX.remainder(local, width)
-    return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
-}
-
-/// Offline equivalence gate for the fused row selection. Needs no checkpoint
-/// and no MTP head. Returns (checked, mismatches, firstBadTrial).
-public func qwen35VerifyRowTop32(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
-    trials: Int = 64, seed: UInt64 = 1
-) -> (Int, Int, Int) {
-    MLXRandom.seed(seed)
-    let selector = Qwen35RowTop32(
-        rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
-    var bad = 0
-    var firstBad = -1
-    for trial in 0 ..< trials {
-        let (rowScore, probed, perm) = qwen35RowTop32Fixture(
-            clusters: clusters, rowsPerCluster: rowsPerCluster, probes: probes,
-            trial: trial)
-        let mine = selector(rowScore, probed, perm)
-        let theirs = qwen35RowTop32Reference(
-            rowScore, probed, perm, rowsPerCluster: rowsPerCluster,
-            candidateCount: qwen35Top32K)
-        eval(mine, theirs)
-        if !MLX.all(MLX.equal(mine, theirs)).item(Bool.self) {
-            bad += 1
-            if firstBad < 0 { firstBad = trial }
-        }
-    }
-    return (trials, bad, firstBad)
-}
-
-/// Positive control for `qwen35VerifyRowTop32`. Raises the single lowest row
-/// score above every other row, which must displace exactly one selected id,
-/// and requires the comparison to report the difference. A gate that cannot
-/// fail is not a gate.
-public func qwen35RowTop32PositiveControl(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
-    seed: UInt64 = 7
-) -> Bool {
-    MLXRandom.seed(seed)
-    let selector = Qwen35RowTop32(
-        rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
-    let (rowScore, probed, perm) = qwen35RowTop32Fixture(
-        clusters: clusters, rowsPerCluster: rowsPerCluster, probes: probes,
-        trial: 0)
-    let theirs = qwen35RowTop32Reference(
-        rowScore, probed, perm, rowsPerCluster: rowsPerCluster,
-        candidateCount: qwen35Top32K)
-    var host = rowScore.asType(.float32).asArray(Float.self)
-    let worst = host.indices.min(by: { host[$0] < host[$1] })!
-    host[worst] = host.max()! + 1
-    let damaged = MLXArray(host).asType(.bfloat16)
-    let mine = selector(damaged, probed, perm)
-    eval(mine, theirs)
-    return !MLX.all(MLX.equal(mine, theirs)).item(Bool.self)
-}
-
-/// Isolated micro-benchmark of the row selection, chain against fused kernel.
-/// Returns (chainUs, kernelUs) per call. Never called on a scored path.
-public func qwen35BenchRowTop32(
-    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
-    iters: Int = 200
-) -> (Double, Double) {
-    MLXRandom.seed(11)
-    let selector = Qwen35RowTop32(
-        rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
-    let (rowScore, probed, perm) = qwen35RowTop32Fixture(
-        clusters: clusters, rowsPerCluster: rowsPerCluster, probes: probes,
-        trial: 0)
-    func chain() -> MLXArray {
-        qwen35RowTop32Reference(
-            rowScore, probed, perm, rowsPerCluster: rowsPerCluster,
-            candidateCount: qwen35Top32K)
-    }
-    for _ in 0 ..< 10 {
-        eval(chain())
-        eval(selector(rowScore, probed, perm))
-    }
-    var t0 = Date()
-    for _ in 0 ..< iters { eval(chain()) }
-    let chainUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
-    t0 = Date()
-    for _ in 0 ..< iters { eval(selector(rowScore, probed, perm)) }
-    return (chainUs, Date().timeIntervalSince(t0) / Double(iters) * 1e6)
-}
-
-/// E101 composition gate for the imported `41bad1c6` rerank kernel.
-///
-/// `qwen35DraftSelectedAffine4RerankKernel` reads `candidate_ids` positionally
-/// and reduces the scored pairs under a strict total order, so a shortlist's
-/// emission ORDER should not reach its output while the shortlist SET is held
-/// fixed. `Qwen35RowTop32` emits in a different order from the `argPartition`
-/// chain it replaces, so that property decides whether the two stages compose,
-/// and it is measured here rather than argued from the source.
-///
-/// Each trial scores one shortlist twice: once in natural order and once under
-/// a random permutation of the same 32 ids. `setMismatches` counts trials
-/// whose permutation did not preserve the set, which would invalidate the
-/// trial itself rather than the kernel. `controlChanged` is the positive
-/// control: it replaces one member of the set instead of reordering it, and a
-/// run where that never changes the emitted token proves the comparison is
-/// insensitive and cannot be trusted.
-///
-/// `prefixCount` and `controlOffset` mirror `Qwen35TextModel`'s private
-/// `compactDraftPrefixCount` and `compactDraftControlStart` mapping.
-public func qwen35VerifySelectedRerankOrderInvariance(
-    rows: Int = 1_024, trials: Int = 256, seed: UInt64 = 1,
-    prefixCount: Int = 98_304, controlOffset: Int = 248_044 - 98_304
-) -> (trials: Int, mismatches: Int, firstBad: Int,
-      setMismatches: Int, controlChanged: Int) {
-    MLXRandom.seed(seed)
-    let hidden = 5_120
-    let low = MLXRandom.randInt(0 ..< 65_536, [rows, 640]).asType(.uint32)
-    let high = MLXRandom.randInt(0 ..< 65_536, [rows, 640]).asType(.uint32)
-    let weight = low + high * 65_536
-    let scales = MLXRandom.normal([rows, 80]).asType(.bfloat16)
-    let biases = MLXRandom.normal([rows, 80]).asType(.bfloat16)
-
-    func rerank(_ x: MLXArray, _ ids: MLXArray) -> Int32 {
-        let out = qwen35DraftSelectedAffine4RerankKernel(
-            [x, ids, weight, scales, biases],
-            template: [
-                ("PREFIX_COUNT", prefixCount),
-                ("CONTROL_OFFSET", controlOffset),
-            ],
-            grid: (256, 1, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[1, 1]],
-            outputDTypes: [.int32]
-        )[0]
-        eval(out)
-        return out.asArray(Int32.self)[0]
-    }
-
-    var mismatches = 0, firstBad = -1, setMismatches = 0, controlChanged = 0
-    for trial in 0 ..< trials {
-        let x = MLXRandom.normal([hidden]).asType(.bfloat16)
-        let ids = MLX.argSort(MLXRandom.normal([rows]))[0 ..< qwen35Top32K]
-            .asType(.uint32)
-        let shuffled = MLX.take(
-            ids, MLX.argSort(MLXRandom.normal([qwen35Top32K])), axis: 0)
-
-        let sortedA = MLX.sorted(ids), sortedB = MLX.sorted(shuffled)
-        eval(sortedA, sortedB)
-        if sortedA.asArray(UInt32.self) != sortedB.asArray(UInt32.self) {
-            setMismatches += 1
-            continue
-        }
-        if rerank(x, ids) != rerank(x, shuffled) {
-            mismatches += 1
-            if firstBad < 0 { firstBad = trial }
-        }
-
-        // Positive control: change the SET, not the order. The replacement is
-        // drawn from outside the shortlist, so the scored population differs.
-        var members = ids.asArray(UInt32.self)
-        var replacement = UInt32((trial &* 7 &+ 3) % rows)
-        while members.contains(replacement) {
-            replacement = (replacement &+ 1) % UInt32(rows)
-        }
-        members[trial % qwen35Top32K] = replacement
-        if rerank(x, MLXArray(members)) != rerank(x, ids) { controlChanged += 1 }
-    }
-    return (trials, mismatches, firstBad, setMismatches, controlChanged)
-}
-
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -5412,7 +4203,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftClusterShape: [Int]?
     private var _draftClusterLHS: MLXArray?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
-    private var _draftRowTop32: Qwen35RowTop32?
+    private var _draftProbeSelect: MLXFast.MLXFastKernel?
+    private var _draftShortlist: MLXFast.MLXFastKernel?
     // One attempt only: a head that cannot support a derived index must keep
     // the dense readout instead of re-deriving on every draft step.
     private var _derivedClusterAttempted = false
@@ -5568,22 +4360,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     "Qwen MTP precision-island artifact is incomplete; expected "
                         + "Q/K/V weight+indices tensors")
             }
-            let environment = ProcessInfo.processInfo.environment
-            let arm = Qwen35IslandArm.fromEnvironment(environment)
-            if environment["DARKBLOOM_QWEN_MTP_ISLAND_ARM"] != nil
-                || environment["MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] != nil
+            if ProcessInfo.processInfo.environment[
+                "MLXFAST_QWEN_MTP_EXACT_QKV_ROWS"] != "0"
             {
-                // Witness that a research leg selected the arm it believes it
-                // ran. Silent when neither variable is set, so the shipped
-                // default writes exactly what it writes today.
-                arm.writeWitness()
-            }
-            if arm != .none {
                 layer.selfAttn.installExactQKVRows(
                     qWeight: qWeight, qIndices: qIndices, qOutputCount: 12_288,
                     kWeight: kWeight, kIndices: kIndices, kOutputCount: 1_024,
-                    vWeight: vWeight, vIndices: vIndices, vOutputCount: 1_024,
-                    arm: arm)
+                    vWeight: vWeight, vIndices: vIndices, vOutputCount: 1_024)
             }
         }
 
@@ -5643,7 +4426,7 @@ extension Qwen35TextModel: MTPCapable {
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = routedLMHead(lmHead, normed)
+            logits = lmHead(normed)
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
@@ -5663,7 +4446,7 @@ extension Qwen35TextModel: MTPCapable {
         let normed = model.norm(hidden)
         let logits: MLXArray
         if let lmHead {
-            logits = routedLMHead(lmHead, normed)
+            logits = lmHead(normed)
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
@@ -5727,7 +4510,7 @@ extension Qwen35TextModel: MTPCapable {
         if configuration.tieWordEmbeddings {
             logits = model.embedTokens.asLinear(mtpOut)
         } else {
-            logits = routedLMHead(lmHead!, mtpOut)
+            logits = lmHead!(mtpOut)
         }
         return (logits, mtpOut)
     }
@@ -5779,16 +4562,9 @@ extension Qwen35TextModel: MTPCapable {
     /// rows. Companion to `mtpHeadHiddenForward` for the rows that need logits.
     public func applyLMHead(_ x: MLXArray) -> MLXArray {
         if let lmHead {
-            return routedLMHead(lmHead, x)
+            return lmHead(x)
         }
         return model.embedTokens.asLinear(x)
-    }
-
-    /// `lmHead` with the candidate-owned wide QMV dispatch in front of it. The
-    /// vocabulary projection is the widest single matvec in the round, so it is
-    /// the largest beneficiary of the hoisted activation chunk sums.
-    func routedLMHead(_ head: Linear, _ x: MLXArray) -> MLXArray {
-        qwen35RoutedLinear(head, x)
     }
 
     /// Draft-only vocabulary projection: the declared head's coarser lm_head
@@ -5988,22 +4764,44 @@ extension Qwen35TextModel: MTPCapable {
             _draftProbeSort = makeQwen35ProbeSortKernel(
                 clusters: clusters, probes: probes)
         }
-        if qwen35RowTop32Enabled, _draftRowTop32 == nil {
-            _draftRowTop32 = Qwen35RowTop32(
-                rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
-        }
-        let hidden = configuration.hiddenSize
-        let centroidScore: MLXArray
-        if let y = qwen35ClusterCentroidQMV(
-            x, weight: centroidWeight, scales: centroidScales,
-            biases: centroidBiases, clusters: clusters, hidden: hidden)
-        {
-            centroidScore = y
-        } else {
-            centroidScore = quantizedMM(
-                x, centroidWeight, scales: centroidScales, biases: centroidBiases,
-                transpose: true, groupSize: 64, bits: 2, mode: .affine
-            ).reshaped([clusters])
+        let centroidScore = quantizedMM(
+            x, centroidWeight, scales: centroidScales, biases: centroidBiases,
+            transpose: true, groupSize: 64, bits: 2, mode: .affine
+        ).reshaped([clusters])
+        if qwen35E87SelectEnabled {
+            // Single-dispatch probe selection and single-dispatch shortlist:
+            // same sets as the `argPartition` chains below (same tie rule),
+            // same element order, ~21 fewer dispatches per draft step.
+            if _draftProbeSelect == nil {
+                _draftProbeSelect = makeQwen35E87ProbeSelectKernel(
+                    clusters: clusters, probes: probes)
+            }
+            if _draftShortlist == nil {
+                _draftShortlist = makeQwen35E87ShortlistKernel(
+                    probes: probes, rowsPerCluster: rowsPerCluster,
+                    topK: candidateCount)
+            }
+            let probedFast = _draftProbeSelect!(
+                [centroidScore],
+                grid: (qwen35E87SelectTG, 1, 1),
+                threadGroup: (qwen35E87SelectTG, 1, 1),
+                outputShapes: [[probes]],
+                outputDTypes: [.uint32]
+            )[0]
+            let rowScoreFast = gatherQuantizedMM(
+                x.reshaped([1, 1, configuration.hiddenSize]),
+                rowWeight, scales: rowScales, biases: rowBiases,
+                lhsIndices: _draftClusterLHS, rhsIndices: probedFast,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine,
+                sortedIndices: true
+            ).reshaped([probes * rowsPerCluster])
+            return _draftShortlist!(
+                [rowScoreFast, probedFast, perm],
+                grid: (qwen35E87SelectTG, 1, 1),
+                threadGroup: (qwen35E87SelectTG, 1, 1),
+                outputShapes: [[candidateCount]],
+                outputDTypes: [.uint32]
+            )[0]
         }
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
@@ -6022,28 +4820,13 @@ extension Qwen35TextModel: MTPCapable {
                 .asType(.uint32)
         }
 
-        let rowScore: MLXArray
-        if let y = qwen35ClusterRowQMV(
-            x, weight: rowWeight, scales: rowScales, biases: rowBiases,
-            probed: probed, clusters: clusters, rowsPerCluster: rowsPerCluster,
-            probes: probes, hidden: hidden)
-        {
-            rowScore = y
-        } else {
-            rowScore = gatherQuantizedMM(
-                x.reshaped([1, 1, configuration.hiddenSize]),
-                rowWeight, scales: rowScales, biases: rowBiases,
-                lhsIndices: _draftClusterLHS, rhsIndices: probed,
-                transpose: true, groupSize: 64, bits: 2, mode: .affine,
-                sortedIndices: true
-            ).reshaped([probes * rowsPerCluster])
-        }
-
-        if let rowTop32 = _draftRowTop32 {
-            qwen35RowTop32FusedDrafts += 1
-            return rowTop32(rowScore, probed, perm)
-        }
-        qwen35RowTop32ArgPartitionDrafts += 1
+        let rowScore = gatherQuantizedMM(
+            x.reshaped([1, 1, configuration.hiddenSize]),
+            rowWeight, scales: rowScales, biases: rowBiases,
+            lhsIndices: _draftClusterLHS, rhsIndices: probed,
+            transpose: true, groupSize: 64, bits: 2, mode: .affine,
+            sortedIndices: true
+        ).reshaped([probes * rowsPerCluster])
 
         let kth = probes * rowsPerCluster - candidateCount
         let local = MLX.argPartition(rowScore, kth: kth)[.ellipsis, (kth)...]
