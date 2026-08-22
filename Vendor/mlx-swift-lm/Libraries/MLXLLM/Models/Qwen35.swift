@@ -2213,8 +2213,12 @@ public enum Qwen35CustomQMV {
         else { return nil }
 
         if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
+            // E123: a producer kernel may have already emitted this tensor's
+            // chunk-sum table (bit-identical fill expression, fused behind the
+            // normed write). Consume it and skip the standalone fill dispatch.
+            let table = Qwen35XSumsRegistry.lookup(x) ?? xsumsTable(x)
             return matmulWithTable(
-                x, w, scales: scales, biases: biases, xsums: xsumsTable(x),
+                x, w, scales: scales, biases: biases, xsums: table,
                 groupSize: groupSize, bits: bits, mode: mode,
                 consume: arm == .sumTable)
         }
@@ -2625,6 +2629,172 @@ private let qwen35FusedResidualRMSNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: false
 )
 
+/// E123: the fused residual+RMSNorm kernel with the affine-4 chunk-sum table
+/// emitted as a third output. The verify-side wide QMV consumes a per-k-block
+/// activation sum table (`qwen35_custom_affine4_g64_xsums_v1`, one standalone
+/// fill dispatch per routed matmul today). The producer already holds one
+/// threadgroup per row, so after the `normed` write and a device fence, the
+/// threadgroup re-reads the just-written bf16 row and forms the table entries
+/// with the fill kernel's EXACT expression — three BF16 adds per
+/// vec<bfloat,4>, accumulated into a float across the four groups a lane
+/// owns, ascending `i` — so every table value is bit-identical to the
+/// standalone fill reading the same buffer, and the fill dispatch disappears
+/// from the round.
+private let qwen35FusedResidualRMSNormXSumsKernel = MLXFast.metalKernel(
+    name: "qwen35_fused_residual_rms_norm_xsums_v1",
+    inputNames: ["x", "r", "weight", "eps"],
+    outputNames: ["h", "normed", "xsums"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+        constexpr uint lsize = 1024;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint axis_size = uint(x_shape[x_ndim - 1]);
+        uint n_rows = 1;
+        for (int d = 0; d < x_ndim - 1; ++d) {
+            n_rows *= uint(x_shape[d]);
+        }
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        // x and r share the same shape [..., axis_size] with contiguous last dim.
+        ulong offset = ulong(row) * ulong(axis_size);
+
+        // -- accumulate sum of squares of BF16-rounded (x+r) --
+        float acc = 0.0f;
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    acc += float(hi) * float(hi);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        acc += float(hi) * float(hi);
+                    }
+                }
+            }
+        }
+
+        // Same reduction tree as rms_norm.metal rms_looped:
+        // simd_sum -> threadgroup barrier -> write per-simd sums ->
+        // barrier -> simd_sum over simd sums -> rsqrt.
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(axis_size) + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+
+        // -- write both the residual h and the weight-scaled normed output --
+        for (uint r_start = 0; r_start < axis_size; r_start += lsize * n_reads) {
+            uint elem = r_start + thread_id * n_reads;
+            if (elem + n_reads <= axis_size) {
+                for (uint i = 0; i < n_reads; ++i) {
+                    float xi = float(x[offset + elem + i]);
+                    float ri = float(r[offset + elem + i]);
+                    bfloat hi = bfloat(xi + ri);
+                    h[offset + elem + i] = hi;
+                    bfloat wi = weight[elem + i];
+                    normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                }
+            } else {
+                for (uint i = 0; i < n_reads; ++i) {
+                    if (elem + i < axis_size) {
+                        float xi = float(x[offset + elem + i]);
+                        float ri = float(r[offset + elem + i]);
+                        bfloat hi = bfloat(xi + ri);
+                        h[offset + elem + i] = hi;
+                        bfloat wi = weight[elem + i];
+                        normed[offset + elem + i] = wi * bfloat(float(hi) * inv_mean);
+                    }
+                }
+            }
+        }
+
+        // -- E123: chunk-sum table entries for this row --
+        // Make this threadgroup's `normed` writes visible to its own reads,
+        // then reproduce qwen35_custom_affine4_g64_xsums_v1 verbatim: lane
+        // owns 16 consecutive bf16 values, summed as vec<bfloat,4> element
+        // adds into a float accumulator in ascending i. Table layout
+        // [(kb*32+lane)*stride + row], stride = n_rows <= 8 ? 8 : 16 —
+        // identical to the standalone fill for the whole tensor.
+        threadgroup_barrier(mem_flags::mem_device);
+        const uint xs_kblocks = axis_size / 512;
+        const uint xs_stride = n_rows <= 8 ? 8 : 16;
+        const uint xs_slots = xs_kblocks * 32;
+        for (uint t = thread_id; t < xs_slots; t += lsize) {
+            const uint xs_kb = t / 32;
+            const uint xs_lane = t % 32;
+            const device bfloat16_t* xm =
+                reinterpret_cast<const device bfloat16_t*>(normed)
+                + offset + ulong(xs_kb) * 512 + ulong(xs_lane) * 16;
+            float s = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const vec<bfloat16_t, 4> xv =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
+                s += xv[0] + xv[1] + xv[2] + xv[3];
+            }
+            xsums[(xs_kb * 32 + xs_lane) * xs_stride + row] = s;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// E123 registry: producer-computed chunk-sum tables keyed by the identity of
+/// the normed tensor they describe. `Qwen35CustomQMV.matmul` consults this
+/// before launching a standalone fill. Bounded ring, host-thread only.
+enum Qwen35XSumsRegistry {
+    nonisolated(unsafe) private static var ring:
+        [(key: ObjectIdentifier, table: MLXArray)] = []
+    private static let capacity = 8
+
+    static func register(_ x: MLXArray, table: MLXArray) {
+        if ring.count >= capacity { ring.removeFirst() }
+        ring.append((ObjectIdentifier(x), table))
+    }
+
+    static func lookup(_ x: MLXArray) -> MLXArray? {
+        let key = ObjectIdentifier(x)
+        for entry in ring.reversed() where entry.key == key {
+            return entry.table
+        }
+        return nil
+    }
+}
+
+/// `MLX_E123_XSUMS=0` restores the standalone fill dispatches bit-for-bit.
+let qwen35E123ProducerXSumsEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E123_XSUMS"] != "0"
+
 /// Wraps the fused residual+RMSNorm kernel.  Returns `(residual, normed)` where
 /// `residual = bf16(x + r)` and `normed = weight * RMSNorm(residual)` with the
 /// same arithmetic as the eager `postAttentionLayerNorm(x + r)`.
@@ -2636,6 +2806,20 @@ func qwen35FusedResidualRMSNorm(
 ) -> (residual: MLXArray, normed: MLXArray) {
     let nRows = x.size / x.dim(-1)
     let shape = x.shape
+    let k = x.dim(-1)
+    if nRows >= 4, nRows <= 9, k % 512 == 0, qwen35E123ProducerXSumsEnabled {
+        let kBlocks = k / 512
+        let stride = nRows <= 8 ? 8 : 16
+        let outputs = qwen35FusedResidualRMSNormXSumsKernel(
+            [x, r, weight, MLXArray(eps)],
+            grid: (nRows * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [shape, shape, [kBlocks * 32 * stride]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        Qwen35XSumsRegistry.register(outputs[1], table: outputs[2])
+        return (outputs[0], outputs[1])
+    }
     let outputs = qwen35FusedResidualRMSNormKernel(
         [x, r, weight, MLXArray(eps)],
         grid: (nRows * 1024, 1, 1),
@@ -4551,6 +4735,187 @@ private let qwen35Top32Enabled: Bool =
 // ceil(CLUSTERS/32) words, scans the per-word popcounts, and emits set bits in
 // ascending order. Thread `t` owns the ascending word range [t*WPT, t*WPT+WPT)
 // and the scan is exclusive over `t`, so the emitted ids ascend globally.
+// MARK: - E87 single-dispatch selections (proposal side only)
+
+/// `MLX_E87_SELECT=0` restores the incumbent `argPartition` chains
+/// bit-for-bit. Proposal-side only: these kernels choose the SAME candidate
+/// sets the incumbent chooses (same tie rule), so the exact rerank that
+/// follows sees identical inputs and the emitted proposal cannot change.
+private let qwen35E87SelectEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLX_E87_SELECT"] != "0"
+
+/// 16-bit order-preserving key of a bf16-sourced float under the merge sort's
+/// (value asc, index asc) order, i.e. `qwen_top32_ordinal >> 16`. Exact for
+/// every bf16 value: bf16 -> f32 leaves the low 16 mantissa bits zero, so the
+/// positive branch truncates nothing and the negative branch (`~u`) drops a
+/// constant 0xFFFF. NaN ranks above every number; -0 folds into +0 so the pair
+/// ties and breaks by index, exactly as the incumbent.
+private let qwen35E87KeyHeader = """
+    inline ushort qwen_e87_key16(float v) {
+        if (isnan(v))  { return 0xFFFFu; }
+        if (v == 0.0f) { return 0x8000u; }
+        uint u = as_type<uint>(v);
+        uint o = (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+        return ushort(o >> 16);
+    }
+    """
+
+private let qwen35E87SelectTG = 1024
+
+/// Replaces `MLX.sorted(MLX.argPartition(score, kth: C - P)[(C - P)...])`
+/// (one 9-dispatch merge sort plus the probe compaction) with ONE dispatch.
+///
+/// The selected set is the P elements maximal under (key asc, index asc):
+/// every key above a threshold T, plus -- among the keys equal to T -- the
+/// highest indices until P is reached (the merge sort's stable tail breaks
+/// ties toward the higher index). T is found by two 8-bit histogram passes,
+/// the index cut by a popcount walk over a bitmap of the T-keyed indices.
+/// Thread `t` owns the contiguous index range [t*PT, t*PT+PT) and the final
+/// prefix scan is exclusive over `t`, so the emitted ids ascend globally.
+private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
+    -> MLXFast.MLXFastKernel
+{
+    MLXFast.metalKernel(
+        name: "qwen_mtp_e87_probe_select",
+        inputNames: ["score"],
+        outputNames: ["probed"],
+        source: """
+            constexpr uint CLUSTERS = \(clusters);
+            constexpr uint PROBES   = \(probes);
+            constexpr uint TG       = \(qwen35E87SelectTG);
+            constexpr uint PT       = (CLUSTERS + TG - 1u) / TG;
+            constexpr uint WORDS    = (CLUSTERS + 31u) / 32u;
+            constexpr uint NSIMD    = TG / 32u;
+            static_assert(PROBES >= 1u && PROBES <= CLUSTERS, "probe count");
+            static_assert(NSIMD == 32u, "scan assumes 32 simdgroups");
+
+            const uint tid  = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg   = simdgroup_index_in_threadgroup;
+            const uint base = tid * PT;
+
+            threadgroup atomic_uint hist[256];
+            threadgroup atomic_uint bits[WORDS];
+            threadgroup uint sel[8];
+            threadgroup uint sgsum[NSIMD];
+
+            ushort key[PT];
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                key[j] = (i < CLUSTERS) ? qwen_e87_key16(float(score[i])) : ushort(0);
+            }
+
+            // Pass 1: high byte.
+            for (uint x = tid; x < 256u; x += TG) {
+                atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = 0; j < PT; ++j) {
+                if (base + j < CLUSTERS) {
+                    atomic_fetch_add_explicit(&hist[uint(key[j]) >> 8], 1u, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                uint acc = 0u, b = 0u;
+                for (int x = 255; x >= 0; --x) {
+                    const uint c = atomic_load_explicit(&hist[x], memory_order_relaxed);
+                    if (acc + c >= PROBES) { b = uint(x); break; }
+                    acc += c;
+                }
+                sel[0] = b; sel[1] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint hi = sel[0];
+            const uint k1 = PROBES - sel[1];
+
+            // Pass 2: low byte among keys whose high byte is `hi`.
+            for (uint x = tid; x < 256u; x += TG) {
+                atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint j = 0; j < PT; ++j) {
+                if (base + j < CLUSTERS && (uint(key[j]) >> 8) == hi) {
+                    atomic_fetch_add_explicit(&hist[uint(key[j]) & 0xFFu], 1u, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                uint acc = 0u, c = 0u;
+                for (int x = 255; x >= 0; --x) {
+                    const uint n = atomic_load_explicit(&hist[x], memory_order_relaxed);
+                    if (acc + n >= k1) { c = uint(x); break; }
+                    acc += n;
+                }
+                sel[2] = c; sel[3] = acc;
+                sel[4] = atomic_load_explicit(&hist[c], memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const ushort T  = ushort((hi << 8) | sel[2]);
+            const uint   k2 = k1 - sel[3];
+            const uint   eq = sel[4];
+
+            // Index cut among the T-keyed elements: keep the k2 highest.
+            uint idxThr = 0u;
+            if (k2 < eq) {
+                for (uint w = tid; w < WORDS; w += TG) {
+                    atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint j = 0; j < PT; ++j) {
+                    const uint i = base + j;
+                    if (i < CLUSTERS && key[j] == T) {
+                        atomic_fetch_or_explicit(&bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0) {
+                    uint need = k2, thr = 0u;
+                    for (int w = int(WORDS) - 1; w >= 0; --w) {
+                        uint v = atomic_load_explicit(&bits[w], memory_order_relaxed);
+                        const uint pc = popcount(v);
+                        if (pc >= need) {
+                            for (uint k = 0; k + 1u < need; ++k) {
+                                v &= ~(1u << (31u - clz(v)));
+                            }
+                            thr = uint(w) * 32u + (31u - clz(v));
+                            break;
+                        }
+                        need -= pc;
+                    }
+                    sel[5] = thr;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                idxThr = sel[5];
+            }
+
+            // Compaction in ascending index order.
+            uint cnt = 0u;
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) { ++cnt; }
+            }
+            const uint incl = simd_prefix_inclusive_sum(cnt);
+            if (lane == 31u) { sgsum[sg] = incl; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                const uint v = sgsum[lane];
+                sgsum[lane] = simd_prefix_exclusive_sum(v);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint out = sgsum[sg] + incl - cnt;
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = base + j;
+                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) {
+                    probed[out++] = i;
+                }
+            }
+            """,
+        header: qwen35E87KeyHeader,
+        ensureRowContiguous: true
+    )
+}
+
 private let qwen35ProbeSortTG = 256
 
 private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
@@ -5412,6 +5777,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftClusterShape: [Int]?
     private var _draftClusterLHS: MLXArray?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
+    private var _draftProbeSelect: MLXFast.MLXFastKernel?
     private var _draftRowTop32: Qwen35RowTop32?
     // One attempt only: a head that cannot support a derived index must keep
     // the dense readout instead of re-deriving on every draft step.
@@ -5988,6 +6354,17 @@ extension Qwen35TextModel: MTPCapable {
             _draftProbeSort = makeQwen35ProbeSortKernel(
                 clusters: clusters, probes: probes)
         }
+        // E87 probe select (francip, promoted +0.72% at fac135f/bc070b7,
+        // then deleted by the 6f1cd66 whole-file overlay whose branch
+        // predates fac135f — restored here; the shortlist half stays with
+        // the ARM-C row-top32 kernels that superseded it). One dispatch
+        // replaces the 9-dispatch argPartition merge sort plus the
+        // probe-sort compaction, same (value asc, index asc) tie rule,
+        // ascending output ids.
+        if qwen35E87SelectEnabled, _draftProbeSelect == nil {
+            _draftProbeSelect = makeQwen35E87ProbeSelectKernel(
+                clusters: clusters, probes: probes)
+        }
         if qwen35RowTop32Enabled, _draftRowTop32 == nil {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
@@ -6007,9 +6384,17 @@ extension Qwen35TextModel: MTPCapable {
         }
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
-        let order = MLX.argPartition(centroidScore, kth: clusters - probes)
         let probed: MLXArray
-        if let sorter = _draftProbeSort {
+        if let selectK = _draftProbeSelect {
+            probed = selectK(
+                [centroidScore],
+                grid: (qwen35E87SelectTG, 1, 1),
+                threadGroup: (qwen35E87SelectTG, 1, 1),
+                outputShapes: [[probes]],
+                outputDTypes: [.uint32]
+            )[0]
+        } else if let sorter = _draftProbeSort {
+            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
             probed = sorter(
                 [order],
                 grid: (qwen35ProbeSortTG, 1, 1),
@@ -6018,6 +6403,7 @@ extension Qwen35TextModel: MTPCapable {
                 outputDTypes: [.uint32]
             )[0]
         } else {
+            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
             probed = MLX.sorted(order[.ellipsis, (clusters - probes)...])
                 .asType(.uint32)
         }
