@@ -1921,11 +1921,20 @@ template <typename T, int group_size, int bits, bool batched>
       // below 4096 outputs the reduced x-group count thins the grid, so the
       // promoted pair kernel is kept there byte-for-byte.
       switch (ntg.x) {
-        case 2:
-          qmv_fast_crossrow_affine4_g64<T, 2>(
+        case 2: {
+          // Same NA=2 geometry as the pair kernel, but the receipted
+          // DIRECT_NIBBLES wide helper (vec<T,4> loads + shifted nibble
+          // masks). tid.x==1 returns: host still launches M=2 x-groups.
+          const int first_m = int(tid.x) * 2;
+          if (first_m >= 2) {
+            return;
+          }
+          const int out_row = int(tid.y) * 8 + int(simd_gid) * 4;
+          qmv_fast_crossrow_affine4_g64_wide<T, 2, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              first_m, out_row, simd_lid);
           return;
+        }
         case 3:
           qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
