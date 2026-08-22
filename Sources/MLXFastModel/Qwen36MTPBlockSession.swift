@@ -538,7 +538,11 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // Restores 0dd455f0's validated qL{1..5} SDPA warm extension (receipt
+        // 3.2355→3.2414 in its note), removed by b40c28e's stale-base overlay.
+        // qL∈{2,3} are dispatched as chunk-B of width-7/8 verifies (see
+        // AttentionUtils exactness chunk).
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -564,7 +568,11 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
+            // Same provenance: restores 0dd455f0's validated qL{1..5} warm
+            // extension (receipt 3.2355→3.2414), removed by b40c28e's
+            // stale-base overlay. qL∈{2,3} hit as chunk-B of width-7/8
+            // verifies (AttentionUtils exactness chunk).
+            for qL in [1, 2, 3, 4, 5] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -709,7 +717,6 @@ public final class Qwen36MTPBlockSession {
     /// `MLXFAST_OFFICIAL_BENCHMARK_RUN=1`, so this stays local-only.
     private static let traceRounds =
         ProcessInfo.processInfo.environment["MLX_QWEN_MTP_TRACE"] == "1"
-
     /// Attribution probe only. `verify_build_us` measures the window in which
     /// the host builds the verify graph WHILE the asynchronously submitted head
     /// chain runs on the GPU, so a head-chain stall is indistinguishable from
@@ -1638,14 +1645,6 @@ public final class Qwen36MTPBlockSession {
                 // the same host work at a lower clock. E89 measures the same
                 // field on a second host under the same name and units.
                 + "host_thread_cpu_ns=\(Self.threadCPUNanoseconds() &- cpuRound0) "
-                // Which row-selection path the drafts of this run actually
-                // took, and the text that resolved the gate. A leg that
-                // exports nothing must read sel_env=unset with sel_argpart=0,
-                // which is the bare-leg proof that the fused kernels are the
-                // compiled default rather than an opt-in.
-                + "sel_env=\(qwen35RowTop32GateSource) "
-                + "sel_fused=\(qwen35RowTop32FusedDrafts) "
-                + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
