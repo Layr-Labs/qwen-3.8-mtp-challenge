@@ -985,8 +985,23 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
+  // E124 threadgroup-ID transpose swizzle: the host dispatches x-fastest over
+  // ((N+BN-1)/BN, (M+BM-1)/BM) threadgroups, so the row-blocks that share a
+  // weight column tile sit a full grid-row apart and each 4-bit weight is
+  // re-streamed from DRAM once per row-block. Remapping (tid.x, tid.y)
+  // through the linear index transposed makes those sharers adjacent in
+  // dispatch order so the column tile is served from cache after the first
+  // read. The remap is a bijection over the same grid: every output tile is
+  // still computed by exactly one threadgroup with an identical K loop,
+  // identical per-element dequant, and identical accumulation order, so the
+  // result is bit-exact regardless of scheduler behavior.
+  const int sw_gw = (N + BN - 1) / BN;
+  const int sw_gh = (M + BM - 1) / BM;
+  const int sw_lin = int(tid.y) * sw_gw + int(tid.x);
+  const int sw_x = sw_lin / sw_gh;
+  const int sw_y = sw_lin - sw_x * sw_gh;
+  const int y_row = sw_y * BM;
+  const int y_col = sw_x * BN;
 
   auto wl = (const device uint8_t*)w;
 

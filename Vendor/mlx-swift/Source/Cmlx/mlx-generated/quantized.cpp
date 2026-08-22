@@ -1524,8 +1524,16 @@ METAL_FUNC void qmm_t_impl(
   // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
+  // E124 threadgroup-ID transpose swizzle (see quantized_nax.cpp twin for
+  // the full rationale): bijective remap so row-blocks sharing a weight
+  // column tile are adjacent in dispatch order; bit-exact by construction.
+  const int sw_gw = (N + BN - 1) / BN;
+  const int sw_gh = (M + BM - 1) / BM;
+  const int sw_lin = int(tid.y) * sw_gw + int(tid.x);
+  const int sw_x = sw_lin / sw_gh;
+  const int sw_y = sw_lin - sw_x * sw_gh;
+  const int y_row = sw_y * BM;
+  const int y_col = sw_x * BN;
 
   auto wl = (const device uint8_t*)w;
 
