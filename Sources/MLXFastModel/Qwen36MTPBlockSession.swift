@@ -943,19 +943,18 @@ public final class Qwen36MTPBlockSession {
     }
 
     internal enum DepthPriceArm: String {
-        case ship, pb5, pb7, pbfit
+        case ship, pb5, pb7, pb8, pbfit
     }
 
     /// THE ONE LINE AN ARM SESSION PATCHES. `QwenMTPDepthPriceTests` pins the
     /// shipped value so a leg session cannot leave another arm behind.
     ///
-    /// The shipped default is `ship` (uniform). `pbfit` wins by -3.5 % on this
-    /// host's kernel dispatch table and loses that win entirely on the crown
-    /// table (E75 rung B/D: +0.33 % on crown, a +3.8 pp interaction). The
-    /// shape is fitted to one dispatch table, so it is a research arm, not a
-    /// shipped constant. Refit and re-price on the live table before shipping
-    /// any non-uniform shape.
-    internal static let depthPriceArm: DepthPriceArm = .ship
+    /// The shipped default prices the one remaining wide-QMV boundary. The
+    /// current verify kernel makes widths 6 and 7 single-pass while widths 8
+    /// and 9 retain the incumbent multi-pass schedule, so the first expensive
+    /// transition now enters width 8. Keep the total depth price unchanged and
+    /// move only its shape; `pbfit` remains tied to the superseded table.
+    internal static let depthPriceArm: DepthPriceArm = .pb8
 
     /// Built once. A computed property here would allocate two arrays on
     /// every round, inside the timed path.
@@ -964,6 +963,7 @@ public final class Qwen36MTPBlockSession {
         case .ship: return makeUniformDepthPrice()
         case .pb5: return makeBoundaryDepthPrice(enteringVerifyWidth: 5)
         case .pb7: return makeBoundaryDepthPrice(enteringVerifyWidth: 7)
+        case .pb8: return makeBoundaryDepthPrice(enteringVerifyWidth: 8)
         case .pbfit: return makeMeasuredDepthPrice()
         }
     }()
