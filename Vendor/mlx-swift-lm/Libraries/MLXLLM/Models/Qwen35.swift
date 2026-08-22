@@ -4153,6 +4153,8 @@ private let qwen35Top32Enabled: Bool =
 // ceil(CLUSTERS/32) words, scans the per-word popcounts, and emits set bits in
 // ascending order. Thread `t` owns the ascending word range [t*WPT, t*WPT+WPT)
 // and the scan is exclusive over `t`, so the emitted ids ascend globally.
+private let qwen35ProbeSortTG = 256
+
 // MARK: - E87 single-dispatch selections (proposal side only)
 
 /// `MLX_E87_SELECT=0` restores the incumbent `argPartition` chains
@@ -4334,8 +4336,198 @@ private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
     )
 }
 
-private let qwen35ProbeSortTG = 256
+/// Replaces `argPartition(rowScore, kth)[kth...]` (a 7-dispatch merge sort)
+/// plus the five-op probe/permutation lookup with ONE dispatch that emits the
+/// 32 shortlist candidate ids directly.
+///
+/// Each element is packed as `(key16 << 16) | index` (N < 65,536), so one
+/// `simd_max` per round ranks (key asc, index asc) exactly as the merge sort
+/// does. 32 rounds per simdgroup, then 32 rounds over the 32 x 32 survivors
+/// in simdgroup 0. Round r is the r-th largest, written at slot 31 - r so the
+/// output ascends like `argPartition`'s tail; the lookup
+/// `perm[probed[l / RPC] * RPC + l % RPC]` is the incumbent's, element-wise.
+private func makeQwen35E87ShortlistKernel(
+    probes: Int, rowsPerCluster: Int, topK: Int
+) -> MLXFast.MLXFastKernel {
+    MLXFast.metalKernel(
+        name: "qwen_mtp_e87_shortlist",
+        inputNames: ["score", "probed", "perm"],
+        outputNames: ["candidates"],
+        source: """
+            constexpr uint RPC   = \(rowsPerCluster);
+            constexpr uint N     = \(probes) * RPC;
+            constexpr uint TOPK  = \(topK);
+            constexpr uint TG    = \(qwen35E87SelectTG);
+            constexpr uint PT    = (N + TG - 1u) / TG;
+            constexpr uint NSIMD = TG / 32u;
+            constexpr uint PB    = (NSIMD * TOPK) / 32u;
+            constexpr uint NONE  = 0xFFFFFFFFu;
+            static_assert(N < 65536u, "index must fit in 16 bits");
+            static_assert(PT <= 32u, "PT exceeds taken-bitmask width");
+            static_assert(PB <= 32u, "PB exceeds tk2-bitmask width");
+            static_assert(NSIMD * TOPK >= TOPK, "survivor pool");
 
+            const uint tid  = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg   = simdgroup_index_in_threadgroup;
+
+            threadgroup uint sc[NSIMD * TOPK];
+
+            uint comp[PT];
+            uint taken = 0u;
+            for (uint j = 0; j < PT; ++j) {
+                const uint i = j * TG + tid;
+                if (i < N) {
+                    comp[j] = (uint(qwen_e87_key16(float(score[i]))) << 16) | i;
+                } else {
+                    comp[j] = 0u;
+                    taken |= (1u << j);
+                }
+            }
+            for (uint r = 0; r < TOPK; ++r) {
+                uint best = 0u, bs = NONE;
+                for (uint j = 0; j < PT; ++j) {
+                    if ((taken & (1u << j)) != 0u) { continue; }
+                    if (bs == NONE || comp[j] > best) { best = comp[j]; bs = j; }
+                }
+                const uint m = simd_max(best);
+                if (bs != NONE && best == m) { taken |= (1u << bs); }
+                if (lane == 0u) { sc[sg * TOPK + r] = m; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0u) {
+                uint o2[PB];
+                for (uint t = 0; t < PB; ++t) { o2[t] = sc[t * 32u + lane]; }
+                uint tk2 = 0u;
+                for (uint r = 0; r < TOPK; ++r) {
+                    uint best = 0u, bs = NONE;
+                    for (uint t = 0; t < PB; ++t) {
+                        if ((tk2 & (1u << t)) != 0u) { continue; }
+                        if (bs == NONE || o2[t] > best) { best = o2[t]; bs = t; }
+                    }
+                    const uint m = simd_max(best);
+                    if (bs != NONE && best == m) { tk2 |= (1u << bs); }
+                    if (lane == 0u) {
+                        const uint local = m & 0xFFFFu;
+                        const uint leaf  = uint(probed[local / RPC]);
+                        candidates[TOPK - 1u - r] =
+                            uint(perm[leaf * RPC + local % RPC]);
+                    }
+                }
+            }
+            """,
+        header: qwen35E87KeyHeader,
+        ensureRowContiguous: true
+    )
+}
+
+/// Offline equivalence gate for both E87 selection kernels against the
+/// incumbent chains on synthetic bf16 rows at the live shape, including rows
+/// quantised hard enough to force heavy ties and all-equal rows. Returns
+/// (checked, mismatches, firstBadTrial). Never called on a scored path.
+public func qwen35VerifyE87Select(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    trials: Int = 64, seed: UInt64 = 1
+) -> (Int, Int, Int) {
+    MLXRandom.seed(seed)
+    let topK = 32
+    let selectK = makeQwen35E87ProbeSelectKernel(clusters: clusters, probes: probes)
+    let shortK = makeQwen35E87ShortlistKernel(
+        probes: probes, rowsPerCluster: rowsPerCluster, topK: topK)
+    let perm = MLXRandom.permutation(clusters * rowsPerCluster).asType(.int32)
+    var bad = 0, firstBad = -1
+    for trial in 0 ..< trials {
+        func row(_ n: Int) -> MLXArray {
+            switch trial % 4 {
+            case 1: return (MLXRandom.normal([n]) * 4).round().asType(.bfloat16)
+            case 2: return MLX.zeros([n], dtype: .bfloat16)
+            case 3: return (MLXRandom.normal([n]) * 0.5).round().asType(.bfloat16)
+            default: return MLXRandom.normal([n]).asType(.bfloat16)
+            }
+        }
+        let score = row(clusters)
+        let kth = clusters - probes
+        let order = MLX.argPartition(score, kth: kth)
+        let probedRef = MLX.sorted(order[.ellipsis, (kth)...]).asType(.uint32)
+        let probedMine = selectK(
+            [score], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[probes]], outputDTypes: [.uint32])[0]
+        let rowScore = row(probes * rowsPerCluster)
+        let k2 = probes * rowsPerCluster - topK
+        let local = MLX.argPartition(rowScore, kth: k2)[.ellipsis, (k2)...]
+        let width = MLXArray(Int32(rowsPerCluster))
+        let permutedRow =
+            MLX.take(probedRef.asType(.int32), MLX.floorDivide(local, width), axis: 0)
+            * width + MLX.remainder(local, width)
+        let candRef = MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+        let candMine = shortK(
+            [rowScore, probedRef, perm], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[topK]], outputDTypes: [.uint32])[0]
+        eval(probedRef, probedMine, candRef, candMine)
+        let sameA = MLX.all(MLX.equal(probedRef, probedMine)).item(Bool.self)
+        let sameB = MLX.all(MLX.equal(candRef, candMine)).item(Bool.self)
+        if !(sameA && sameB) {
+            bad += 1
+            if firstBad < 0 { firstBad = trial }
+        }
+    }
+    return (trials, bad, firstBad)
+}
+
+/// Isolated micro-benchmark: incumbent chain vs the two kernels, per draft
+/// step, at the live shape. Returns (incumbentUs, mineUs).
+public func qwen35BenchE87Select(
+    clusters: Int = 12_292, rowsPerCluster: Int = 8, probes: Int = 3_073,
+    iters: Int = 200
+) -> (Double, Double) {
+    MLXRandom.seed(3)
+    let topK = 32
+    let selectK = makeQwen35E87ProbeSelectKernel(clusters: clusters, probes: probes)
+    let shortK = makeQwen35E87ShortlistKernel(
+        probes: probes, rowsPerCluster: rowsPerCluster, topK: topK)
+    let sorter = makeQwen35ProbeSortKernel(clusters: clusters, probes: probes)
+    let perm = MLXRandom.permutation(clusters * rowsPerCluster).asType(.int32)
+    let score = MLXRandom.normal([clusters]).asType(.bfloat16)
+    let rowScore = MLXRandom.normal([probes * rowsPerCluster]).asType(.bfloat16)
+    let width = MLXArray(Int32(rowsPerCluster))
+    func incumbent() -> MLXArray {
+        let kth = clusters - probes
+        let order = MLX.argPartition(score, kth: kth)
+        let probed = sorter(
+            [order], grid: (qwen35ProbeSortTG, 1, 1),
+            threadGroup: (qwen35ProbeSortTG, 1, 1),
+            outputShapes: [[probes]], outputDTypes: [.uint32])[0]
+        let k2 = probes * rowsPerCluster - topK
+        let local = MLX.argPartition(rowScore, kth: k2)[.ellipsis, (k2)...]
+        let permutedRow =
+            MLX.take(probed.asType(.int32), MLX.floorDivide(local, width), axis: 0)
+            * width + MLX.remainder(local, width)
+        return MLX.take(perm, permutedRow, axis: 0).asType(.uint32)
+    }
+    func mine() -> MLXArray {
+        let probed = selectK(
+            [score], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[probes]], outputDTypes: [.uint32])[0]
+        return shortK(
+            [rowScore, probed, perm], grid: (qwen35E87SelectTG, 1, 1),
+            threadGroup: (qwen35E87SelectTG, 1, 1),
+            outputShapes: [[topK]], outputDTypes: [.uint32])[0]
+    }
+    for _ in 0 ..< 10 { eval(incumbent()); eval(mine()) }
+    var t0 = Date()
+    for _ in 0 ..< iters { eval(incumbent()) }
+    let baseUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    t0 = Date()
+    for _ in 0 ..< iters { eval(mine()) }
+    let mineUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    return (baseUs, mineUs)
+}
+
+/// `MLX_E87_PROBE_SORT=0` restores the `MLX.sorted` path bit-for-bit. The
+/// `MLX_` prefix is load-bearing: the worker sanitizer drops `MLXFAST_*`.
 private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
     -> MLXFast.MLXFastKernel
 {
@@ -4958,6 +5150,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftClusterLHS: MLXArray?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
     private var _draftProbeSelect: MLXFast.MLXFastKernel?
+    private var _draftShortlist: MLXFast.MLXFastKernel?
     private var _draftRowTop32: Qwen35RowTop32?
     // One attempt only: a head that cannot support a derived index must keep
     // the dense readout instead of re-deriving on every draft step.
@@ -5534,17 +5727,6 @@ extension Qwen35TextModel: MTPCapable {
             _draftProbeSort = makeQwen35ProbeSortKernel(
                 clusters: clusters, probes: probes)
         }
-        // E87 probe select (francip, promoted +0.72% at fac135f/bc070b7,
-        // then deleted by the 6f1cd66 whole-file overlay whose branch
-        // predates fac135f — restored here; the shortlist half stays with
-        // the ARM-C row-top32 kernels that superseded it). One dispatch
-        // replaces the 9-dispatch argPartition merge sort plus the
-        // probe-sort compaction, same (value asc, index asc) tie rule,
-        // ascending output ids.
-        if qwen35E87SelectEnabled, _draftProbeSelect == nil {
-            _draftProbeSelect = makeQwen35E87ProbeSelectKernel(
-                clusters: clusters, probes: probes)
-        }
         if qwen35RowTop32Enabled, _draftRowTop32 == nil {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
@@ -5553,19 +5735,47 @@ extension Qwen35TextModel: MTPCapable {
             x, centroidWeight, scales: centroidScales, biases: centroidBiases,
             transpose: true, groupSize: 64, bits: 2, mode: .affine
         ).reshaped([clusters])
-        // `gatherQuantizedMM` is handed the probes in ascending index order,
-        // while the top-C arrive in partition order.
-        let probed: MLXArray
-        if let selectK = _draftProbeSelect {
-            probed = selectK(
+        if qwen35E87SelectEnabled {
+            // Single-dispatch probe selection and single-dispatch shortlist:
+            // same sets as the `argPartition` chains below (same tie rule),
+            // same element order, ~21 fewer dispatches per draft step.
+            if _draftProbeSelect == nil {
+                _draftProbeSelect = makeQwen35E87ProbeSelectKernel(
+                    clusters: clusters, probes: probes)
+            }
+            if _draftShortlist == nil {
+                _draftShortlist = makeQwen35E87ShortlistKernel(
+                    probes: probes, rowsPerCluster: rowsPerCluster,
+                    topK: candidateCount)
+            }
+            let probedFast = _draftProbeSelect!(
                 [centroidScore],
                 grid: (qwen35E87SelectTG, 1, 1),
                 threadGroup: (qwen35E87SelectTG, 1, 1),
                 outputShapes: [[probes]],
                 outputDTypes: [.uint32]
             )[0]
-        } else if let sorter = _draftProbeSort {
-            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
+            let rowScoreFast = gatherQuantizedMM(
+                x.reshaped([1, 1, configuration.hiddenSize]),
+                rowWeight, scales: rowScales, biases: rowBiases,
+                lhsIndices: _draftClusterLHS, rhsIndices: probedFast,
+                transpose: true, groupSize: 64, bits: 2, mode: .affine,
+                sortedIndices: true
+            ).reshaped([probes * rowsPerCluster])
+            return _draftShortlist!(
+                [rowScoreFast, probedFast, perm],
+                grid: (qwen35E87SelectTG, 1, 1),
+                threadGroup: (qwen35E87SelectTG, 1, 1),
+                outputShapes: [[candidateCount]],
+                outputDTypes: [.uint32]
+            )[0]
+        }
+
+        // `gatherQuantizedMM` is handed the probes in ascending index order,
+        // while the top-C arrive in partition order.
+        let order = MLX.argPartition(centroidScore, kth: clusters - probes)
+        let probed: MLXArray
+        if let sorter = _draftProbeSort {
             probed = sorter(
                 [order],
                 grid: (qwen35ProbeSortTG, 1, 1),
@@ -5574,7 +5784,6 @@ extension Qwen35TextModel: MTPCapable {
                 outputDTypes: [.uint32]
             )[0]
         } else {
-            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
             probed = MLX.sorted(order[.ellipsis, (clusters - probes)...])
                 .asType(.uint32)
         }
