@@ -538,7 +538,12 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        for qL in [1, 5, 4] {
+        // qL={2,3} added to {1,4,5}: the exactness chunk splits width-7/8/9
+        // verifies into a qL=5 chunk A plus a qL={2,3,4} chunk B, so deep
+        // rounds dispatch the qL=2 and qL=3 pipeline states too. Ranked
+        // receipts for exactly this extension on the pre-jump frontier:
+        // qL{1,4,5} 3.2355 -> qL{1..5} 3.2414, best draw 3.2452.
+        for qL in [1, 2, 3, 4, 5] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -564,7 +569,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            for qL in [1, 5, 4] {
+            for qL in [1, 2, 3, 4, 5] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -1637,14 +1642,6 @@ public final class Qwen36MTPBlockSession {
                 // the same host work at a lower clock. E89 measures the same
                 // field on a second host under the same name and units.
                 + "host_thread_cpu_ns=\(Self.threadCPUNanoseconds() &- cpuRound0) "
-                // Which row-selection path the drafts of this run actually
-                // took, and the text that resolved the gate. A leg that
-                // exports nothing must read sel_env=unset with sel_argpart=0,
-                // which is the bare-leg proof that the fused kernels are the
-                // compiled default rather than an opt-in.
-                + "sel_env=\(qwen35RowTop32GateSource) "
-                + "sel_fused=\(qwen35RowTop32FusedDrafts) "
-                + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
