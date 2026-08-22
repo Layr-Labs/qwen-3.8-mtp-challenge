@@ -1622,6 +1622,8 @@ private func qwen35E120QMVName(table: Bool, tier: Int?) -> String {
     switch (table, tier) {
     case (false, nil): return "qwen35_custom_affine4_g64_qmv_wide_v2"
     case (true, nil): return "qwen35_custom_affine4_g64_qmv_wide_sums_v2"
+    case (false, 2): return "qwen35_custom_affine4_g64_qmv_wide_na2_v2"
+    case (true, 2): return "qwen35_custom_affine4_g64_qmv_wide_sums_na2_v2"
     case (false, 3): return "qwen35_custom_affine4_g64_qmv_wide_na3_v2"
     case (false, 4): return "qwen35_custom_affine4_g64_qmv_wide_na4_v2"
     case (false, 5): return "qwen35_custom_affine4_g64_qmv_wide_na5_v2"
@@ -1754,7 +1756,7 @@ public enum Qwen35CustomQMV {
     }()
 
     public enum Entry: String, Sendable {
-        /// One switch over all seven routed widths.
+        /// One switch over all eight routed widths.
         case shared = "shared_switch"
         /// One entry point per distinct `ipg`.
         case tiered = "tiered_switch"
@@ -1774,9 +1776,10 @@ public enum Qwen35CustomQMV {
         return Entry(rawValue: raw) ?? .compiledDefault
     }()
 
-    /// Widths whose incumbent route is `qmv_fast_crossrow_affine4_g64_m`. M=1
-    /// and M=2 reach different kernels and are left to MLX.
-    public static let widths = 3 ... 9
+    /// Widths the candidate-owned dispatch may take. M=1 remains on MLX and
+    /// is shared by serial and speculative legs. E122b admits M=2 only for
+    /// measured small/medium output widths; M=3...9 retain their live plans.
+    public static let widths = 2 ... 9
 
     /// How the shared entry point is specialized for each routed width.
     ///
@@ -1820,22 +1823,22 @@ public enum Qwen35CustomQMV {
         /// M=9 stays on tier 3 in every plan. It is above the ranked verify
         /// cap of 8, so one pass there would add a pipeline and buy nothing.
         /// It cannot be dropped from the table either: the dispatch switch
-        /// routes `3 ... 9` with `default: break`, so a missing case is a
+        /// routes `2 ... 9` with `default: break`, so a missing case is a
         /// silent no-op round rather than a compile error.
         public var plan: [(m: Int, ipg: Int, rps: Int)] {
             switch self {
             case .shipped:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 3, 4), (7, 4, 4),
-                        (8, 4, 4), (9, 3, 4)]
+                return [(2, 2, 4), (3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 3, 4),
+                        (7, 4, 4), (8, 4, 4), (9, 3, 4)]
             case .onePass6:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4), (7, 4, 4),
-                        (8, 4, 4), (9, 3, 4)]
+                return [(2, 2, 4), (3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4),
+                        (7, 4, 4), (8, 4, 4), (9, 3, 4)]
             case .onePass67:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4), (7, 7, 4),
-                        (8, 4, 4), (9, 3, 4)]
+                return [(2, 2, 4), (3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4),
+                        (7, 7, 4), (8, 4, 4), (9, 3, 4)]
             case .onePass678:
-                return [(3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4), (7, 7, 4),
-                        (8, 8, 4), (9, 3, 4)]
+                return [(2, 2, 4), (3, 3, 4), (4, 4, 4), (5, 5, 4), (6, 6, 4),
+                        (7, 7, 4), (8, 8, 4), (9, 3, 4)]
             }
         }
 
@@ -1852,13 +1855,13 @@ public enum Qwen35CustomQMV {
         public var witness: String {
             switch self {
             case .shipped:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:3:4,7:4:4,8:4:4,9:3:4"
+                return "e120_width_plan/2:2:4,3:3:4,4:4:4,5:5:4,6:3:4,7:4:4,8:4:4,9:3:4"
             case .onePass6:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:6:4,7:4:4,8:4:4,9:3:4"
+                return "e120_width_plan/2:2:4,3:3:4,4:4:4,5:5:4,6:6:4,7:4:4,8:4:4,9:3:4"
             case .onePass67:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:6:4,7:7:4,8:4:4,9:3:4"
+                return "e120_width_plan/2:2:4,3:3:4,4:4:4,5:5:4,6:6:4,7:7:4,8:4:4,9:3:4"
             case .onePass678:
-                return "e120_width_plan/3:3:4,4:4:4,5:5:4,6:6:4,7:7:4,8:8:4,9:3:4"
+                return "e120_width_plan/2:2:4,3:3:4,4:4:4,5:5:4,6:6:4,7:7:4,8:8:4,9:3:4"
             }
         }
     }
@@ -2096,7 +2099,12 @@ public enum Qwen35CustomQMV {
     /// coding one host's timings, so this declines M=3 outright instead.
     public static let minimumTableWidth = 4
 
-    public static func tablePays(m: Int) -> Bool { m >= minimumTableWidth }
+    /// M=2 has a measured M5 crossover: the sum-table path wins through the
+    /// live N=34,816 projection family, but loses at N=98,336 and N=248,320.
+    /// The cap lies in the unused gap; N is always a multiple of eight here.
+    public static let maximumM2OutputWidth = 65_535
+
+    public static func tablePays(m: Int) -> Bool { m == 2 || m >= minimumTableWidth }
 
     /// True when the last two dimensions are densely packed, so the kernel's
     /// `row * rowStride + col` indexing reads the buffer as it stands.
@@ -2124,6 +2132,9 @@ public enum Qwen35CustomQMV {
         }
         let m = x.size / k
         guard Self.widths.contains(m), x.dim(-2) == m else { return nil }
+        // Saturated large M=2 readouts stay on MLX and pay no xsums fill.
+        // M>=3 keeps the promoted width-specialized plan byte-for-byte.
+        if m == 2 && n > Self.maximumM2OutputWidth { return nil }
         // `ensureRowContiguous: true` would keep a strided input correct by
         // copying it first. `quantizedMM` reads the stride directly, so hand
         // the cell back rather than pay for a copy the incumbent avoids.
