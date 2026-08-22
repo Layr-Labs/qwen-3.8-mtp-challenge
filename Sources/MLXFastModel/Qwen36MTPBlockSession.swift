@@ -418,35 +418,13 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            // Warm the SAME expression scored rounds dispatch:
-            // `callWithHiddenAndNormed`. Warming only `callWithHidden`
-            // leaves the published post-norm output to cold-JIT inside the
-            // first timed verify — the 7b33621 failure mode. (Promoted at
-            // 1d7876fd/be3361b, then deleted by a later whole-file overlay;
-            // restored byte-for-byte with this provenance note.)
-            let verifyLogits: MLXArray
-            let verifyNormed: MLXArray?
-            if width >= 2 {
-                let triple = model.callWithHiddenAndNormed(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 1)
-                verifyLogits = triple.0
-                verifyNormed = triple.2
-            } else {
-                let pair = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 0)
-                verifyLogits = pair.0
-                verifyNormed = nil
-            }
+            let (verifyLogits, _) = model.callWithHidden(
+                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
+                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
-            if let verifyNormed { warmBundle.append(verifyNormed) }
-            eval(warmBundle)
+            eval(verifyLogits, warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -467,13 +445,10 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _, oneRowReplayNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-                cache: oneRowReplayCache, nConfirmed: 1)
-        var oneRowBundle = [oneRowReplayLogits]
-        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
-        eval(oneRowBundle)
+        let (oneRowReplayLogits, _) = model.callWithHidden(
+            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+            cache: oneRowReplayCache, nConfirmed: 1)
+        eval(oneRowReplayLogits)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -563,11 +538,7 @@ public final class Qwen36MTPBlockSession {
         let headDim = extK.dim(3)
         let scale = 1 / Float(headDim).squareRoot()
         var outs: [MLXArray] = []
-        // Restores 0dd455f0's validated qL{1..5} SDPA warm extension (receipt
-        // 3.2355→3.2414 in its note), removed by b40c28e's stale-base overlay.
-        // qL∈{2,3} are dispatched as chunk-B of width-7/8 verifies (see
-        // AttentionUtils exactness chunk).
-        for qL in [1, 2, 3, 4, 5] {
+        for qL in [1, 5, 4] {
             let q = MLXArray.zeros(
                 [extK.dim(0), qHeads, qL, headDim], dtype: extK.dtype)
             outs.append(
@@ -593,11 +564,7 @@ public final class Qwen36MTPBlockSession {
             let k1025 = concatenated([extK, kPad1], axis: 2)
             let v1025 = concatenated([extV, vPad1], axis: 2)
             var outs1025: [MLXArray] = []
-            // Same provenance: restores 0dd455f0's validated qL{1..5} warm
-            // extension (receipt 3.2355→3.2414), removed by b40c28e's
-            // stale-base overlay. qL∈{2,3} hit as chunk-B of width-7/8
-            // verifies (AttentionUtils exactness chunk).
-            for qL in [1, 2, 3, 4, 5] {
+            for qL in [1, 5, 4] {
                 let q = MLXArray.zeros(
                     [k1025.dim(0), qHeads, qL, headDim], dtype: k1025.dtype)
                 outs1025.append(
@@ -1816,18 +1783,6 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
-            // E020 replay-prefetch (promoted +0.039%, then deleted by a
-            // whole-file overlay in 6209702 whose author never opened this
-            // file — see Amal-David's crown-tree audit note 062ba58): submit
-            // the restored GDN boundary states asynchronously so the next
-            // round's draft chain does not stall on their first use.
-            // Re-validated 2026-08-21: ranked pair a5cd3ef vs ccc5184
-            // moved +0.033%, reproducing the promoted receipt within noise.
-            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
-                guard let arrays = entry as? ArraysCache else { return nil }
-                return arrays[1]
-            }
-            asyncEval(replayedRecurrentStates)
             return true
         }
 
