@@ -1774,6 +1774,16 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
+            // E020 replay-prefetch (promoted +0.039%, then deleted by a
+            // whole-file overlay in 6209702 whose author never opened this
+            // file — see Amal-David's crown-tree audit note 062ba58): submit
+            // the restored GDN boundary states asynchronously so the next
+            // round's draft chain does not stall on their first use.
+            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
+                guard let arrays = entry as? ArraysCache else { return nil }
+                return arrays[1]
+            }
+            asyncEval(replayedRecurrentStates)
             return true
         }
 
