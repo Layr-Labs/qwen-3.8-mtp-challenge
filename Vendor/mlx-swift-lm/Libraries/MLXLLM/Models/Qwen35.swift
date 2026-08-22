@@ -3065,7 +3065,7 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
     outputNames: ["token_id"],
     source: """
         constexpr uint TG_SIZE    = 256;
-        constexpr uint TOPK       = 32;
+        constexpr uint TOPK       = 64;
         constexpr uint SIMD_SIZE  = 32;
         constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
         constexpr uint K          = 5120;
@@ -3073,11 +3073,22 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
         constexpr uint K_GROUPS   = 80;
         constexpr uint VALUES_PER_LANE = 16;
         constexpr uint BLOCK      = 512;
-        static_assert(NSIMD * 4 == TOPK, "one four-row dot tile per SIMDgroup");
+        constexpr uint ROWS_PER_SG = TOPK / NSIMD;
+        static_assert(ROWS_PER_SG % 4 == 0,
+            "four-row dot tiles must tile each SIMDgroup's rows exactly");
+        static_assert(TOPK % SIMD_SIZE == 0,
+            "the final reduce folds whole candidates per lane");
 
         uint lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
-        uint candidate_base = sg * 4;
+
+        threadgroup float exact_scores[TOPK];
+        // Each SIMDgroup owns ROWS_PER_SG consecutive candidates as 4-row dot
+        // tiles. Register pressure matches the promoted 32-wide build (one
+        // K-pass live at a time); at TOPK == NSIMD*4 the loop runs once and
+        // the emitted code is identical to it.
+        for (uint tile = 0; tile < ROWS_PER_SG; tile += 4) {
+        uint candidate_base = sg * ROWS_PER_SG + tile;
         float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
         for (uint k = 0; k < K; k += BLOCK) {
@@ -3115,19 +3126,29 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
                 result[r] += scale * accum + sum * bias;
             }
         }
-
-        threadgroup float exact_scores[TOPK];
         for (uint r = 0; r < 4; ++r) {
             float reduced = simd_sum(result[r]);
             if (lane == 0) {
                 exact_scores[candidate_base + r] = float(InT(reduced));
             }
         }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sg == 0) {
             float best_value = exact_scores[lane];
             uint best_id = uint(candidate_ids[lane]);
+            // TOPK may exceed SIMD_SIZE: fold each lane's remaining candidate
+            // slots into its running best under the same strict (value, id)
+            // total order before the butterfly reduce. Dead at TOPK == 32.
+            for (uint alt = lane + SIMD_SIZE; alt < TOPK; alt += SIMD_SIZE) {
+                if (qwen_draft_selected_rerank_better(
+                        exact_scores[alt], uint(candidate_ids[alt]),
+                        best_value, best_id)) {
+                    best_value = exact_scores[alt];
+                    best_id = uint(candidate_ids[alt]);
+                }
+            }
             for (uint offset = 16; offset > 0; offset >>= 1) {
                 float other_value = simd_shuffle_down(best_value, offset);
                 uint other_id = simd_shuffle_down(best_id, offset);
@@ -3199,7 +3220,7 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
 // identity would suffice. Element-wise identity is a strictly stronger
 // property and makes the offline gate a plain array equality.
 private let qwen35Top32RealCount    = 98_330
-private let qwen35Top32K            = 32
+private let qwen35Top32K            = 64
 private let qwen35Top32TG           = 256
 private let qwen35Top32Tiles        = 64
 private let qwen35Top32Stride       = qwen35Top32Tiles * qwen35Top32TG
@@ -3698,7 +3719,7 @@ private func makeQwen35E87ShortlistKernel(
             constexpr uint NONE  = 0xFFFFFFFFu;
             static_assert(N < 65536u, "index must fit in 16 bits");
             static_assert(PT <= 32u, "PT exceeds taken-bitmask width");
-            static_assert(PB <= 32u, "PB exceeds tk2-bitmask width");
+            static_assert(PB <= 64u, "PB exceeds tk2-bitmask width");
             static_assert(NSIMD * TOPK >= TOPK, "survivor pool");
 
             const uint tid  = thread_position_in_threadgroup.x;
@@ -3732,15 +3753,24 @@ private func makeQwen35E87ShortlistKernel(
             if (sg == 0u) {
                 uint o2[PB];
                 for (uint t = 0; t < PB; ++t) { o2[t] = sc[t * 32u + lane]; }
-                uint tk2 = 0u;
+                // Survivor mask: TOPK > 32 needs 64 bits, so the low and high
+                // halves of the survivor pool live in separate words. At
+                // TOPK <= 32 hi is always zero and this is the incumbent.
+                uint tk2 = 0u, tk2hi = 0u;
                 for (uint r = 0; r < TOPK; ++r) {
                     uint best = 0u, bs = NONE;
                     for (uint t = 0; t < PB; ++t) {
-                        if ((tk2 & (1u << t)) != 0u) { continue; }
+                        const bool gone =
+                            t < 32u ? ((tk2 & (1u << t)) != 0u)
+                                    : ((tk2hi & (1u << (t - 32u))) != 0u);
+                        if (gone) { continue; }
                         if (bs == NONE || o2[t] > best) { best = o2[t]; bs = t; }
                     }
                     const uint m = simd_max(best);
-                    if (bs != NONE && best == m) { tk2 |= (1u << bs); }
+                    if (bs != NONE && best == m) {
+                        if (bs < 32u) { tk2 |= (1u << bs); }
+                        else { tk2hi |= (1u << (bs - 32u)); }
+                    }
                     if (lane == 0u) {
                         const uint local = m & 0xFFFFu;
                         const uint leaf  = uint(probed[local / RPC]);
@@ -4227,7 +4257,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private static let compactDraftRealCount =
         compactDraftPrefixCount + compactDraftControlEnd - compactDraftControlStart
     private static let compactDraftPaddedCount = 98_336
-    private static let draftRerankCandidateCount = 32
+    private static let draftRerankCandidateCount = 64
     // Derived cluster index. Eight rows per leaf and eight refinement passes
     // are the screened settings; the centroid table stays 2-bit like the rows
     // it indexes.
