@@ -1127,11 +1127,14 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     const device T* xm = x + k + simd_lid * values_per_thread;
     float sum = 0.0f;
     for (int i = 0; i < values_per_thread; i += 4) {
-      x0[i] = static_cast<float>(xm[i]);
-      x0[i + 1] = static_cast<float>(xm[i + 1]);
-      x0[i + 2] = static_cast<float>(xm[i + 2]);
-      x0[i + 3] = static_cast<float>(xm[i + 3]);
-      sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+      const vec<T, 4> xv = *reinterpret_cast<const device vec<T, 4>*>(xm + i);
+      x0[i] = static_cast<float>(xv[0]);
+      x0[i + 1] = static_cast<float>(xv[1]);
+      x0[i + 2] = static_cast<float>(xv[2]);
+      x0[i + 3] = static_cast<float>(xv[3]);
+      // Preserve the incumbent BF16 expression tree used for the affine
+      // bias correction; only the activation gather width changes.
+      sum += xv[0] + xv[1] + xv[2] + xv[3];
     }
 
     for (int r = 0; r < rows_per_simd; r++) {
