@@ -977,7 +977,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     int first_m,
     int out_row,
     uint simd_lid) {
-  static_assert(NA >= 2 && NA <= 4, "wide multi-row QMV supports NA in [2, 4]");
+  static_assert(NA >= 2 && NA <= 5, "wide multi-row QMV supports NA in [2, 5]");
   typedef vec<float, NA> VF;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -1020,13 +1020,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
             simd_lid * values_per_thread + 4 * i;
         thread float xc[4];
         if (DIRECT_NIBBLES) {
-          xc[0] = static_cast<float>(xm[0]);
-          xc[1] = static_cast<float>(xm[1]);
-          xc[2] = static_cast<float>(xm[2]);
-          xc[3] = static_cast<float>(xm[3]);
+          const vec<T, 4> xv = *reinterpret_cast<const device vec<T, 4>*>(xm);
+          xc[0] = static_cast<float>(xv[0]);
+          xc[1] = static_cast<float>(xv[1]);
+          xc[2] = static_cast<float>(xv[2]);
+          xc[3] = static_cast<float>(xv[3]);
           // Preserve the incumbent BF16 expression tree used for the affine
           // bias correction; only the qdot nibble extraction changes.
-          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+          sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
         } else {
           sums[m] += load_vector<T, float, 4, 4>(xm, xc);
         }
@@ -1936,7 +1937,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+          qmv_fast_crossrow_affine4_g64_m<T, 5, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;

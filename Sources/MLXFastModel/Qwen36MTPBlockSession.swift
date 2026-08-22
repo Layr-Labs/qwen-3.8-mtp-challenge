@@ -1637,6 +1637,14 @@ public final class Qwen36MTPBlockSession {
                 // the same host work at a lower clock. E89 measures the same
                 // field on a second host under the same name and units.
                 + "host_thread_cpu_ns=\(Self.threadCPUNanoseconds() &- cpuRound0) "
+                // Which row-selection path the drafts of this run actually
+                // took, and the text that resolved the gate. A leg that
+                // exports nothing must read sel_env=unset with sel_argpart=0,
+                // which is the bare-leg proof that the fused kernels are the
+                // compiled default rather than an opt-in.
+                + "sel_env=\(qwen35RowTop32GateSource) "
+                + "sel_fused=\(qwen35RowTop32FusedDrafts) "
+                + "sel_argpart=\(qwen35RowTop32ArgPartitionDrafts) "
                 + scheduleTrace + "\n"
             Self.traceWrite(line)
             // Absolute anchors on the mach uptime clock, so an offline reader
