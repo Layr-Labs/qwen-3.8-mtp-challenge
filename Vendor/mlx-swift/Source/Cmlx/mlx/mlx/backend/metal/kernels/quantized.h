@@ -976,13 +976,18 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     const int out_vec_size,
     int first_m,
     int out_row,
-    uint simd_lid) {
-  static_assert(NA >= 2 && NA <= 4, "wide multi-row QMV supports NA in [2, 4]");
+    uint simd_gid,
+    uint simd_lid,
+    threadgroup float* sums_xchg) {
+  static_assert(NA >= 2 && NA <= 5, "wide multi-row QMV supports NA in [2, 5]");
   typedef vec<float, NA> VF;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_lane = 8;
+  constexpr bool SHARE_SUMS = NA <= 4;
+  constexpr int H = NA / 2;
+  const bool own_lo = simd_gid == 0;
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
 
@@ -1019,16 +1024,23 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         const device T* xm = x + (first_m + m) * in_vec_size + k +
             simd_lid * values_per_thread + 4 * i;
         thread float xc[4];
+        const bool owns_m = !SHARE_SUMS || ((m < H) == own_lo);
         if (DIRECT_NIBBLES) {
-          xc[0] = static_cast<float>(xm[0]);
-          xc[1] = static_cast<float>(xm[1]);
-          xc[2] = static_cast<float>(xm[2]);
-          xc[3] = static_cast<float>(xm[3]);
+          const vec<T, 4> xv = *reinterpret_cast<const device vec<T, 4>*>(xm);
+          xc[0] = static_cast<float>(xv[0]);
+          xc[1] = static_cast<float>(xv[1]);
+          xc[2] = static_cast<float>(xv[2]);
+          xc[3] = static_cast<float>(xv[3]);
           // Preserve the incumbent BF16 expression tree used for the affine
           // bias correction; only the qdot nibble extraction changes.
-          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
+          if (owns_m) {
+            sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
+          }
         } else {
-          sums[m] += load_vector<T, float, 4, 4>(xm, xc);
+          const float xsum = load_vector<T, float, 4, 4>(xm, xc);
+          if (owns_m) {
+            sums[m] += xsum;
+          }
         }
         a0[m] = xc[0];
         a1[m] = xc[1];
@@ -1048,6 +1060,20 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
                          a3 * (packed[r][i] & 0xf000));
         }
       }
+    }
+    if constexpr (SHARE_SUMS) {
+      for (int m = 0; m < NA; m++) {
+        if ((m < H) == own_lo) {
+          sums_xchg[m * SIMD_SIZE + simd_lid] = sums[m];
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int m = 0; m < NA; m++) {
+        if ((m < H) != own_lo) {
+          sums[m] = sums_xchg[m * SIMD_SIZE + simd_lid];
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (int r = 0; r < rows_per_simd; r++) {
       acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
@@ -1164,7 +1190,8 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
     const constant int& out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    threadgroup float* sums_xchg) {
   static_assert(M >= 3 && M <= 9, "wide multi-row QMV dispatch covers M in [3, 9]");
   static_assert(M % IPG != 1, "a one-input tail group is not instantiated");
   constexpr int TAIL = M % IPG;
@@ -1176,12 +1203,12 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   if (TAIL == 0 || M - first_m >= IPG) {
     qmv_fast_crossrow_affine4_g64_wide<T, IPG, DIRECT_NIBBLES>(
         w, scales, biases, x, y, in_vec_size, out_vec_size,
-        first_m, out_row, simd_lid);
+        first_m, out_row, simd_gid, simd_lid, sums_xchg);
   } else {
     qmv_fast_crossrow_affine4_g64_wide<
         T, (TAIL >= 2 ? TAIL : 2), DIRECT_NIBBLES>(
         w, scales, biases, x, y, in_vec_size, out_vec_size,
-        first_m, out_row, simd_lid);
+        first_m, out_row, simd_gid, simd_lid, sums_xchg);
   }
 }
 
@@ -1914,6 +1941,7 @@ template <typename T, int group_size, int bits, bool batched>
         simd_lid);
     return;
   }
+  threadgroup float sums_xchg[1 * 4 * 32];
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
@@ -1928,27 +1956,27 @@ template <typename T, int group_size, int bits, bool batched>
         case 3:
           qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         case 4:
           qmv_fast_crossrow_affine4_g64_m<T, 4, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+          qmv_fast_crossrow_affine4_g64_m<T, 5, 5, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         case 6:
           qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         case 7:
           qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         case 8:
           // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
@@ -1966,12 +1994,12 @@ template <typename T, int group_size, int bits, bool batched>
           // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         case 9:
           qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
-              tid, simd_gid, simd_lid);
+              tid, simd_gid, simd_lid, sums_xchg);
           return;
         default:
           break;
