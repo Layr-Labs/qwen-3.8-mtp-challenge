@@ -3761,6 +3761,122 @@ private let qwen35DraftSelectedAffine4RerankKernel = MLXFast.metalKernel(
 )
 
 // ---------------------------------------------------------------------------
+// E130 ROW-PARALLEL RERANK SPLIT
+//
+// The v1 kernel above runs all 32 candidate dots inside ONE threadgroup
+// (grid (256, 1, 1)): eight simdgroups walking dependent weight loads
+// serialize on a single SM's memory pipeline, and the dispatch measures
+// ~0.7 ms per draft against a ~102 KB byte floor. The rows are independent,
+// so per-row arithmetic is unchanged when each row moves to its own
+// simdgroup in its OWN threadgroup: same k-block order, same xv expression
+// tree, same scale*accum + sum*bias per block, same simd_sum reduction,
+// InT rounding applied before any comparison. A micro-kernel then reduces
+// the 32 rounded (value, id) pairs under the identical comparator and tie
+// rule. Proposal-side only — the target still verifies every token.
+private let qwen35DraftSelectedAffine4RerankPartialKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_selected_affine4_rerank_g64_partial_v1",
+    inputNames: ["x", "candidate_ids", "weight", "scales", "biases"],
+    outputNames: ["out_val", "out_id"],
+    source: """
+        constexpr uint K          = 5120;
+        constexpr uint K_WORDS    = 640;
+        constexpr uint K_GROUPS   = 80;
+        constexpr uint VALUES_PER_LANE = 16;
+        constexpr uint BLOCK      = 512;
+
+        uint lane = thread_index_in_simdgroup;
+        uint g = threadgroup_position_in_grid.x;
+        uint row = uint(candidate_ids[g]);
+        float result = 0.0f;
+
+        for (uint k = 0; k < K; k += BLOCK) {
+            float xv[VALUES_PER_LANE];
+            uint x_base = k + lane * VALUES_PER_LANE;
+            float sum = 0.0f;
+            for (uint i = 0; i < VALUES_PER_LANE; i += 4) {
+                sum += x[x_base + i] + x[x_base + i + 1]
+                    + x[x_base + i + 2] + x[x_base + i + 3];
+                xv[i] = x[x_base + i];
+                xv[i + 1] = x[x_base + i + 1] / 16.0f;
+                xv[i + 2] = x[x_base + i + 2] / 256.0f;
+                xv[i + 3] = x[x_base + i + 3] / 4096.0f;
+            }
+            uint word_base = row * K_WORDS + k / 8 + lane * 2;
+            uint p0 = weight[word_base];
+            uint p1 = weight[word_base + 1];
+            ushort packed[4] = {
+                ushort(p0 & 0xffffu), ushort(p0 >> 16),
+                ushort(p1 & 0xffffu), ushort(p1 >> 16)
+            };
+            uint group_index = row * K_GROUPS + k / 64 + lane / 4;
+            float scale = scales[group_index];
+            float bias = biases[group_index];
+            float accum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                accum +=
+                    xv[4 * i] * (packed[i] & 0x000f) +
+                    xv[4 * i + 1] * (packed[i] & 0x00f0) +
+                    xv[4 * i + 2] * (packed[i] & 0x0f00) +
+                    xv[4 * i + 3] * (packed[i] & 0xf000);
+            }
+            result += scale * accum + sum * bias;
+        }
+
+        float reduced = simd_sum(result);
+        if (lane == 0) {
+            out_val[g] = float(InT(reduced));
+            out_id[g] = row;
+        }
+    """,
+    header: """
+        typedef bfloat16_t InT;
+    """,
+    ensureRowContiguous: false
+)
+
+private let qwen35DraftSelectedAffine4RerankFinalKernel = MLXFast.metalKernel(
+    name: "qwen_mtp_draft_selected_affine4_rerank_g64_final_v1",
+    inputNames: ["out_val", "out_id"],
+    outputNames: ["token_id"],
+    source: """
+        uint lane = thread_index_in_threadgroup;
+        float best_value = out_val[lane];
+        uint best_id = out_id[lane];
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_value = simd_shuffle_down(best_value, offset);
+            uint other_id = simd_shuffle_down(best_id, offset);
+            if (lane < offset && qwen_draft_selected_rerank_better(
+                    other_value, other_id, best_value, best_id)) {
+                best_value = other_value;
+                best_id = other_id;
+            }
+        }
+        if (lane == 0) {
+            token_id[0] = int(
+                best_id < PREFIX_COUNT
+                    ? best_id
+                    : best_id + CONTROL_OFFSET);
+        }
+    """,
+    header: """
+        inline bool qwen_draft_selected_rerank_better(
+            float candidate_value,
+            uint candidate_id,
+            float current_value,
+            uint current_id
+        ) {
+            bool candidate_nan = isnan(candidate_value);
+            bool current_nan = isnan(current_value);
+            if (candidate_nan != current_nan) { return !candidate_nan; }
+            if (candidate_value > current_value) { return true; }
+            if (candidate_value < current_value) { return false; }
+            return candidate_id < current_id;
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+// ---------------------------------------------------------------------------
 // PROPOSAL-SIDE TOP-32 SHORTLIST
 //
 // Replaces `MLX.argPartition(coarse, kth: 98_298, axis: -1)[98_298...]`.
@@ -4153,187 +4269,6 @@ private let qwen35Top32Enabled: Bool =
 // ceil(CLUSTERS/32) words, scans the per-word popcounts, and emits set bits in
 // ascending order. Thread `t` owns the ascending word range [t*WPT, t*WPT+WPT)
 // and the scan is exclusive over `t`, so the emitted ids ascend globally.
-// MARK: - E87 single-dispatch selections (proposal side only)
-
-/// `MLX_E87_SELECT=0` restores the incumbent `argPartition` chains
-/// bit-for-bit. Proposal-side only: these kernels choose the SAME candidate
-/// sets the incumbent chooses (same tie rule), so the exact rerank that
-/// follows sees identical inputs and the emitted proposal cannot change.
-private let qwen35E87SelectEnabled: Bool =
-    ProcessInfo.processInfo.environment["MLX_E87_SELECT"] != "0"
-
-/// 16-bit order-preserving key of a bf16-sourced float under the merge sort's
-/// (value asc, index asc) order, i.e. `qwen_top32_ordinal >> 16`. Exact for
-/// every bf16 value: bf16 -> f32 leaves the low 16 mantissa bits zero, so the
-/// positive branch truncates nothing and the negative branch (`~u`) drops a
-/// constant 0xFFFF. NaN ranks above every number; -0 folds into +0 so the pair
-/// ties and breaks by index, exactly as the incumbent.
-private let qwen35E87KeyHeader = """
-    inline ushort qwen_e87_key16(float v) {
-        if (isnan(v))  { return 0xFFFFu; }
-        if (v == 0.0f) { return 0x8000u; }
-        uint u = as_type<uint>(v);
-        uint o = (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
-        return ushort(o >> 16);
-    }
-    """
-
-private let qwen35E87SelectTG = 1024
-
-/// Replaces `MLX.sorted(MLX.argPartition(score, kth: C - P)[(C - P)...])`
-/// (one 9-dispatch merge sort plus the probe compaction) with ONE dispatch.
-///
-/// The selected set is the P elements maximal under (key asc, index asc):
-/// every key above a threshold T, plus -- among the keys equal to T -- the
-/// highest indices until P is reached (the merge sort's stable tail breaks
-/// ties toward the higher index). T is found by two 8-bit histogram passes,
-/// the index cut by a popcount walk over a bitmap of the T-keyed indices.
-/// Thread `t` owns the contiguous index range [t*PT, t*PT+PT) and the final
-/// prefix scan is exclusive over `t`, so the emitted ids ascend globally.
-private func makeQwen35E87ProbeSelectKernel(clusters: Int, probes: Int)
-    -> MLXFast.MLXFastKernel
-{
-    MLXFast.metalKernel(
-        name: "qwen_mtp_e87_probe_select",
-        inputNames: ["score"],
-        outputNames: ["probed"],
-        source: """
-            constexpr uint CLUSTERS = \(clusters);
-            constexpr uint PROBES   = \(probes);
-            constexpr uint TG       = \(qwen35E87SelectTG);
-            constexpr uint PT       = (CLUSTERS + TG - 1u) / TG;
-            constexpr uint WORDS    = (CLUSTERS + 31u) / 32u;
-            constexpr uint NSIMD    = TG / 32u;
-            static_assert(PROBES >= 1u && PROBES <= CLUSTERS, "probe count");
-            static_assert(NSIMD == 32u, "scan assumes 32 simdgroups");
-
-            const uint tid  = thread_position_in_threadgroup.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint sg   = simdgroup_index_in_threadgroup;
-            const uint base = tid * PT;
-
-            threadgroup atomic_uint hist[256];
-            threadgroup atomic_uint bits[WORDS];
-            threadgroup uint sel[8];
-            threadgroup uint sgsum[NSIMD];
-
-            ushort key[PT];
-            for (uint j = 0; j < PT; ++j) {
-                const uint i = base + j;
-                key[j] = (i < CLUSTERS) ? qwen_e87_key16(float(score[i])) : ushort(0);
-            }
-
-            // Pass 1: high byte.
-            for (uint x = tid; x < 256u; x += TG) {
-                atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint j = 0; j < PT; ++j) {
-                if (base + j < CLUSTERS) {
-                    atomic_fetch_add_explicit(&hist[uint(key[j]) >> 8], 1u, memory_order_relaxed);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                uint acc = 0u, b = 0u;
-                for (int x = 255; x >= 0; --x) {
-                    const uint c = atomic_load_explicit(&hist[x], memory_order_relaxed);
-                    if (acc + c >= PROBES) { b = uint(x); break; }
-                    acc += c;
-                }
-                sel[0] = b; sel[1] = acc;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const uint hi = sel[0];
-            const uint k1 = PROBES - sel[1];
-
-            // Pass 2: low byte among keys whose high byte is `hi`.
-            for (uint x = tid; x < 256u; x += TG) {
-                atomic_store_explicit(&hist[x], 0u, memory_order_relaxed);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint j = 0; j < PT; ++j) {
-                if (base + j < CLUSTERS && (uint(key[j]) >> 8) == hi) {
-                    atomic_fetch_add_explicit(&hist[uint(key[j]) & 0xFFu], 1u, memory_order_relaxed);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                uint acc = 0u, c = 0u;
-                for (int x = 255; x >= 0; --x) {
-                    const uint n = atomic_load_explicit(&hist[x], memory_order_relaxed);
-                    if (acc + n >= k1) { c = uint(x); break; }
-                    acc += n;
-                }
-                sel[2] = c; sel[3] = acc;
-                sel[4] = atomic_load_explicit(&hist[c], memory_order_relaxed);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const ushort T  = ushort((hi << 8) | sel[2]);
-            const uint   k2 = k1 - sel[3];
-            const uint   eq = sel[4];
-
-            // Index cut among the T-keyed elements: keep the k2 highest.
-            uint idxThr = 0u;
-            if (k2 < eq) {
-                for (uint w = tid; w < WORDS; w += TG) {
-                    atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint j = 0; j < PT; ++j) {
-                    const uint i = base + j;
-                    if (i < CLUSTERS && key[j] == T) {
-                        atomic_fetch_or_explicit(&bits[i >> 5], 1u << (i & 31u), memory_order_relaxed);
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (tid == 0) {
-                    uint need = k2, thr = 0u;
-                    for (int w = int(WORDS) - 1; w >= 0; --w) {
-                        uint v = atomic_load_explicit(&bits[w], memory_order_relaxed);
-                        const uint pc = popcount(v);
-                        if (pc >= need) {
-                            for (uint k = 0; k + 1u < need; ++k) {
-                                v &= ~(1u << (31u - clz(v)));
-                            }
-                            thr = uint(w) * 32u + (31u - clz(v));
-                            break;
-                        }
-                        need -= pc;
-                    }
-                    sel[5] = thr;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                idxThr = sel[5];
-            }
-
-            // Compaction in ascending index order.
-            uint cnt = 0u;
-            for (uint j = 0; j < PT; ++j) {
-                const uint i = base + j;
-                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) { ++cnt; }
-            }
-            const uint incl = simd_prefix_inclusive_sum(cnt);
-            if (lane == 31u) { sgsum[sg] = incl; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (sg == 0u) {
-                const uint v = sgsum[lane];
-                sgsum[lane] = simd_prefix_exclusive_sum(v);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint out = sgsum[sg] + incl - cnt;
-            for (uint j = 0; j < PT; ++j) {
-                const uint i = base + j;
-                if (i < CLUSTERS && (key[j] > T || (key[j] == T && i >= idxThr))) {
-                    probed[out++] = i;
-                }
-            }
-            """,
-        header: qwen35E87KeyHeader,
-        ensureRowContiguous: true
-    )
-}
-
 private let qwen35ProbeSortTG = 256
 
 private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
@@ -4957,7 +4892,6 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftClusterShape: [Int]?
     private var _draftClusterLHS: MLXArray?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
-    private var _draftProbeSelect: MLXFast.MLXFastKernel?
     private var _draftRowTop32: Qwen35RowTop32?
     // One attempt only: a head that cannot support a derived index must keep
     // the dense readout instead of re-deriving on every draft step.
@@ -5534,17 +5468,6 @@ extension Qwen35TextModel: MTPCapable {
             _draftProbeSort = makeQwen35ProbeSortKernel(
                 clusters: clusters, probes: probes)
         }
-        // E87 probe select (francip, promoted +0.72% at fac135f/bc070b7,
-        // then deleted by the 6f1cd66 whole-file overlay whose branch
-        // predates fac135f — restored here; the shortlist half stays with
-        // the ARM-C row-top32 kernels that superseded it). One dispatch
-        // replaces the 9-dispatch argPartition merge sort plus the
-        // probe-sort compaction, same (value asc, index asc) tie rule,
-        // ascending output ids.
-        if qwen35E87SelectEnabled, _draftProbeSelect == nil {
-            _draftProbeSelect = makeQwen35E87ProbeSelectKernel(
-                clusters: clusters, probes: probes)
-        }
         if qwen35RowTop32Enabled, _draftRowTop32 == nil {
             _draftRowTop32 = Qwen35RowTop32(
                 rows: probes * rowsPerCluster, rowsPerCluster: rowsPerCluster)
@@ -5555,17 +5478,9 @@ extension Qwen35TextModel: MTPCapable {
         ).reshaped([clusters])
         // `gatherQuantizedMM` is handed the probes in ascending index order,
         // while the top-C arrive in partition order.
+        let order = MLX.argPartition(centroidScore, kth: clusters - probes)
         let probed: MLXArray
-        if let selectK = _draftProbeSelect {
-            probed = selectK(
-                [centroidScore],
-                grid: (qwen35E87SelectTG, 1, 1),
-                threadGroup: (qwen35E87SelectTG, 1, 1),
-                outputShapes: [[probes]],
-                outputDTypes: [.uint32]
-            )[0]
-        } else if let sorter = _draftProbeSort {
-            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
+        if let sorter = _draftProbeSort {
             probed = sorter(
                 [order],
                 grid: (qwen35ProbeSortTG, 1, 1),
@@ -5574,7 +5489,6 @@ extension Qwen35TextModel: MTPCapable {
                 outputDTypes: [.uint32]
             )[0]
         } else {
-            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
             probed = MLX.sorted(order[.ellipsis, (clusters - probes)...])
                 .asType(.uint32)
         }
@@ -5663,16 +5577,31 @@ extension Qwen35TextModel: MTPCapable {
             }
         }
 
-        return qwen35DraftSelectedAffine4RerankKernel(
+        // E130: row-parallel partial dots (32 threadgroups) + micro final
+        // reduce. Bit-identical to the v1 single-threadgroup kernel by
+        // construction; see the kernel block's provenance comment. Verified
+        // in vivo during development with a temporary both-paths assertion:
+        // every draft of a full local leg matched v1 token-for-token.
+        let rerankPartials = qwen35DraftSelectedAffine4RerankPartialKernel(
             [x.reshaped([configuration.hiddenSize]), candidateIDs,
              exact.weight, exact.scales, exactBiases],
+            template: [],
+            // grid is in THREADS: 32 threadgroups x 32 threads, one
+            // simdgroup per candidate row.
+            grid: (32 * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[32], [32]],
+            outputDTypes: [.float32, .uint32]
+        )
+        return qwen35DraftSelectedAffine4RerankFinalKernel(
+            [rerankPartials[0], rerankPartials[1]],
             template: [
                 ("PREFIX_COUNT", Self.compactDraftPrefixCount),
                 ("CONTROL_OFFSET",
                  Self.compactDraftControlStart - Self.compactDraftPrefixCount),
             ],
-            grid: (256, 1, 1),
-            threadGroup: (256, 1, 1),
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
             outputShapes: [[1, 1]],
             outputDTypes: [.int32]
         )[0]

@@ -418,35 +418,13 @@ public final class Qwen36MTPBlockSession {
             // Every drafting width verifies with nConfirmed: 1. Width two uses
             // the eager boundary checkpoint; wider blocks retain a replay
             // tape. Warm the same shapes the scored rounds dispatch.
-            // Warm the SAME expression scored rounds dispatch:
-            // `callWithHiddenAndNormed`. Warming only `callWithHidden`
-            // leaves the published post-norm output to cold-JIT inside the
-            // first timed verify — the 7b33621 failure mode. (Promoted at
-            // 1d7876fd/be3361b, then deleted by a later whole-file overlay;
-            // restored byte-for-byte with this provenance note.)
-            let verifyLogits: MLXArray
-            let verifyNormed: MLXArray?
-            if width >= 2 {
-                let triple = model.callWithHiddenAndNormed(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 1)
-                verifyLogits = triple.0
-                verifyNormed = triple.2
-            } else {
-                let pair = model.callWithHidden(
-                    input: LMInput.Text(
-                        tokens: MLXArray(block).reshaped([1, width])),
-                    cache: warmCache, nConfirmed: 0)
-                verifyLogits = pair.0
-                verifyNormed = nil
-            }
+            let (verifyLogits, _) = model.callWithHidden(
+                input: LMInput.Text(tokens: MLXArray(block).reshaped([1, width])),
+                cache: warmCache, nConfirmed: width >= 2 ? 1 : 0)
             // Compile the two top-2 reduction kernels outside the scored window
             // at every row count a round can dispatch.
             let (warmTop2IDs, warmTop2Values) = Self.linearTopTwoRows(verifyLogits)
-            var warmBundle: [MLXArray] = [verifyLogits, warmTop2IDs, warmTop2Values]
-            if let verifyNormed { warmBundle.append(verifyNormed) }
-            eval(warmBundle)
+            eval(verifyLogits, warmTop2IDs, warmTop2Values)
             eval(warmCache.flatMap { $0.state })
             if width >= 3 {
                 // Warm arbitrary-prefix replay T=2...8. Restore all but the
@@ -467,13 +445,10 @@ public final class Qwen36MTPBlockSession {
         // Width 2 stays on the validated eager K1 path, so compile this last
         // missing replay shape with one extra throwaway width-3 verify.
         let oneRowReplayCache = model.newCache(parameters: nil)
-        let (oneRowReplayLogits, _, oneRowReplayNormed) =
-            model.callWithHiddenAndNormed(
-                input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
-                cache: oneRowReplayCache, nConfirmed: 1)
-        var oneRowBundle = [oneRowReplayLogits]
-        if let oneRowReplayNormed { oneRowBundle.append(oneRowReplayNormed) }
-        eval(oneRowBundle)
+        let (oneRowReplayLogits, _) = model.callWithHidden(
+            input: LMInput.Text(tokens: MLXArray([0, 0, 0]).reshaped([1, 3])),
+            cache: oneRowReplayCache, nConfirmed: 1)
+        eval(oneRowReplayLogits)
         eval(oneRowReplayCache.flatMap { $0.state })
         precondition(model.replayRecurrentPrefix(
             cache: oneRowReplayCache, committedRows: 1))
@@ -1442,6 +1417,14 @@ public final class Qwen36MTPBlockSession {
             draftHidden = Self.lastHiddenRow(headHidden)
             draftId = model.draftTokenID(draftHidden)
             draftIdArrays.append(draftId)
+            // E131 PER-STEP SUBMISSION. Neutral on the bf16-head stack, where
+            // a step was GPU-bound (~10 ms GPU vs ~2.4 ms host build) so the
+            // build hid under execute. The declared q2-q4 head inverted that:
+            // ~4.2 ms of GPU work against ~2.5 ms of host graph build per
+            // step, so building steps 2..d with nothing submitted idled the
+            // device through most of the build. Submitting each step
+            // pipelines the two; no value changes, only submission timing.
+            asyncEval(draftId)
         }
         let tChainBuilt = Self.traceRounds
             ? DispatchTime.now().uptimeNanoseconds : 0
@@ -1816,18 +1799,6 @@ public final class Qwen36MTPBlockSession {
                     _ = entry.trim(entry.offset - committedOffset)
                 }
             }
-            // E020 replay-prefetch (promoted +0.039%, then deleted by a
-            // whole-file overlay in 6209702 whose author never opened this
-            // file — see Amal-David's crown-tree audit note 062ba58): submit
-            // the restored GDN boundary states asynchronously so the next
-            // round's draft chain does not stall on their first use.
-            // Re-validated 2026-08-21: ranked pair a5cd3ef vs ccc5184
-            // moved +0.033%, reproducing the promoted receipt within noise.
-            let replayedRecurrentStates = cache.compactMap { entry -> MLXArray? in
-                guard let arrays = entry as? ArraysCache else { return nil }
-                return arrays[1]
-            }
-            asyncEval(replayedRecurrentStates)
             return true
         }
 
