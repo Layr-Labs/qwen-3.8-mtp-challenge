@@ -1390,10 +1390,12 @@ private let qwen35CompiledFusedSwiGLU:
 //
 // Geometry. `quantized.cpp:253-254` launches `grid_dims(M, (N+7)/8, B)`
 // threadgroups of `(32, 2, 1)` threads. `custom_kernel.cpp:113-117` calls
-// `dispatch_threads`, which counts the grid in THREADS, so the identical
-// geometry is `grid: (M*32, (N/8)*2, 1)` with `threadGroup: (32, 2, 1)`.
-// `threadgroup_position_in_grid` and `simdgroup_index_in_threadgroup` then
-// carry the same values the incumbent reads.
+// `dispatch_threads`, which counts the grid in THREADS, so the original
+// replica used `grid: (M*32, (N/8)*2, 1)` with `threadGroup: (32, 2, 1)`.
+// The Swift launcher now retains exactly the leading `ceil(M/IPG)` working
+// groups and omits only later groups that return before any read or write;
+// every retained `threadgroup_position_in_grid` and simdgroup index is the
+// same value the incumbent reads.
 //
 // M is read from `x_shape` rather than from `threadgroups_per_grid.x`, because
 // the launched x-extent stops being M as soon as the dispatch is ours to
@@ -1701,6 +1703,27 @@ public enum Qwen35CustomQMV {
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
 
+    /// Number of input-row threadgroups that can execute real work for the
+    /// current shared QMV width table. The Metal body maps group `g` to
+    /// `first_m = g * IPG` and returns before any read or write when
+    /// `first_m >= M`; launching `M` groups therefore submitted 67--80 %
+    /// no-op groups at every routed width. Keep the table explicit so a future
+    /// width-plan edit must update this launch witness deliberately.
+    static func activeInputGroups(_ m: Int) -> Int {
+        let inputsPerGroup: Int
+        switch m {
+        case 3: inputsPerGroup = 3
+        case 4: inputsPerGroup = 4
+        case 5: inputsPerGroup = 5
+        case 6: inputsPerGroup = 3
+        case 7: inputsPerGroup = 4
+        case 8: inputsPerGroup = 4
+        case 9: inputsPerGroup = 3
+        default: preconditionFailure("Qwen wide QMV has no width plan for \(m)")
+        }
+        return (m + inputsPerGroup - 1) / inputsPerGroup
+    }
+
     /// The chunk-sum table costs one fill dispatch, measured at 4 to 6 us and
     /// close to flat in the table size, and repays it with recomputation the
     /// wide kernel no longer does. The gate is a pure function of the width: no
@@ -1804,7 +1827,7 @@ public enum Qwen35CustomQMV {
         return qwen35CustomAffine4QMVTableKernel(
             [w, scales, biases, x, xsums],
             template: [("USE_TABLE", consume)],
-            grid: (cell.m * 32, (cell.n / 8) * 2, 1),
+            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
@@ -1839,7 +1862,7 @@ public enum Qwen35CustomQMV {
         outShape[outShape.count - 1] = cell.n
         return qwen35CustomAffine4QMVKernel(
             [w, scales, biases, x],
-            grid: (cell.m * 32, (cell.n / 8) * 2, 1),
+            grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [outShape],
             outputDTypes: [.bfloat16]
@@ -4413,14 +4436,16 @@ private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
 private let qwen35ProbeSortEnabled: Bool =
     ProcessInfo.processInfo.environment["MLX_E87_PROBE_SORT"] != "0"
 
-/// Fraction of leaves probed per draft step. 0.15 is the screened cheaper
-/// cut: 1,844 of 12,292 leaves (ceil), 14,752 coarse rows instead of 24,584.
-/// The 0.25 default was the low-variance choice while the fitted model
-/// already preferred 0.15 (+2.02 % against +1.83 %). At these miss rates a
-/// 512-token leg expects under one changed proposal, so the ranked eight-
-/// prompt median is the resolver. The exact affine-4 rerank of the 32-row
-/// shortlist is unchanged.
-private let qwen35DerivedClusterProbeFraction: Double = 0.15
+/// Fraction of leaves probed per draft step. 0.25 removes 23.0 % of the
+/// declared head's per-draft bytes at a worst-domain argmax miss rate of
+/// 2.3e-4, 13x inside the accepted gate.
+///
+/// 0.15 screens better under the fitted acceptance penalty (+2.02 % against
+/// +1.83 %), but the whole difference lives inside that fitted coefficient,
+/// and no local leg can resolve it: at these miss rates a 512-token leg
+/// expects under one changed proposal. 0.25 is the low-variance choice and it
+/// is the byte point the r1 arm-C and r2 balanced sessions both measured.
+private let qwen35DerivedClusterProbeFraction: Double = 0.25
 
 /// `[m, s, c]` squared distance from every row to every centre, formed as
 /// `||x||^2 - 2 x.c + ||c||^2` so no `[m, s, D]` difference tensor exists.
