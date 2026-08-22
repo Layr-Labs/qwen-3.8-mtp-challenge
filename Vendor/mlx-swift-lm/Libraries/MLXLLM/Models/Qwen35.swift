@@ -3378,7 +3378,7 @@ final class Qwen35DecoderLayer: Module {
 /// once, so a scored run with the variable unset pays one set lookup per layer
 /// and behaves exactly as before.
 let qwen35DecodeLadderRungs: Set<Int> = {
-    let shipped: Set<Int> = [0, 1, 9, 19, 29, 39, 49, 57]
+    let shipped: Set<Int> = [0, 1, 9, 29, 49, 57]
     guard let raw = ProcessInfo.processInfo.environment["MLX_QWEN_MTP_LADDER"],
           !raw.isEmpty
     else { return shipped }
