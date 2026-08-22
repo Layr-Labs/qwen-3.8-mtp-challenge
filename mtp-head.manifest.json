@@ -1,9 +1,9 @@
 {
   "version": 1,
   "source": "remote",
-  "source_url": "hf:amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae6282749a52e052496dd5300b4aa441df7301e8",
-  "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
-  "bytes": 427742600,
+  "source_url": "hf:francip/qwen38-mtp-head-q2-q4-mlp3-v1@c815ec271af7e23d0aacb263a3e08b35c17d316d",
+  "sha256": "5b0b4944fd528ccce9c6ed8e3ea5d9df920eb4c7b03a6f8d0ec56fb9cf159dca",
+  "bytes": 394318808,
   "max_bytes": 2147483648,
-  "note": "The promoted affine-4/group-64 proposal head and affine-2 compact readout remain tensor-for-tensor pinned. The live PR #958 two-level cluster index and exact one-dispatch qwen_mtp_probe_sort compaction are unchanged and still form the same 32 compact row ids at probe fraction 0.25. A new proposal-only Metal tail evaluates those selected ids directly from the full affine-4/group-64 compact matrix, preserves qmv_fast BF16 rounding and the incumbent value/id total order, and maps the winning compact id in the same dispatch. This removes the prior gather_qmm plus separate reducer without changing the target forward pass, exact target top-2, emitted-token decision, cache journal, rollback, or trusted serial replay. The artifact remains immutable-revision and pinned to the runner's single-file model.safetensors tree digest; no remote code is executed."
+  "note": "amal-david/qwen38-mtp-head-q2-q4-rerank-v1@ae628274 with ONE change: layers.0.mlp.{gate,up,down}_proj re-quantized affine-3/group-64 directly from the organizer bf16 head (EigenLabs/Qwen3.8-27B-MTP-bf16@26a328e0, mlx 0.32.1 quantize). Every other tensor -- affine-4/g64 attention and fc, affine-2 compact draft_lm_head, bf16 precision islands -- is byte-identical to the parent. 34 MB fewer weight bytes per draft step (MLP 134 -> 100 MB); acceptance measured neutral on four mixed-difficulty local fixtures (283 vs 284 rounds, 741 vs 740 accepted drafts over 1,024 tokens). The loader reads each head projection's bit width and group size from its packed tensor shape (Qwen35.swift sanitize) and installs the matching QuantizedLinear before the quantization walk; default-geometry tensors take the unchanged stock path. Proposal side only: the pinned target decides every emitted token. Single-file model.safetensors tree digest; no remote code."
 }

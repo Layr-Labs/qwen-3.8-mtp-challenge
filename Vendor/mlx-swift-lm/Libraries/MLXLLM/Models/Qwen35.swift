@@ -4370,6 +4370,58 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
+        // DECLARED-HEAD PER-TENSOR QUANTIZATION GEOMETRY. A declared head is
+        // staged as a bare `model.safetensors` -- the runner fetches no
+        // config.json for it -- so the loader's quantization walk would wire
+        // every head projection at the TARGET checkpoint's global geometry
+        // (affine-4 / group-64). A head may legitimately pack a projection at
+        // another width (the proposal side carries no exactness constraint;
+        // only acceptance is at stake). The packed tensor states its own
+        // geometry: bits = 32 * packedColumns / inputDims, groupSize =
+        // inputDims / scaleColumns. Install a QuantizedLinear of that geometry
+        // BEFORE the walk, which skips modules that are already `Quantized`;
+        // the weights stay in the dictionary so the strict parameter update
+        // assigns the same arrays. Projections at the default geometry are
+        // left to the stock path untouched, so a 4-bit head loads exactly as
+        // before. Head side only: the target's `model.*` keys are never
+        // inspected here.
+        if let head = mtp {
+            var geometryUpdates: [(String, Module)] = []
+            for (path, module) in head.leafModules().flattened() {
+                guard let linear = module as? Linear, !(linear is QuantizedLinear),
+                      let packed = weights["mtp.\(path).weight"],
+                      packed.dtype == .uint32, packed.ndim == 2,
+                      let scales = weights["mtp.\(path).scales"],
+                      scales.ndim == 2
+                else { continue }
+                let inputDims = linear.weight.dim(1)
+                let outputDims = linear.weight.dim(0)
+                guard packed.dim(0) == outputDims, scales.dim(0) == outputDims,
+                      (32 * packed.dim(1)) % inputDims == 0,
+                      scales.dim(1) > 0, inputDims % scales.dim(1) == 0
+                else { continue }
+                let bits = 32 * packed.dim(1) / inputDims
+                let groupSize = inputDims / scales.dim(1)
+                guard [2, 3, 4, 5, 6, 8].contains(bits),
+                      [32, 64, 128].contains(groupSize),
+                      !(bits == 4 && groupSize == 64)
+                else { continue }
+                let biases = weights["mtp.\(path).biases"]
+                let quantized = QuantizedLinear(
+                    weight: packed,
+                    bias: weights["mtp.\(path).bias"],
+                    scales: scales,
+                    biases: biases,
+                    groupSize: groupSize,
+                    bits: bits,
+                    mode: .affine)
+                geometryUpdates.append((path, quantized))
+            }
+            if !geometryUpdates.isEmpty {
+                head.update(modules: ModuleChildren.unflattened(geometryUpdates))
+            }
+        }
+
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
