@@ -1562,7 +1562,7 @@ private let qwen35E120QMVHeader = """
 private func qwen35E120QMVSource(table: Bool) -> String {
     let sums = table ? "xsums" : "qmv_null_sums"
     let flag = table ? "USE_TABLE" : "false"
-    let cases = [(3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
+    let cases = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 3), (7, 4), (8, 4), (9, 3)]
         .map { m, ipg in
             """
                     case \(m):
@@ -1694,9 +1694,14 @@ public enum Qwen35CustomQMV {
         return Arm(rawValue: raw) ?? .sumTable
     }()
 
-    /// Widths whose incumbent route is `qmv_fast_crossrow_affine4_g64_m`. M=1
-    /// and M=2 reach different kernels and are left to MLX.
-    static let widths = 3 ... 9
+    /// Widths the candidate-owned dispatch may take. M=1 stays on MLX
+    /// (serial and the candidate share it, so speeding it does not move the
+    /// ratio). M=2 is the pair kernel `#1063` left on the library launcher;
+    /// E122 routes it through the same DIRECT_NIBBLES wide helper and the
+    /// same chunk-sum table as M>=4. M=3 stays replica-without-table: the
+    /// published grid sign-splits there, and a rival already owns the
+    /// `m==3 && n>=65536` cut.
+    static let widths = 2 ... 9
 
     /// Lane stride of the chunk-sum table, in floats.
     public static func sumsStride(_ m: Int) -> Int { m <= 8 ? 8 : 16 }
@@ -1724,10 +1729,16 @@ public enum Qwen35CustomQMV {
     /// test there. At M=3 the sign splits and the whole question is worth at
     /// most +62 us of a 68,410 us round (0.09%), against -90 us for taking
     /// every M=3 cell. A per-shape M=3 table would buy that 0.09% by hard
-    /// coding one host's timings, so this declines M=3 outright instead.
+    /// coding one host's timings, so this still declines M=3 outright.
+    ///
+    /// E122 adds M=2 to the table. Hidden prompts run narrower than the local
+    /// width-7 mix, so the pair kernel `#1063` left on MLX is the width the
+    /// ranked box actually hits between serial M=1 and the already-hoisted
+    /// M>=4 band. The fill is the same 4–6 us dispatch; lm_head at M=4 saved
+    /// 199 us on that grid, and M=2 still walks the same N output tiles.
     public static let minimumTableWidth = 4
 
-    public static func tablePays(m: Int) -> Bool { m >= minimumTableWidth }
+    public static func tablePays(m: Int) -> Bool { m == 2 || m >= minimumTableWidth }
 
     /// True when the last two dimensions are densely packed, so the kernel's
     /// `row * rowStride + col` indexing reads the buffer as it stands.
