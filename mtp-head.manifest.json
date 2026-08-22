@@ -5,5 +5,5 @@
   "sha256": "559b24ebca354018e4402fdb1f5af1afe5a0721bd2ebf04133500d846f7d5f71",
   "bytes": 427742600,
   "max_bytes": 2147483648,
-  "note": "qL{1..5} SDPA warm restore on morgan 60d5b34 after 05341264 failed compile (E121 stored properties were inserted inside MTPCapable extension). Head tensors remain pinned. Origin dropped qL{2,3} via whole-file overlay; this archive restores for qL in [1, 2, 3, 4, 5] only. E121 already on crown. No E87, no M=2, no radix probe-select. Proposal-only. No remote code."
+  "note": "E87 probe-select file-scope restore on newjordan 166e0ca after dacf7005 promoted qL{1..5}. Head tensors remain pinned. Restores qwen_mtp_e87_probe_select at FILE SCOPE (not inside MTPCapable). E121 QMV and qL warm untouched. No radix probe-select, no M=2. Proposal-only. No remote code is executed."
 }
