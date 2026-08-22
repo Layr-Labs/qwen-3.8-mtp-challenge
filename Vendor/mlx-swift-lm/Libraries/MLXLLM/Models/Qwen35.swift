@@ -1727,7 +1727,30 @@ public enum Qwen35CustomQMV {
     /// coding one host's timings, so this declines M=3 outright instead.
     public static let minimumTableWidth = 4
 
-    public static func tablePays(m: Int) -> Bool { m >= minimumTableWidth }
+    /// Output widths whose streamed weight bytes amortize the flat fill cost
+    /// at ANY legal width, including M = 3. The fill is one launch measured at
+    /// 4 to 6 us and close to flat in table size; the in-loop recomputation it
+    /// removes scales with the weight bytes one matvec streams,
+    /// `out_width * in_vec_size / 2` bytes for an affine-4 pack. At
+    /// `n >= minimumTableOutputWidth` and the routed floor `k >= 512` that is
+    /// >= 16 MiB of weight traffic per call, and at the k this family actually
+    /// ships (k >= 4096) it is >= 128 MiB — three orders of magnitude above
+    /// the flat fill cost at any plausible device bandwidth, on every host
+    /// this could rank on. The gate below therefore stays a pure function of
+    /// the routed cell geometry (m, n): no clock, no counter, no state that
+    /// survives a request, no per-shape timing table. On the pinned Qwen 3.8
+    /// tower exactly one shape family clears the bound — lm_head
+    /// (n = 151,936; every other routed output width is <= ~24,576) — which is
+    /// precisely the cell whose M=3 entry in the grid above is strongly
+    /// positive (+17.10 us net, the only m=3 cell with a sign that does not
+    /// split). The arithmetic is unchanged: the USE_TABLE instantiation of the
+    /// (M=3, IPG=3) template case is bit-identical to the recompute path by
+    /// the same 210-cell sweep that covers every routed shape, width and arm.
+    public static let minimumTableOutputWidth = 65536
+
+    public static func tablePays(m: Int, n: Int) -> Bool {
+        m >= minimumTableWidth || n >= minimumTableOutputWidth
+    }
 
     /// True when the last two dimensions are densely packed, so the kernel's
     /// `row * rowStride + col` indexing reads the buffer as it stands.
@@ -1828,7 +1851,7 @@ public enum Qwen35CustomQMV {
                 groupSize: groupSize, bits: bits, mode: mode)
         else { return nil }
 
-        if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m)) {
+        if arm == .fillNoConsume || (arm == .sumTable && tablePays(m: cell.m, n: cell.n)) {
             return matmulWithTable(
                 x, w, scales: scales, biases: biases, xsums: xsumsTable(x),
                 groupSize: groupSize, bits: bits, mode: mode,
