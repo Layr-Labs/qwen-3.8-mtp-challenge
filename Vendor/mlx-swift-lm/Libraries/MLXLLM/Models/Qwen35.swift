@@ -1609,6 +1609,127 @@ func qwen35AttentionQKRMSRoPE(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - History K RMS + KV pack (no RoPE)
+
+/// Proposal-head `appendHistoryKV` still pays eager `kNorm` + two layout
+/// transposes, then a separate RoPE launch. `#1048` fused RMS **and** RoPE
+/// (`qwen35_attention_k_rms_rope_bf16_v1`) and missed by 4.07% on live
+/// `fac135f`; the kernel is the miss, so this leftover does **not** restack
+/// it. It only folds the RMS + `[B,L,H,D] → [B,H,L,D]` pack for K and V.
+/// Eager `applyRotaryPosition` stays, so RoPE bytes match the crown.
+///
+/// Same RMS tree as the K half of `qwen35_attention_qk_rms_rope_bf16_v1`
+/// (`simd_sum → barrier → precise::rsqrt`, `weight * bfloat(float(x)*inv)`).
+/// V is a pure layout copy. One dispatch replaces `kNorm` + K transpose +
+/// V transpose. Fail closed onto the eager triple.
+private let qwen35AttentionKVRMSPackKernel = MLXFast.metalKernel(
+    name: "qwen35_attention_kv_rms_pack_bf16_v1",
+    inputNames: ["k", "v", "k_weight", "eps"],
+    outputNames: ["k_out", "v_out"],
+    source: """
+        constexpr uint n_reads = 4;
+        constexpr uint simd_size = 32;
+
+        uint row = threadgroup_position_in_grid.x;
+        uint thread_id = thread_position_in_threadgroup.x;
+        uint simd_thread = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+
+        uint batch_size = uint(k_shape[0]);
+        uint sequence_length = uint(k_shape[1]);
+        uint key_heads = uint(k_shape[2]);
+        uint axis_size = uint(k_shape[3]);
+
+        uint batch = row / (key_heads * sequence_length);
+        uint head_sequence = row % (key_heads * sequence_length);
+        uint head = head_sequence / sequence_length;
+        uint sequence = head_sequence % sequence_length;
+
+        ulong k_input_base = ulong(batch) * ulong(k_strides[0])
+            + ulong(sequence) * ulong(k_strides[1])
+            + ulong(head) * ulong(k_strides[2]);
+        ulong k_input_axis_stride = ulong(k_strides[3]);
+        ulong v_input_base = ulong(batch) * ulong(v_strides[0])
+            + ulong(sequence) * ulong(v_strides[1])
+            + ulong(head) * ulong(v_strides[2]);
+        ulong v_input_axis_stride = ulong(v_strides[3]);
+        ulong weight_stride = ulong(k_weight_strides[0]);
+        ulong output_base = ulong(row) * ulong(axis_size);
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[simd_size];
+
+        float acc = 0.0f;
+        uint first = thread_id * n_reads;
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong index = k_input_base + ulong(element) * k_input_axis_stride;
+                float value = float(k[index]);
+                acc += value * value;
+            }
+        }
+
+        acc = simd_sum(acc);
+        if (simd_group == 0) {
+            local_sums[simd_thread] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_thread == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[simd_thread]);
+            if (simd_thread == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_mean = local_inv_mean[0];
+        for (uint i = 0; i < n_reads; ++i) {
+            uint element = first + i;
+            if (element < axis_size) {
+                ulong k_index = k_input_base + ulong(element) * k_input_axis_stride;
+                ulong v_index = v_input_base + ulong(element) * v_input_axis_stride;
+                bfloat input_value = k[k_index];
+                bfloat rms_value = bfloat(float(input_value) * inv_mean);
+                bfloat weight = k_weight[ulong(element) * weight_stride];
+                k_out[output_base + ulong(element)] = weight * rms_value;
+                v_out[output_base + ulong(element)] = v[v_index];
+            }
+        }
+    """,
+    ensureRowContiguous: false
+)
+
+/// Internal for exact Metal parity tests. Inputs are `[B,L,H,D]`; outputs are
+/// row-contiguous `[B,H,L,D]` K (RMS-normalized, **not** RoPE'd) and V.
+func qwen35AttentionKVRMSPack(
+    keys: MLXArray,
+    values: MLXArray,
+    kWeight: MLXArray,
+    eps: Float
+) -> (keys: MLXArray, values: MLXArray) {
+    let B = keys.dim(0)
+    let L = keys.dim(1)
+    let keyHeads = keys.dim(2)
+    let D = keys.dim(3)
+    let totalRows = B * L * keyHeads
+    let outputs = qwen35AttentionKVRMSPackKernel(
+        [keys, values, kWeight, eps],
+        grid: (totalRows * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[B, keyHeads, L, D], [B, keyHeads, L, D]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Fused residual + RMS norm (PR #250 mechanism, receipt 2.9083)
 
 /// Fused `h = x + r` with `RMSNorm(h)` in one kernel launch.
@@ -2514,10 +2635,36 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
         var (keys, values) = kv(x)
-        keys = kNorm(keys.reshaped(B, L, kvHeads, -1))
-            .transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, kvHeads, -1)
         values = values.reshaped(B, L, kvHeads, -1)
-            .transposed(0, 2, 1, 3)
+        let hasArrayOffset = cache is CompilableRotatingKVCache
+            || cache is CompilableKVCache
+            || cache is BatchPositionedKVCache
+        // History flushes are L=2 (accept fold) or L~511 (seed prime). Fold
+        // kNorm + K/V layout only. Do **not** fuse RoPE: `#1048`
+        // `qwen35_attention_k_rms_rope_bf16_v1` missed −4.07% on live
+        // `fac135f`. Eager `applyRotaryPosition` keeps the crown's RoPE bytes.
+        if usesFusedQKPreparation,
+           L >= 1, L <= 512,
+           !hasArrayOffset,
+           keys.dtype == .bfloat16,
+           values.dtype == .bfloat16,
+           kNorm.weight.dtype == .bfloat16,
+           keys.shape == [B, L, kvHeads, headDim],
+           values.shape == [B, L, kvHeads, headDim],
+           kNorm.weight.shape == [headDim]
+        {
+            let packed = qwen35AttentionKVRMSPack(
+                keys: keys,
+                values: values,
+                kWeight: kNorm.weight,
+                eps: kNorm.eps)
+            keys = packed.keys
+            values = packed.values
+        } else {
+            keys = kNorm(keys).transposed(0, 2, 1, 3)
+            values = values.transposed(0, 2, 1, 3)
+        }
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
         _ = cache.update(keys: keys, values: values)
     }
