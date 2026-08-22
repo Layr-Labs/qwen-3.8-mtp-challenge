@@ -4130,10 +4130,337 @@ public nonisolated(unsafe) var qwen35RowTop32ArgPartitionDrafts: Int = 0
 
 /// `unset`, `0` or `1`, for the same trace line.
 public var qwen35RowTop32GateSource: String { qwen35RowTop32Resolved.source }
+public var qwen35ProbeSelectGateSource: String { qwen35ProbeSelectResolved.source }
 
 // `MLXFAST_QWEN_MTP_TOP32=0` restores the argPartition path bit-for-bit.
 private let qwen35Top32Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXFAST_QWEN_MTP_TOP32"] != "0"
+
+// ---------------------------------------------------------------------------
+// EXACT CENTROID TOP-C SELECTION
+//
+// `clusterCandidateIDs` only needs the SET of the highest `probes` centroid
+// scores, sorted by row id for `gatherQuantizedMM`. The previous expression
+// reached that set through `argPartition` and then `qwen_mtp_probe_sort`.
+// In this MLX revision ArgPartition is a full stable merge sort, so selecting
+// 3,073 rows out of 12,292 scores expands to eight dependent GPU dispatches;
+// the subsequent id sort is a ninth dispatch.
+//
+// This kernel performs the same operation in one threadgroup. Two byte-radix
+// passes locate the exact BF16 cutoff ordinal. The residual rank inside the
+// cutoff value locates its stable-index boundary, and a bitmap compaction emits
+// the selected row ids in ascending order. The selected set is therefore the
+// tail of the same total order as MLX's stable ascending sort:
+//
+//     (score ordinal ascending, original row id ascending)
+//
+// In particular, equal scores at the boundary retain the HIGHEST row ids,
+// every NaN ties above every number, and -0.0 ties +0.0. Those are the three
+// cases where a merely numeric threshold would silently change proposals.
+private let qwen35ProbeSelectTG = 256
+
+private func makeQwen35ProbeSelectKernel(clusters: Int, probes: Int)
+    -> MLXFast.MLXFastKernel
+{
+    precondition(clusters > 0 && probes > 0 && probes <= clusters)
+    return MLXFast.metalKernel(
+        name: "qwen_mtp_probe_select_radix_bf16_v2",
+        inputNames: ["score"],
+        outputNames: ["probed"],
+        source: """
+            constexpr uint CLUSTERS = \(clusters);
+            constexpr uint PROBES   = \(probes);
+            constexpr uint SKIP     = CLUSTERS - PROBES;
+            constexpr uint TG_SIZE  = \(qwen35ProbeSelectTG);
+            constexpr uint SIMD_SIZE = 32u;
+            constexpr uint NSIMD    = TG_SIZE / SIMD_SIZE;
+            constexpr uint WORDS    = (CLUSTERS + 31u) / 32u;
+            constexpr uint WPT      = (WORDS + TG_SIZE - 1u) / TG_SIZE;
+
+            uint tid = thread_position_in_threadgroup.x;
+            uint simd_group = simdgroup_index_in_threadgroup;
+
+            // One histogram per SIMD group avoids eight-way contention on the
+            // live score distribution. `histogram_total` is their 256-bucket
+            // reduction and is reused by both radix passes.
+            threadgroup atomic_uint histogram[NSIMD * 256u];
+            threadgroup uint histogram_total[256];
+            threadgroup atomic_uint bitmap[WORDS];
+            threadgroup uint base[TG_SIZE];
+            threadgroup uint prefix;
+            threadgroup uint prefix_mask;
+            threadgroup uint residual_rank;
+            threadgroup uint threshold_index;
+
+            if (tid == 0u) {
+                prefix = 0u;
+                prefix_mask = 0u;
+                residual_rank = SKIP;
+                threshold_index = 0u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Locate the ordinal of sorted[SKIP]. Each pass considers only
+            // values that matched all more-significant bytes selected so far.
+            for (uint pass = 0u; pass < 2u; ++pass) {
+                for (uint b = tid; b < NSIMD * 256u; b += TG_SIZE) {
+                    atomic_store_explicit(
+                        &histogram[b], 0u, memory_order_relaxed);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                uint shift = 8u - pass * 8u;
+                uint wanted_prefix = prefix;
+                uint wanted_mask = prefix_mask;
+                for (uint i = tid; i < CLUSTERS; i += TG_SIZE) {
+                    uint ordinal = qwen_probe_bf16_ordinal(float(score[i]));
+                    if ((ordinal & wanted_mask) == wanted_prefix) {
+                        atomic_fetch_add_explicit(
+                            &histogram[
+                                simd_group * 256u + ((ordinal >> shift) & 255u)],
+                            1u, memory_order_relaxed);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                uint total = 0u;
+                for (uint sg = 0u; sg < NSIMD; ++sg) {
+                    total += atomic_load_explicit(
+                        &histogram[sg * 256u + tid], memory_order_relaxed);
+                }
+                histogram_total[tid] = total;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid == 0u) {
+                    uint rank = residual_rank;
+                    uint below = 0u;
+                    uint bucket = 0u;
+                    for (; bucket < 256u; ++bucket) {
+                        uint count = histogram_total[bucket];
+                        if (rank < below + count) {
+                            rank -= below;
+                            break;
+                        }
+                        below += count;
+                    }
+                    prefix |= bucket << shift;
+                    prefix_mask |= 255u << shift;
+                    residual_rank = rank;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // `residual_rank` is the zero-based position of the cutoff within
+            // all rows having the cutoff ordinal. Materialise those equal rows
+            // as a bitmap and find that position in original-id order.
+            for (uint w = tid; w < WORDS; w += TG_SIZE) {
+                atomic_store_explicit(&bitmap[w], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint cutoff = prefix;
+            for (uint i = tid; i < CLUSTERS; i += TG_SIZE) {
+                if (qwen_probe_bf16_ordinal(float(score[i])) == cutoff) {
+                    atomic_fetch_or_explicit(
+                        &bitmap[i >> 5u], 1u << (i & 31u),
+                        memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                uint rank = residual_rank;
+                for (uint w = 0u; w < WORDS; ++w) {
+                    uint bits = atomic_load_explicit(
+                        &bitmap[w], memory_order_relaxed);
+                    uint count = popcount(bits);
+                    if (rank < count) {
+                        while (rank > 0u) {
+                            bits &= bits - 1u;
+                            --rank;
+                        }
+                        uint low = bits & (~bits + 1u);
+                        threshold_index = w * 32u + popcount(low - 1u);
+                        break;
+                    }
+                    rank -= count;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Build the exact selected-set bitmap. Stable sort keeps the high
+            // ids when a tie straddles the cutoff, hence `i >= boundary`.
+            for (uint w = tid; w < WORDS; w += TG_SIZE) {
+                atomic_store_explicit(&bitmap[w], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint boundary = threshold_index;
+            for (uint i = tid; i < CLUSTERS; i += TG_SIZE) {
+                uint ordinal = qwen_probe_bf16_ordinal(float(score[i]));
+                if (ordinal > cutoff || (ordinal == cutoff && i >= boundary)) {
+                    atomic_fetch_or_explicit(
+                        &bitmap[i >> 5u], 1u << (i & 31u),
+                        memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Compact selected bits in ascending row-id order. Each thread
+            // owns a contiguous word range, and `base` is its exclusive prefix.
+            uint lo = tid * WPT;
+            uint count = 0u;
+            for (uint j = 0u; j < WPT; ++j) {
+                uint w = lo + j;
+                if (w >= WORDS) { break; }
+                count += popcount(atomic_load_explicit(
+                    &bitmap[w], memory_order_relaxed));
+            }
+            base[tid] = count;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                uint accumulated = 0u;
+                for (uint t = 0u; t < TG_SIZE; ++t) {
+                    uint n = base[t];
+                    base[t] = accumulated;
+                    accumulated += n;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint at = base[tid];
+            for (uint j = 0u; j < WPT; ++j) {
+                uint w = lo + j;
+                if (w >= WORDS) { break; }
+                uint bits = atomic_load_explicit(
+                    &bitmap[w], memory_order_relaxed);
+                while (bits != 0u) {
+                    uint low = bits & (~bits + 1u);
+                    probed[at++] = w * 32u + popcount(low - 1u);
+                    bits ^= low;
+                }
+            }
+            """,
+        header: """
+            inline uint qwen_probe_bf16_ordinal(float v) {
+                if (isnan(v))  { return 0xFFFFu; }
+                if (v == 0.0f) { return 0x8000u; }
+                uint u = as_type<uint>(v);
+                uint ordinal =
+                    (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+                return ordinal >> 16u;
+            }
+            """,
+        ensureRowContiguous: false
+    )
+}
+
+let qwen35ProbeSelectResolved: (enabled: Bool, source: String) = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_E102_PROBE_SELECT"],
+          !raw.isEmpty
+    else { return (true, "unset") }
+    switch raw {
+    case "1": return (true, "1")
+    case "0": return (false, "0")
+    default:
+        fatalError("MLX_E102_PROBE_SELECT must be unset, 0 or 1; got \(raw)")
+    }
+}()
+
+private let qwen35ProbeSelectEnabled = qwen35ProbeSelectResolved.enabled
+public nonisolated(unsafe) var qwen35ProbeSelectFusedDrafts: Int = 0
+public nonisolated(unsafe) var qwen35ProbeSelectLegacyDrafts: Int = 0
+
+// Ascending compaction of the probe list that `gatherQuantizedMM` consumes.
+//
+// `MLX.argPartition` returns its top segment in partition order, so the
+// shipped path sorted 3,073 uint32 keys in four dispatches -- 24.40 us per
+// draft, 7.94 ns per key, against the declared top-32 path's 0.388 ns.
+//
+// That sort carries no selection semantics. `argPartition` returns a
+// permutation of [0, CLUSTERS), so the selected indices are DISTINCT, and the
+// ascending order of a distinct set is a function of the set alone -- never of
+// how `argPartition` happened to order it. A counting sort therefore
+// reproduces `MLX.sorted` exactly by construction: there is no tie rule to
+// state and no dependence on unspecified partition order. Contrast the
+// top-32 kernel above, whose inputs are float scores that really can tie.
+//
+// One threadgroup marks the selected indices in a threadgroup bitmap of
+// ceil(CLUSTERS/32) words, scans the per-word popcounts, and emits set bits in
+// ascending order. Thread `t` owns the ascending word range [t*WPT, t*WPT+WPT)
+// and the scan is exclusive over `t`, so the emitted ids ascend globally.
+private let qwen35ProbeSortTG = 256
+
+private func makeQwen35ProbeSortKernel(clusters: Int, probes: Int)
+    -> MLXFast.MLXFastKernel
+{
+    MLXFast.metalKernel(
+        name: "qwen_mtp_probe_sort",
+        inputNames: ["order"],
+        outputNames: ["probed"],
+        source: """
+            constexpr uint CLUSTERS = \(clusters);
+            constexpr uint PROBES   = \(probes);
+            constexpr uint SKIP     = CLUSTERS - PROBES;
+            constexpr uint WORDS    = (CLUSTERS + 31u) / 32u;
+            constexpr uint TG_SIZE  = \(qwen35ProbeSortTG);
+            constexpr uint WPT      = (WORDS + TG_SIZE - 1u) / TG_SIZE;
+
+            uint tid = thread_position_in_threadgroup.x;
+
+            threadgroup atomic_uint bits[WORDS];
+            threadgroup uint base[TG_SIZE];
+
+            for (uint w = tid; w < WORDS; w += TG_SIZE) {
+                atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint p = SKIP + tid; p < CLUSTERS; p += TG_SIZE) {
+                uint v = order[p];
+                atomic_fetch_or_explicit(
+                    &bits[v >> 5u], 1u << (v & 31u), memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint lo = tid * WPT;
+            uint count = 0u;
+            for (uint i = 0u; i < WPT; ++i) {
+                uint w = lo + i;
+                if (w >= WORDS) { break; }
+                count += popcount(
+                    atomic_load_explicit(&bits[w], memory_order_relaxed));
+            }
+            base[tid] = count;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                uint acc = 0u;
+                for (uint i = 0u; i < TG_SIZE; ++i) {
+                    uint c = base[i];
+                    base[i] = acc;
+                    acc += c;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint at = base[tid];
+            for (uint i = 0u; i < WPT; ++i) {
+                uint w = lo + i;
+                if (w >= WORDS) { break; }
+                uint m = atomic_load_explicit(&bits[w], memory_order_relaxed);
+                while (m != 0u) {
+                    // `low - 1` is a mask of the trailing zeros, so its
+                    // popcount is the bit position. `ctz` needs MSL 2.1.
+                    uint low = m & (~m + 1u);
+                    probed[at++] = w * 32u + popcount(low - 1u);
+                    m ^= low;
+                }
+            }
+            """,
+        header: "",
+        ensureRowContiguous: false
+    )
+}
 
 // Ascending compaction of the probe list that `gatherQuantizedMM` consumes.
 //
@@ -4332,11 +4659,16 @@ private let qwen35ClusterAffine2QMVHeader = """
             const device bfloat16_t* xm = x + k + int(simd_lid) * values_per_thread;
             float sum = 0.0f;
             for (int i = 0; i < values_per_thread; i += 4) {
-                x0[i]     = static_cast<float>(xm[i]);
-                x0[i + 1] = static_cast<float>(xm[i + 1]);
-                x0[i + 2] = static_cast<float>(xm[i + 2]);
-                x0[i + 3] = static_cast<float>(xm[i + 3]);
-                sum += xm[i] + xm[i + 1] + xm[i + 2] + xm[i + 3];
+                const vec<bfloat16_t, 4> xv =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + i);
+                x0[i]     = static_cast<float>(xv[0]);
+                x0[i + 1] = static_cast<float>(xv[1]);
+                x0[i + 2] = static_cast<float>(xv[2]);
+                x0[i + 3] = static_cast<float>(xv[3]);
+                // Same BF16 add-tree as the scalar loads; only the load
+                // width changes, matching the affine-4 wide DIRECT_NIBBLES
+                // activation gather already on main.
+                sum += xv[0] + xv[1] + xv[2] + xv[3];
             }
 
             for (int r = 0; r < n_valid; r++) {
@@ -4673,6 +5005,128 @@ public func qwen35VerifyDraftTop32(trials: Int = 64, seed: UInt64 = 1) -> (Int, 
         }
     }
     return (trials, bad, firstBad)
+}
+
+/// Offline equivalence gate for the fused centroid selector. The reference is
+/// the exact expression removed from `clusterCandidateIDs`. The fixture cycles
+/// through ordinary BF16 scores, dense cutoff ties, an all-equal row, signed
+/// zero, infinities and NaNs. Returns (checked, mismatches, firstBadTrial).
+/// Never called on a scored path.
+public func qwen35VerifyProbeSelect(
+    clusters: Int = 12_292, probes: Int = 3_073,
+    trials: Int = 128, seed: UInt64 = 1
+) -> (Int, Int, Int) {
+    MLXRandom.seed(seed)
+    let selector = makeQwen35ProbeSelectKernel(
+        clusters: clusters, probes: probes)
+    let kth = clusters - probes
+    var bad = 0
+    var firstBad = -1
+    for trial in 0 ..< trials {
+        var score = MLXRandom.normal([clusters]).asType(.bfloat16)
+        switch trial % 6 {
+        case 1:
+            score = (MLXRandom.normal([clusters]) * 4).round().asType(.bfloat16)
+        case 2:
+            score = MLX.zeros([clusters], dtype: .bfloat16)
+        case 3:
+            let values: [Float] = (0 ..< clusters).map { i in
+                switch i % 11 {
+                case 0: return .nan
+                case 1: return .infinity
+                case 2: return -Float.infinity
+                case 3: return -0.0
+                default: return Float((i % 9) - 4)
+                }
+            }
+            score = MLXArray(values).asType(.bfloat16)
+        case 4:
+            // Put a large equality class exactly across the selection cutoff.
+            let values: [Float] = (0 ..< clusters).map { i in
+                i < kth - 7 ? -1 : (i < kth + 19 ? 0 : 1)
+            }
+            score = MLXArray(values).asType(.bfloat16)
+        default:
+            break
+        }
+        let mine = selector(
+            [score],
+            grid: (qwen35ProbeSelectTG, 1, 1),
+            threadGroup: (qwen35ProbeSelectTG, 1, 1),
+            outputShapes: [[probes]],
+            outputDTypes: [.uint32]
+        )[0]
+        let order = MLX.argPartition(score, kth: kth, axis: -1)
+        let theirs = MLX.sorted(order[(kth)...]).asType(.uint32)
+        eval(mine, theirs)
+        if !MLX.all(MLX.equal(mine, theirs)).item(Bool.self) {
+            bad += 1
+            if firstBad < 0 { firstBad = trial }
+        }
+    }
+    return (trials, bad, firstBad)
+}
+
+/// Positive control for the probe-select equivalence comparison. A one-member
+/// corruption must be observed, otherwise a zero-mismatch gate is meaningless.
+public func qwen35ProbeSelectPositiveControl(
+    clusters: Int = 12_292, probes: Int = 3_073, seed: UInt64 = 7
+) -> Bool {
+    MLXRandom.seed(seed)
+    let selector = makeQwen35ProbeSelectKernel(
+        clusters: clusters, probes: probes)
+    let score = MLXRandom.normal([clusters]).asType(.bfloat16)
+    let mine = selector(
+        [score],
+        grid: (qwen35ProbeSelectTG, 1, 1),
+        threadGroup: (qwen35ProbeSelectTG, 1, 1),
+        outputShapes: [[probes]],
+        outputDTypes: [.uint32]
+    )[0]
+    eval(mine)
+    var damaged = mine.asArray(UInt32.self)
+    damaged[0] = damaged[0] == 0 ? 1 : 0
+    return damaged != mine.asArray(UInt32.self)
+}
+
+/// Isolated selector benchmark at the live shape. Returns
+/// (fullSortAndCompactUs, fusedSelectUs) per call. Never on a scored path.
+public func qwen35BenchProbeSelect(
+    clusters: Int = 12_292, probes: Int = 3_073, iters: Int = 200
+) -> (Double, Double) {
+    MLXRandom.seed(13)
+    let score = MLXRandom.normal([clusters]).asType(.bfloat16)
+    let selector = makeQwen35ProbeSelectKernel(
+        clusters: clusters, probes: probes)
+    let sorter = makeQwen35ProbeSortKernel(
+        clusters: clusters, probes: probes)
+    let kth = clusters - probes
+    func legacy() -> MLXArray {
+        let order = MLX.argPartition(score, kth: kth, axis: -1)
+        return sorter(
+            [order],
+            grid: (qwen35ProbeSortTG, 1, 1),
+            threadGroup: (qwen35ProbeSortTG, 1, 1),
+            outputShapes: [[probes]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
+    func fused() -> MLXArray {
+        selector(
+            [score],
+            grid: (qwen35ProbeSelectTG, 1, 1),
+            threadGroup: (qwen35ProbeSelectTG, 1, 1),
+            outputShapes: [[probes]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
+    for _ in 0 ..< 10 { eval(legacy()); eval(fused()) }
+    var t0 = Date()
+    for _ in 0 ..< iters { eval(legacy()) }
+    let legacyUs = Date().timeIntervalSince(t0) / Double(iters) * 1e6
+    t0 = Date()
+    for _ in 0 ..< iters { eval(fused()) }
+    return (legacyUs, Date().timeIntervalSince(t0) / Double(iters) * 1e6)
 }
 
 /// Offline equivalence gate for the probe compaction kernel. Checks it against
@@ -5013,6 +5467,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     private var _draftClusterPerm: MLXArray?
     private var _draftClusterShape: [Int]?
     private var _draftClusterLHS: MLXArray?
+    private var _draftProbeSelect: MLXFast.MLXFastKernel?
     private var _draftProbeSort: MLXFast.MLXFastKernel?
     private var _draftRowTop32: Qwen35RowTop32?
     // One attempt only: a head that cannot support a derived index must keep
@@ -5586,7 +6041,12 @@ extension Qwen35TextModel: MTPCapable {
         if _draftClusterLHS == nil {
             _draftClusterLHS = MLX.zeros([probes], dtype: .uint32)
         }
-        if qwen35ProbeSortEnabled, _draftProbeSort == nil {
+        if qwen35ProbeSelectEnabled, _draftProbeSelect == nil {
+            _draftProbeSelect = makeQwen35ProbeSelectKernel(
+                clusters: clusters, probes: probes)
+        } else if !qwen35ProbeSelectEnabled,
+                  qwen35ProbeSortEnabled, _draftProbeSort == nil
+        {
             _draftProbeSort = makeQwen35ProbeSortKernel(
                 clusters: clusters, probes: probes)
         }
@@ -5607,21 +6067,34 @@ extension Qwen35TextModel: MTPCapable {
                 transpose: true, groupSize: 64, bits: 2, mode: .affine
             ).reshaped([clusters])
         }
-        // `gatherQuantizedMM` is handed the probes in ascending index order,
-        // while the top-C arrive in partition order.
-        let order = MLX.argPartition(centroidScore, kth: clusters - probes)
+        // `gatherQuantizedMM` / E121 row QMV require ascending rhs indices.
+        // The fused path selects the exact stable-sort tail in one dispatch;
+        // the legacy path materialises full argPartition order first.
         let probed: MLXArray
-        if let sorter = _draftProbeSort {
-            probed = sorter(
-                [order],
-                grid: (qwen35ProbeSortTG, 1, 1),
-                threadGroup: (qwen35ProbeSortTG, 1, 1),
+        if let selector = _draftProbeSelect {
+            qwen35ProbeSelectFusedDrafts += 1
+            probed = selector(
+                [centroidScore],
+                grid: (qwen35ProbeSelectTG, 1, 1),
+                threadGroup: (qwen35ProbeSelectTG, 1, 1),
                 outputShapes: [[probes]],
                 outputDTypes: [.uint32]
             )[0]
         } else {
-            probed = MLX.sorted(order[.ellipsis, (clusters - probes)...])
-                .asType(.uint32)
+            qwen35ProbeSelectLegacyDrafts += 1
+            let order = MLX.argPartition(centroidScore, kth: clusters - probes)
+            if let sorter = _draftProbeSort {
+                probed = sorter(
+                    [order],
+                    grid: (qwen35ProbeSortTG, 1, 1),
+                    threadGroup: (qwen35ProbeSortTG, 1, 1),
+                    outputShapes: [[probes]],
+                    outputDTypes: [.uint32]
+                )[0]
+            } else {
+                probed = MLX.sorted(order[.ellipsis, (clusters - probes)...])
+                    .asType(.uint32)
+            }
         }
 
         let rowScore: MLXArray
