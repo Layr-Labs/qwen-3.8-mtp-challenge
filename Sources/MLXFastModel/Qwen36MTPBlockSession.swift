@@ -1449,6 +1449,7 @@ public final class Qwen36MTPBlockSession {
         if Self.traceSyncHeadChain {
             eval(draftIdArrays[draftIdArrays.count - 1])
         }
+        let draftIDBatch = concatenated(draftIdArrays, axis: 0)
         if Self.traceRounds { tDraftBuilt = DispatchTime.now().uptimeNanoseconds }
 
         // 2. Keep the generic pre-verify snapshot as a fallback, but use the
@@ -1491,12 +1492,11 @@ public final class Qwen36MTPBlockSession {
         // materialised buffers without waiting on the GPU. (MTPLX production
         // budget: 1 sync/cycle, batched_decode.py:504-525.)
         let (top2IDs, top2Values) = Self.linearTopTwoRows(verifyLogits)
-        var bundle: [MLXArray] = [top2IDs, top2Values]
-        bundle.append(contentsOf: draftIdArrays)
+        let bundle: [MLXArray] = [top2IDs, top2Values, draftIDBatch]
         eval(cache.flatMap { $0.state } + bundle)
         if Self.traceRounds { tEvalDone = DispatchTime.now().uptimeNanoseconds }
 
-        let drafts = draftIdArrays.map { Int($0.item(Int32.self)) }
+        let drafts = draftIDBatch.asArray(Int32.self).map { Int($0) }
         let flatTop2IDs = top2IDs.asArray(Int32.self).map { Int($0) }
         let flatTop2Values = top2Values.asArray(Float.self).map { Double($0) }
         // The top-2 reducer's first ID per row IS the row argmax under the
