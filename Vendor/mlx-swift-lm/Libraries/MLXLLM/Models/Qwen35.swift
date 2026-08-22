@@ -5550,7 +5550,10 @@ extension Qwen35TextModel: MTPCapable {
         if _draftClusterLHS == nil {
             _draftClusterLHS = MLX.zeros([probes], dtype: .uint32)
         }
-        if qwen35ProbeSortEnabled, _draftProbeSort == nil {
+        // Live E87 select never consumes `_draftProbeSort`. Constructing it
+        // still JITs qwen_mtp_probe_sort on the first draft. Skip that
+        // factory while E87 is the first arm.
+        if !qwen35E87SelectEnabled, qwen35ProbeSortEnabled, _draftProbeSort == nil {
             _draftProbeSort = makeQwen35ProbeSortKernel(
                 clusters: clusters, probes: probes)
         }
