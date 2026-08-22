@@ -191,9 +191,15 @@ public final class Qwen36MTPBlockSession {
         // below h. The streak ladder's behavior is the degenerate one-EMA
         // version of this; the per-position EMAs let depth 5-8 pay where the
         // ladder's cap of 4 left committed tokens on the table.
-        draftPolicy = { [weak self] offeredDepth, _ in
-            guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+        // FIXED DEPTH 2 (this submission). Every drafting round proposes
+        // exactly min(offeredDepth, 2) drafts. The adaptive cost-model
+        // schedule below is deliberately not consulted for this candidate;
+        // rationale lives in the submission note. Legal under the 2026-08-14
+        // contract: any constant in 0 ... min(offeredDepth, maxDepth) is a
+        // legal per-round policy, and the trusted parent reads the real
+        // drafted counts out of its own journal.
+        draftPolicy = { offeredDepth, _ in
+            Swift.min(offeredDepth, 2)
         }
     }
 
