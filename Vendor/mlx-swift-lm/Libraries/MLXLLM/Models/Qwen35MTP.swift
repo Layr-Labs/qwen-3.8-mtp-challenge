@@ -78,6 +78,11 @@ final class Qwen35MTPDecoderLayer: Module {
                 x: x, r: r,
                 weight: postAttentionLayerNorm.weight,
                 eps: postAttentionLayerNorm.eps)
+            if let mlpFused = mlp as? Qwen35FusedMLP,
+                let out = mlpFused.downProjResidualAdd(postAttnNorm, residual: h)
+            {
+                return out
+            }
             return h + (mlp as! UnaryLayer)(postAttnNorm)
         }
         let h = x + r

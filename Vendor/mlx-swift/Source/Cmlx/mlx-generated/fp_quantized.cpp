@@ -588,6 +588,104 @@ METAL_FUNC void fp_qmv_fast_impl(
   }
 }
 
+// NVFP4 (gs=16, bits=4) multi-row qmv_fast: shares each group's W/scale
+// stream across a PAIR of adjacent input rows so the device reads each
+// weight byte once per two rows instead of once per row. Same grid
+// contract as qmv_fast_crossrow_affine4_g64: the frozen host launches the
+// single-row grid (M, N/8); the group at tid.x claims input rows
+// 2*tid.x and 2*tid.x+1, and groups whose claim starts at or past M
+// return before any weight read. Bit-exact vs fp_qmv_fast_impl by
+// construction: every output element accumulates the identical
+// qdot<float, values_per_thread, 4> sequence over the same k blocks with
+// the same wl bytes and the same per-row x values in the same order, and
+// reduces with one simd_sum at the end exactly as the single-row path.
+// The vec<T,4> x load replicates the gs16/bits4 fast-path load (same
+// elements into the same slots, same conversion).
+template <typename T, int M>
+METAL_FUNC void fp_qmv_fast_crossrow_nvfp4_g16(
+    const device uint32_t* w,
+    const device uint8_t* scales,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int inputs_per_group = 2;
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<32, 4>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = 16 / values_per_thread;
+
+  static_assert(M >= 1, "crossrow M must be positive");
+
+  const int first_m = int(tid.x) * inputs_per_group;
+  if (first_m >= M) {
+    return;
+  }
+  const int n_rows =
+      (first_m + inputs_per_group <= M) ? inputs_per_group : (M - first_m);
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / 16;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w +
+      out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  const device uint8_t* sl = scales + out_row * in_vec_size_g +
+      simd_lid / scale_step_per_thread;
+
+  thread float result[inputs_per_group][results_per_simdgroup] = {{0}};
+  thread float x_thread[inputs_per_group][values_per_thread];
+
+  const device T* xm =
+      x + first_m * in_vec_size + simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    for (int mi = 0; mi < n_rows; mi++) {
+      // Same x elements into the same slots with the same per-element
+      // T -> float conversion as the gs16/bits4 fast path in
+      // fp_qmv_fast_impl (wider aligned loads, identical values).
+      const device vec<T, 4>* xv = (const device vec<T, 4>*)(xm + mi * in_vec_size);
+#pragma unroll
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const vec<T, 4> xi = xv[i];
+        x_thread[mi][4 * i] = xi[0];
+        x_thread[mi][4 * i + 1] = xi[1];
+        x_thread[mi][4 * i + 2] = xi[2];
+        x_thread[mi][4 * i + 3] = xi[3];
+      }
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = ws + row * in_vec_size_w;
+      float s = dequantize_scale<float, 16>(sl[row * in_vec_size_g]);
+      for (int mi = 0; mi < n_rows; mi++) {
+        result[mi][row] +=
+            qdot<float, values_per_thread, 4>(wl, x_thread[mi], s);
+      }
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    sl += block_size / 16;
+    xm += block_size;
+  }
+
+  for (int mi = 0; mi < n_rows; mi++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[mi][row] = simd_sum(result[mi][row]);
+      if (simd_lid == 0) {
+        y[(first_m + mi) * out_vec_size + out_row + row] =
+            static_cast<T>(result[mi][row]);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void fp_qmv_impl(
     const device uint32_t* w,
@@ -1231,6 +1329,7 @@ template <typename T, int group_size, int bits, bool batched>
     const constant int64_t* w_strides,
     const constant int64_t* s_strides,
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   if (batched) {
@@ -1249,6 +1348,68 @@ template <typename T, int group_size, int bits, bool batched>
         w_strides,
         s_strides,
         tid);
+  }
+  if (!batched && group_size == 16 && bits == 4 && out_vec_size >= 1024 &&
+      ntg.x >= 2 && ntg.x <= 12) {
+    switch (ntg.x) {
+      case 2:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 2>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 3:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 3>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 4:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 4>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 5:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 5>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 6:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 6>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 7:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 7>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 8:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 8>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 9:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 9>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 10:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 10>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 11:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 11>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      case 12:
+        fp_qmv_fast_crossrow_nvfp4_g16<T, 12>(
+            w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid,
+            simd_lid);
+        return;
+      default:
+        break;
+    }
   }
   fp_qmv_fast_impl<T, group_size, bits>(
       w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);

@@ -868,7 +868,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  static_assert(M >= 2 && M <= 9, "multi-row QMV supports M in [2, 9]");
+  static_assert(M >= 1 && M <= 9, "multi-row QMV supports M in [1, 9]");
   constexpr int inputs_per_group = 2;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -977,7 +977,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     int first_m,
     int out_row,
     uint simd_lid) {
-  static_assert(NA >= 2 && NA <= 5, "wide multi-row QMV supports NA in [2, 5]");
+  static_assert(NA >= 2 && NA <= 4, "wide multi-row QMV supports NA in [2, 4]");
   typedef vec<float, NA> VF;
   constexpr int rows_per_simd = 4;
   constexpr int values_per_thread = 16;
@@ -1020,14 +1020,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
             simd_lid * values_per_thread + 4 * i;
         thread float xc[4];
         if (DIRECT_NIBBLES) {
-          const vec<T, 4> xv = *reinterpret_cast<const device vec<T, 4>*>(xm);
-          xc[0] = static_cast<float>(xv[0]);
-          xc[1] = static_cast<float>(xv[1]);
-          xc[2] = static_cast<float>(xv[2]);
-          xc[3] = static_cast<float>(xv[3]);
+          xc[0] = static_cast<float>(xm[0]);
+          xc[1] = static_cast<float>(xm[1]);
+          xc[2] = static_cast<float>(xm[2]);
+          xc[3] = static_cast<float>(xm[3]);
           // Preserve the incumbent BF16 expression tree used for the affine
           // bias correction; only the qdot nibble extraction changes.
-          sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
+          sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
         } else {
           sums[m] += load_vector<T, float, 4, 4>(xm, xc);
         }
@@ -1937,7 +1936,7 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 5:
-          qmv_fast_crossrow_affine4_g64_m<T, 5, 5, true>(
+          qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
@@ -1979,6 +1978,22 @@ template <typename T, int group_size, int bits, bool batched>
       }
     } else {
       switch (ntg.x) {
+        case 1:
+          // M == 1 below 4096 outputs: the MTP head's per-position narrow
+          // matmuls (head qkv 3*1024 = 3072, the per-committed-token K/V
+          // pack at 2048) previously fell through to qmv_fast_impl. The
+          // serial leg is 512 plain forwards whose quantized matmuls are
+          // ALL >= 4096 outputs (fused qkv 8192, o_proj 5120, mlp
+          // 17408/20480, lm_head 248_320), so this branch is MTP-only by
+          // construction and cannot touch the serial numerator or the
+          // 5% denominator band. With M == 1 the kernel's has_pair guard
+          // idles the second-lane load; the single lane is the same
+          // qdot_affine4_loaded expression tree as the promoted narrow
+          // rows, so no arithmetic drift vs the fallback.
+          qmv_fast_crossrow_affine4_g64<T, 1>(
+              w, scales, biases, x, y, in_vec_size, out_vec_size,
+              tid, simd_gid, simd_lid);
+          return;
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
