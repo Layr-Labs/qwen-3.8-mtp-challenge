@@ -193,7 +193,14 @@ public final class Qwen36MTPBlockSession {
         // ladder's cap of 4 left committed tokens on the table.
         draftPolicy = { [weak self] offeredDepth, _ in
             guard let self else { return Swift.min(offeredDepth, 1) }
-            return self.costModelDepth(offeredDepth: offeredDepth)
+            // RESEARCH ONLY. A constant depth, so a forced-depth ladder can
+            // measure R(M) at a KNOWN width and so a deep forced run observes
+            // acceptance at every position. The head chain is deterministic
+            // given the prefix, so the first d drafts of a depth-8 round are
+            // exactly the drafts a depth-d round would have made -- which is
+            // what makes an offline counterfactual over stopping depth exact.
+            // Unset takes the shipped cost-model schedule.
+            return self.argmaxDepth(offeredDepth: offeredDepth)
         }
     }
 
@@ -838,6 +845,244 @@ public final class Qwen36MTPBlockSession {
         .map { 0.85 * pow(0.98, Double($0)) }
     private static let acceptEMAAlpha = 0.15
 
+    // MARK: - THE SPENDING RULE
+    //
+    // The shipped schedule is a GREEDY MARGINAL WALK against a UNIFORM price,
+    // and both halves of that are now measured to be wrong on this stack.
+    //
+    // GREEDY FIRST-FAIL. It stops at the first locally unprofitable increment.
+    // After grid compaction the verify cost is a STAIRCASE whose risers land on
+    // the row-group increments, so CHEAP rungs sit directly behind expensive
+    // ones -- widths 7 and 8 are cheap and live behind the width-6 riser. A
+    // first-fail scan cannot reach them at any price.
+    //
+    // UNIFORM PRICE. `h = 0.18` is documented as "one head draft step / one
+    // batched verify forward". Measured on this stack by draining the head
+    // chain before the verify build (MLX_QWEN_MTP_TRACE_SYNC_HEAD), one head
+    // step is 0.83 ms against a ~30 ms verify forward, so the true ratio is
+    // ~0.03. The 0.18 that was bracketed on both sides is not the head step at
+    // all: it is standing in for the VERIFY ROW, which the shipped model
+    // represents as free. Right total, wrong cause -- and a model that
+    // misattributes the marginal cannot be re-optimised when either term moves.
+    //
+    // This arm replaces the SPENDING RULE and the PRICE, and leaves the
+    // estimator's shape alone apart from one repair named below:
+    //
+    //   T(d) / a  =  1 + 0.131 * M + 0.486 * G(M),   M = d + 1
+    //
+    // with G the WORKING X-GROUP COUNT the compacted launcher actually issues.
+    // G is structural, not fitted: it is `ceil(M / IPG(M))` from the frontier's
+    // own width switch, so the shape of the staircase travels with the kernel
+    // rather than with this host. Only the two scalars are fitted, and they are
+    // fitted on ONE regime (tech) and used unchanged on all of them -- of the
+    // five candidate fits, tech's is the only one with no negative regime.
+    //
+    // ESTIMATOR REPAIR. The shipped optimism transfer exists to let a GREEDY
+    // walk widen at all; with an exact argmax it is pure over-draft, and it is
+    // what pushes the shallow regimes past their optimum. It is replaced by a
+    // WARM SEED: a position reached for the first time starts from the deepest
+    // position that already has evidence, capped at the same 0.95. Without the
+    // seed the first deep round updates a COLD estimate and leaves that rung
+    // looking worse than never having tried it -- measured, and the reason the
+    // first version of this arm lost.
+    // THE PRICE, refit on eb5eadc from a FORCED-DEPTH ladder d=1..7. The
+    // window is the WHOLE ROUND -- committed tokens per round divided by the
+    // parent's measured seconds per token -- not the p50 block-request
+    // sub-window the first fit used. That is the quantity the rule's objective
+    // actually divides by, so the ratios below are on a better-defined price
+    // than the ones they replace, not merely a newer one.
+    //
+    //   M       2      3      4      5      6      7      8
+    //   ms  33.333 36.241 39.628 42.946 53.592 56.175 59.157
+    //   G       1      1      1      1      2      2      2
+    //
+    // Three structural terms carry all SEVEN points to within 0.71 %:
+    //
+    //   T(M) = BASE + WEIGHT_PASS * G(M) + ROW * M
+    //
+    // with BASE 19.766 ms, WEIGHT_PASS 7.432 ms, ROW 3.097 ms. Both scalars
+    // below are RATIOS to BASE, because the rule compares prices and never
+    // needs the absolute one. Only these two are fitted; `G` is read from the
+    // kernel's own width switch, so the staircase travels with the kernel.
+    //
+    // M=2 IS NO LONGER A SPECIAL CASE. The previous fit priced it separately at
+    // 2.1501 x BASE because M=2 fell outside the replica's routed range and
+    // reached MLX's own launcher. eb5eadc routes it (widths 2...9, IPG 2), and
+    // the ladder now measures 1.6864 x BASE against an on-model 1.6893 -- 0.17 %
+    // apart. The special case was carrying a 27 % over-price at depth 1, which
+    // biases the rule DEEPER than optimal exactly where acceptance is weakest.
+    // It is deleted rather than refitted: the model covers the width.
+    //
+    // WEIGHT_PASS is worth reading twice. A second x-group re-reads the whole
+    // routed weight matrix, so a bandwidth-bound kernel would charge a full
+    // stream pass -- 19.5 ms at the measured 718 GB/s. The measured 7.43 ms is
+    // 38 % of that, which says these decode widths do not saturate the memory
+    // system and the second pass rides in the slack.
+    //
+    // CAVEAT, carried deliberately: a forced-depth round also pays rollback,
+    // whose frequency falls with depth as acceptance falls. The 0.71 % fit says
+    // that term is small or affine in M, not that it is absent.
+    private static let argmaxRowPrice = 0.1567
+    private static let argmaxGroupPrice = 0.3760
+
+    // ---- ONE ESTIMATOR (replaces EMA + warm seed + optimism transfer) ----
+    //
+    // The shipped estimator has three separate devices bolted together: a
+    // per-position EMA, a WARM SEED for never-reached positions capped at 0.95,
+    // and (before this arm) an optimism transfer. Each patches a different
+    // symptom of ONE underlying problem: the policy cannot tell
+    //
+    //     "low acceptance, and I have a lot of evidence for that"
+    //
+    // apart from
+    //
+    //     "low estimate, because this position has almost never been reached".
+    //
+    // Those are different states and they call for opposite actions. The EMA
+    // carries no observation count, so it cannot represent the difference at
+    // all, and the 0.95 seed cap then hard-codes a WRONG answer in exactly the
+    // regime where deep drafting pays: codeimpl accepts ~0.993 at depth, is
+    // seeded at 0.95, and the policy stops early and loses.
+    //
+    // This is also the CENSORING problem (QWEN_ESTIMATOR_MONOTONICITY) in a new
+    // costume. Positions past the chosen depth are never observed, so their
+    // counts never grow, so their uncertainty never shrinks. One estimator with
+    // valid sufficient statistics answers both.
+    //
+    // STATE: discounted Beta counts per position. `argmaxS` successes,
+    // `argmaxF` failures, both multiplied by GAMMA before each update so the
+    // estimator tracks a drifting prompt instead of averaging the whole run.
+    // Effective sample size saturates at 1/(1-GAMMA).
+    //
+    // ESTIMATE: a recursive hierarchical shrinkage. Position k's prior mean is
+    // position k-1's POSTERIOR mean, with strength PRIOR_N:
+    //
+    //     mu[k] = (S[k] + PRIOR_N * mu[k-1]) / (S[k] + F[k] + PRIOR_N)
+    //
+    // A position with no observations at all evaluates to exactly mu[k-1]. That
+    // is the whole warm-seed mechanism, derived rather than asserted, and with
+    // no 0.95 cap: in a regime running at 0.99 the unreached rung inherits 0.99,
+    // which is the correct guess, and in a regime running at 0.3 it inherits
+    // 0.3 rather than an invented 0.95.
+    //
+    // DECISION VALUE: mean plus optimism that decays with evidence,
+    //
+    //     p[k] = min(P_CAP, mu[k] + BETA * sqrt(mu[k](1-mu[k]) / (n[k]+PRIOR_N)))
+    //
+    // so a rung that has been tried ONCE and failed is not written off -- its
+    // n is 1, its interval is wide, and the rule tries it again -- while a rung
+    // with a hundred observations is priced at its mean. This is the piece the
+    // shipped EMA cannot express, and it is what makes trying a rung once no
+    // longer worse than never trying it.
+    private static let argmaxGamma = 0.99
+    private static let argmaxPriorN = 4.0
+    private static let argmaxRootPrior = 0.85
+    /// MONOTONE SURVIVAL PRIOR. The plain hierarchical prior assumes
+    /// p[k] ~= p[k-1]. Acceptance DECAYS with position, so a rarely-reached
+    /// deep rung inherits too much and the rule over-drafts exactly where the
+    /// evidence is thinnest. RHO is the per-position decay applied to the
+    /// INHERITED prior only -- observations override it at the usual rate, so
+    /// a regime that genuinely accepts 0.99 at depth 7 is unaffected because
+    /// its deep positions are reached every round and carry real counts.
+    private static let argmaxRho = 0.95
+    private static let argmaxPCap = 0.995
+
+    private var argmaxS = [Double](repeating: 0, count: Qwen36MTPLimits.maxDepth)
+    private var argmaxF = [Double](repeating: 0, count: Qwen36MTPLimits.maxDepth)
+
+    /// Posterior means, shallow to deep, each shrunk toward the one before it.
+    private func argmaxPosterior() -> [Double] {
+        var mu = [Double](repeating: 0, count: argmaxS.count)
+        var parent = Self.argmaxRootPrior
+        for k in 0 ..< argmaxS.count {
+            let n = argmaxS[k] + argmaxF[k]
+            mu[k] = (argmaxS[k] + Self.argmaxPriorN * parent)
+                / (n + Self.argmaxPriorN)
+            parent = mu[k] * Self.argmaxRho
+        }
+        return mu
+    }
+
+    /// Decision value. MEASURED to be the posterior mean itself: an optimism
+    /// term `BETA * sqrt(mu(1-mu)/(n+PRIOR_N))` was built, swept over
+    /// {0.5, 0.3, 0.15, 0}, and found monotonically HARMFUL (REFUT-QWEN-043).
+    /// The same formula that keeps an n=1 rung alive also adds ~0.035 to an
+    /// n=100 rung, and the shallow regimes live entirely at n=100. The
+    /// hierarchical prior already covers the n=1 case, so optimism bought
+    /// nothing and paid everywhere. Kept as a named closure, not a constant.
+    private func argmaxDecisionP() -> [Double] {
+        argmaxPosterior().map { Swift.min(Self.argmaxPCap, $0) }
+    }
+
+    /// Discounted Beta update. Positions DEEPER than the rejection are CENSORED
+    /// -- the round never learned anything about them -- so they are not
+    /// touched. That is the difference between "no evidence" and "evidence of
+    /// failure", and collapsing the two is what made the old estimator walk
+    /// backwards off a rung it had only probed once.
+    private func argmaxObserve(_ k: Int, success: Bool) {
+        guard k >= 0, k < argmaxS.count else { return }
+        argmaxS[k] *= Self.argmaxGamma
+        argmaxF[k] *= Self.argmaxGamma
+        if success { argmaxS[k] += 1.0 } else { argmaxF[k] += 1.0 }
+    }
+
+    /// Working x-groups the launcher issues for verify width `m`.
+    ///
+    /// Read from `Qwen35CustomQMV.activeInputGroups` -- THE SAME FUNCTION THE
+    /// DISPATCH USES TO SIZE ITS X-EXTENT -- rather than restated here, so the
+    /// staircase this rule prices cannot drift from the geometry actually
+    /// launched. That drift is not hypothetical: the width table changed under
+    /// this policy twice in one day of upstream commits, and a price naming a
+    /// rung the kernel no longer makes cheap is exactly how the rule goes
+    /// wrong.
+    private static func workingGroups(_ m: Int) -> Int {
+        guard (2 ... 9).contains(m) else { return 1 }
+        return Qwen35CustomQMV.activeInputGroups(m)
+    }
+
+    private static func argmaxPrice(_ depth: Int) -> Double {
+        let m = depth + 1
+        return 1.0 + argmaxRowPrice * Double(m)
+            + argmaxGroupPrice * Double(workingGroups(m))
+    }
+
+    /// EXACT ARGMAX over every legal depth. Never a greedy scan: the price is a
+    /// staircase and the objective is not concave in depth.
+    private func argmaxDepth(offeredDepth: Int) -> Int {
+        let cap = Swift.min(
+            Swift.min(offeredDepth, Qwen36MTPLimits.maxDepth),
+            Self.segmentedVerifyDepthCap)
+        guard cap > 0 else { return 0 }
+        let effective = argmaxDecisionP()
+        var reach = 1.0
+        var value = 1.0
+        var best = -Double.infinity
+        var bestDepth = 1
+        for d in 1 ... cap {
+            reach *= effective[d - 1]
+            value += reach
+            let z = value / Self.argmaxPrice(d)
+            if z > best { best = z; bestDepth = d }
+        }
+        return bestDepth
+    }
+
+    /// The arm's own estimator update. Successes for every position the round
+    /// reached, ONE failure at the position that rejected, and no optimism
+    /// transfer. Positions this round is about to touch for the first time are
+    /// seeded from the deepest position that already has evidence.
+    private func argmaxRecord(acceptedCount: Int, drafts: [Int]) {
+        let drafted = drafts.count
+        let stoppedEarly = acceptedCount > 0 && acceptedCount <= drafted
+            && stopTokens.contains(drafts[acceptedCount - 1])
+        for k in 0 ..< Swift.min(acceptedCount, argmaxS.count) {
+            argmaxObserve(k, success: true)
+        }
+        if acceptedCount < drafted, !stoppedEarly {
+            argmaxObserve(acceptedCount, success: false)
+        }
+    }
+
     /// h = (one head draft step) / (one batched verify forward), the only
     /// constant the marginal rule needs. Derivation from the campaign's
     /// measured budgets: the verify forward is weight-stream bound on the
@@ -1173,6 +1418,7 @@ public final class Qwen36MTPBlockSession {
     /// rejected there (not when it ended early on a committed stop token);
     /// deeper positions were never reached and observe nothing.
     private func recordAcceptOutcome(acceptedCount: Int, drafts: [Int]) {
+        argmaxRecord(acceptedCount: acceptedCount, drafts: drafts)
         let alpha = Self.acceptEMAAlpha
         for index in 0 ..< acceptedCount where index < positionAcceptEMA.count {
             positionAcceptEMA[index] += alpha * (1.0 - positionAcceptEMA[index])

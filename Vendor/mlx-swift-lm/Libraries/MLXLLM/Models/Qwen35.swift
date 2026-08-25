@@ -1712,7 +1712,7 @@ public enum Qwen35CustomQMV {
     /// `first_m >= M`; launching `M` groups therefore submitted 67--80 %
     /// no-op groups at every routed width. Keep the table explicit so a future
     /// width-plan edit must update this launch witness deliberately.
-    static func activeInputGroups(_ m: Int) -> Int {
+    public static func activeInputGroups(_ m: Int) -> Int {
         let inputsPerGroup: Int
         switch m {
         case 2: inputsPerGroup = 2
