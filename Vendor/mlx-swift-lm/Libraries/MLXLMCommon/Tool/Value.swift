@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+import CoreFoundation
 import Foundation
 
 /// Type-safe representation of JSON values
@@ -60,8 +61,8 @@ public enum JSONValue: Hashable, Codable, Sendable {
         switch value {
         case is NSNull:
             return .null
-        case let bool as Bool:
-            return .bool(bool)
+        case let number as NSNumber where CFGetTypeID(number) == CFBooleanGetTypeID():
+            return .bool(number.boolValue)
         case let int as Int:
             return .int(int)
         case let double as Double:

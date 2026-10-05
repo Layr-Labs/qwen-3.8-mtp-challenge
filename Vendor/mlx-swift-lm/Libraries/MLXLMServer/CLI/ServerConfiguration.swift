@@ -19,6 +19,8 @@ public struct MLXServerConfiguration: Sendable, Equatable {
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
     public var embeddingModel: String?
+    /// Total tokenizer prompt plus output budget for each request.
+    public var contextTokens: Int
     /// Which engine to construct. Default: ``MLXServerEngineKind/batched``.
     public var engineKind: MLXServerEngineKind
     /// Batching knobs; ignored when ``engineKind`` is ``MLXServerEngineKind/singleRequest``.
@@ -33,6 +35,7 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
         embeddingModel: String? = nil,
+        contextTokens: Int = 32768,
         engineKind: MLXServerEngineKind = .batched,
         batchedEngineConfiguration: BatchedEngineServerConfiguration = .init()
     ) {
@@ -44,6 +47,7 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
         self.embeddingModel = embeddingModel
+        self.contextTokens = contextTokens
         self.engineKind = engineKind
         self.batchedEngineConfiguration = batchedEngineConfiguration
     }
@@ -60,6 +64,7 @@ public enum MLXServerCLIError: Error, LocalizedError, Equatable {
     case invalidPort(String)
     case unknownOption(String)
     case invalidEngineKind(String)
+    case invalidContextTokens(String)
 
     public var errorDescription: String? {
         switch self {
@@ -71,6 +76,8 @@ public enum MLXServerCLIError: Error, LocalizedError, Equatable {
             return "Unknown option '\(option)'"
         case .invalidEngineKind(let value):
             return "Invalid engine kind '\(value)'"
+        case .invalidContextTokens(let value):
+            return "Invalid context token limit '\(value)' (expected 1...262144)"
         }
     }
 }
@@ -87,6 +94,10 @@ public enum MLXServerCLI {
         var modelType = environment["MLX_SERVER_MODEL_TYPE"]
         var toolCallParser = environment["MLX_SERVER_TOOL_CALL_PARSER"]
         var embeddingModel = environment["MLX_SERVER_EMBEDDING_MODEL"]
+        var contextTokens = 32768
+        if let raw = environment["MLX_SERVER_CONTEXT_TOKENS"] {
+            contextTokens = try decodeContextTokens(raw)
+        }
         var reasoningParser: ReasoningParserFormat?
         if let raw = environment["MLX_SERVER_REASONING_PARSER"] {
             reasoningParser = try decodeReasoningParser(raw)
@@ -126,6 +137,10 @@ public enum MLXServerCLI {
                 )
             case "--embedding-model":
                 embeddingModel = try value(after: option, arguments: arguments, index: &index)
+            case "--context-tokens":
+                contextTokens = try decodeContextTokens(
+                    try value(after: option, arguments: arguments, index: &index)
+                )
             case "--engine-kind":
                 engineKind = try decodeEngineKind(
                     try value(after: option, arguments: arguments, index: &index)
@@ -149,6 +164,7 @@ public enum MLXServerCLI {
                 toolCallParser: toolCallParser,
                 reasoningParser: reasoningParser,
                 embeddingModel: embeddingModel,
+                contextTokens: contextTokens,
                 engineKind: engineKind
             )
         )
@@ -166,6 +182,7 @@ public enum MLXServerCLI {
               --tool-call-parser <parser>  auto, json, lfm2, xml_function, glm4, gemma, gemma4, kimi_k2, minimax_m2, mistral, llama3_json, harmony
               --reasoning-parser <parser>  none, deepseek_r1, qwen3, harmony
               --embedding-model <id>       Optional embedding model id for /v1/embeddings
+              --context-tokens <tokens>    Total prompt plus output limit (default: 32768)
               --engine-kind <kind>         batched (default) or single_request
               --list-routes                Print the server route manifest
           -h, --help                       Print this help
@@ -173,7 +190,7 @@ public enum MLXServerCLI {
         Environment:
           MLX_SERVER_MODEL, MLX_SERVER_REVISION, MLX_SERVER_HOST, MLX_SERVER_PORT,
           MLX_SERVER_MODEL_TYPE, MLX_SERVER_TOOL_CALL_PARSER, MLX_SERVER_REASONING_PARSER,
-          MLX_SERVER_EMBEDDING_MODEL, MLX_SERVER_ENGINE_KIND
+          MLX_SERVER_EMBEDDING_MODEL, MLX_SERVER_ENGINE_KIND, MLX_SERVER_CONTEXT_TOKENS
         """
 
     private static func value(
@@ -200,5 +217,12 @@ public enum MLXServerCLI {
             throw MLXServerCLIError.invalidEngineKind(raw)
         }
         return kind
+    }
+
+    private static func decodeContextTokens(_ raw: String) throws -> Int {
+        guard let limit = Int(raw), (1...262144).contains(limit) else {
+            throw MLXServerCLIError.invalidContextTokens(raw)
+        }
+        return limit
     }
 }

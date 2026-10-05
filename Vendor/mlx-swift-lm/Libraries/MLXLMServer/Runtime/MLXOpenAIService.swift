@@ -91,9 +91,8 @@ public struct MLXOpenAIService: Sendable {
             let task = Task {
                 var usage: OpenAIUsage?
                 var finishReason = "stop"
-                var reasoningParser = StreamingReasoningParser(
-                    format: request.reasoningParser ?? defaultReasoningParser ?? .none
-                )
+                var nextToolCallIndex = 0
+                var reasoningParser = reasoningPolicy(for: request).makeStreamingParser()
                 do {
                     continuation.yield(
                         try ServerSentEventEncoder.encode(
@@ -152,8 +151,9 @@ public struct MLXOpenAIService: Sendable {
                             let openAIToolCall = try OpenAIToolCall(
                                 toolCall: toolCall,
                                 id: idProvider("call"),
-                                index: 0
+                                index: nextToolCallIndex
                             )
+                            nextToolCallIndex += 1
                             continuation.yield(
                                 try ServerSentEventEncoder.encode(
                                     OpenAIChatCompletionChunk(
@@ -355,8 +355,7 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIChatCompletionRequest,
         output: CollectedChatOutput
     ) throws -> OpenAIChatCompletionResponse {
-        let parsed = ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
+        let parsed = reasoningPolicy(for: request).parse(output.content)
         let content = output.toolCalls.isEmpty
             ? try OpenAIResponseFormatSupport.normalizedContent(
                 parsed.content,
@@ -377,6 +376,22 @@ public struct MLXOpenAIService: Sendable {
                 .init(index: 0, message: message, finishReason: output.finishReason)
             ],
             usage: output.usage ?? .init(promptTokens: 0, completionTokens: 0)
+        )
+    }
+
+    private func reasoningPolicy(
+        for request: OpenAIChatCompletionRequest
+    ) -> RequestReasoningPolicy {
+        let enableThinking: Bool?
+        if case .bool(let value)? = request.chatTemplateKwargs?["enable_thinking"] {
+            enableThinking = value
+        } else {
+            enableThinking = nil
+        }
+        return RequestReasoningPolicy(
+            format: request.reasoningParser ?? defaultReasoningParser ?? .none,
+            enableThinking: enableThinking,
+            qwenPromptStartsInReasoning: defaultReasoningParser == .qwen3
         )
     }
 

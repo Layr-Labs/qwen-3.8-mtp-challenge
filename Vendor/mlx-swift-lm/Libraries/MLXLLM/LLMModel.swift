@@ -21,17 +21,23 @@ extension LLMModel {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        try Task.checkCancellation()
         let prefillStepSize = windowSize ?? 512
         var y = input.text
 
         // Prepare the prompt in chunks if larger than the prefill size
         while y.tokens.size > prefillStepSize {
+            try Task.checkCancellation()
             let input = y[.newAxis, ..<prefillStepSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
+            // Finish the current device work, then stop before scheduling
+            // another chunk for a request whose consumer has gone away.
+            try Task.checkCancellation()
             y = y[prefillStepSize...]
         }
 
+        try Task.checkCancellation()
         return .tokens(y)
     }
 

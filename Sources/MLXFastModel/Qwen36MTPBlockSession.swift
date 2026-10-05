@@ -673,6 +673,58 @@ public final class Qwen36MTPBlockSession {
         return pendingPrimary!
     }
 
+    /// Serving-only seed preparation; the ranked begin/round path is unchanged.
+    /// Kept separate so bounded cancellation can be tested without a live model.
+    func prefillForServing(seedTokens: [Int], chunkSize: Int = 512) throws -> MLXArray {
+        try Task.checkCancellation()
+        guard !seedTokens.isEmpty else { throw Qwen36MTPSessionError.emptySeed }
+        guard (1...512).contains(chunkSize) else {
+            throw MLXFastError.invalidInput("Serving prefill chunk size must be 1...512.")
+        }
+        cache = model.newCache(parameters: nil)
+        var chunks: [MLXArray] = []
+        for start in stride(from: 0, to: seedTokens.count, by: chunkSize) {
+            try Task.checkCancellation()
+            let tokens = Array(seedTokens[start..<Swift.min(start + chunkSize, seedTokens.count)])
+            let (_, hidden) = model.callWithHidden(input: .init(
+                tokens: MLXArray(tokens).reshaped([1, tokens.count])),
+                cache: cache, nConfirmed: 0)
+            // Retain materialized pre-norm rows for exact committed-history
+            // alignment; never evaluate the dead full-vocabulary projection.
+            eval(cache.flatMap { $0.state } + [hidden])
+            try Task.checkCancellation()
+            chunks.append(hidden)
+        }
+        let hidden = chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 1)
+        eval(hidden)
+        try Task.checkCancellation()
+        return hidden
+    }
+
+    /// Initializes a disposable API session. The returned primary remains
+    /// pending: only generateRound commits/emits it, avoiding a duplicate seed.
+    @discardableResult
+    public func beginForServing(seedTokens: [Int]) throws -> Int {
+        try Task.checkCancellation()
+        guard !began else { throw Qwen36MTPSessionError.alreadyBegun }
+        let hidden = try prefillForServing(seedTokens: seedTokens)
+        pendingHidden = hiddenRow(hidden, hidden.dim(1) - 1)
+        seedHiddenForPriming = hidden
+        seedTokensForPriming = seedTokens
+        let (tailIDs, tailValues) = Self.linearTopTwoRows(model.applyLMHead(pendingHidden!))
+        eval(cache.flatMap { $0.state } + [tailIDs, tailValues, pendingHidden!, hidden])
+        try Task.checkCancellation()
+        let readTail = (tailIDs.asArray(Int32.self).map(Int.init),
+                        tailValues.asArray(Float.self).map(Double.init))
+        pendingPrimary = readTail.0[0]
+        pendingTop2 = readTail
+        seedTokenCount = seedTokens.count
+        committedTokenCount = 0
+        try Task.checkCancellation()
+        began = true
+        return pendingPrimary!
+    }
+
     // MARK: - draft schedule (EDITABLE POLICY)
 
     /// How many tokens to draft this round, given the parent's offer.

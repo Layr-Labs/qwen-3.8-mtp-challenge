@@ -8,6 +8,42 @@ import MLXLMCommon
 import Testing
 
 struct OpenAIServiceTests {
+    @Test("streamed multiple tool calls keep separate stable indices across responses")
+    func streamingMultipleToolCallsKeepDistinctIndices() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .toolCall(ToolCall(function: .init(name: "read", arguments: ["path": .string("go.mod")]))),
+            .toolCall(ToolCall(function: .init(name: "read", arguments: ["path": .string("README.md")]))),
+            .info(.init(promptTokens: 12, completionTokens: 8)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+        for _ in 0..<2 {
+            var calls: [OpenAIToolCall] = []
+            var terminal: OpenAIChatCompletionChunk?
+            let stream = try await service.streamChatCompletionFrames(
+                request: .test(stream: true, streamOptions: .init(includeUsage: true, continuousUsageStats: nil))
+            )
+            var finished = false
+            for try await frame in stream {
+                if frame == ServerSentEventEncoder.done {
+                    finished = true
+                    continue
+                }
+                let data = Data(String(frame.dropFirst("data: ".count)).trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+                let chunk = try JSONDecoder().decode(OpenAIChatCompletionChunk.self, from: data)
+                calls.append(contentsOf: chunk.choices.flatMap { $0.delta.toolCalls ?? [] })
+                if chunk.choices.contains(where: { $0.finishReason != nil }) { terminal = chunk }
+            }
+            try #require(calls.count == 2)
+            #expect(calls.map(\.index) == [0, 1])
+            #expect(Set(calls.map(\.id)).count == 2)
+            #expect(calls.map(\.function.name) == ["read", "read"])
+            #expect(calls[0].function.arguments.contains("go.mod"))
+            #expect(calls[1].function.arguments.contains("README.md"))
+            #expect(terminal?.choices.first?.finishReason == "tool_calls")
+            #expect(finished)
+        }
+    }
+
     @Test("chat completion collects generated content, reasoning, tool calls, usage, and metrics")
     func chatCompletionCollectsContentReasoningToolCallsUsageAndMetrics() async throws {
         let engine = ScriptedServerEngine(events: [
@@ -524,7 +560,7 @@ struct OpenAIServiceTests {
         )
         let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
 
-        try await app.test(.router) { client in
+        try await app.test(.live) { client in
             try await client.execute(uri: "/health", method: .get) { response in
                 #expect(response.status == .ok)
                 #expect(String(buffer: response.body).contains("\"status\":\"ok\""))
@@ -582,7 +618,7 @@ struct OpenAIServiceTests {
         let service = MLXOpenAIService(engine: engine)
         let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
 
-        try await app.test(.router) { client in
+        try await app.test(.live) { client in
             let chatBody = ByteBuffer(
                 string:
                     #"{"model":"local-model","messages":[{"role":"user","content":"Return JSON"}],"response_format":{"type":"json_object"}}"#

@@ -44,10 +44,11 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
 
             let paramName = String(paramSection[paramStart.upperBound ..< nameEnd.lowerBound])
 
-            // Find the closing </parameter> tag
+            // Close at the </parameter> that is followed by the next parameter
+            // or </function>. An earlier copy inside the value stays in the text.
             guard
-                let paramEnd = paramSection.range(
-                    of: "</parameter>", range: nameEnd.upperBound ..< paramSection.endIndex)
+                let paramEnd = structuralParameterClose(
+                    in: paramSection, from: nameEnd.upperBound)
             else { break }
 
             var paramValue = String(paramSection[nameEnd.upperBound ..< paramEnd.lowerBound])
@@ -68,5 +69,22 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
         }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    /// A parameter closer is structural when the next tag is a sibling parameter
+    /// or the function end. A `</parameter>` buried in a file body is not.
+    private func structuralParameterClose(
+        in text: String, from start: String.Index
+    ) -> Range<String.Index>? {
+        let marker = "</parameter>"
+        var search = start ..< text.endIndex
+        while let candidate = text.range(of: marker, range: search) {
+            let rest = text[candidate.upperBound...].drop(while: { $0.isWhitespace })
+            if rest.isEmpty || rest.hasPrefix("<parameter=") || rest.hasPrefix("</function>") {
+                return candidate
+            }
+            search = candidate.upperBound ..< text.endIndex
+        }
+        return nil
     }
 }

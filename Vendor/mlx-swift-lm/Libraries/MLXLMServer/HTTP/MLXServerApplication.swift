@@ -97,7 +97,7 @@ public enum MLXServerApplication {
                 )
                 if chatRequest.stream == true {
                     let frames = try await service.streamChatCompletionFrames(request: chatRequest)
-                    return sseResponse(frames)
+                    return sseResponse(frames, requestBody: request.body)
                 }
                 return try jsonResponse(try await service.createChatCompletion(request: chatRequest))
             }
@@ -250,7 +250,9 @@ private func textResponse(_ text: String, contentType: String) -> Response {
     )
 }
 
-private func sseResponse(_ frames: AsyncThrowingStream<String, Error>) -> Response {
+private func sseResponse(
+    _ frames: AsyncThrowingStream<String, Error>, requestBody: RequestBody? = nil
+) -> Response {
     let body = AsyncThrowingStream<ByteBuffer, Error> { continuation in
         let task = Task {
             do {
@@ -266,12 +268,39 @@ private func sseResponse(_ frames: AsyncThrowingStream<String, Error>) -> Respon
             task.cancel()
         }
     }
+    let responseBody: ResponseBody
+    if let requestBody {
+        // Watch the connection for the whole response, including native
+        // prefill before the first frame. Canceling this writer terminates
+        // the streams above and their owned generation task.
+        responseBody = .init { writer in
+            try await requestBody.consumeWithCancellationOnInboundClose { inboundBody in
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    // Decode already consumed the original request end. Keep
+                    // a consumer of the watcher's fresh body alive while we
+                    // write, then cancel and join it so its producer finishes.
+                    group.addTask {
+                        do {
+                            _ = try await inboundBody.collect(upTo: 2 * 1024 * 1024)
+                        } catch is CancellationError where Task.isCancelled {}
+                    }
+                    defer { group.cancelAll() }
+                    try await writer.write(body)
+                    group.cancelAll()
+                    try await group.waitForAll()
+                }
+            }
+            try await writer.finish(nil)
+        }
+    } else {
+        responseBody = .init(asyncSequence: body)
+    }
     return Response(
         status: .ok,
         headers: [
             .contentType: "text/event-stream; charset=utf-8",
             .cacheControl: "no-cache",
         ],
-        body: .init(asyncSequence: body)
+        body: responseBody
     )
 }

@@ -1369,7 +1369,8 @@ public func generate(
 /// ```
 public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [ToolSpec]? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
@@ -1378,7 +1379,8 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemoryTicket: wiredMemoryTicket)
+        wiredMemoryTicket: wiredMemoryTicket,
+        tools: tools)
     return stream
 }
 
@@ -1497,7 +1499,8 @@ public func generateTask(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [ToolSpec]? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1507,7 +1510,8 @@ public func generateTask(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            format: modelConfiguration.toolCallFormat ?? .json
+            format: modelConfiguration.toolCallFormat ?? .json,
+            tools: tools
         )
     )
 }
@@ -1522,7 +1526,9 @@ public func generateTask(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming any TokenIteratorProtocol,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [ToolSpec]? = nil,
+    stopSequences: [String]? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1532,7 +1538,9 @@ public func generateTask(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            format: modelConfiguration.toolCallFormat ?? .json
+            format: modelConfiguration.toolCallFormat ?? .json,
+            tools: tools,
+            stopSequences: stopSequences
         )
     )
 }
@@ -1710,7 +1718,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            let iterator = iterator.consume()
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -1723,7 +1731,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            for token in iterator {
+            // Advance the owned iterator so termination metadata reads its final count.
+            while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
@@ -1751,7 +1760,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
                 tokenCount += 1
                 if !handler.onToken(token, emit: continuation.yield) {
-                    stopReason = .cancelled
+                    stopReason = handler.requestedStop ? .stop : .cancelled
                     break
                 }
             }
@@ -1967,6 +1976,7 @@ public enum TokenGeneration: Sendable {
 
 private protocol TokenLoopHandler: Sendable {
     associatedtype Output
+    var requestedStop: Bool { get }
 
     /// Return false to stop the loop early.
     mutating func onToken(
@@ -1988,15 +1998,25 @@ private protocol TokenLoopHandler: Sendable {
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
 }
 
+extension TokenLoopHandler {
+    var requestedStop: Bool { false }
+}
+
 private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     typealias Output = Generation
 
     var detokenizer: NaiveStreamingDetokenizer
     let toolCallProcessor: ToolCallProcessor
+    private var stopFilter: LiteralStopFilter?
+    var requestedStop: Bool { stopFilter?.matched ?? false }
 
-    init(tokenizer: Tokenizer, format: ToolCallFormat) {
+    init(tokenizer: Tokenizer, format: ToolCallFormat, tools: [ToolSpec]? = nil,
+         stopSequences: [String]? = nil) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        toolCallProcessor = ToolCallProcessor(format: format)
+        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
+        if let stopSequences, !stopSequences.isEmpty {
+            stopFilter = LiteralStopFilter(stops: stopSequences)
+        }
     }
 
     mutating func onToken(
@@ -2005,22 +2025,10 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     ) -> Bool {
         detokenizer.append(token: token)
         if let chunk = detokenizer.next() {
-            // Process chunk through the tool call processor.
-            if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield)) {
-                    return false
-                }
-            }
-
-            // Emit all complete tool calls in parse order.
-            for toolCall in toolCallProcessor.drainToolCalls() {
-                if case .terminated = emit(.toolCall(toolCall)) {
-                    return false
-                }
-            }
+            let text = stopFilter == nil ? chunk : stopFilter!.process(chunk)
+            if !processText(text, emit: emit) { return false }
         }
-
-        return true
+        return !requestedStop
     }
 
     mutating func onStopToken(
@@ -2033,6 +2041,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
+        if let remaining = stopFilter?.finish(), !processText(remaining, emit: emit) { return }
         if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
             !bufferedText.isEmpty
         {
@@ -2050,6 +2059,56 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
         .info(info)
+    }
+
+    private func processText(_ chunk: String,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult) -> Bool {
+        if !chunk.isEmpty, let text = toolCallProcessor.processChunk(chunk) {
+            if case .terminated = emit(.chunk(text)) { return false }
+        }
+        for call in toolCallProcessor.drainToolCalls() {
+            if case .terminated = emit(.toolCall(call)) { return false }
+        }
+        return true
+    }
+}
+
+/// Retains only a possible literal stop prefix between detokenizer chunks.
+/// Matching uses UTF-8 bytes, so Unicode normalization cannot invent a stop.
+private struct LiteralStopFilter {
+    let stops: [Data]
+    var pending = Data()
+    private(set) var matched = false
+    init(stops: [String]) { self.stops = stops.filter { !$0.isEmpty }.map { Data($0.utf8) } }
+    mutating func process(_ chunk: String) -> String {
+        guard !matched else { return "" }
+        pending.append(contentsOf: chunk.utf8)
+        if let start = stops.compactMap({ pending.range(of: $0)?.lowerBound }).min() {
+            let text = String(decoding: pending[..<start], as: UTF8.self)
+            pending.removeAll(keepingCapacity: true)
+            matched = true
+            return text
+        }
+        var retained = 0
+        for stop in stops {
+            let limit = Swift.min(pending.count, stop.count - 1)
+            guard limit > retained else { continue }
+            for count in stride(from: limit, through: retained + 1, by: -1) {
+                if pending.suffix(count).elementsEqual(stop.prefix(count)) {
+                    retained = count
+                    break
+                }
+            }
+        }
+        let released = pending.count - retained
+        let text = String(decoding: pending.prefix(released), as: UTF8.self)
+        pending.removeFirst(released)
+        return text
+    }
+    mutating func finish() -> String {
+        guard !matched else { return "" }
+        defer { pending.removeAll() }
+        return String(decoding: pending, as: UTF8.self)
     }
 }
 

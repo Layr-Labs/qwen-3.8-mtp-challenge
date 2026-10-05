@@ -28,6 +28,7 @@ public enum MLXServer {
                 modelID: configuration.model,
                 modelContext: context,
                 modelType: configuration.modelType,
+                contextTokens: configuration.contextTokens,
                 configuration: configuration.batchedEngineConfiguration,
                 defaultToolCallParser: configuration.toolCallParser
             )
@@ -42,6 +43,7 @@ public enum MLXServer {
                 modelID: configuration.model,
                 model: model,
                 modelType: configuration.modelType,
+                contextTokens: configuration.contextTokens,
                 defaultToolCallParser: configuration.toolCallParser
             )
             batchedEngine = nil

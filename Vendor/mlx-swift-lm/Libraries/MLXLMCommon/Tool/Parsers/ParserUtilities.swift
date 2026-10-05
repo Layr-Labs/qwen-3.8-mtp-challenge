@@ -113,6 +113,71 @@ func getParameterConfig(
     return [:]
 }
 
+/// Parameter object for one function argument.
+///
+/// `getParameterType` only sees a `type` string. JSON schemas decoded through
+/// `JSONValue.sendableValue` store a type array or `anyOf` as `[any Sendable]`,
+/// which that cast misses. This returns the property dictionary either way.
+func parameterSchema(
+    funcName: String, paramName: String, tools: [[String: any Sendable]]?
+) -> [String: any Sendable]? {
+    guard let tools else { return nil }
+    for tool in tools {
+        guard let function = tool["function"] as? [String: any Sendable],
+            function["name"] as? String == funcName,
+            let parameters = function["parameters"] as? [String: any Sendable],
+            let properties = parameters["properties"] as? [String: any Sendable],
+            let param = properties[paramName] as? [String: any Sendable]
+        else { continue }
+        return param
+    }
+    return nil
+}
+
+/// Type names declared by `type`, including an array, plus `anyOf` / `oneOf` / `allOf`.
+///
+/// A `[String]` and an `[any Sendable]` of strings are both accepted. Live tool
+/// specs use the second shape, and a Swift dictionary literal often uses the first.
+func schemaTypeNames(_ schema: [String: any Sendable]) -> Set<String> {
+    var types: Set<String> = []
+    if let name = schema["type"] as? String {
+        types.insert(name.lowercased())
+    } else if let names = schema["type"] as? [String] {
+        types.formUnion(names.map { $0.lowercased() })
+    } else if let names = schema["type"] as? [any Sendable] {
+        for item in names {
+            if let name = item as? String {
+                types.insert(name.lowercased())
+            }
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        let choices: [any Sendable]
+        if let typed = schema[key] as? [[String: any Sendable]] {
+            choices = typed.map { $0 as any Sendable }
+        } else if let untyped = schema[key] as? [any Sendable] {
+            choices = untyped
+        } else {
+            continue
+        }
+        for choice in choices {
+            if let child = choice as? [String: any Sendable] {
+                types.formUnion(schemaTypeNames(child))
+            }
+        }
+    }
+    return types
+}
+
+func declaredParameterTypes(
+    funcName: String, paramName: String, tools: [[String: any Sendable]]?
+) -> Set<String> {
+    guard let schema = parameterSchema(
+        funcName: funcName, paramName: paramName, tools: tools)
+    else { return [] }
+    return schemaTypeNames(schema)
+}
+
 // MARK: - Schema Type Extraction
 
 /// Extract types from JSON schema (handles anyOf, oneOf, allOf, enums).
@@ -224,11 +289,41 @@ func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
 func convertParameterValue(
     _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?
 ) -> any Sendable {
-    guard let paramType = getParameterType(funcName: funcName, paramName: paramName, tools: tools)
-    else {
+    if let paramType = getParameterType(funcName: funcName, paramName: paramName, tools: tools) {
+        return convertTypedParameterValue(value, type: paramType)
+    }
+    return convertUnionParameterValue(
+        value, paramName: paramName, funcName: funcName, tools: tools)
+}
+
+/// Union and `anyOf` coercion used only when `type` is not a single string.
+///
+/// A declared string keeps the raw XML text, including the word `null`.
+/// `NSNull` is returned only when null is declared, string is not, and the
+/// text is a null token. One remaining concrete type reuses the single-type
+/// converter. Mixed concrete types stay strings. `convertValueWithTypes` is
+/// not used: it turns the text `null` into `NSNull` for every schema.
+func convertUnionParameterValue(
+    _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?
+) -> any Sendable {
+    let types = declaredParameterTypes(
+        funcName: funcName, paramName: paramName, tools: tools)
+    if types.isEmpty { return value }
+    if types.contains("string") || types.contains("str") || types.contains("text") {
         return value
     }
+    let token = value.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    if types.contains("null"), ["null", "none", "nil"].contains(token) {
+        return NSNull()
+    }
+    let concrete = types.subtracting(["null"])
+    guard concrete.count == 1, let only = concrete.first else {
+        return value
+    }
+    return convertTypedParameterValue(value, type: only)
+}
 
+func convertTypedParameterValue(_ value: String, type paramType: String) -> any Sendable {
     let type = paramType.lowercased()
 
     // String types - return as-is
@@ -247,16 +342,19 @@ func convertParameterValue(
     // Float types
     if type.hasPrefix("num") || type.hasPrefix("float") {
         if let floatVal = Double(value) {
-            let intVal = Int(floatVal)
-            return floatVal != Double(intVal) ? floatVal : intVal
+            guard floatVal.isFinite else { return value }
+            if let intVal = Int(exactly: floatVal) { return intVal }
+            return floatVal
         }
         return value
     }
 
     // Boolean types
     if ["boolean", "bool", "binary"].contains(type) {
-        return ["true", "1", "yes", "on"].contains(
-            value.lowercased().trimmingCharacters(in: .whitespaces))
+        let normalized = value.lowercased().trimmingCharacters(in: .whitespaces)
+        if ["true", "1", "yes", "on"].contains(normalized) { return true }
+        if ["false", "0", "no", "off"].contains(normalized) { return false }
+        return value
     }
 
     // Object/Array types - JSON decode

@@ -30,6 +30,7 @@ public final class MLXBatchedEngineServerEngine: MLXServerEngine, @unchecked Sen
     /// Tool-call format pinned for every request served by this engine.
     public let toolCallFormat: ToolCallFormat
     public let engine: BatchedEngine
+    let contextTokens: Int
 
     private let tokenizer: any Tokenizer
 
@@ -37,11 +38,13 @@ public final class MLXBatchedEngineServerEngine: MLXServerEngine, @unchecked Sen
         modelID: String,
         modelContext: consuming sending ModelContext,
         modelType: String? = nil,
+        contextTokens: Int = 32768,
         configuration: BatchedEngineServerConfiguration = .init(),
         defaultToolCallParser: String? = nil
     ) throws {
         self.modelID = modelID
         self.modelType = modelType
+        self.contextTokens = contextTokens
 
         let resolvedFormat: ToolCallFormat
         if defaultToolCallParser == nil,
@@ -70,13 +73,15 @@ public final class MLXBatchedEngineServerEngine: MLXServerEngine, @unchecked Sen
         engine: BatchedEngine,
         tokenizer: any Tokenizer,
         toolCallFormat: ToolCallFormat,
-        modelType: String? = nil
+        modelType: String? = nil,
+        contextTokens: Int = 32768
     ) {
         self.modelID = modelID
         self.engine = engine
         self.tokenizer = tokenizer
         self.toolCallFormat = toolCallFormat
         self.modelType = modelType
+        self.contextTokens = contextTokens
     }
 
     /// Start the underlying engine loop. Idempotent.
@@ -90,6 +95,10 @@ public final class MLXBatchedEngineServerEngine: MLXServerEngine, @unchecked Sen
     }
 
     // MARK: - MLXServerEngine
+
+    func promptTokenCount(_ prompt: String) -> Int {
+        tokenizer.encode(text: prompt).count
+    }
 
     public func availableModels() async throws -> [MLXServerModel] {
         [.init(id: modelID)]

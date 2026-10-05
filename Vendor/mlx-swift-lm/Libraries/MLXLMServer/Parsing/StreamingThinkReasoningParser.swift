@@ -3,12 +3,17 @@
 struct StreamingThinkReasoningParser: Sendable {
     private enum State: Sendable {
         case undecided
+        case reasoningStart
         case reasoning
         case content
     }
 
     private var state: State = .undecided
     private var buffer = ""
+
+    init(startsInReasoning: Bool = false) {
+        state = startsInReasoning ? .reasoningStart : .undecided
+    }
 
     mutating func parse(_ chunk: String) -> [ParsedReasoning] {
         buffer += chunk
@@ -27,6 +32,20 @@ struct StreamingThinkReasoningParser: Sendable {
 
         while shouldContinue {
             switch state {
+            case .reasoningStart:
+                // The pinned Qwen template already opened the thinking block.
+                // Some model outputs repeat that opening tag; hold only a
+                // possible initial tag prefix, rather than buffering reasoning.
+                let prefix = buffer.prefix { $0.isWhitespace }
+                let remaining = buffer.dropFirst(prefix.count)
+                if remaining.hasPrefix(opening) {
+                    buffer.removeFirst(prefix.count + opening.count)
+                    state = .reasoning
+                } else if !final && (remaining.isEmpty || opening.hasPrefix(remaining)) {
+                    shouldContinue = false
+                } else {
+                    state = .reasoning
+                }
             case .undecided:
                 if let open = buffer.range(of: opening) {
                     appendContent(String(buffer[..<open.lowerBound]), to: &output)

@@ -5970,6 +5970,24 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        if languageModel.hasMTPHead {
+            // The declared draft head and precision islands belong to the
+            // text model's side channels, whose loader expects bare mtp.*
+            // keys. Restore the outer Module namespace only after that exact
+            // sanitizer has consumed them.
+            let textWeights: [String: MLXArray]
+            do {
+                textWeights = try Self.mtpTextWeights(from: weights)
+            } catch {
+                // sanitize is nonthrowing. Ambiguous names must not select an
+                // arbitrary tensor according to Dictionary iteration order.
+                fatalError("Qwen MTP checkpoint contains conflicting weight namespaces")
+            }
+            return Dictionary(uniqueKeysWithValues: languageModel.sanitize(weights: textWeights).map {
+                ("language_model." + $0.key, $0.value)
+            })
+        }
+
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {
             if key.hasPrefix("vision_tower") || key.hasPrefix("model.visual") {
@@ -5987,6 +6005,35 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return languageModel.sanitize(weights: sanitized)
+    }
+
+    /// Apply the existing wrapper key normalization in the child's namespace,
+    /// refusing multiple input keys that identify one tensor.
+    static func mtpTextWeights(from weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        var textWeights = [String: MLXArray]()
+        let prefix = "language_model."
+        for (originalKey, value) in weights {
+            if originalKey.hasPrefix("vision_tower") || originalKey.hasPrefix("model.visual") {
+                continue
+            }
+            var key = originalKey
+            if key.hasPrefix("model.language_model") {
+                key = key.replacingOccurrences(
+                    of: "model.language_model", with: "language_model.model")
+            } else if !key.hasPrefix(prefix) {
+                key = prefix + key
+            }
+            key = String(key.dropFirst(prefix.count))
+            guard textWeights[key] == nil else {
+                throw MTPWeightNamespaceError.ambiguous
+            }
+            textWeights[key] = value
+        }
+        return textWeights
+    }
+
+    private enum MTPWeightNamespaceError: Error {
+        case ambiguous
     }
 }
 

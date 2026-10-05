@@ -7,8 +7,11 @@ public struct StreamingReasoningParser: Sendable {
     private var harmonyParser = StreamingHarmonyReasoningParser()
     private var gemma4Parser = StreamingGemma4ReasoningParser()
 
-    public init(format: ReasoningParserFormat) {
+    public init(format: ReasoningParserFormat, startsInReasoning: Bool = false) {
         self.format = format
+        thinkParser = StreamingThinkReasoningParser(
+            startsInReasoning: startsInReasoning && format == .qwen3
+        )
     }
 
     public mutating func parse(_ chunk: String) -> [ParsedReasoning] {

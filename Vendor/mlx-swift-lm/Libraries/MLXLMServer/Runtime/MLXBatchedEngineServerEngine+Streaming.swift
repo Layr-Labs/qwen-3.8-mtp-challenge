@@ -19,10 +19,15 @@ extension MLXBatchedEngineServerEngine {
         let prompt = engine.buildPrompt(
             messages: request.messages.map { $0.templateMessage() },
             tools: request.tools?.map { $0.toolSpec() },
-            additionalContext: nil
+            additionalContext: request.templateContext
         )
 
-        let samplingParams = request.batchedSamplingParams
+        var samplingParams = request.batchedSamplingParams
+        samplingParams.maxTokens = try ContextTokenBudget.outputLimit(
+            promptTokens: promptTokenCount(prompt),
+            requested: request.maxTokens,
+            contextTokens: contextTokens
+        )
         let requestId = UUID().uuidString
         let batchedRequest = Request(
             requestId: requestId,

@@ -7,6 +7,8 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
+        .library(name: "MLXFastServing", targets: ["MLXFastServing"]),
+        .executable(name: "mlxfast-mtp-server", targets: ["MLXFastMTPServer"]),
         .executable(name: "mlxfast-swift", targets: ["MLXFastCLI"]),
         .executable(
             name: "mlxfast-runtime-worker",
@@ -32,8 +34,37 @@ let package = Package(
         // and resolve passes --force-resolved-versions so SwiftPM fails
         // closed instead of silently re-resolving.
         .package(url: "https://github.com/huggingface/swift-transformers", exact: "1.3.3"),
+        // Existing resolved node; direct access is needed only by loopback tests.
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.0"),
     ],
     targets: [
+        .target(name: "MLXFastServing", dependencies: [
+            "MLXFastModel", "MLXFastCore",
+            .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            .product(name: "MLXLMServer", package: "mlx-swift-lm"),
+            .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+            .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            .product(name: "MLX", package: "mlx-swift"),
+            .product(name: "Tokenizers", package: "swift-transformers"),
+        ]),
+        .executableTarget(name: "MLXFastMTPServer", dependencies: ["MLXFastServing"]),
+        .testTarget(name: "MLXFastServingCompatibilityTests", dependencies: [
+            .product(name: "MLXLMServer", package: "mlx-swift-lm"),
+            .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            .product(name: "MLX", package: "mlx-swift"),
+            .product(name: "MLXNN", package: "mlx-swift"),
+            .product(name: "Hummingbird", package: "hummingbird"),
+            .product(name: "HummingbirdTesting", package: "hummingbird"),
+        ], path: "Vendor/mlx-swift-lm/Tests/MLXLMServerTests"),
+        .testTarget(name: "MLXFastServingTests", dependencies: [
+            "MLXFastServing", "MLXFastModel",
+            .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            .product(name: "MLXLMServer", package: "mlx-swift-lm"),
+            .product(name: "MLX", package: "mlx-swift"),
+            .product(name: "MLXNN", package: "mlx-swift"),
+            .product(name: "Hummingbird", package: "hummingbird"),
+            .product(name: "HummingbirdTesting", package: "hummingbird"),
+        ]),
         .target(name: "MLXFastCore"),
         .target(
             name: "MLXFastTransform",

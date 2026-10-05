@@ -751,8 +751,8 @@ struct QwenMTPHeadManifestTests {
         for absent in ["tokenizer.json", "tokenizer_config.json"] {
             #expect(
                 !paths.contains(absent),
-                "the head tree does not ship \(absent); pinning it would fail "
-                    + "verify_cache's inventory half against the published tree")
+                Comment(rawValue: "the head tree does not ship \(absent); pinning it would fail "
+                    + "verify_cache's inventory half against the published tree"))
         }
         // `.gitattributes` IS pinned, exactly as it is now pinned in the backbone
         // manifest (16 repo files, 16 records). The inventory half of

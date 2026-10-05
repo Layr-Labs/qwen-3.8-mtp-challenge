@@ -13,18 +13,24 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     private let modelID: String
     private let model: ModelContainer
     private let modelType: String?
+    private let contextTokens: Int
     private let defaultToolCallParser: String?
+    private let generationDriver: (any MLXServerGenerationDriver)?
 
     public init(
         modelID: String,
         model: ModelContainer,
         modelType: String? = nil,
-        defaultToolCallParser: String? = nil
+        contextTokens: Int = 32768,
+        defaultToolCallParser: String? = nil,
+        generationDriver: (any MLXServerGenerationDriver)? = nil
     ) {
         self.modelID = modelID
         self.model = model
         self.modelType = modelType
+        self.contextTokens = contextTokens
         self.defaultToolCallParser = defaultToolCallParser
+        self.generationDriver = generationDriver
     }
 
     public func availableModels() async throws -> [MLXServerModel] {
@@ -34,8 +40,8 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     public func streamChatCompletion(
         request: OpenAIChatCompletionRequest
     ) async throws -> AsyncThrowingStream<MLXServerGenerationEvent, Error> {
-        // This engine builds its prompt by flattening each message to text via
-        // `chatMessage()`, which discards `image_url`/`video_url` parts. Rather
+        // This text-only engine passes template-ready message dictionaries,
+        // which retain tool history but discard `image_url`/`video_url` parts. Rather
         // than accept media and silently ignore it, fail loud — real media
         // serving lives in the downstream VLM path, not this text-only engine.
         // Checked before any model state is mutated so a rejected request is a
@@ -44,19 +50,32 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             throw MLXModelContainerEngineError.mediaUnsupported
         }
 
-        try await configureToolParser(for: request)
+        let requestToolFormat: ToolCallFormat?
+        if let generationDriver {
+            try generationDriver.validate(request: request)
+            requestToolFormat = try await toolParserFormat(for: request)
+        } else {
+            try await configureToolParser(for: request)
+            requestToolFormat = nil
+        }
 
-        let userInput = UserInput(
-            chat: request.messages.map { $0.chatMessage() },
-            tools: request.tools?.map { $0.toolSpec() }
-        )
+        let userInput = request.templateInput
+        let tools = userInput.tools
         let input = try await model.prepare(input: userInput)
-        let stream = try await model.generate(
-            input: input, parameters: request.generationParameters)
-
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                for await item in stream {
+        var parameters = request.generationParameters
+        parameters.maxTokens = try ContextTokenBudget.outputLimit(
+            promptTokens: input.text.tokens.size,
+            requested: request.maxTokens,
+            contextTokens: contextTokens
+        )
+        // Match ModelContainer's single-consumption transfer for non-Sendable
+        // MLX arrays; only this producer task can consume the prepared input.
+        let preparedInput = SendableBox(input)
+        let (stream, continuation) = AsyncThrowingStream<MLXServerGenerationEvent, Error>.makeStream()
+        let task = Task {
+            do {
+                try Task.checkCancellation()
+                let emit: @Sendable (Generation) -> Void = { item in
                     switch item {
                     case .chunk(let text):
                         continuation.yield(.content(text))
@@ -66,12 +85,31 @@ public struct MLXModelContainerEngine: MLXServerEngine {
                         continuation.yield(.info(.init(info)))
                     }
                 }
+                if let generationDriver, let requestToolFormat {
+                    let generated = try await generationDriver.generate(
+                        model: model, input: preparedInput.consume(), parameters: parameters,
+                        request: request, tools: tools, toolCallFormat: requestToolFormat)
+                    for try await item in generated {
+                        try Task.checkCancellation()
+                        emit(item)
+                    }
+                } else {
+                    let generated = try await model.generate(
+                        input: preparedInput.consume(), parameters: parameters, tools: tools)
+                    for await item in generated {
+                        try Task.checkCancellation()
+                        emit(item)
+                    }
+                }
                 continuation.finish()
-            }
-            continuation.onTermination = { _ in
-                task.cancel()
+            } catch {
+                continuation.finish(throwing: error)
             }
         }
+        continuation.onTermination = { _ in
+            task.cancel()
+        }
+        return stream
     }
 
     public func tokenize(_ request: TokenizeRequest) async throws -> TokenizeResponse {
@@ -95,12 +133,7 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     }
 
     public func applyTemplate(_ request: ApplyTemplateRequest) async throws -> TokenizeResponse {
-        let messages = request.messages.map { message in
-            [
-                "role": message.role.rawValue,
-                "content": message.textContent,
-            ] as [String: any Sendable]
-        }
+        let messages = request.messages.map { $0.templateMessage() }
         let tools = request.tools?.map { $0.toolSpec() }
         let tokens = try await model.perform { context in
             try context.tokenizer.applyChatTemplate(
@@ -113,6 +146,13 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     }
 
     private func configureToolParser(for request: OpenAIChatCompletionRequest) async throws {
+        let format = try await toolParserFormat(for: request)
+        await model.update { context in
+            context.configuration.toolCallFormat = format
+        }
+    }
+
+    private func toolParserFormat(for request: OpenAIChatCompletionRequest) async throws -> ToolCallFormat {
         let configuration = await model.configuration
         let format: ToolCallFormat
         let requested = request.toolCallParser ?? defaultToolCallParser
@@ -125,9 +165,7 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             )
         }
 
-        await model.update { context in
-            context.configuration.toolCallFormat = format
-        }
+        return format
     }
 }
 

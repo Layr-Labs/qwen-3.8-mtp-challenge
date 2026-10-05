@@ -237,41 +237,39 @@ public class ToolCallProcessor {
         }
 
         toolCallBuffer += chunk
-        var leadingToken: String?
 
         switch state {
         case .normal:
-            // Change state to potential tool call
             state = .potentialToolCall
-
-            leadingToken = separateToken(
-                from: &toolCallBuffer, separators: startTags, returnLeading: true)
-
             fallthrough
         case .potentialToolCall:
-            if let startTag = partialMatch(buffer: toolCallBuffer, tags: startTags) {
-                if toolCallBuffer.starts(with: startTag) {
-                    state = .collectingToolCall
-                    fallthrough
-                } else {
-                    return nil
-                }
-            } else {
-                // Otherwise, return the collected text and reset the state
+            // A previous call can end in the middle of a chunk, leaving
+            // "\n<tool" in the next buffer. Matching only at index 0 drops
+            // that partial tag. Align to the tag, and keep a partial one.
+            guard let aligned = partialTagStart(in: toolCallBuffer, tags: startTags) else {
                 state = .normal
                 let buffer = toolCallBuffer
                 toolCallBuffer = ""
-                return (leadingToken ?? "") + buffer
+                return buffer.isEmpty ? nil : buffer
             }
+            let skipped = String(toolCallBuffer[..<aligned])
+            toolCallBuffer = String(toolCallBuffer[aligned...])
+            guard startTags.contains(where: { toolCallBuffer.hasPrefix($0) }) else {
+                return skipped.isEmpty ? nil : skipped
+            }
+            state = .collectingToolCall
+            let rest = processTaggedChunk("")
+            if skipped.isEmpty { return rest }
+            if let rest, !rest.isEmpty { return skipped + rest }
+            return skipped
         case .collectingToolCall:
             guard !endTags.isEmpty else {
                 return nil
             }
 
-            if endTags.contains(where: { toolCallBuffer.contains($0) }) {
-                // Separate the trailing token
-                let trailingToken = separateToken(
-                    from: &toolCallBuffer, separators: endTags, returnLeading: false)
+            if let endRange = structuralEndTag(in: toolCallBuffer, endTags: endTags) {
+                let trailingToken = String(toolCallBuffer[endRange.upperBound...])
+                toolCallBuffer = String(toolCallBuffer[..<endRange.upperBound])
 
                 // Parse the tool call using the parser
                 if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
@@ -282,13 +280,11 @@ public class ToolCallProcessor {
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
-                if let trailingToken,
-                    startTagFirstChars.contains(where: { trailingToken.contains($0) })
-                {
+                if startTagFirstChars.contains(where: { trailingToken.contains($0) }) {
                     return processChunk(trailingToken)
                 } else {
                     // Otherwise, return the collected token, or nil if it's empty
-                    return trailingToken?.isEmpty ?? true ? nil : trailingToken
+                    return trailingToken.isEmpty ? nil : trailingToken
                 }
             } else {
                 return nil
@@ -340,6 +336,58 @@ public class ToolCallProcessor {
 
     private func partialMatch(buffer: String, tags: [String]) -> String? {
         tags.first { partialMatch(buffer: buffer, tag: $0) }
+    }
+
+    /// Index of a suffix that is a start tag or the beginning of one.
+    private func partialTagStart(in buffer: String, tags: [String]) -> String.Index? {
+        var index = buffer.startIndex
+        while index < buffer.endIndex {
+            let suffix = buffer[index...]
+            if tags.contains(where: { suffix.hasPrefix($0) || $0.hasPrefix(suffix) }) {
+                return index
+            }
+            index = buffer.index(after: index)
+        }
+        return nil
+    }
+
+    /// End tag that closes the call, ignoring a copy that sits inside a parameter value.
+    ///
+    /// `<parameter=` raises the depth. A `</parameter>` lowers it only when the
+    /// following non-whitespace text is another parameter, `</function>`, or the
+    /// end of the buffer. Qwen writes one wrapper per call, so a later
+    /// `<tool_call>` still starts a second call after this split.
+    private func structuralEndTag(in buffer: String, endTags: [String]) -> Range<String.Index>? {
+        var index = buffer.startIndex
+        var depth = 0
+        while index < buffer.endIndex {
+            let rest = buffer[index...]
+            if rest.hasPrefix("<parameter=") {
+                depth += 1
+                index = buffer.index(index, offsetBy: "<parameter=".count)
+                continue
+            }
+            if rest.hasPrefix("</parameter>") {
+                let after = buffer.index(index, offsetBy: "</parameter>".count)
+                if depth > 0, parameterCloseIsStructural(buffer, at: after) {
+                    depth -= 1
+                }
+                index = after
+                continue
+            }
+            if depth == 0, let tag = endTags.first(where: { rest.hasPrefix($0) }) {
+                let end = buffer.index(index, offsetBy: tag.count)
+                return index ..< end
+            }
+            index = buffer.index(after: index)
+        }
+        return nil
+    }
+
+    private func parameterCloseIsStructural(_ buffer: String, at index: String.Index) -> Bool {
+        let rest = buffer[index...].drop(while: { $0.isWhitespace })
+        if rest.isEmpty { return true }
+        return rest.hasPrefix("<parameter=") || rest.hasPrefix("</function>")
     }
 
     private func firstSeparator(in buffer: String, separators: [String]) -> String? {

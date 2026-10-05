@@ -144,6 +144,28 @@ public struct OpenAIChatMessage: Codable, Sendable, Equatable {
         case reasoningContent = "reasoning_content"
     }
 
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        role = try container.decode(OpenAIRole.self, forKey: .role)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        toolCallID = try container.decodeIfPresent(String.self, forKey: .toolCallID)
+        toolCalls = try container.decodeIfPresent([OpenAIToolCall].self, forKey: .toolCalls)
+        reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
+        if container.contains(.content) {
+            content = try container.decode(OpenAIMessageContent.self, forKey: .content)
+        } else if role == .assistant, let toolCalls, !toolCalls.isEmpty {
+            // FloCode/OpenAI assistant tool-use messages may omit content.
+            // Other missing-content roles remain invalid instead of silently
+            // constructing an empty prompt or losing a tool result.
+            content = .null
+        } else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.content,
+                .init(codingPath: decoder.codingPath, debugDescription: "Missing message content.")
+            )
+        }
+    }
+
     public init(
         role: OpenAIRole,
         content: OpenAIMessageContent,
@@ -182,11 +204,13 @@ public struct OpenAIFunctionDefinition: Codable, Sendable, Equatable {
     public var name: String
     public var description: String?
     public var parameters: JSONValue?
+    public var strict: Bool?
 
-    public init(name: String, description: String? = nil, parameters: JSONValue? = nil) {
+    public init(name: String, description: String? = nil, parameters: JSONValue? = nil, strict: Bool? = nil) {
         self.name = name
         self.description = description
         self.parameters = parameters
+        self.strict = strict
     }
 }
 
@@ -352,6 +376,9 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var messages: [OpenAIChatMessage]
     public var tools: [OpenAITool]?
     public var toolChoice: OpenAIToolChoice?
+    /// Present only when the client sent `parallel_tool_calls`. Native MTP
+    /// rejects the field; it does not implement a one-call cutoff.
+    public var parallelToolCalls: Bool?
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
     public var responseFormat: OpenAIResponseFormat?
@@ -366,12 +393,14 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var repetitionPenalty: Float?
     public var stop: [String]?
     public var streamOptions: OpenAIStreamOptions?
+    public var chatTemplateKwargs: [String: JSONValue]?
 
     private enum CodingKeys: String, CodingKey {
         case model
         case messages
         case tools
         case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
         case toolCallParser = "tool_call_parser"
         case reasoningParser = "reasoning_parser"
         case responseFormat = "response_format"
@@ -386,6 +415,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         case repetitionPenalty = "repetition_penalty"
         case stop
         case streamOptions = "stream_options"
+        case chatTemplateKwargs = "chat_template_kwargs"
     }
 
     public init(
@@ -393,6 +423,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         messages: [OpenAIChatMessage],
         tools: [OpenAITool]? = nil,
         toolChoice: OpenAIToolChoice? = nil,
+        parallelToolCalls: Bool? = nil,
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
         responseFormat: OpenAIResponseFormat? = nil,
@@ -406,12 +437,14 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         frequencyPenalty: Float? = nil,
         repetitionPenalty: Float? = nil,
         stop: [String]? = nil,
-        streamOptions: OpenAIStreamOptions? = nil
+        streamOptions: OpenAIStreamOptions? = nil,
+        chatTemplateKwargs: [String: JSONValue]? = nil
     ) {
         self.model = model
         self.messages = messages
         self.tools = tools
         self.toolChoice = toolChoice
+        self.parallelToolCalls = parallelToolCalls
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
         self.responseFormat = responseFormat
@@ -426,6 +459,19 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.stop = stop
         self.streamOptions = streamOptions
+        self.chatTemplateKwargs = chatTemplateKwargs
+    }
+
+    var templateContext: [String: any Sendable]? {
+        chatTemplateKwargs?.mapValues(\.sendableValue)
+    }
+
+    var templateInput: UserInput {
+        UserInput(
+            messages: messages.map { $0.templateMessage() },
+            tools: tools?.map { $0.toolSpec() },
+            additionalContext: templateContext
+        )
     }
 
     public var generationParameters: GenerateParameters {
